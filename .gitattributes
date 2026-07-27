@@ -1,0 +1,5 @@
+# Keep repository content byte-stable across Windows, Linux, and macOS.
+* text=auto eol=lf
+
+# Generated benchmark datasets are data files, never platform-translated.
+benchmarks/datasets/** -text
