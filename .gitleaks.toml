@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "tt-ai-secret-canary"
+description = "TT-AI secret-scanning canary"
+regex = '''TT_AI_SECRET_CANARY_[A-F0-9]{32}'''
+secretGroup = 0
