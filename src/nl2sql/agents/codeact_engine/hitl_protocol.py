@@ -21,7 +21,7 @@ from src.nl2sql.agents.codeact_engine.prompts import (
     DECOMPOSER_SYSTEM_PROMPT,
     PLAN_REFINE_SYSTEM_PROMPT,
 )
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ async def decompose_to_plan_card(
     Returns:
         结构化的 CalcPlanCard，包含 AI 对四要素的分解结果
     """
-    llm = get_llm().with_structured_output(CalcPlanCard, method="function_calling")
+    llm = get_legacy_model().with_structured_output(CalcPlanCard, method="function_calling")
 
     prompt = DECOMPOSER_SYSTEM_PROMPT.format(schema_context=schema_context or "（无可用 schema 信息）")
 
@@ -103,7 +103,7 @@ async def refine_plan_card(
         )
         return current_card
 
-    llm = get_llm().with_structured_output(CalcPlanCard, method="function_calling")
+    llm = get_legacy_model().with_structured_output(CalcPlanCard, method="function_calling")
     prompt = PLAN_REFINE_SYSTEM_PROMPT.format(
         current_plan_markdown=current_card.to_markdown(),
         user_feedback=user_feedback,

@@ -24,7 +24,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from src.core.observer import create_monitored_config
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 from src.nl2sql.infra.runtime.registry import (
     get_or_create_codeact_graph,
     get_or_create_dynamic_calc_graph,
@@ -352,7 +352,7 @@ async def create_supervisor(checkpointer: BaseCheckpointSaver) -> Any:
     3. 调用子 Agent 工具
     """
     logger.info("开始创建 Supervisor Agent")
-    llm = get_llm()
+    llm = get_legacy_model()
 
     agent_config = get_agent_config()
     # 二分类路由：Path A (标准语义查询) + Path B (HITL + CodeAct 动态计算)

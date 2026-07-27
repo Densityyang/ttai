@@ -25,7 +25,7 @@ from src.nl2sql.agents.dynamic_calc.schemas import (
     SandboxResult,
 )
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 from src.nl2sql.infra.store.database import get_nl2sql_db_manager
 from src.nl2sql.tools.async_sql_tools import create_async_sql_tools
 
@@ -82,7 +82,7 @@ def _create_data_fetch_node(tools: list[BaseTool]) -> Any:
                 question = str(msg.content)
                 break
 
-        llm = get_llm()
+        llm = get_legacy_model()
         query_tool = db_tools_by_name.get("sql_db_query")
         list_tool = db_tools_by_name.get("sql_db_list_tables")
         schema_tool = db_tools_by_name.get("sql_db_schema")
@@ -176,7 +176,7 @@ async def code_gen_node(state: DynamicCalcState) -> dict[str, Any]:
         "请生成完整的计算代码。"
     )
 
-    llm = get_llm()
+    llm = get_legacy_model()
     response = await llm.ainvoke([
         SystemMessage(content=CODE_GENERATOR_SYSTEM_PROMPT),
         SystemMessage(content=prompt),
@@ -249,7 +249,7 @@ async def code_repair_node(state: DynamicCalcState) -> dict[str, Any]:
         data_context=data_desc or "无可用数据",
     )
 
-    llm = get_llm()
+    llm = get_legacy_model()
     response = await llm.ainvoke([SystemMessage(content=prompt)])
     repaired = _extract_code_from_response(str(response.content))
 
@@ -274,7 +274,7 @@ async def format_result_node(state: DynamicCalcState) -> dict[str, Any]:
             ],
         )
 
-        llm = get_llm()
+        llm = get_legacy_model()
         question = ""
         for msg in reversed(state["messages"]):
             if msg.type == "human":

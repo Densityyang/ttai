@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
@@ -13,7 +13,9 @@ from pydantic import Field, model_validator
 
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.types import AuthUser
+from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import ErrorEnvelope, RequestContext, RequestIdentity, StrictContract
+from src.nl2sql.orchestration.shadow import is_shadow_sample
 from src.nl2sql.ownership import runtime_config
 
 MAX_MESSAGE_BYTES = 8 * 1024
@@ -121,6 +123,18 @@ def _request_context(request: Request, auth_user: AuthUser, thread_id: UUID) -> 
     )
 
 
+def _runtime_config(context: RequestContext) -> RunnableConfig:
+    config = cast(RunnableConfig, runtime_config(context))
+    agent_config = get_agent_config()
+    config["recursion_limit"] = agent_config.graph_recursion_limit
+    configurable = cast(dict[str, object], config.get("configurable", {}))
+    configurable["shadow_mode"] = (
+        agent_config.engine_mode == "shadow"
+        and is_shadow_sample(context.identity.request_id, percentage=agent_config.shadow_traffic_percent)
+    )
+    return config
+
+
 def _snapshot(thread_id: UUID, state: Any) -> StateSnapshot:
     from src.nl2sql.api import extract_messages
 
@@ -138,21 +152,25 @@ def _snapshot(thread_id: UUID, state: Any) -> StateSnapshot:
 
 
 async def _stream_query(
-    supervisor: Any,
+    engine: Any,
     messages: list[dict[str, str]],
     config: RunnableConfig,
     thread_id: UUID,
 ) -> AsyncGenerator[str, None]:
     from src.nl2sql.api import stream_blocks
 
-    async for chunk in stream_blocks(supervisor, messages, config, str(thread_id)):
+    async for chunk in stream_blocks(engine, messages, config, str(thread_id)):
         yield chunk
 
 
-async def _supervisor_from_request(request: Request) -> Any:
+async def _engine_from_request(request: Request) -> Any:
     container = getattr(request.app.state, "container", None)
     if container is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="runtime unavailable")
+    get_engine = getattr(container, "get_engine", None)
+    if callable(get_engine):
+        return await cast(Callable[[], Awaitable[Any]], get_engine)()
+    # Compatibility with test doubles from the v2-contract PR.
     return await container.get_supervisor()
 
 
@@ -160,8 +178,6 @@ def register_v2_routes(app: FastAPI) -> None:
     """Register the sole executable API contract for NL2SQL."""
 
     from src.nl2sql.api import extract_blocks
-    from src.nl2sql.config.settings import get_agent_config
-
     router = APIRouter(prefix="/api/v2/nl2sql", tags=["nl2sql-v2"])
 
     @router.post("/queries", response_model=QueryResponse)
@@ -172,9 +188,8 @@ def register_v2_routes(app: FastAPI) -> None:
     ) -> QueryResponse:
         thread_id = body.thread_id or uuid4()
         context = _request_context(request, auth_user, thread_id)
-        config = cast(RunnableConfig, runtime_config(context))
-        config["recursion_limit"] = get_agent_config().graph_recursion_limit
-        result = await (await _supervisor_from_request(request)).ainvoke(
+        config = _runtime_config(context)
+        result = await (await _engine_from_request(request)).ainvoke(
             {"messages": [message.model_dump() for message in body.messages]}, config
         )
         return QueryResponse(thread_id=thread_id, blocks=extract_blocks(result))
@@ -187,11 +202,10 @@ def register_v2_routes(app: FastAPI) -> None:
     ) -> StreamingResponse:
         thread_id = body.thread_id or uuid4()
         context = _request_context(request, auth_user, thread_id)
-        config = cast(RunnableConfig, runtime_config(context))
-        config["recursion_limit"] = get_agent_config().graph_recursion_limit
+        config = _runtime_config(context)
         return StreamingResponse(
             _stream_query(
-                await _supervisor_from_request(request),
+                await _engine_from_request(request),
                 [message.model_dump() for message in body.messages],
                 config,
                 thread_id,
@@ -211,7 +225,7 @@ def register_v2_routes(app: FastAPI) -> None:
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> StateSnapshot:
         context = _request_context(request, auth_user, thread_id)
-        state_value = await (await _supervisor_from_request(request)).aget_state(runtime_config(context))
+        state_value = await (await _engine_from_request(request)).aget_state(runtime_config(context))
         if not state_value or not getattr(state_value, "values", None):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
         return _snapshot(thread_id, state_value)
@@ -225,7 +239,7 @@ def register_v2_routes(app: FastAPI) -> None:
         context = _request_context(request, auth_user, thread_id)
         snapshots = [
             _snapshot(thread_id, state_value)
-            async for state_value in (await _supervisor_from_request(request)).aget_state_history(
+            async for state_value in (await _engine_from_request(request)).aget_state_history(
                 runtime_config(context)
             )
         ]
@@ -241,7 +255,7 @@ def register_v2_routes(app: FastAPI) -> None:
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> ThreadActionResponse:
         context = _request_context(request, auth_user, thread_id)
-        state_value = await (await _supervisor_from_request(request)).aget_state(runtime_config(context))
+        state_value = await (await _engine_from_request(request)).aget_state(runtime_config(context))
         if not state_value or not getattr(state_value, "values", None):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
         status_by_action: dict[
@@ -257,7 +271,7 @@ def register_v2_routes(app: FastAPI) -> None:
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> dict[str, str]:
         context = _request_context(request, auth_user, body.thread_id)
-        state_value = await (await _supervisor_from_request(request)).aget_state(runtime_config(context))
+        state_value = await (await _engine_from_request(request)).aget_state(runtime_config(context))
         if not state_value or not getattr(state_value, "values", None):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
         return {"status": "accepted"}
@@ -268,16 +282,17 @@ def register_v2_routes(app: FastAPI) -> None:
     ) -> CapabilityResponse:
         del auth_user
         config = get_agent_config()
+        from src.nl2sql.infra.llm.gateway import model_gateway_available
+
         return CapabilityResponse(
-            model=False,
+            model=model_gateway_available(),
             embedding=False,
             semantic_release=False,
             graph_rag=config.enable_graph_rag,
             hitl=True,
             codeact=config.enable_dynamic_calc,
             degradation_reasons=(
-                "model and embedding provider preflight is introduced in PR06",
-                "semantic release management is introduced in PR05",
+                () if model_gateway_available() else ("model provider is not configured",)
             ),
         )
 

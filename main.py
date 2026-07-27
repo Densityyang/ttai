@@ -50,7 +50,9 @@ def create_app():
 
     @app.get("/readyz", include_in_schema=False)
     async def readyz():
-        model_ready = bool(settings.openai_api_key.strip())
+        from src.nl2sql.infra.llm.gateway import model_gateway_available
+
+        model_ready = model_gateway_available()
         ready = not settings.model_required or model_ready
         payload = {
             "status": "ready" if ready else "not_ready",

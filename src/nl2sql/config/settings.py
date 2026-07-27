@@ -53,6 +53,21 @@ class AgentConfig(BaseSettings):
         ge=1,
         description="? Agent ?????????",
     )
+    engine_mode: Literal["shadow", "v2"] = Field(
+        default="v2",
+        description="Explicit v2 engine mode; shadow never executes business SQL.",
+    )
+    shadow_traffic_percent: int = Field(default=5, ge=0, le=5)
+    v2_request_deadline_ms: int = Field(default=30_000, ge=1, le=120_000)
+    v2_token_budget: int = Field(default=8_000, ge=1)
+    v2_cost_budget: float = Field(default=1.0, ge=0)
+    v2_max_model_attempts: int = Field(default=2, ge=1, le=2)
+    model_profile_version: str = Field(default="v1", min_length=1, max_length=64)
+    deepseek_base_url: str = Field(default="https://api.deepseek.com")
+    deepseek_flash_model: str = Field(default="deepseek-v4-flash", min_length=1)
+    deepseek_pro_model: str = Field(default="deepseek-v4-pro", min_length=1)
+    nvidia_nim_base_url: str = Field(default="https://integrate.api.nvidia.com/v1")
+    nvidia_nim_model_fast: str = Field(default="", description="Approved NVIDIA small-model ID")
 
     embedding_api_key: SecretStr = Field(
         default=SecretStr("not-needed"),
@@ -211,7 +226,7 @@ class AgentConfig(BaseSettings):
         description="????????? SQL ?? + ?????",
     )
     enable_experience_store: bool = Field(
-        default=True,
+        default=False,
         description="???? Memo-SQL ?????",
     )
 
@@ -253,6 +268,8 @@ class AgentConfig(BaseSettings):
     def validate_codeact_profile(self) -> "AgentConfig":
         if self.service_mode == "product" and self.codeact_mode == "unsafe-dev":
             raise ValueError("CODEACT_MODE=unsafe-dev is not permitted when SERVICE_MODE=product")
+        if self.service_mode == "product" and self.enable_experience_store:
+            raise ValueError("ExperienceStore must be disabled when SERVICE_MODE=product")
         return self
 
 

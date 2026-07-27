@@ -48,7 +48,7 @@ from src.nl2sql.agents.codeact_engine.validator import (
 )
 from src.nl2sql.agents.dynamic_calc.schemas import SandboxResult
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 from src.nl2sql.infra.store.database import get_nl2sql_db_manager
 from src.nl2sql.tools.async_sql_tools import create_async_sql_tools
 
@@ -288,7 +288,7 @@ async def format_node(state: CodeActState) -> dict[str, Any]:
         stats=str(sandbox.stats),
     )
 
-    llm = get_llm()
+    llm = get_legacy_model()
     response = await llm.ainvoke([SystemMessage(content=prompt)])
 
     content = str(response.content)

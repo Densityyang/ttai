@@ -12,6 +12,8 @@ def test_infra_dev_is_ready_without_a_model(monkeypatch) -> None:
     monkeypatch.setenv("SERVICE_MODE", "infra-dev")
     monkeypatch.setenv("MODEL_REQUIRED", "false")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     get_settings.cache_clear()
     try:
         with TestClient(create_app()) as client:
@@ -27,6 +29,8 @@ def test_product_requires_a_model_for_readiness(monkeypatch) -> None:
     monkeypatch.setenv("SERVICE_MODE", "product")
     monkeypatch.setenv("MODEL_REQUIRED", "true")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     get_settings.cache_clear()
     try:
         with TestClient(create_app()) as client:

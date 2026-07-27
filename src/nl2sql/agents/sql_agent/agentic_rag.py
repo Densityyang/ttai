@@ -12,7 +12,7 @@ Phase 3 升级：
 - inject_node 中的并发检索使用 asyncio.gather，无共享可变状态
 - GraphRAG 访问 lru_cache 单例（只读），NetworkX 图的只读遍历是线程安全的
 - ExperienceStore 的读取是线程安全的（dict 读取在 CPython GIL 下原子）
-- 所有 LLM 调用均通过 get_llm() 获取独立实例，无跨请求状态
+- Retired graphs use the gateway compatibility bridge; v2 uses ModelGateway.
 """
 
 import asyncio
@@ -34,7 +34,7 @@ from src.nl2sql.agents.sql_agent.adaptive_router import (
 )
 from src.nl2sql.agents.sql_agent.experience_store import get_experience_store
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 from src.nl2sql.infra.store.qa_rag import get_qa_retriever
 from src.nl2sql.infra.store.semantic_rag import get_semantic_retriever
 from src.nl2sql.semantic.retrieval import retrieve_active_semantic
@@ -271,7 +271,7 @@ async def grade_node(state: AgenticRagState) -> dict[str, Any]:
     并发安全：LLM 调用是独立的，无共享可变状态。
     """
     config = get_agent_config()
-    llm = get_llm(model_name=config.rag_grader_model)
+    llm = get_legacy_model(model_name=config.rag_grader_model)
 
     question = state.get("current_query") or _extract_question(state["messages"])
 
@@ -339,7 +339,7 @@ async def grade_node(state: AgenticRagState) -> dict[str, Any]:
 
 async def rewrite_node(state: AgenticRagState) -> dict[str, Any]:
     """基于低分原因重写查询词。"""
-    llm = get_llm()
+    llm = get_legacy_model()
     question = state.get("current_query") or _extract_question(state["messages"])
 
     low_score_reasons = [
@@ -508,7 +508,7 @@ async def finalize_node(state: AgenticRagState) -> dict[str, Any]:
     if extra_context_parts:
         finalize_prompt += "\n\n额外参考信息：" + "\n".join(extra_context_parts)
 
-    llm = get_llm().with_structured_output(ExplorationResult, method="function_calling")
+    llm = get_legacy_model().with_structured_output(ExplorationResult, method="function_calling")
     msgs = [SystemMessage(content=finalize_prompt)] + state["messages"]
     try:
         result: ExplorationResult = await llm.ainvoke(msgs)  # type: ignore[assignment]
@@ -602,7 +602,7 @@ async def fast_finalize_node(state: AgenticRagState) -> dict[str, Any]:
     if experience_ctx:
         combined += f"\n\n{experience_ctx}"
 
-    llm = get_llm().with_structured_output(ExplorationResult, method="function_calling")
+    llm = get_legacy_model().with_structured_output(ExplorationResult, method="function_calling")
     try:
         response = await llm.ainvoke([
             SystemMessage(content=_FINALIZE_PROMPT + f"\n\n额外参考：\n{combined}"),
