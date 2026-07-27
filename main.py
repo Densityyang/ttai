@@ -44,6 +44,25 @@ def create_app():
         allow_headers=["*"],
     )
 
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/readyz", include_in_schema=False)
+    async def readyz():
+        model_ready = bool(settings.openai_api_key.strip())
+        ready = not settings.model_required or model_ready
+        payload = {
+            "status": "ready" if ready else "not_ready",
+            "service_mode": settings.service_mode,
+            "components": {"model": "ready" if model_ready else "unavailable"},
+        }
+        if ready:
+            return payload
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=503, content=payload)
+
     return app
 
 

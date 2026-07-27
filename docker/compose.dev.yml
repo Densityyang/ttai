@@ -1,0 +1,15 @@
+services:
+  api-a:
+    environment:
+      SERVICE_MODE: infra-dev
+      MODEL_REQUIRED: "false"
+    volumes:
+      - ../src:/app/src:ro
+      - ../configs:/app/configs:ro
+  api-b:
+    environment:
+      SERVICE_MODE: infra-dev
+      MODEL_REQUIRED: "false"
+    volumes:
+      - ../src:/app/src:ro
+      - ../configs:/app/configs:ro

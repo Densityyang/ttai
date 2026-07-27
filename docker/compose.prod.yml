@@ -1,0 +1,20 @@
+services:
+  api-a:
+    environment:
+      SERVICE_MODE: product
+      MODEL_REQUIRED: "true"
+    networks:
+      - app_internal
+      - business_external_net
+  api-b:
+    environment:
+      SERVICE_MODE: product
+      MODEL_REQUIRED: "true"
+    networks:
+      - app_internal
+      - business_external_net
+
+networks:
+  business_external_net:
+    external: true
+    name: ${BUSINESS_EXTERNAL_NETWORK:-business_external_net}
