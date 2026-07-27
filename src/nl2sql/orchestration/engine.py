@@ -7,13 +7,14 @@ have been recorded.
 
 from __future__ import annotations
 
-from typing import Annotated, Any, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage
 from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import interrupt
 
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import ModelRequest
@@ -27,6 +28,11 @@ class V2EngineState(TypedDict):
     route_record: NotRequired[dict[str, object]]
     model_receipt: NotRequired[dict[str, object]]
     degradation_flags: NotRequired[list[str]]
+    pending_answer: NotRequired[str]
+    needs_hitl: NotRequired[bool]
+    hitl_version: NotRequired[int]
+    hitl_status: NotRequired[str]
+    applied_actions: NotRequired[dict[str, dict[str, object]]]
 
 
 def create_v2_engine(*, checkpointer: BaseCheckpointSaver, model_gateway: ModelGateway) -> Any:
@@ -76,17 +82,86 @@ def create_v2_engine(*, checkpointer: BaseCheckpointSaver, model_gateway: ModelG
                 "messages": [AIMessage(content="Model service is unavailable for this request.")],
                 "degradation_flags": [type(exc).__name__],
             }
-        prefix = "Shadow plan (no business SQL executed): " if is_shadow else ""
-        return {
-            "messages": [AIMessage(content=f"{prefix}{receipt.content}")],
-            "model_receipt": receipt.model_dump(mode="json"),
+        answer = f"{'Shadow plan (no business SQL executed): ' if is_shadow else ''}{receipt.content}"
+        result: dict[str, object] = {"model_receipt": receipt.model_dump(mode="json")}
+        if route == "deep" and not is_shadow:
+            # Keep the generated plan at the checkpoint; business SQL remains blocked
+            # until the owner makes an explicit, versioned decision.
+            result.update(
+                {
+                    "pending_answer": answer,
+                    "needs_hitl": True,
+                    "hitl_version": 1,
+                    "hitl_status": "awaiting_action",
+                    "applied_actions": {},
+                }
+            )
+        else:
+            result["messages"] = [AIMessage(content=answer)]
+        return result
+
+    async def hitl_node(state: V2EngineState) -> dict[str, object]:
+        version = int(state.get("hitl_version", 1))
+        action_payload = interrupt(
+            {
+                "kind": "nl2sql_hitl_action",
+                "version": version,
+                "actions": ["approve", "modify", "reject", "cancel"],
+                "summary": state.get("pending_answer", ""),
+            }
+        )
+        if not isinstance(action_payload, dict):
+            return _failed_action("invalid_action_payload", version)
+        action = action_payload.get("action")
+        idempotency_key = action_payload.get("idempotency_key")
+        expected_version = action_payload.get("expected_version")
+        if action not in {"approve", "modify", "reject", "cancel"}:
+            return _failed_action("unsupported_action", version)
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            return _failed_action("missing_idempotency_key", version)
+        if expected_version != version:
+            return _failed_action("stale_action_version", version)
+
+        applied_actions = dict(state.get("applied_actions", {}))
+        existing = applied_actions.get(idempotency_key)
+        if existing is not None:
+            return {
+                "hitl_status": existing["status"],
+                "needs_hitl": False,
+                "applied_actions": applied_actions,
+            }
+        status_by_action: dict[str, str] = {
+            "approve": "approved",
+            "modify": "modified",
+            "reject": "rejected",
+            "cancel": "cancelled",
         }
+        action_status = status_by_action[action]
+        if action == "approve":
+            content = str(state.get("pending_answer", ""))
+        elif action == "modify":
+            feedback = action_payload.get("feedback")
+            content = f"Plan modification requested: {feedback}" if feedback else "Plan modification requested."
+        else:
+            content = f"Request {action_status}. No business SQL was executed."
+        applied_actions[idempotency_key] = {"status": action_status, "version": version + 1}
+        return {
+            "messages": [AIMessage(content=content)],
+            "hitl_status": action_status,
+            "hitl_version": version + 1,
+            "needs_hitl": False,
+            "applied_actions": applied_actions,
+        }
+
+    def after_model(state: V2EngineState) -> Literal["hitl", "__end__"]:
+        return "hitl" if state.get("needs_hitl") else "__end__"
 
     graph.add_node("route", route_node)
     graph.add_node("model", model_node)
+    graph.add_node("hitl", hitl_node)
     graph.add_edge(START, "route")
     graph.add_edge("route", "model")
-    graph.add_edge("model", END)
+    graph.add_conditional_edges("model", after_model, {"hitl": "hitl", END: END})
     return graph.compile(checkpointer=checkpointer, name="nl2sql_v2_explicit")
 
 
@@ -95,6 +170,15 @@ def _question(state: V2EngineState) -> str:
         if getattr(message, "type", None) in {"human", "user"}:
             return str(getattr(message, "content", ""))
     return ""
+
+
+def _failed_action(reason: str, version: int) -> dict[str, object]:
+    return {
+        "messages": [AIMessage(content="The requested approval action could not be applied.")],
+        "hitl_status": reason,
+        "hitl_version": version,
+        "needs_hitl": False,
+    }
 
 
 def _signals(question: str) -> RiskSignals:
