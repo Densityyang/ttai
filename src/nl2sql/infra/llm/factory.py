@@ -33,7 +33,7 @@ def _build_llm(
     )
 
 
-def get_llm(
+def build_legacy_provider_model(
     model_name: str | None = None,
     openai_base_url: str | None = None,
     temperature: float = 0,

@@ -11,6 +11,7 @@ def test_dynamic_calculation_is_disabled_by_default() -> None:
 
     assert config.enable_dynamic_calc is False
     assert config.codeact_mode == "disabled"
+    assert config.enable_experience_store is False
 
 
 def test_product_profile_rejects_unsafe_development_codeact() -> None:
@@ -30,3 +31,8 @@ def test_infra_dev_profile_can_explicitly_enable_unsafe_development_codeact() ->
     )
 
     assert config.codeact_mode == "unsafe-dev"
+
+
+def test_product_profile_rejects_memory_experience_store() -> None:
+    with pytest.raises(ValueError, match="ExperienceStore"):
+        AgentConfig(service_mode="product", enable_experience_store=True)

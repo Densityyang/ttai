@@ -90,7 +90,7 @@ class ErrorEnvelope(StrictContract):
 
 
 class ModelRequest(StrictContract):
-    stage: str
+    stage: Literal["classify", "retrieve", "plan", "generate_sql", "verify", "answer"]
     alias: str
     messages: list[dict[str, Any]]
     tool_schema: dict[str, Any] | None = None
@@ -98,6 +98,7 @@ class ModelRequest(StrictContract):
     token_budget: int = Field(ge=1)
     cost_budget: float = Field(ge=0)
     data_classification: str
+    plan_reason: str | None = Field(default=None, max_length=1024)
 
 
 class ModelReceipt(StrictContract):
@@ -109,3 +110,5 @@ class ModelReceipt(StrictContract):
     retries: int = Field(default=0, ge=0)
     fallback_used: bool = False
     profile_version: str
+    content: str = ""
+    estimated_cost: float = Field(default=0, ge=0)

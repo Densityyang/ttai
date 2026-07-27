@@ -14,7 +14,7 @@ from src.nl2sql.agents.codeact_engine.prompts import (
     CODE_GENERATOR_SYSTEM_PROMPT,
     CODE_REPAIR_SYSTEM_PROMPT,
 )
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ async def generate_code(
         data_variables=data_vars,
     )
 
-    llm = get_llm()
+    llm = get_legacy_model()
     response = await llm.ainvoke([SystemMessage(content=prompt)])
     code = _extract_code(str(response.content))
 
@@ -91,7 +91,7 @@ async def repair_code(
         data_context=data_desc or "无可用数据变量",
     )
 
-    llm = get_llm()
+    llm = get_legacy_model()
     response = await llm.ainvoke([SystemMessage(content=prompt)])
     repaired = _extract_code(str(response.content))
 
