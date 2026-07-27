@@ -20,6 +20,17 @@ def test_compose_profiles_have_two_api_instances_and_external_product_network() 
     product = _load_yaml("docker/compose.prod.yml")
     assert product["networks"]["business_external_net"]["external"] is True
     assert "business_external_net" in product["services"]["api-a"]["networks"]
+    for service_name in ("api-a", "api-b"):
+        environment = product["services"][service_name]["environment"]
+        assert environment["CODEACT_MODE"] == "disabled"
+        assert environment["ENABLE_DYNAMIC_CALC"] == "false"
+
+    compose_text = (ROOT / "docker/compose.base.yml").read_text(encoding="utf-8") + (
+        ROOT / "docker/compose.prod.yml"
+    ).read_text(encoding="utf-8")
+    assert "/var/run/docker.sock" not in compose_text
+    assert "privileged:" not in compose_text
+    assert "network_mode: host" not in compose_text
 
 
 def test_nginx_contract_preserves_sse_request_id_and_body_limits() -> None:

@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import HumanMessage
 from pydantic import ValidationError
 
+import src.nl2sql.v2 as v2
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.types import AuthUser
 from src.nl2sql.contracts import RequestContext, RequestIdentity
@@ -125,3 +126,23 @@ def test_runtime_config_propagates_request_identity_to_subgraphs() -> None:
     context = cast(dict[str, str], configurable["request_context"])
     assert identity["user_id"] == "alice"
     assert context["thread_id"] == str(THREAD_ID)
+
+
+def test_capabilities_explain_when_codeact_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.nl2sql.config.settings import AgentConfig
+    from src.nl2sql.infra.llm import gateway
+
+    app = _app_for(FakeSupervisor(internal_thread_id(_context_for("alice"))))
+    monkeypatch.setattr(v2, "get_agent_config", lambda: AgentConfig(_env_file=None))
+    monkeypatch.setattr(gateway, "model_gateway_available", lambda: True)
+
+    async def alice_dependency() -> AuthUser:
+        return AuthUser(user_id="alice", telephone=None, roles=["analyst"], permissions=["*"])
+
+    app.dependency_overrides[require_nl2sql_permission] = alice_dependency
+    with TestClient(app) as client:
+        response = client.get("/api/v2/nl2sql/capabilities")
+
+    assert response.status_code == 200
+    assert response.json()["codeact"] is False
+    assert "dynamic calculation is disabled" in response.json()["degradation_reasons"]

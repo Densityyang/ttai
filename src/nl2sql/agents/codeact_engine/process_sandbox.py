@@ -183,6 +183,12 @@ class ProcessSandbox:
             data_context: 注入的数据上下文 (DataFrame 需先序列化)
         """
         start = time.perf_counter()
+        if get_agent_config().codeact_mode != "unsafe-dev":
+            return SandboxResult(
+                success=False,
+                error="arbitrary code execution is disabled outside unsafe-dev mode",
+                elapsed_ms=(time.perf_counter() - start) * 1000,
+            )
 
         violation = self._static_check(code)
         if violation:

@@ -39,6 +39,14 @@ class DynamicCalcPlan(BaseModel):
         default="report_partial",
         description="降级策略：report_partial / skip_calc / abort",
     )
+    trusted_template_id: str | None = Field(
+        default=None,
+        description="Approved template identifier required in trusted-template mode.",
+    )
+    trusted_template_inputs: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Typed input payload for the approved template.",
+    )
 
 
 class DynamicCalcResult(BaseModel):

@@ -272,6 +272,17 @@ class AgentConfig(BaseSettings):
             raise ValueError("ExperienceStore must be disabled when SERVICE_MODE=product")
         return self
 
+    def codeact_capability(self) -> tuple[bool, str | None]:
+        """Return the externally safe CodeAct capability state and reason."""
+        if not self.enable_dynamic_calc:
+            return False, "dynamic calculation is disabled"
+        if self.codeact_mode == "disabled":
+            return False, "dynamic calculation mode is disabled"
+        if self.codeact_mode == "trusted-template":
+            return True, None
+        # ``unsafe-dev`` is constrained by validate_codeact_profile above.
+        return True, "unsafe development calculation mode is enabled"
+
 
 @lru_cache
 def get_agent_config() -> AgentConfig:

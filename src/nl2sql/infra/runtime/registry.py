@@ -81,8 +81,11 @@ async def warmup_runtime() -> None:
     await get_or_create_semantic_sql_graph()
 
     config = get_agent_config()
-    if config.enable_dynamic_calc:
-        await get_or_create_dynamic_calc_graph()
+    if config.codeact_capability()[0]:
+        if config.codeact_mode == "trusted-template":
+            await get_or_create_dynamic_calc_graph()
+        else:
+            await get_or_create_codeact_graph()
 
     if config.enable_graph_rag:
         from src.nl2sql.infra.store.graph_rag import get_schema_relation_graph
