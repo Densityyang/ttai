@@ -36,6 +36,21 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Render Compose configuration
+        run: |
+          : > .env
+          docker compose -f docker/docker-compose.yml config --no-interpolate > "${RUNNER_TEMP}/compose.yaml"
+      - name: Scan worktree and rendered Compose configuration
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" zricethezav/gitleaks:v8.30.0 dir /repo --config /repo/.gitleaks.toml --redact=100
+          docker run --rm -v "${RUNNER_TEMP}:/scan:ro" -v "$GITHUB_WORKSPACE/.gitleaks.toml:/config/gitleaks.toml:ro" zricethezav/gitleaks:v8.30.0 dir /scan --config /config/gitleaks.toml --redact=100
+      - name: Verify the secret-scanning canary blocks
+        run: |
+          printf '%s%s\n' 'TT_AI_SECRET_CANARY_' '0123456789ABCDEF0123456789ABCDEF' > "${RUNNER_TEMP}/gitleaks-canary.txt"
+          if docker run --rm -v "${RUNNER_TEMP}:/scan:ro" -v "$GITHUB_WORKSPACE/.gitleaks.toml:/config/gitleaks.toml:ro" zricethezav/gitleaks:v8.30.0 dir /scan --config /config/gitleaks.toml --redact=100; then
+            echo "Expected Gitleaks to block the canary, but it succeeded."
+            exit 1
+          fi
 
   container:
     runs-on: ubuntu-latest
@@ -50,7 +65,7 @@ jobs:
           -t tt-ai:${{ github.sha }}
           .
       - name: Scan image filesystem
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: tt-ai:${{ github.sha }}
           format: table
@@ -58,6 +73,6 @@ jobs:
           ignore-unfixed: true
           severity: CRITICAL,HIGH
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@v0.24.0
         with:
           image: tt-ai:${{ github.sha }}
