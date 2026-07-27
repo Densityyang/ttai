@@ -37,6 +37,7 @@ from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.infra.llm.factory import get_llm
 from src.nl2sql.infra.store.qa_rag import get_qa_retriever
 from src.nl2sql.infra.store.semantic_rag import get_semantic_retriever
+from src.nl2sql.semantic.retrieval import retrieve_active_semantic
 
 from .state import ExplorationResult
 
@@ -66,14 +67,13 @@ async def qa_retriever_tool(query: str) -> str:
 @tool("semantic_retriever_tool")
 async def semantic_retriever_tool(query: str) -> str:
     """从语义层检索指定业务术语、指标公式、源表及过滤条件的详细定义。"""
-    config = get_agent_config()
-    if config.semantic_retriever_mode == "direct":
-        return await _semantic_direct_read()
     return await _semantic_rag_retrieve(query)
 
 
 async def _semantic_direct_read() -> str:
     """直接读取 semantic.md 全文内容。"""
+    return "direct semantic-file reads are disabled; publish an active semantic release first"
+
     try:
         config = get_agent_config()
         file_path = Path(config.rag_semantic_file_path).expanduser()
@@ -90,6 +90,21 @@ async def _semantic_direct_read() -> str:
 async def _semantic_rag_retrieve(query: str) -> str:
     """基于 FAISS 向量相似度检索语义层。"""
     try:
+        active_result = await retrieve_active_semantic(query)
+        if active_result.degraded and not active_result.documents:
+            return f"semantic retrieval degraded: {active_result.reason}"
+        if not active_result.documents:
+            return "no semantic evidence in the active release"
+        evidence = "\n\n".join(
+            f"- evidence {index} (release={active_result.release_id}, domain={item.metadata.get('domain', '')}):\n{item.content}"
+            for index, item in enumerate(active_result.documents, start=1)
+        )
+        graph = "\n".join(f"- graph relation: {hint}" for hint in active_result.graph_hints)
+        degradation = (
+            f"semantic retrieval degraded: {active_result.reason}\n\n" if active_result.degraded else ""
+        )
+        return f"{degradation}{evidence}" + (f"\n\n{graph}" if graph else "")
+
         retriever = get_semantic_retriever()
         items = await retriever.aretrieve_filtered(query)
         if not items:
