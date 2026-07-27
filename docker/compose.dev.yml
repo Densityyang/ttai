@@ -13,3 +13,116 @@ services:
     volumes:
       - ../src:/app/src:ro
       - ../configs:/app/configs:ro
+
+  control-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ttai_control
+      POSTGRES_USER: control_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/control_owner_password
+    volumes:
+      - control_pgdata:/var/lib/postgresql/data
+    secrets:
+      - control_owner_password
+    networks:
+      - app_internal
+
+  checkpoint-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ttai_checkpoint
+      POSTGRES_USER: checkpoint_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/checkpoint_owner_password
+    volumes:
+      - checkpoint_pgdata:/var/lib/postgresql/data
+    secrets:
+      - checkpoint_owner_password
+    networks:
+      - app_internal
+
+  business-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ttai_business
+      POSTGRES_USER: business_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/business_owner_password
+    volumes:
+      - business_pgdata:/var/lib/postgresql/data
+    secrets:
+      - business_owner_password
+    networks:
+      - app_internal
+
+  migrate:
+    image: postgres:17-alpine
+    profiles: ["ops"]
+    depends_on:
+      control-postgres:
+        condition: service_started
+      checkpoint-postgres:
+        condition: service_started
+    environment:
+      CONTROL_MIGRATOR_DATABASE_URL_FILE: /run/secrets/control_migrator_database_url
+      CHECKPOINT_MIGRATOR_DATABASE_URL_FILE: /run/secrets/checkpoint_migrator_database_url
+    command: ["/bin/sh", "/scripts/migrate.sh"]
+    volumes:
+      - ./migrations:/migrations:ro
+      - ./scripts:/scripts:ro
+    secrets:
+      - control_migrator_database_url
+      - checkpoint_migrator_database_url
+    networks:
+      - app_internal
+
+  backup:
+    image: postgres:17-alpine
+    profiles: ["ops"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/control_backup_database_url
+      BACKUP_DIR: /backups
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
+    command: ["/bin/sh", "/scripts/backup.sh"]
+    volumes:
+      - ./scripts:/scripts:ro
+      - control_backups:/backups
+    secrets:
+      - control_backup_database_url
+    networks:
+      - app_internal
+
+  restore-test:
+    image: postgres:17-alpine
+    profiles: ["ops"]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/control_restore_database_url
+      BACKUP_FILE: /backups/latest.dump
+    command: ["/bin/sh", "/scripts/restore-test.sh"]
+    volumes:
+      - ./scripts:/scripts:ro
+      - control_backups:/backups:ro
+    secrets:
+      - control_restore_database_url
+    networks:
+      - app_internal
+
+volumes:
+  control_pgdata:
+  checkpoint_pgdata:
+  business_pgdata:
+  control_backups:
+
+secrets:
+  control_owner_password:
+    file: ../secrets/database/control_owner_password
+  checkpoint_owner_password:
+    file: ../secrets/database/checkpoint_owner_password
+  business_owner_password:
+    file: ../secrets/database/business_owner_password
+  control_migrator_database_url:
+    file: ../secrets/database/control_migrator_database_url
+  checkpoint_migrator_database_url:
+    file: ../secrets/database/checkpoint_migrator_database_url
+  control_backup_database_url:
+    file: ../secrets/database/control_backup_database_url
+  control_restore_database_url:
+    file: ../secrets/database/control_restore_database_url

@@ -40,13 +40,13 @@ class CheckpointerManager:
                 case "postgresql":
                     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-                    if not settings.memory_backend_url:
+                    if not settings.checkpoint_database_url:
                         raise ValueError(
-                            "memory_backend=postgresql ????? MEMORY_BACKEND_URL"
+                            "memory_backend=postgresql ????? CHECKPOINT_DATABASE_URL"
                         )
                     # from_conn_string ??????????
                     self._postgres_context = AsyncPostgresSaver.from_conn_string(
-                        settings.memory_backend_url
+                        settings.checkpoint_database_url
                     )
                     # ?????
                     checkpointer = await self._postgres_context.__aenter__()

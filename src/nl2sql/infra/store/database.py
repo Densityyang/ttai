@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import (
 
 from src.core.settings import get_settings
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.store.ai_views import sync_ai_views_from_yaml
 from src.nl2sql.infra.store.sql_utils import mask_sql_literals_and_comments
 
 _SCHEMA_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -60,31 +59,6 @@ class DatabaseManager:
             raise ValueError("DATABASE_URL 未设置")
         self._engine = create_async_engine(self.database_url)
         self._session_factory = async_sessionmaker(self._engine, class_=AsyncSession, expire_on_commit=False)
-        grant_roles = _resolve_ai_views_grantee_roles(self.database_url)
-
-        agent_config = get_agent_config()
-        if agent_config.ai_views_auto_sync:
-            settings = get_settings()
-            admin_url = settings.database_url_admin
-            if admin_url:
-                admin_engine = create_async_engine(admin_url)
-                try:
-                    await sync_ai_views_from_yaml(
-                        engine=admin_engine,
-                        config_path=agent_config.ai_views_config_path,
-                        expected_schema=self._schema,
-                        grantee_roles=grant_roles,
-                    )
-                finally:
-                    await admin_engine.dispose()
-            else:
-                await sync_ai_views_from_yaml(
-                    engine=self._engine,
-                    config_path=agent_config.ai_views_config_path,
-                    expected_schema=self._schema,
-                    grantee_roles=grant_roles,
-                )
-
         await self._load_schema_info()
 
     async def disconnect(self) -> None:
