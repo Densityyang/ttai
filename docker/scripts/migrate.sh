@@ -10,5 +10,10 @@ run_migration() {
 : "${CONTROL_MIGRATOR_DATABASE_URL_FILE:?required}"
 : "${CHECKPOINT_MIGRATOR_DATABASE_URL_FILE:?required}"
 
-run_migration "$(cat "$CONTROL_MIGRATOR_DATABASE_URL_FILE")" /migrations/control/001_control_schema.sql
-run_migration "$(cat "$CHECKPOINT_MIGRATOR_DATABASE_URL_FILE")" /migrations/checkpoint/001_checkpoint_schema.sql
+for migration_file in /migrations/control/*.sql; do
+  run_migration "$(cat "$CONTROL_MIGRATOR_DATABASE_URL_FILE")" "$migration_file"
+done
+
+for migration_file in /migrations/checkpoint/*.sql; do
+  run_migration "$(cat "$CHECKPOINT_MIGRATOR_DATABASE_URL_FILE")" "$migration_file"
+done

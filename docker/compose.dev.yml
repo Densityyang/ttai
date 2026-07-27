@@ -15,7 +15,7 @@ services:
       - ../configs:/app/configs:ro
 
   control-postgres:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:pg17
     environment:
       POSTGRES_DB: ttai_control
       POSTGRES_USER: control_owner
@@ -74,6 +74,24 @@ services:
     networks:
       - app_internal
 
+  indexer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    profiles: ["ops"]
+    depends_on:
+      control-postgres:
+        condition: service_started
+    environment:
+      CONTROL_DATABASE_URL_FILE: /run/secrets/control_app_database_url
+    command: ["python", "-m", "src.nl2sql.semantic.indexer"]
+    volumes:
+      - ../configs:/app/configs:ro
+    secrets:
+      - control_app_database_url
+    networks:
+      - app_internal
+
   backup:
     image: postgres:17-alpine
     profiles: ["ops"]
@@ -120,6 +138,8 @@ secrets:
     file: ../secrets/database/business_owner_password
   control_migrator_database_url:
     file: ../secrets/database/control_migrator_database_url
+  control_app_database_url:
+    file: ../secrets/database/control_app_database_url
   checkpoint_migrator_database_url:
     file: ../secrets/database/checkpoint_migrator_database_url
   control_backup_database_url:
