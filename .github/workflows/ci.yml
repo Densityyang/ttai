@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv python install 3.13
+      - run: uv sync --frozen --all-groups
+      - run: uv run ruff check src tests
+      - run: uv run pyright
+      - run: uv run pytest
+      - run: uv run pip-audit
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build immutable candidate image
+        run: >-
+          docker build
+          --build-arg VCS_REF="${{ github.sha }}"
+          --build-arg VERSION="${{ github.ref_name }}-${{ github.sha }}"
+          -f docker/Dockerfile
+          -t tt-ai:${{ github.sha }}
+          .
+      - name: Scan image filesystem
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: tt-ai:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: tt-ai:${{ github.sha }}

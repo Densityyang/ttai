@@ -1,0 +1,2 @@
+run_id,case_id,model_name,embedding_name,retriever_pipeline,repair_strategy,output_sql,output_calc,output_value,metric_scores_json,fail_reason
+RUN_20260318_0001,CASE_000001,qwen-plus,bge-m3,vector_rerank,self_repair_sql_code,"SELECT ...","result_df = ...","{""rows"":32}","{""execution_accuracy"":1.0,""dynamic_metric_success_at_1"":1.0,""latency_ms"":1420}",""

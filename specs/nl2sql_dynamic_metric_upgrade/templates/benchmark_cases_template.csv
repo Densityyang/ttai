@@ -1,0 +1,2 @@
+case_id,source_type,layer,domain,user_query,query_paraphrases,risk_level,permission_profile,expected_mode,tags
+CASE_000001,real,L3,repair_service,"统计上月各区县报修归档及时率，排除分母为0","[""上个月各区县报修归档及时率是多少"",""按区县看上月报修归档及时率""]",medium,role_ops_manager,sql_plus_code,"[""time:month"",""metric:rate"",""domain:repair_service""]"

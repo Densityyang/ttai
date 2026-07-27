@@ -1,0 +1,2 @@
+case_id,schema_version,tables_json,columns_json,semantic_terms_json
+CASE_000001,2026-03-18,"[""silver_repair_service"",""vadmin_area""]","{""silver_repair_service"":[""id"",""report_time"",""completion_receipt_time"",""is_archive_on_time"",""area_id""],""vadmin_area"":[""id"",""name""]}","[""repair_service_archive_rate_area_day"",""repair_service_calc_total_count_area_day""]"

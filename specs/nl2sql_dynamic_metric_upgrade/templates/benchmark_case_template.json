@@ -1,0 +1,90 @@
+{
+  "benchmark_case": {
+    "case_id": "CASE_000001",
+    "source_type": "real",
+    "layer": "L3",
+    "domain": "repair_service",
+    "user_query": "统计上月各区县报修归档及时率，排除分母为0",
+    "query_paraphrases": [
+      "上个月各区县报修归档及时率是多少",
+      "按区县看上月报修归档及时率"
+    ],
+    "risk_level": "medium",
+    "permission_profile": "role_ops_manager",
+    "expected_mode": "sql_plus_code",
+    "tags": [
+      "time:month",
+      "metric:rate",
+      "domain:repair_service"
+    ]
+  },
+  "schema_snapshot": {
+    "schema_version": "2026-03-18",
+    "tables": [
+      "silver_repair_service",
+      "vadmin_area"
+    ],
+    "columns": {
+      "silver_repair_service": [
+        "id",
+        "report_time",
+        "completion_receipt_time",
+        "is_archive_on_time",
+        "area_id"
+      ],
+      "vadmin_area": [
+        "id",
+        "name"
+      ]
+    },
+    "semantic_terms": [
+      "repair_service_archive_rate_area_day",
+      "repair_service_calc_total_count_area_day"
+    ]
+  },
+  "gold_execution": {
+    "gold_sql": "SELECT DATE(report_time) AS stat_date, area_id, ROUND(100.0 * COUNT(*) FILTER (WHERE is_archive_on_time = TRUE AND completion_receipt_time IS NOT NULL) / NULLIF(COUNT(*) FILTER (WHERE completion_receipt_time IS NOT NULL), 0), 2) AS repair_archive_rate FROM silver_repair_service GROUP BY DATE(report_time), area_id",
+    "gold_sql_result_hash": "sha256:replace_me",
+    "gold_calc_code": "result_df = sql_df.copy()",
+    "gold_calc_steps": [
+      {
+        "step": 1,
+        "name": "derive_rate",
+        "input": "sql_df",
+        "output": "result_df"
+      }
+    ],
+    "gold_final_value": {
+      "type": "table",
+      "primary_key": [
+        "stat_date",
+        "area_id"
+      ],
+      "metrics": [
+        "repair_archive_rate"
+      ]
+    },
+    "tolerance_rule": {
+      "numeric": {
+        "default_abs_tol": 0.01,
+        "default_rel_tol": 0.001
+      },
+      "null_policy": "both_null_pass"
+    }
+  },
+  "gold_evidence": {
+    "expected_evidence_refs": [
+      "semantic:repair_service_archive_rate_area_day",
+      "semantic:repair_service_calc_total_count_area_day",
+      "qa:报修归档及时率怎么计算"
+    ],
+    "forbidden_evidence_refs": [
+      "qa:投诉未归档看archive_time"
+    ],
+    "evidence_grading_rule": {
+      "min_expected_hits": 2,
+      "forbidden_hits": 0,
+      "score_threshold": 0.8
+    }
+  }
+}

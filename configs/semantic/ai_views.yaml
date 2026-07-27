@@ -1,0 +1,342 @@
+# AI 视图配置 - 基于 tt-api 数据库实际表结构
+# 用于 NL2SQL 场景的语义层视图定义
+
+schema: ai_views
+views:
+  # ==================== 工单类视图 ====================
+
+  - name: v_single_fault_order
+    description: 单障工单视图，关联区县和班组信息
+    source_table: silver_single_faulty_order
+    source_alias: sfo
+    joins:
+      - table: vadmin_area
+        alias: area
+        type: left
+        join_condition: sfo.area_id = area.id
+      - table: organization_team
+        alias: team
+        type: left
+        join_condition: sfo.team_id = team.id
+    columns:
+      - sfo.id
+      - sfo.work_order_serial
+      - sfo.work_order_number
+      - sfo.status
+      - sfo.city
+      - sfo.district
+      - sfo.community
+      - sfo.fault_reason
+      - sfo.maintenance_account
+      - sfo.maintenance_personnel
+      - sfo.maintenance_phone
+      - sfo.work_order_arrival_time
+      - sfo.order_acceptance_time
+      - sfo.completion_receipt_time
+      - sfo.first_response_time
+      - sfo.first_response_duration_minutes
+      - sfo.archive_duration_minutes
+      - sfo.is_first_response_on_time
+      - sfo.is_archive_on_time
+      - sfo.is_valid_for_metrics
+      - sfo.area_id
+      - sfo.team_id
+      - area.name AS area_name
+      - team.name AS team_name
+    filters:
+      - column: sfo.is_valid_for_metrics
+        operator: eq
+        value: true
+
+  - name: v_repair_service
+    description: 报修服务视图，关联区县和班组信息
+    source_table: silver_repair_service
+    source_alias: rs
+    joins:
+      - table: vadmin_area
+        alias: area
+        type: left
+        join_condition: rs.area_id = area.id
+      - table: organization_team
+        alias: team
+        type: left
+        join_condition: rs.team_id = team.id
+    columns:
+      - rs.id
+      - rs.work_order_serial
+      - rs.work_order_number
+      - rs.status
+      - rs.city
+      - rs.district
+      - rs.request_type
+      - rs.fault_reason
+      - rs.work_order_source
+      - rs.current_repair_service
+      - rs.secondary_scene
+      - rs.fault_account
+      - rs.maintenance_personnel
+      - rs.report_time
+      - rs.completion_receipt_time
+      - rs.appointment_time
+      - rs.is_dispatched
+      - rs.is_group_fault
+      - rs.is_fttr
+      - rs.is_intelligent_network
+      - rs.business_success
+      - rs.archive_duration_minutes
+      - rs.is_archive_on_time
+      - rs.is_valid_for_metrics
+      - rs.area_id
+      - rs.team_id
+      - area.name AS area_name
+      - team.name AS team_name
+    filters:
+      - column: rs.is_valid_for_metrics
+        operator: eq
+        value: true
+
+  - name: v_fault_reporting_order
+    description: 报障工单视图，关联区县和班组信息
+    source_table: silver_fault_reporting_order
+    source_alias: fro
+    joins:
+      - table: vadmin_area
+        alias: area
+        type: left
+        join_condition: fro.area_id = area.id
+      - table: organization_team
+        alias: team
+        type: left
+        join_condition: fro.team_id = team.id
+    columns:
+      - fro.id
+      - fro.serial_number
+      - fro.status
+      - fro.branch_company
+      - fro.district_county
+      - fro.assigned_team
+      - fro.community_name
+      - fro.fault_account
+      - fro.maintenance_account
+      - fro.maintenance_personnel
+      - fro.maintenance_company
+      - fro.fault_reason
+      - fro.bandwidth
+      - fro.work_order_type
+      - fro.acceptance_time
+      - fro.generation_time
+      - fro.appointment_time
+      - fro.start_construction_time
+      - fro.completion_time
+      - fro.archive_time
+      - fro.first_arrival_time
+      - fro.first_response_time
+      - fro.first_dispatch_time
+      - fro.total_duration_minutes
+      - fro.appointment_count
+      - fro.is_gold_medal
+      - fro.first_response_duration_minutes
+      - fro.arrival_duration_minutes
+      - fro.same_day_repair_duration_minutes
+      - fro.is_first_response_on_time
+      - fro.is_arrival_on_time
+      - fro.is_same_day_repair_on_time
+      - fro.has_valid_bandwidth
+      - fro.is_valid_for_metrics
+      - fro.area_id
+      - fro.team_id
+      - area.name AS area_name
+      - team.name AS team_name
+    filters:
+      - column: fro.is_valid_for_metrics
+        operator: eq
+        value: true
+
+  - name: v_installation_work_order
+    description: 装机工单视图，关联区县和班组信息
+    source_table: silver_installation_work_order
+    source_alias: iwo
+    joins:
+      - table: vadmin_area
+        alias: area
+        type: left
+        join_condition: iwo.area_id = area.id
+      - table: organization_team
+        alias: team
+        type: left
+        join_condition: iwo.team_id = team.id
+    columns:
+      - iwo.id
+      - iwo.work_order_serial
+      - iwo.work_order_number
+      - iwo.order_number
+      - iwo.work_order_type
+      - iwo.work_order_status
+      - iwo.branch_company
+      - iwo.district_county
+      - iwo.team_name
+      - iwo.community_name
+      - iwo.area_attribute
+      - iwo.bandwidth
+      - iwo.package_type
+      - iwo.service_package_name
+      - iwo.maintenance_account
+      - iwo.maintenance_name
+      - iwo.maintenance_company
+      - iwo.acceptance_time
+      - iwo.first_dispatch_time
+      - iwo.appointment_time
+      - iwo.start_construction_time
+      - iwo.archive_time
+      - iwo.first_response_time
+      - iwo.work_order_arrival_time
+      - iwo.appointment_count
+      - iwo.total_duration_hours
+      - iwo.first_response_duration_minutes
+      - iwo.arrival_duration_minutes
+      - iwo.archive_duration_minutes
+      - iwo.same_day_archive_duration_minutes
+      - iwo.is_first_response_on_time
+      - iwo.is_arrival_on_time
+      - iwo.is_archive_on_time
+      - iwo.is_same_day_archive_on_time
+      - iwo.is_short_process
+      - iwo.is_valid_for_metrics
+      - iwo.area_id
+      - iwo.team_id
+      - area.name AS area_name
+      - team.name AS team_ref_name
+    filters:
+      - column: iwo.is_valid_for_metrics
+        operator: eq
+        value: true
+
+  # ==================== 指标类视图 ====================
+
+  - name: v_metric_result
+    description: 指标结果视图，关联区县和班组信息
+    source_table: gold_metric_result
+    source_alias: mr
+    joins:
+      - table: vadmin_area
+        alias: area
+        type: left
+        join_condition: mr.area_id = area.id
+      - table: organization_team
+        alias: team
+        type: left
+        join_condition: mr.team_id = team.id
+    columns:
+      - mr.id
+      - mr.metric_code
+      - mr.time_grain
+      - mr.time_value
+      - mr.dimension_type
+      - mr.area_id
+      - mr.team_id
+      - mr.value
+      - mr.value_type
+      - mr.unit
+      - mr.status
+      - mr.error_message
+      - mr.data_quality_score
+      - mr.computed_at
+      - area.name AS area_name
+      - team.name AS team_name
+    filters:
+      - column: mr.status
+        operator: eq
+        value: success
+
+  - name: v_metric_metadata
+    description: 指标元数据视图，包含指标定义信息
+    source_table: gold_metric_metadata
+    source_alias: mm
+    columns:
+      - mm.metric_code
+      - mm.display_name
+      - mm.description
+      - mm.source_type
+      - mm.calculation_type
+      - mm.domain
+      - mm.owner
+      - mm.tags
+      - mm.time_grain
+      - mm.rollup_strategy
+      - mm.value_type
+      - mm.unit
+      - mm.threshold_target
+      - mm.threshold_warning
+      - mm.calculation_order
+
+  - name: v_maintenance_metric_daily
+    description: 维护部门日指标预计算视图
+    source_table: gold_maintenance_metric_daily
+    source_alias: mmd
+    joins:
+      - table: vadmin_area
+        alias: area
+        type: left
+        join_condition: mmd.area_id = area.id
+      - table: organization_team
+        alias: team
+        type: left
+        join_condition: mmd.team_id = team.id
+    columns:
+      - mmd.id
+      - mmd.metric_code
+      - mmd.stat_date
+      - mmd.dimension_type
+      - mmd.area_id
+      - mmd.team_id
+      - mmd.numerator
+      - mmd.denominator
+      - mmd.value
+      - mmd.calculated_at
+      - area.name AS area_name
+      - team.name AS team_name
+
+  # ==================== 维度类视图 ====================
+
+  - name: v_area
+    description: 区县维度视图，按区县层级(level=3)过滤
+    source_table: vadmin_area
+    source_alias: area
+    columns:
+      - area.id
+      - area.name
+      - area.code
+      - area.level
+      - area.parent_id
+      - area.order_num
+      - area.is_active
+    filters:
+      - column: area.level
+        operator: eq
+        value: 3
+      - column: area.is_active
+        operator: eq
+        value: true
+      - column: area.is_deleted
+        operator: eq
+        value: false
+
+  - name: v_team
+    description: 班组维度视图
+    source_table: organization_team
+    source_alias: team
+    columns:
+      - team.id
+      - team.name
+      - team.code
+      - team.leader
+      - team.contact_phone
+      - team.is_active
+      - team.remark
+    filters:
+      - column: team.is_active
+        operator: eq
+        value: true
+      - column: team.is_deleted
+        operator: eq
+        value: false

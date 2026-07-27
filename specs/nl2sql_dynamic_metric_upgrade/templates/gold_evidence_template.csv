@@ -1,0 +1,2 @@
+case_id,expected_evidence_refs,forbidden_evidence_refs,evidence_grading_rule
+CASE_000001,"[""semantic:repair_service_archive_rate_area_day"",""semantic:repair_service_calc_total_count_area_day"",""qa:报修归档及时率怎么计算""]","[""qa:投诉未归档看archive_time""]","{""min_expected_hits"":2,""forbidden_hits"":0,""score_threshold"":0.8}"

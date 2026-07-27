@@ -1,0 +1,4 @@
+sample_id,sample_type,source_case_id,split,domain,layer,difficulty,schema_version,version,notes
+SFT_000001,sft,CASE_000001,train,repair_service,L3,medium,2026-03-18,v1.0.0,"from benchmark case"
+PREF_000001,preference,CASE_000001,train,repair_service,L3,medium,2026-03-18,v1.0.0,"chosen vs rejected pair"
+TRAJ_000001,trajectory,CASE_000001,train,repair_service,L3,medium,2026-03-18,v1.0.0,"tool sequence sample"

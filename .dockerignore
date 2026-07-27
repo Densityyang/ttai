@@ -1,0 +1,30 @@
+# Secrets and deployment-only material must never enter a build context.
+secrets/
+deploy/private/
+.env*
+
+# Local data and raw benchmark output can contain sensitive source material.
+.vector_store/
+.traces/
+logs/
+benchmarks/raw/
+benchmarks/output/
+*.faiss
+*.pkl
+*.db
+*.sqlite*
+
+# Development-only files.
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+tests/
+specs/
+docs/
