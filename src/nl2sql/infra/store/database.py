@@ -16,6 +16,11 @@ from sqlalchemy.ext.asyncio import (
 
 from src.core.settings import get_settings
 from src.nl2sql.config.settings import get_agent_config
+from src.nl2sql.infra.governance.query_gateway import (
+    QueryGateway,
+    QueryGatewayError,
+    QueryReceipt,
+)
 from src.nl2sql.infra.store.sql_utils import mask_sql_literals_and_comments
 
 _SCHEMA_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -46,6 +51,7 @@ class DatabaseManager:
 
         self._engine: AsyncEngine | None = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
+        self._query_gateway: QueryGateway | None = None
         self._schema_info: dict[str, Any] = {}
 
     @property
@@ -59,6 +65,15 @@ class DatabaseManager:
             raise ValueError("DATABASE_URL 未设置")
         self._engine = create_async_engine(self.database_url)
         self._session_factory = async_sessionmaker(self._engine, class_=AsyncSession, expire_on_commit=False)
+        self._query_gateway = QueryGateway(
+            self._session_factory,
+            schema=self._schema,
+            timeout_seconds=self.timeout_seconds,
+            max_rows=self.max_query_results,
+            max_plan_cost=float(os.getenv("NL2SQL_MAX_PLAN_COST", "500000")),
+            max_plan_rows=int(os.getenv("NL2SQL_MAX_PLAN_ROWS", "100000")),
+            max_result_bytes=int(os.getenv("NL2SQL_MAX_RESULT_BYTES", "1000000")),
+        )
         await self._load_schema_info()
 
     async def disconnect(self) -> None:
@@ -67,12 +82,7 @@ class DatabaseManager:
             await self._engine.dispose()
         self._engine = None
         self._session_factory = None
-
-    def session(self) -> async_sessionmaker[AsyncSession]:
-        """返回可创建 session 的工厂。"""
-        if self._session_factory is None:
-            raise RuntimeError("DatabaseManager 未连接")
-        return self._session_factory
+        self._query_gateway = None
 
     async def _load_schema_info(self) -> None:
         if self._engine is None:
@@ -128,11 +138,6 @@ class DatabaseManager:
             "tables": tables,
         }
 
-    async def _apply_search_path(self, session: AsyncSession) -> None:
-        if not self._schema:
-            return
-        await session.execute(text(f"SET LOCAL search_path TO {self._schema}"))
-
     def get_table_names(self) -> list[str]:
         """获取已加载的表名。"""
         return sorted(self._schema_info.get("tables", {}).keys())
@@ -159,63 +164,26 @@ class DatabaseManager:
 
     async def execute_query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """执行查询并返回字典结果（含并发控制）。"""
-        from src.nl2sql.infra.governance.semaphore import get_concurrency_governor
+        receipt = await self.query(sql, params)
+        if not receipt.accepted:
+            assert receipt.error is not None
+            raise QueryGatewayError(receipt.error)
+        return receipt.rows
 
-        governor = get_concurrency_governor()
-        async with governor.acquire("sql"):
-            session_factory = self.session()
-            async with session_factory() as session:
-                await self._apply_search_path(session)
-                result = await asyncio.wait_for(
-                    session.execute(text(sql), params or {}),
-                    timeout=self.timeout_seconds,
-                )
-                rows = result.fetchmany(self.max_query_results)
-                keys = result.keys()
-                return [dict(zip(keys, row)) for row in rows]
+    async def query(self, sql: str, params: dict[str, Any] | None = None) -> QueryReceipt:
+        """Run application SQL exclusively through :class:`QueryGateway`."""
+        if self._query_gateway is None:
+            raise RuntimeError("DatabaseManager connection is not initialized")
+        return await self._query_gateway.execute(sql, params)
 
     async def validate_query(self, sql: str) -> tuple[bool, str | None]:
         """检查 SQL 是否安全且可执行（Phase 4 增强：AST 校验 + 成本估算）。"""
-        from src.nl2sql.infra.governance.sql_guard import full_validate_query
-
-        stripped_sql = sql.strip()
-        if not stripped_sql:
-            return False, "SQL 不能为空"
-
-        body_sql = stripped_sql[:-1] if stripped_sql.endswith(";") else stripped_sql
-        if ";" in body_sql:
-            return False, "不允许执行多语句 SQL"
-
-        normalized = stripped_sql.upper()
-        if not (normalized.startswith("SELECT") or normalized.startswith("WITH")):
-            return False, "仅允许执行 SELECT/CTE 查询"
-
         if self._schema and _has_forbidden_schema_reference(sql, allowed_schema=self._schema):
-            return False, f"仅允许访问 schema `{self._schema}`"
-
-        # Phase 4: 使用完整校验（含 AST + 笛卡尔积 + EXPLAIN 成本估算）
-        session_factory = self.session()
-        safe_sql, guard_err = await full_validate_query(
-            stripped_sql,
-            session_factory=session_factory,
-            schema=self._schema,
-        )
-        if guard_err:
-            return False, guard_err
-
-        # 保留原有的 EXPLAIN 语法校验（成本已在 full_validate_query 中检查）
-        try:
-            async with session_factory() as session:
-                await self._apply_search_path(session)
-                await asyncio.wait_for(
-                    session.execute(text(f"EXPLAIN {safe_sql}")),
-                    timeout=self.timeout_seconds,
-                )
-            return True, None
-        except TimeoutError:
-            return False, f"查询校验超时（{self.timeout_seconds} 秒）"
-        except Exception as exc:
-            return False, str(exc)
+            return False, f"only schema `{self._schema}` may be queried"
+        if self._query_gateway is None:
+            return False, "DatabaseManager connection is not initialized"
+        receipt = await self._query_gateway.preflight(sql)
+        return receipt.accepted, receipt.error.message if receipt.error else None
 
 
 _db_manager: DatabaseManager | None = None

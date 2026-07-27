@@ -53,12 +53,14 @@ def create_async_sql_tools(db_manager: DatabaseManager) -> list[BaseTool]:
         """
         try:
             # 验证查询安全性
-            is_valid, error_msg = await db_manager.validate_query(query)
+            receipt = await db_manager.query(query)
+            is_valid = receipt.accepted
+            error_msg = receipt.error.message if receipt.error else None
             if not is_valid:
                 return f"查询验证失败: {error_msg}"
 
             # 执行查询
-            results = await db_manager.execute_query(query)
+            results = receipt.rows
 
             if not results:
                 return "查询成功,但没有返回结果"
