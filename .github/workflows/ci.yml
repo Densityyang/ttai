@@ -46,7 +46,7 @@ jobs:
           docker run --rm -v "${RUNNER_TEMP}:/scan:ro" -v "$GITHUB_WORKSPACE/.gitleaks.toml:/config/gitleaks.toml:ro" zricethezav/gitleaks:v8.30.0 dir /scan --config /config/gitleaks.toml --redact=100
       - name: Verify the secret-scanning canary blocks
         run: |
-          printf '%s\n' 'TT_AI_SECRET_CANARY_0123456789ABCDEF0123456789ABCDEF' > "${RUNNER_TEMP}/gitleaks-canary.txt"
+          printf '%s%s\n' 'TT_AI_SECRET_CANARY_' '0123456789ABCDEF0123456789ABCDEF' > "${RUNNER_TEMP}/gitleaks-canary.txt"
           if docker run --rm -v "${RUNNER_TEMP}:/scan:ro" -v "$GITHUB_WORKSPACE/.gitleaks.toml:/config/gitleaks.toml:ro" zricethezav/gitleaks:v8.30.0 dir /scan --config /config/gitleaks.toml --redact=100; then
             echo "Expected Gitleaks to block the canary, but it succeeded."
             exit 1
