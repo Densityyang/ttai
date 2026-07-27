@@ -1,6 +1,6 @@
-"""tt-ai 服务入口模块
+"""tt-ai ??????
 
-提供开发环境、生产环境和 CLI 三种启动方式。
+???????????? CLI ???????
 """
 
 import time
@@ -14,25 +14,28 @@ shell_app = typer.Typer()
 
 
 def create_app():
-    """创建 FastAPI 应用实例"""
+    """?? FastAPI ????"""
     from fastapi import FastAPI
     from starlette.middleware.cors import CORSMiddleware
 
     from src.nl2sql.api import lifespan
+    from src.nl2sql.v2 import register_v1_gone_routes, register_v2_routes
 
     settings = get_settings()
 
     app = FastAPI(
         title="tt-ai",
-        description="NL2SQL AI 服务 - 自然语言转 SQL 查询",
+        description="NL2SQL AI ?? - ????? SQL ??",
         version="0.1.0",
         lifespan=lifespan,
         docs_url="/docs" if settings.auth_enabled else None,
         redoc_url="/redoc" if settings.auth_enabled else None,
         openapi_url="/openapi.json" if settings.auth_enabled else None,
     )
+    register_v2_routes(app)
+    register_v1_gone_routes(app)
 
-    # 跨域配置
+    # ????
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -46,13 +49,13 @@ def create_app():
 
 @shell_app.command()
 def dev(
-    host: str = typer.Option(default="0.0.0.0", help="监听主机 IP"),
-    port: int | None = typer.Option(default=None, help="监听端口"),
+    host: str = typer.Option(default="0.0.0.0", help="???? IP"),
+    port: int | None = typer.Option(default=None, help="????"),
     reload_dirs: list[str] | None = typer.Option(
-        default=None, help="热重载监听目录，可多次传入"
+        default=None, help="?????????????"
     ),
 ):
-    """开发环境启动（热重载）"""
+    """???????????"""
     settings = get_settings()
     actual_port = port if port is not None else settings.api_port
 
@@ -69,13 +72,13 @@ def dev(
 
 @shell_app.command()
 def prod(
-    host: str = typer.Option(default="0.0.0.0", help="监听主机 IP"),
-    port: int | None = typer.Option(default=None, help="监听端口"),
-    workers: int = typer.Option(default=1, help="Worker 进程数"),
+    host: str = typer.Option(default="0.0.0.0", help="???? IP"),
+    port: int | None = typer.Option(default=None, help="????"),
+    workers: int = typer.Option(default=1, help="Worker ???"),
 ):
-    """生产环境启动
+    """??????
 
-    使用 uvicorn 的多 worker 模式运行，适合生产环境部署。
+    ?? uvicorn ?? worker ??????????????
     """
     settings = get_settings()
     actual_port = port if port is not None else settings.api_port
@@ -92,14 +95,14 @@ def prod(
 
 @shell_app.command()
 def cli(
-    thread_id: str | None = typer.Option(default=None, help="会话线程 ID"),
-    sync_rag: bool = typer.Option(default=False, help="同步 RAG 索引后退出"),
-    force: bool = typer.Option(default=False, help="强制重建 RAG 索引"),
+    thread_id: str | None = typer.Option(default=None, help="???? ID"),
+    sync_rag: bool = typer.Option(default=False, help="?? RAG ?????"),
+    force: bool = typer.Option(default=False, help="???? RAG ??"),
 ):
-    """启动交互式命令行工具
+    """??????????
 
-    通过 Supervisor Agent 交互，支持多轮对话记忆。
-    相同 thread_id 可复用对话上下文。
+    ?? Supervisor Agent ????????????
+    ?? thread_id ?????????
     """
     from uuid import uuid4
 
@@ -109,29 +112,29 @@ def cli(
         try:
             result = sync_qa_index(force=force)
         except ImportError as e:
-            print("RAG 索引同步失败：缺少 FAISS 依赖。")
-            print("请先安装 `faiss-cpu`，再执行 --sync-rag。")
-            print(f"详细错误: {e}")
+            print("RAG ????????? FAISS ???")
+            print("???? `faiss-cpu`???? --sync-rag?")
+            print(f"????: {e}")
             raise typer.Exit(1)
 
         print("=" * 60)
-        print("RAG 索引同步结果")
+        print("RAG ??????")
         print("=" * 60)
-        print(f"变更: {'是' if result.changed else '否'}")
-        print(f"QA 条目数: {result.total_qas}")
-        print(f"分片数: {result.total_chunks}")
-        print(f"说明: {result.reason}")
+        print(f"??: {'?' if result.changed else '?'}")
+        print(f"QA ???: {result.total_qas}")
+        print(f"???: {result.total_chunks}")
+        print(f"??: {result.reason}")
         raise typer.Exit(0)
 
     actual_thread_id = thread_id or str(uuid4())
 
     print("=" * 60)
-    print("NL2SQL 命令行工具 (Supervisor 版本)")
+    print("NL2SQL ????? (Supervisor ??)")
     print("=" * 60)
     print(f"Thread ID: {actual_thread_id}")
-    print("输入 'exit' 退出\n")
+    print("?? 'exit' ??\n")
 
-    # 使用 prompt_toolkit 的 asyncio 集成
+    # ?? prompt_toolkit ? asyncio ??
     from prompt_toolkit import PromptSession
     from prompt_toolkit.application import create_app_session
     from prompt_toolkit.input import create_input
@@ -149,28 +152,28 @@ def cli(
 
         agent_config = get_agent_config()
 
-        # 初始化数据库连接和预热 runtime
+        # ??????????? runtime
         await get_db_manager(schema=agent_config.nl2sql_db_schema)
         await warmup_runtime()
 
-        # 初始化 checkpointer
+        # ??? checkpointer
         checkpointer_manager = get_checkpointer_manager()
         await checkpointer_manager.init()
 
         try:
             supervisor = await create_supervisor(checkpointer_manager.checkpointer)
 
-            # 在 asyncio 环境中创建 prompt_toolkit session
+            # ? asyncio ????? prompt_toolkit session
             with create_app_session(input=create_input(), output=create_output()):
                 session: PromptSession[str] = PromptSession()
 
                 while True:
                     try:
-                        question = await session.prompt_async("问题> ")
+                        question = await session.prompt_async("??> ")
                         question = question.strip()
 
                         if question.lower() in {"exit", "quit", "q"}:
-                            print("再见!")
+                            print("??!")
                             break
 
                         if not question:
@@ -200,13 +203,13 @@ def cli(
                                         print(chunk.content, end="", flush=True)
                                         final_answer = (final_answer or "") + chunk.content
 
-                            # 捕获最终响应
+                            # ??????
                             if event["event"] == "on_chain_end":
                                 output = event.get("data", {}).get("output")
                                 if isinstance(output, dict) and "structured_response" in output:
                                     structured = output["structured_response"]
                                     if structured and hasattr(structured, "blocks") and structured.blocks:
-                                        # 直接输出结构化响应块，避免额外渲染器模块依赖
+                                        # ??????????????????????
                                         rendered_blocks: list[object] = []
                                         for block in structured.blocks:
                                             if hasattr(block, "model_dump"):
@@ -217,14 +220,14 @@ def cli(
                                                 rendered_blocks.append(block)
 
                                         if rendered_blocks:
-                                            # 如果前面没有大模型直接输出的纯文本，此处打印各区块
+                                            # ?????????????????????????
                                             if final_answer is None:
                                                 final_answer = ""
                                             import json
 
                                             block_output = json.dumps(rendered_blocks, ensure_ascii=False, indent=2)
-                                            print(f"\n[结构化响应块]:\n{block_output}", end="", flush=True)
-                                            final_answer += f"\n[结构化响应块]:\n{block_output}"
+                                            print(f"\n[??????]:\n{block_output}", end="", flush=True)
+                                            final_answer += f"\n[??????]:\n{block_output}"
 
                                 if final_answer is None and event["name"] == "nl2sql":
                                     result = event.get("data", {}).get("output")
@@ -238,14 +241,14 @@ def cli(
 
                         if final_answer:
                             elapsed = time.perf_counter() - start_time
-                            print(f"\n(耗时 {elapsed:.2f}s)")
+                            print(f"\n(?? {elapsed:.2f}s)")
                             print(f"{'=' * 60}\n")
 
                     except KeyboardInterrupt:
-                        print("\n\n再见!")
+                        print("\n\n??!")
                         break
                     except Exception as e:
-                        print(f"\n异常: {e}\n")
+                        print(f"\n??: {e}\n")
                         import traceback
                         traceback.print_exc()
         finally:
