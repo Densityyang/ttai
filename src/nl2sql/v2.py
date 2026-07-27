@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command
 from pydantic import Field, model_validator
 
 from src.core.auth.dependencies import require_nl2sql_permission
@@ -69,7 +70,9 @@ class ThreadHistoryResponse(StrictContract):
 
 
 class ThreadActionRequest(StrictContract):
-    action: Literal["confirm", "modify", "cancel"]
+    action: Literal["approve", "modify", "reject", "cancel"]
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    expected_version: int = Field(ge=1)
     feedback: str | None = Field(default=None, max_length=4096)
 
     @model_validator(mode="after")
@@ -81,7 +84,9 @@ class ThreadActionRequest(StrictContract):
 
 class ThreadActionResponse(StrictContract):
     thread_id: UUID
-    status: Literal["confirmed", "modified", "cancelled"]
+    status: Literal["approved", "modified", "rejected", "cancelled"]
+    version: int
+    idempotent: bool = False
 
 
 class FeedbackRequest(StrictContract):
@@ -255,14 +260,40 @@ def register_v2_routes(app: FastAPI) -> None:
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> ThreadActionResponse:
         context = _request_context(request, auth_user, thread_id)
-        state_value = await (await _engine_from_request(request)).aget_state(runtime_config(context))
+        engine = await _engine_from_request(request)
+        config = _runtime_config(context)
+        state_value = await engine.aget_state(config)
         if not state_value or not getattr(state_value, "values", None):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
-        status_by_action: dict[
-            Literal["confirm", "modify", "cancel"],
-            Literal["confirmed", "modified", "cancelled"],
-        ] = {"confirm": "confirmed", "modify": "modified", "cancel": "cancelled"}
-        return ThreadActionResponse(thread_id=thread_id, status=status_by_action[body.action])
+        values = cast(dict[str, object], state_value.values)
+        applied_actions = values.get("applied_actions", {})
+        if isinstance(applied_actions, dict):
+            prior = applied_actions.get(body.idempotency_key)
+            if isinstance(prior, dict):
+                prior_status = prior.get("status")
+                prior_version = prior.get("version")
+                if isinstance(prior_status, str) and isinstance(prior_version, int):
+                    return ThreadActionResponse(
+                        thread_id=thread_id,
+                        status=cast(Literal["approved", "modified", "rejected", "cancelled"], prior_status),
+                        version=prior_version,
+                        idempotent=True,
+                    )
+        if values.get("hitl_status") != "awaiting_action":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="thread is not awaiting an action")
+        version = values.get("hitl_version")
+        if version != body.expected_version:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="action version is stale")
+        result = await engine.ainvoke(Command(resume=body.model_dump()), config)
+        result_status = result.get("hitl_status") if isinstance(result, dict) else None
+        result_version = result.get("hitl_version") if isinstance(result, dict) else None
+        if result_status not in {"approved", "modified", "rejected", "cancelled"} or not isinstance(result_version, int):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="action was not applied")
+        return ThreadActionResponse(
+            thread_id=thread_id,
+            status=cast(Literal["approved", "modified", "rejected", "cancelled"], result_status),
+            version=result_version,
+        )
 
     @router.post("/feedback", status_code=status.HTTP_202_ACCEPTED)
     async def feedback(
