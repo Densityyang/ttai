@@ -29,10 +29,9 @@ class Settings(BaseSettings):
 
     # ???
     database_url: str = Field(default="", description="????? URL?????????????")
-    database_url_admin: str | None = Field(
-        default=None,
-        description="???????? URL?DDL ?????? schema/???",
-    )
+    control_database_url: str | None = Field(default=None)
+    checkpoint_database_url: str | None = Field(default=None)
+    backup_retention_days: int = Field(default=7, ge=1, le=365)
 
     # LLM
     openai_api_key: str = Field(default="", description="OpenAI API Key")
@@ -83,10 +82,6 @@ class Settings(BaseSettings):
         default="memory",
         description="???????memory=?????postgresql=????",
     )
-    memory_backend_url: str | None = Field(
-        default=None,
-        description="?????? URL?memory_backend=postgresql ????",
-    )
 
     @model_validator(mode="before")
     @classmethod
@@ -95,11 +90,11 @@ class Settings(BaseSettings):
         provider = SecretProvider()
         for env_name, field_name in {
             "DATABASE_URL": "database_url",
-            "DATABASE_URL_ADMIN": "database_url_admin",
+            "CONTROL_DATABASE_URL": "control_database_url",
+            "CHECKPOINT_DATABASE_URL": "checkpoint_database_url",
             "OPENAI_API_KEY": "openai_api_key",
             "LANGFUSE_PUBLIC_KEY": "langfuse_public_key",
             "LANGFUSE_SECRET_KEY": "langfuse_secret_key",
-            "MEMORY_BACKEND_URL": "memory_backend_url",
         }.items():
             if f"{env_name}_FILE" in os.environ:
                 values[field_name] = provider.get(env_name)
@@ -113,8 +108,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_memory_backend(self) -> "Settings":
-        if self.memory_backend == "postgresql" and not self.memory_backend_url:
-            raise ValueError("MEMORY_BACKEND=postgresql ????? MEMORY_BACKEND_URL")
+        if self.memory_backend == "postgresql" and not self.checkpoint_database_url:
+            raise ValueError("MEMORY_BACKEND=postgresql ????? CHECKPOINT_DATABASE_URL")
         return self
 
 

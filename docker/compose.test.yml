@@ -11,3 +11,13 @@ services:
       MODEL_REQUIRED: "false"
       AUTH_ENABLED: "false"
       LANGFUSE_ENABLED: "false"
+
+  control-postgres:
+    environment:
+      POSTGRES_DB: ttai_control_test
+  checkpoint-postgres:
+    environment:
+      POSTGRES_DB: ttai_checkpoint_test
+  business-postgres:
+    environment:
+      POSTGRES_DB: ttai_business_test
