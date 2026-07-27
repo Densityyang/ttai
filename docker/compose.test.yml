@@ -1,0 +1,13 @@
+services:
+  api-a:
+    environment:
+      SERVICE_MODE: infra-dev
+      MODEL_REQUIRED: "false"
+      AUTH_ENABLED: "false"
+      LANGFUSE_ENABLED: "false"
+  api-b:
+    environment:
+      SERVICE_MODE: infra-dev
+      MODEL_REQUIRED: "false"
+      AUTH_ENABLED: "false"
+      LANGFUSE_ENABLED: "false"

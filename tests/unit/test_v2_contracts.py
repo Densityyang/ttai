@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import cast
 from uuid import UUID
 
 import pytest
@@ -38,6 +39,14 @@ class FakeSupervisor:
             yield state
 
 
+class FakeContainer:
+    def __init__(self, supervisor: FakeSupervisor) -> None:
+        self._supervisor = supervisor
+
+    async def get_supervisor(self) -> FakeSupervisor:
+        return self._supervisor
+
+
 def _context_for(user_id: str) -> RequestContext:
     return RequestContext(
         identity=RequestIdentity(
@@ -52,10 +61,8 @@ def _context_for(user_id: str) -> RequestContext:
 
 
 def _app_for(supervisor: FakeSupervisor) -> FastAPI:
-    import src.nl2sql.api as legacy_api
-
-    legacy_api._supervisor = supervisor
     app = FastAPI()
+    app.state.container = FakeContainer(supervisor)
     register_v2_routes(app)
     register_v1_gone_routes(app)
     return app
@@ -112,7 +119,9 @@ def test_thread_namespace_is_safe_for_user_ids_with_delimiters() -> None:
 
 def test_runtime_config_propagates_request_identity_to_subgraphs() -> None:
     config = runtime_config(_context_for("alice"))
-    configurable = config["configurable"]
+    configurable = cast(dict[str, object], config["configurable"])
     assert configurable["thread_id"] == f"default:alice:{THREAD_ID}"
-    assert configurable["request_identity"]["user_id"] == "alice"
-    assert configurable["request_context"]["thread_id"] == str(THREAD_ID)
+    identity = cast(dict[str, str], configurable["request_identity"])
+    context = cast(dict[str, str], configurable["request_context"])
+    assert identity["user_id"] == "alice"
+    assert context["thread_id"] == str(THREAD_ID)

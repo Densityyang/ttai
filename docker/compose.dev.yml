@@ -1,8 +1,5 @@
 services:
   api-a:
-    extends:
-      file: compose.base.yml
-      service: api-a
     environment:
       SERVICE_MODE: infra-dev
       MODEL_REQUIRED: "false"
@@ -10,21 +7,9 @@ services:
       - ../src:/app/src:ro
       - ../configs:/app/configs:ro
   api-b:
-    extends:
-      file: compose.base.yml
-      service: api-b
     environment:
       SERVICE_MODE: infra-dev
       MODEL_REQUIRED: "false"
     volumes:
       - ../src:/app/src:ro
       - ../configs:/app/configs:ro
-  nginx:
-    extends:
-      file: compose.base.yml
-      service: nginx
-
-networks:
-  app_internal:
-    driver: bridge
-    internal: true
