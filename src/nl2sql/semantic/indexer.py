@@ -91,12 +91,28 @@ async def run_indexer(change_summary: str) -> SemanticRelease:
         await publisher.close()
 
 
+async def rollback_index(release_id: str) -> SemanticRelease:
+    settings = get_settings()
+    if not settings.control_database_url:
+        raise RuntimeError("CONTROL_DATABASE_URL is required for semantic rollback")
+    publisher = ControlSemanticReleasePublisher(settings.control_database_url)
+    try:
+        return await publisher.rollback(release_id)
+    finally:
+        await publisher.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build and publish a semantic release")
     parser.add_argument("--change-summary", default="semantic release indexer")
+    parser.add_argument("--rollback-release", default=None)
     args = parser.parse_args()
-    release = asyncio.run(run_indexer(args.change_summary))
-    print(f"published semantic release {release.release_id} version={release.version}")
+    if args.rollback_release:
+        release = asyncio.run(rollback_index(args.rollback_release))
+        print(f"rolled back semantic release {release.release_id} version={release.version}")
+    else:
+        release = asyncio.run(run_indexer(args.change_summary))
+        print(f"published semantic release {release.release_id} version={release.version}")
 
 
 if __name__ == "__main__":
