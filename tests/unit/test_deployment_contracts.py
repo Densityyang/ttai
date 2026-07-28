@@ -41,6 +41,15 @@ def test_benchmark_is_an_explicit_one_shot_compose_profile() -> None:
     assert "/run/secrets/control_app_database_url" in benchmark["environment"]["CONTROL_DATABASE_URL_FILE"]
 
 
+def test_release_compose_pins_app_image_and_keeps_ops_profiles() -> None:
+    release = _load_yaml("docker/compose.release.yml")
+    for service_name in ("api-a", "api-b", "indexer"):
+        assert "TTAI_IMAGE_REF" in release["services"][service_name]["image"]
+    assert release["services"]["migrate"]["profiles"] == ["ops"]
+    assert release["services"]["backup"]["volumes"][0].endswith(":/backups")
+    assert release["networks"]["business_external_net"]["external"] is True
+
+
 def test_nginx_contract_preserves_sse_request_id_and_body_limits() -> None:
     config = (ROOT / "nginx/nginx.conf").read_text(encoding="utf-8")
     assert "client_max_body_size 32k" in config

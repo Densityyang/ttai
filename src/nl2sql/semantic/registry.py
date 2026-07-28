@@ -253,6 +253,85 @@ class ControlSemanticReleasePublisher:
             validation_report=validation_report,
         )
 
+    async def rollback(self, release_id: str) -> SemanticRelease:
+        """Atomically move the active pointer to a previously validated release."""
+        async with self._engine.begin() as connection:
+            target = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT release_id::text, version, checksum, state, previous_release_id::text,
+                               created_at, change_summary, validation_report
+                        FROM semantic_releases
+                        WHERE release_id = CAST(:release_id AS uuid)
+                        FOR UPDATE
+                        """
+                    ),
+                    {"release_id": release_id},
+                )
+            ).mappings().one_or_none()
+            if target is None:
+                raise SemanticReleaseError("rollback target does not exist")
+            if str(target["state"]) not in {SemanticReleaseState.RETIRED, SemanticReleaseState.VALIDATED}:
+                raise SemanticReleaseError("rollback target must be retired or validated")
+            await connection.execute(
+                text("UPDATE semantic_releases SET state = 'retired' WHERE state = 'active'")
+            )
+            await connection.execute(
+                text(
+                    """
+                    UPDATE semantic_releases
+                    SET state = 'active', activated_at = now()
+                    WHERE release_id = CAST(:release_id AS uuid)
+                    """
+                ),
+                {"release_id": release_id},
+            )
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO semantic_release_pointers (pointer_name, release_id)
+                    VALUES ('active', CAST(:release_id AS uuid))
+                    ON CONFLICT (pointer_name) DO UPDATE
+                    SET release_id = EXCLUDED.release_id, updated_at = now()
+                    """
+                ),
+                {"release_id": release_id},
+            )
+            document_rows = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT document_id, content, metadata
+                        FROM semantic_documents
+                        WHERE release_id = CAST(:release_id AS uuid)
+                        ORDER BY document_id
+                        """
+                    ),
+                    {"release_id": release_id},
+                )
+            ).mappings().all()
+        return SemanticRelease(
+            release_id=str(target["release_id"]),
+            version=int(target["version"]),
+            checksum=str(target["checksum"]),
+            state=SemanticReleaseState.ACTIVE,
+            documents=tuple(
+                SemanticDocument(
+                    document_id=str(row["document_id"]),
+                    content=str(row["content"]),
+                    metadata={str(key): str(value) for key, value in dict(row["metadata"]).items()},
+                )
+                for row in document_rows
+            ),
+            validation_report=dict(target["validation_report"] or {}),
+            change_summary=str(target["change_summary"]),
+            previous_release_id=(
+                str(target["previous_release_id"]) if target["previous_release_id"] is not None else None
+            ),
+            created_at=target["created_at"],
+        )
+
     async def read_active(self) -> SemanticRelease | None:
         async with self._engine.connect() as connection:
             release_row = (
