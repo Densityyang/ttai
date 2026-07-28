@@ -92,6 +92,28 @@ services:
     networks:
       - app_internal
 
+  benchmark:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    profiles: ["benchmark"]
+    depends_on:
+      control-postgres:
+        condition: service_started
+      business-postgres:
+        condition: service_started
+    environment:
+      CONTROL_DATABASE_URL_FILE: /run/secrets/control_app_database_url
+      BENCHMARK_MAX_CONCURRENCY: ${BENCHMARK_MAX_CONCURRENCY:-4}
+      BENCHMARK_MAX_COST: ${BENCHMARK_MAX_COST:-1.00}
+    command: ["python", "-m", "benchmarks.runner", "--dataset", "enterprise", "--stub"]
+    volumes:
+      - ../benchmarks/results:/app/benchmarks/results
+    secrets:
+      - control_app_database_url
+    networks:
+      - app_internal
+
   backup:
     image: postgres:17-alpine
     profiles: ["ops"]

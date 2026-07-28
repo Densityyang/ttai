@@ -13,7 +13,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 import sqlglot
 from sqlalchemy import text
@@ -64,6 +64,21 @@ class QueryPolicyError(ValueError):
     def __init__(self, code: QueryErrorCode, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class QueryAuditSink(Protocol):
+    async def record_sql_start(self, trace_id: str, sql: str) -> None: ...
+
+    async def record_sql_result(
+        self,
+        trace_id: str,
+        sql: str,
+        *,
+        accepted: bool,
+        row_count: int,
+        elapsed_ms: float,
+        error_code: str | None,
+    ) -> None: ...
 
 
 _SENSITIVE_COLUMN = re.compile(r"(?:password|secret|token|api[_-]?key|authorization|credential)", re.I)
@@ -140,6 +155,7 @@ class QueryGateway:
         max_plan_cost: float = 500_000.0,
         max_plan_rows: int = 100_000,
         max_result_bytes: int = 1_000_000,
+        audit_sink: QueryAuditSink | None = None,
     ) -> None:
         if schema and not _SAFE_SCHEMA.fullmatch(schema):
             raise ValueError(f"invalid schema identifier: {schema}")
@@ -151,6 +167,7 @@ class QueryGateway:
         self._max_plan_cost = max_plan_cost
         self._max_plan_rows = max_plan_rows
         self._max_result_bytes = max_result_bytes
+        self._audit_sink = audit_sink
         self._policy = PolicyEngine(max_rows=max_rows)
 
     def prepare(self, sql: str) -> str:
@@ -175,12 +192,46 @@ class QueryGateway:
         except Exception as exc:
             return _rejected(sql, QueryErrorCode.PLAN_FAILED, "query planning failed", started, detail=exc)
 
-    async def execute(self, sql: str, params: dict[str, Any] | None = None) -> QueryReceipt:
+    async def execute(
+        self,
+        sql: str,
+        params: dict[str, Any] | None = None,
+        *,
+        trace_id: str = "",
+    ) -> QueryReceipt:
         from src.nl2sql.infra.governance.semaphore import get_concurrency_governor
 
+        if self._audit_sink is not None:
+            try:
+                await self._audit_sink.record_sql_start(trace_id, sql)
+            except Exception:
+                return _rejected(
+                    sql,
+                    QueryErrorCode.DATABASE_ERROR,
+                    "control audit is unavailable; SQL execution was not started",
+                    time.perf_counter(),
+                )
         governor = get_concurrency_governor()
         async with governor.acquire("sql"):
-            return await self._execute_locked(sql, params)
+            receipt = await self._execute_locked(sql, params)
+        if self._audit_sink is not None:
+            try:
+                await self._audit_sink.record_sql_result(
+                    trace_id,
+                    receipt.sql,
+                    accepted=receipt.accepted,
+                    row_count=receipt.row_count,
+                    elapsed_ms=receipt.elapsed_ms,
+                    error_code=receipt.error.code if receipt.error else None,
+                )
+            except Exception:
+                return _rejected(
+                    receipt.sql,
+                    QueryErrorCode.DATABASE_ERROR,
+                    "control audit result write failed",
+                    time.perf_counter(),
+                )
+        return receipt
 
     async def _execute_locked(self, sql: str, params: dict[str, Any] | None = None) -> QueryReceipt:
         started = time.perf_counter()

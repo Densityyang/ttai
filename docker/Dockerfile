@@ -17,6 +17,7 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
+COPY benchmarks ./benchmarks
 COPY configs ./configs
 COPY main.py ./
 RUN uv sync --frozen --no-dev
@@ -38,6 +39,7 @@ RUN groupadd --system app && useradd --system --gid app --create-home app
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder --chown=app:app /build/src ./src
+COPY --from=builder --chown=app:app /build/benchmarks ./benchmarks
 COPY --from=builder --chown=app:app /build/configs ./configs
 COPY --from=builder --chown=app:app /build/main.py ./
 

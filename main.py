@@ -53,11 +53,18 @@ def create_app():
         from src.nl2sql.infra.llm.gateway import model_gateway_available
 
         model_ready = model_gateway_available()
-        ready = not settings.model_required or model_ready
+        container = getattr(app.state, "container", None)
+        audit_ready = settings.service_mode != "product" or bool(
+            getattr(container, "audit_available", False)
+        )
+        ready = (not settings.model_required or model_ready) and audit_ready
         payload = {
             "status": "ready" if ready else "not_ready",
             "service_mode": settings.service_mode,
-            "components": {"model": "ready" if model_ready else "unavailable"},
+            "components": {
+                "model": "ready" if model_ready else "unavailable",
+                "control_audit": "ready" if audit_ready else "unavailable",
+            },
         }
         if ready:
             return payload

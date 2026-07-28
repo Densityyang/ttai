@@ -33,6 +33,14 @@ def test_compose_profiles_have_two_api_instances_and_external_product_network() 
     assert "network_mode: host" not in compose_text
 
 
+def test_benchmark_is_an_explicit_one_shot_compose_profile() -> None:
+    dev = _load_yaml("docker/compose.dev.yml")
+    benchmark = dev["services"]["benchmark"]
+    assert benchmark["profiles"] == ["benchmark"]
+    assert benchmark["command"] == ["python", "-m", "benchmarks.runner", "--dataset", "enterprise", "--stub"]
+    assert "/run/secrets/control_app_database_url" in benchmark["environment"]["CONTROL_DATABASE_URL_FILE"]
+
+
 def test_nginx_contract_preserves_sse_request_id_and_body_limits() -> None:
     config = (ROOT / "nginx/nginx.conf").read_text(encoding="utf-8")
     assert "client_max_body_size 32k" in config

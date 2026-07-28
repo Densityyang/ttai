@@ -7,7 +7,7 @@ have been recorded.
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, Protocol, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage
 from langchain_core.runnables.config import var_child_runnable_config
@@ -19,6 +19,7 @@ from langgraph.types import interrupt
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import ModelRequest
 from src.nl2sql.infra.llm.gateway import ModelGateway, ModelGatewayError
+from src.nl2sql.observability.trace import TraceEnvelope, TraceEvent, fingerprint
 from src.nl2sql.orchestration.budget import BudgetExceeded, CallBudget
 from src.nl2sql.orchestration.routing import RiskSignals, choose_route
 
@@ -33,9 +34,19 @@ class V2EngineState(TypedDict):
     hitl_version: NotRequired[int]
     hitl_status: NotRequired[str]
     applied_actions: NotRequired[dict[str, dict[str, object]]]
+    trace_events: NotRequired[list[dict[str, object]]]
 
 
-def create_v2_engine(*, checkpointer: BaseCheckpointSaver, model_gateway: ModelGateway) -> Any:
+class TraceSink(Protocol):
+    async def append(self, event: TraceEvent) -> None: ...
+
+
+def create_v2_engine(
+    *,
+    checkpointer: BaseCheckpointSaver,
+    model_gateway: ModelGateway,
+    trace_sink: TraceSink | None = None,
+) -> Any:
     graph = StateGraph(V2EngineState)
 
     async def route_node(state: V2EngineState) -> dict[str, object]:
@@ -43,7 +54,16 @@ def create_v2_engine(*, checkpointer: BaseCheckpointSaver, model_gateway: ModelG
         signals = _signals(question)
         confidence = 0.9 if signals.score <= 20 else 0.7 if signals.score <= 60 else 0.45
         decision = choose_route(signals=signals, confidence=confidence)
-        return {"route_record": decision.replay_record()}
+        trace = _trace(state)
+        trace.record(
+            "query",
+            "received",
+            question_fingerprint=fingerprint(question),
+            question_length=len(question),
+        )
+        trace.record("policy", "route_selected", route=decision.route, risk=signals.score, confidence=confidence)
+        await _persist_new_events(trace_sink, trace.events[-2:])
+        return {"route_record": decision.replay_record(), "trace_events": _events(trace)}
 
     async def model_node(state: V2EngineState) -> dict[str, object]:
         config = get_agent_config()
@@ -83,7 +103,21 @@ def create_v2_engine(*, checkpointer: BaseCheckpointSaver, model_gateway: ModelG
                 "degradation_flags": [type(exc).__name__],
             }
         answer = f"{'Shadow plan (no business SQL executed): ' if is_shadow else ''}{receipt.content}"
-        result: dict[str, object] = {"model_receipt": receipt.model_dump(mode="json")}
+        trace = _trace(state)
+        trace.record(
+            "answer",
+            "model_completed",
+            resolved_model=receipt.resolved_model,
+            input_tokens=receipt.usage.get("input_tokens", 0),
+            output_tokens=receipt.usage.get("output_tokens", 0),
+            estimated_cost=receipt.estimated_cost,
+            answer_hash=fingerprint(answer),
+        )
+        await _persist_new_events(trace_sink, trace.events[-1:])
+        result: dict[str, object] = {
+            "model_receipt": receipt.model_dump(mode="json"),
+            "trace_events": _events(trace),
+        }
         if route == "deep" and not is_shadow:
             # Keep the generated plan at the checkpoint; business SQL remains blocked
             # until the owner makes an explicit, versioned decision.
@@ -179,6 +213,34 @@ def _failed_action(reason: str, version: int) -> dict[str, object]:
         "hitl_version": version,
         "needs_hitl": False,
     }
+
+
+def _trace(state: V2EngineState) -> TraceEnvelope:
+    events = state.get("trace_events", [])
+    trace = TraceEnvelope(trace_id=_trace_id(state))
+    for event in events:
+        trace.events.append(TraceEvent.model_validate(event))
+    return trace
+
+
+def _events(trace: TraceEnvelope) -> list[dict[str, object]]:
+    return [event.model_dump(mode="json") for event in trace.events]
+
+
+def _trace_id(state: V2EngineState) -> str:
+    runtime = var_child_runnable_config.get()
+    configurable = runtime.get("configurable", {}) if isinstance(runtime, dict) else {}
+    request_context = configurable.get("request_context", {}) if isinstance(configurable, dict) else {}
+    if isinstance(request_context, dict) and isinstance(request_context.get("trace_id"), str):
+        return request_context["trace_id"]
+    return str(configurable.get("thread_id", "unscoped"))
+
+
+async def _persist_new_events(trace_sink: TraceSink | None, events: list[TraceEvent]) -> None:
+    if trace_sink is None:
+        return
+    for event in events:
+        await trace_sink.append(event)
 
 
 def _signals(question: str) -> RiskSignals:
