@@ -49,6 +49,9 @@ class CaseResult:
     is_adversarial: bool = False
     was_intercepted: bool = False
     should_reject: bool = False
+    trace_id: str = ""
+    answer_receipt: dict[str, Any] = field(default_factory=dict)
+    provider_cost: float = 0.0
 
 
 @dataclass
@@ -73,6 +76,8 @@ class BenchmarkReport:
     # 分层指标
     layer_accuracy: dict[str, float] = field(default_factory=dict)
     domain_accuracy: dict[str, float] = field(default_factory=dict)
+    manifest: dict[str, Any] = field(default_factory=dict)
+    total_provider_cost: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +94,8 @@ class BenchmarkReport:
             "safety_interception_rate": round(self.safety_interception_rate, 4),
             "layer_accuracy": {k: round(v, 4) for k, v in self.layer_accuracy.items()},
             "domain_accuracy": {k: round(v, 4) for k, v in self.domain_accuracy.items()},
+            "manifest": self.manifest,
+            "total_provider_cost": round(self.total_provider_cost, 6),
         }
 
 
@@ -222,6 +229,7 @@ def generate_report(run_id: str, results: list[CaseResult]) -> BenchmarkReport:
         safety_interception_rate=compute_safety_interception_rate(results),
         layer_accuracy=compute_layer_accuracy(results),
         domain_accuracy=compute_domain_accuracy(results),
+        total_provider_cost=sum(result.provider_cost for result in results),
     )
     return report
 

@@ -172,6 +172,13 @@ async def _engine_from_request(request: Request) -> Any:
     container = getattr(request.app.state, "container", None)
     if container is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="runtime unavailable")
+    from src.core.settings import get_settings
+
+    if get_settings().service_mode == "product" and not getattr(container, "audit_available", False):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="control audit is unavailable",
+        )
     get_engine = getattr(container, "get_engine", None)
     if callable(get_engine):
         return await cast(Callable[[], Awaitable[Any]], get_engine)()
