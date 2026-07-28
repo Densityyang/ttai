@@ -332,11 +332,20 @@ async def codeact_dynamic_calculation(question: str) -> str:
 
 
 async def _invoke_codeact_agent(normalized_question: str) -> str:
-    runnable = await get_or_create_codeact_graph()
+    config = get_agent_config()
+    available, reason = config.codeact_capability()
+    if not available:
+        return f"Dynamic calculation is unavailable: {reason}."
+    if config.codeact_mode == "trusted-template":
+        runnable = await get_or_create_dynamic_calc_graph()
+        run_name = "trusted_template_calculation"
+    else:
+        runnable = await get_or_create_codeact_graph()
+        run_name = "codeact_engine"
     return await _invoke_sql_runnable(
         normalized_question=normalized_question,
         runnable=runnable,
-        run_name="codeact_engine",
+        run_name=run_name,
     )
 
 
@@ -357,7 +366,7 @@ async def create_supervisor(checkpointer: BaseCheckpointSaver) -> Any:
     agent_config = get_agent_config()
     # 二分类路由：Path A (标准语义查询) + Path B (HITL + CodeAct 动态计算)
     active_tools: list[Any] = [query_database_with_semantic_sql]
-    if agent_config.enable_dynamic_calc:
+    if agent_config.codeact_capability()[0]:
         active_tools.append(codeact_dynamic_calculation)
 
     supervisor = create_agent(

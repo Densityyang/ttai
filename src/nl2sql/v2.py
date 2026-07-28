@@ -315,16 +315,21 @@ def register_v2_routes(app: FastAPI) -> None:
         config = get_agent_config()
         from src.nl2sql.infra.llm.gateway import model_gateway_available
 
+        codeact_available, codeact_reason = config.codeact_capability()
+        degradation_reasons = []
+        if not model_gateway_available():
+            degradation_reasons.append("model provider is not configured")
+        if codeact_reason:
+            degradation_reasons.append(codeact_reason)
+
         return CapabilityResponse(
             model=model_gateway_available(),
             embedding=False,
             semantic_release=False,
             graph_rag=config.enable_graph_rag,
             hitl=True,
-            codeact=config.enable_dynamic_calc,
-            degradation_reasons=(
-                () if model_gateway_available() else ("model provider is not configured",)
-            ),
+            codeact=codeact_available,
+            degradation_reasons=tuple(degradation_reasons),
         )
 
     app.include_router(router)

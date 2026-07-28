@@ -27,10 +27,23 @@ def test_infra_dev_profile_can_explicitly_enable_unsafe_development_codeact() ->
     config = AgentConfig(
         _env_file=None,
         service_mode="infra-dev",
+        enable_dynamic_calc=True,
         codeact_mode="unsafe-dev",
     )
 
     assert config.codeact_mode == "unsafe-dev"
+    assert config.codeact_capability() == (True, "unsafe development calculation mode is enabled")
+
+
+def test_trusted_template_mode_is_explicitly_available_and_default_has_reason() -> None:
+    trusted = AgentConfig(
+        _env_file=None,
+        enable_dynamic_calc=True,
+        codeact_mode="trusted-template",
+    )
+
+    assert trusted.codeact_capability() == (True, None)
+    assert AgentConfig(_env_file=None).codeact_capability() == (False, "dynamic calculation is disabled")
 
 
 def test_product_profile_rejects_memory_experience_store() -> None:

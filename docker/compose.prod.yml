@@ -3,6 +3,8 @@ services:
     environment:
       SERVICE_MODE: product
       MODEL_REQUIRED: "true"
+      CODEACT_MODE: disabled
+      ENABLE_DYNAMIC_CALC: "false"
     networks:
       - app_internal
       - business_external_net
@@ -10,6 +12,8 @@ services:
     environment:
       SERVICE_MODE: product
       MODEL_REQUIRED: "true"
+      CODEACT_MODE: disabled
+      ENABLE_DYNAMIC_CALC: "false"
     networks:
       - app_internal
       - business_external_net
