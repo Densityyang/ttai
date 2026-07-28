@@ -24,8 +24,12 @@ from src.nl2sql.agents.dynamic_calc.schemas import (
     DynamicCalcResult,
     SandboxResult,
 )
+from src.nl2sql.agents.dynamic_calc.trusted_templates import (
+    TrustedTemplateError,
+    trusted_template_registry,
+)
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 from src.nl2sql.infra.store.database import get_nl2sql_db_manager
 from src.nl2sql.tools.async_sql_tools import create_async_sql_tools
 
@@ -82,7 +86,7 @@ def _create_data_fetch_node(tools: list[BaseTool]) -> Any:
                 question = str(msg.content)
                 break
 
-        llm = get_llm()
+        llm = get_legacy_model()
         query_tool = db_tools_by_name.get("sql_db_query")
         list_tool = db_tools_by_name.get("sql_db_list_tables")
         schema_tool = db_tools_by_name.get("sql_db_schema")
@@ -176,7 +180,7 @@ async def code_gen_node(state: DynamicCalcState) -> dict[str, Any]:
         "请生成完整的计算代码。"
     )
 
-    llm = get_llm()
+    llm = get_legacy_model()
     response = await llm.ainvoke([
         SystemMessage(content=CODE_GENERATOR_SYSTEM_PROMPT),
         SystemMessage(content=prompt),
@@ -187,7 +191,38 @@ async def code_gen_node(state: DynamicCalcState) -> dict[str, Any]:
 
 
 async def code_exec_node(state: DynamicCalcState) -> dict[str, Any]:
-    """在沙箱中执行计算代码。"""
+    """Execute only an approved template or explicitly unsafe development code."""
+    config = get_agent_config()
+    if not config.enable_dynamic_calc or config.codeact_mode == "disabled":
+        return {
+            "sandbox_result": SandboxResult(
+                success=False,
+                error="dynamic calculation is disabled by runtime policy",
+            ),
+        }
+    if config.codeact_mode == "trusted-template":
+        plan = state.get("plan")
+        if not plan or not plan.trusted_template_id:
+            return {
+                "sandbox_result": SandboxResult(
+                    success=False,
+                    error="trusted-template mode requires an approved template identifier",
+                ),
+            }
+        try:
+            output = trusted_template_registry.execute(
+                plan.trusted_template_id,
+                plan.trusted_template_inputs,
+            )
+        except TrustedTemplateError as exc:
+            return {"sandbox_result": SandboxResult(success=False, error=str(exc))}
+        return {
+            "sandbox_result": SandboxResult(
+                success=True,
+                result=output.model_dump(mode="json"),
+                stats={"template_id": plan.trusted_template_id},
+            ),
+        }
     code = state.get("generated_code")
     if not code:
         return {
@@ -249,7 +284,7 @@ async def code_repair_node(state: DynamicCalcState) -> dict[str, Any]:
         data_context=data_desc or "无可用数据",
     )
 
-    llm = get_llm()
+    llm = get_legacy_model()
     response = await llm.ainvoke([SystemMessage(content=prompt)])
     repaired = _extract_code_from_response(str(response.content))
 
@@ -274,7 +309,7 @@ async def format_result_node(state: DynamicCalcState) -> dict[str, Any]:
             ],
         )
 
-        llm = get_llm()
+        llm = get_legacy_model()
         question = ""
         for msg in reversed(state["messages"]):
             if msg.type == "human":
@@ -326,9 +361,13 @@ async def fallback_node(state: DynamicCalcState) -> dict[str, Any]:
 # ── 路由 ──────────────────────────────────────────────────────────────────────
 
 
-def after_plan_router(state: DynamicCalcState) -> Literal["data_fetch", "fallback"]:
+def after_plan_router(state: DynamicCalcState) -> Literal["data_fetch", "code_exec", "fallback"]:
     """计划生成后路由。"""
     plan = state.get("plan")
+    if get_agent_config().codeact_mode == "trusted-template":
+        if plan and plan.trusted_template_id:
+            return "code_exec"
+        return "fallback"
     if not plan or plan.fallback_strategy == "abort" or not plan.data_steps:
         return "fallback"
     return "data_fetch"
@@ -350,6 +389,8 @@ def after_code_exec_router(state: DynamicCalcState) -> Literal["format_result", 
         return "format_result"
 
     config = get_agent_config()
+    if config.codeact_mode != "unsafe-dev":
+        return "fallback"
     if state.get("code_repair_count", 0) < config.code_max_repair_rounds:
         return "code_repair"
 
@@ -423,7 +464,7 @@ async def build_dynamic_calc_graph(
     builder.add_edge(START, "plan")
     builder.add_conditional_edges(
         "plan", after_plan_router,
-        {"data_fetch": "data_fetch", "fallback": "fallback"},
+        {"data_fetch": "data_fetch", "code_exec": "code_exec", "fallback": "fallback"},
     )
     builder.add_conditional_edges(
         "data_fetch", after_data_fetch_router,

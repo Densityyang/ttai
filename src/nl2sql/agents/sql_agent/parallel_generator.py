@@ -19,7 +19,7 @@ from langchain_core.tools import BaseTool
 from src.nl2sql.agents.sql_agent.hypothesis_verifier import HypothesisReport
 from src.nl2sql.agents.sql_agent.state import ExplorationResult
 from src.nl2sql.infra.governance.semaphore import get_concurrency_governor
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +188,7 @@ async def _generate_single(strategy: str, prompt_template: str) -> SQLCandidate:
     candidate = SQLCandidate(strategy=strategy, sql="")
 
     try:
-        llm = get_llm()
+        llm = get_legacy_model()
         response = await llm.ainvoke([SystemMessage(content=prompt_template)])
         sql = _extract_sql(str(response.content))
         candidate.sql = sql or ""

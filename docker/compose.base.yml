@@ -1,0 +1,52 @@
+name: ttai
+
+x-api-common: &api-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  restart: unless-stopped
+  env_file:
+    - path: ../.env
+      required: false
+  environment:
+    SERVICE_MODE: ${SERVICE_MODE:-infra-dev}
+    MODEL_REQUIRED: ${MODEL_REQUIRED:-false}
+  expose:
+    - "8000"
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+    interval: 10s
+    timeout: 3s
+    retries: 6
+    start_period: 15s
+  networks:
+    - app_internal
+
+services:
+  api-a:
+    <<: *api-common
+    container_name: ttai-api-a
+
+  api-b:
+    <<: *api-common
+    container_name: ttai-api-b
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      api-a:
+        condition: service_healthy
+      api-b:
+        condition: service_healthy
+    ports:
+      - "${TTAI_PORT:-8000}:8080"
+    volumes:
+      - ../nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - app_internal
+
+networks:
+  app_internal:
+    driver: bridge
+    internal: true

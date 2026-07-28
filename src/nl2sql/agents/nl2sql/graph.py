@@ -12,7 +12,7 @@ from langchain_core.messages import AIMessage
 from langgraph.graph import END, START, StateGraph
 
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 from src.nl2sql.infra.store.database import get_nl2sql_db_manager
 from src.nl2sql.tools.async_sql_tools import create_async_sql_tools
 
@@ -40,7 +40,7 @@ async def build_sql_agent_graph(
         database_url=database_url,
         schema=agent_config.nl2sql_db_schema,
     )
-    model = get_llm()
+    model = get_legacy_model()
 
     tools = create_async_sql_tools(db_manager)
     model_with_tools = cast(Any, model).bind_tools(tools)

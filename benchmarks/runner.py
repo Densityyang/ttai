@@ -15,7 +15,7 @@ import argparse
 import asyncio
 import json
 import logging
-import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,19 +26,28 @@ from benchmarks.adapters import (
     load_enterprise_cases,
     load_spider_cases,
 )
+from benchmarks.agent_bridge import execute_case, override_agent_config
 from benchmarks.metrics import (
     BenchmarkReport,
     CaseResult,
     generate_report,
     statistical_significance,
 )
-from benchmarks.agent_bridge import execute_case, override_agent_config
+from benchmarks.typed_receipts import (
+    BenchmarkManifest,
+    BudgetGate,
+    TypedAnswerReceipt,
+    mcnemar_exact,
+    paired_bootstrap_interval,
+    validate_receipt,
+)
 
 logger = logging.getLogger(__name__)
 
 BENCHMARKS_DIR = Path(__file__).resolve().parent
 DATASETS_DIR = BENCHMARKS_DIR / "datasets"
 RESULTS_DIR = BENCHMARKS_DIR / "results"
+TypedExecutor = Callable[[BenchmarkCase], Awaitable[TypedAnswerReceipt]]
 
 
 # ── A/B/C 对照实验预置配置 ────────────────────────────────────────────────────
@@ -179,7 +188,7 @@ async def run_benchmark(
 
     case_results: list[CaseResult] = []
     for i, r in enumerate(results):
-        if isinstance(r, Exception):
+        if isinstance(r, BaseException):
             logger.warning("Case %s 执行异常: %s", cases[i].case_id, r)
             case_results.append(CaseResult(
                 case_id=cases[i].case_id,
@@ -197,6 +206,49 @@ async def run_benchmark(
     return report
 
 
+async def run_typed_benchmark(
+    cases: list[BenchmarkCase],
+    *,
+    manifest: BenchmarkManifest,
+    executor: TypedExecutor,
+    budget: BudgetGate,
+) -> BenchmarkReport:
+    """Run a benchmark from structured receipts, never parsed answer prose.
+
+    The executor is deliberately injected so fake providers and a test database
+    exercise the same policy, receipt and budget gates as a real benchmark.
+    """
+    results: list[CaseResult] = []
+    for case in cases:
+        receipt = await executor(case)
+        validate_receipt(receipt)
+        budget.consume(receipt)
+        successful = receipt.execution_accepted and receipt.answer_type == "answer"
+        if case.should_reject:
+            successful = receipt.answer_type == "rejected" and receipt.policy_outcome == "deny"
+        results.append(
+            CaseResult(
+                case_id=case.case_id,
+                layer=case.layer,
+                domain=case.domain,
+                expected_mode=case.expected_mode,
+                gold_sql=case.gold_sql,
+                gold_value=case.gold_value,
+                tolerance=case.tolerance,
+                is_adversarial=case.is_adversarial,
+                should_reject=case.should_reject,
+                execution_success=successful,
+                was_intercepted=receipt.answer_type == "rejected",
+                trace_id=receipt.trace_id,
+                answer_receipt=receipt.model_dump(mode="json"),
+                provider_cost=sum(call.estimated_cost for call in receipt.model_calls),
+            )
+        )
+    report = generate_report(manifest.run_id, results)
+    report.manifest = manifest.model_dump(mode="json")
+    return report
+
+
 def save_report(report: BenchmarkReport, output_dir: Path | None = None) -> Path:
     """保存评测报告为 JSON + Markdown。"""
     out_dir = output_dir or RESULTS_DIR
@@ -207,12 +259,13 @@ def save_report(report: BenchmarkReport, output_dir: Path | None = None) -> Path
     report_dict = report.to_dict()
     report_dict["case_details"] = [
         {
-            "case_id": r.case_id,
+            "sample_id": _redacted_sample_id(r.case_id),
             "layer": r.layer,
             "domain": r.domain,
             "success": r.execution_success,
             "latency_ms": round(r.latency_ms, 1),
-            "error": r.execution_error[:200] if r.execution_error else "",
+            "error_code": _safe_error_code(r.execution_error),
+            "trace_id": r.trace_id,
         }
         for r in report.results
     ]
@@ -226,18 +279,31 @@ def save_report(report: BenchmarkReport, output_dir: Path | None = None) -> Path
     return json_path
 
 
+def _safe_error_code(error: str) -> str:
+    """Reports may contain error classes but never raw model prompts/results."""
+    if not error:
+        return ""
+    return error.split(":", 1)[0][:64]
+
+
+def _redacted_sample_id(case_id: str) -> str:
+    from benchmarks.typed_receipts import redacted_sample_id
+
+    return redacted_sample_id(case_id)
+
+
 def _generate_markdown_report(report: BenchmarkReport) -> str:
     """生成 Markdown 格式的评测报告。"""
     lines: list[str] = [
         f"# Benchmark Report: {report.run_id}",
-        f"",
+        "",
         f"**Total Cases**: {report.total_cases}",
         f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"",
-        f"## Overall Metrics",
-        f"",
-        f"| Metric | Value |",
-        f"|--------|-------|",
+        "",
+        "## Overall Metrics",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
         f"| Execution Accuracy | {report.execution_accuracy:.2%} |",
         f"| Dynamic Metric Success@1 | {report.dynamic_metric_success_at_1:.2%} |",
         f"| MAPE | {report.mean_absolute_percentage_error:.4f} |",
@@ -247,15 +313,16 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
         f"| Auto-Repair Success Rate | {report.auto_repair_success_rate:.2%} |",
         f"| P95 Latency | {report.p95_latency_ms:.0f} ms |",
         f"| Safety Interception Rate | {report.safety_interception_rate:.2%} |",
-        f"",
+        f"| Total Provider Cost | {report.total_provider_cost:.6f} |",
+        "",
     ]
 
     if report.layer_accuracy:
         lines.extend([
-            f"## Accuracy by Layer",
-            f"",
-            f"| Layer | Accuracy | Cases |",
-            f"|-------|----------|-------|",
+            "## Accuracy by Layer",
+            "",
+            "| Layer | Accuracy | Cases |",
+            "|-------|----------|-------|",
         ])
         layer_counts: dict[str, int] = {}
         for r in report.results:
@@ -266,10 +333,10 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
 
     if report.domain_accuracy:
         lines.extend([
-            f"## Accuracy by Domain (Top 10)",
-            f"",
-            f"| Domain | Accuracy |",
-            f"|--------|----------|",
+            "## Accuracy by Domain (Top 10)",
+            "",
+            "| Domain | Accuracy |",
+            "|--------|----------|",
         ])
         sorted_domains = sorted(report.domain_accuracy.items(), key=lambda x: x[1])
         for domain, acc in sorted_domains[:10]:
@@ -280,14 +347,14 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
     failed = [r for r in report.results if not r.execution_success]
     if failed:
         lines.extend([
-            f"## Failed Cases (Top 20)",
-            f"",
-            f"| Case ID | Layer | Error |",
-            f"|---------|-------|-------|",
+            "## Failed Cases (Top 20)",
+            "",
+            "| Sample ID | Layer | Error code |",
+            "|-----------|-------|------------|",
         ])
         for r in failed[:20]:
-            err = r.execution_error[:80] if r.execution_error else "unknown"
-            lines.append(f"| {r.case_id} | {r.layer} | {err} |")
+            error_code = _safe_error_code(r.execution_error) or "unknown"
+            lines.append(f"| {_redacted_sample_id(r.case_id)} | {r.layer} | {error_code} |")
         if len(failed) > 20:
             lines.append(f"| ... | ... | {len(failed) - 20} more |")
         lines.append("")
@@ -355,13 +422,13 @@ def _generate_comparison_report(
 
     lines: list[str] = [
         f"# Experiment Comparison: {experiment_name}",
-        f"",
+        "",
         f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"",
-        f"## Results",
-        f"",
-        f"| Variant | EX Acc | DM S@1 | SQL Fail | P95 Lat | Safety |",
-        f"|---------|--------|--------|----------|---------|--------|",
+        "",
+        "## Results",
+        "",
+        "| Variant | EX Acc | DM S@1 | SQL Fail | P95 Lat | Safety |",
+        "|---------|--------|--------|----------|---------|--------|",
     ]
 
     for name, report in reports.items():
@@ -387,9 +454,9 @@ def _generate_comparison_report(
 
         lines.extend([
             f"## Statistical Significance (vs {baseline_name})",
-            f"",
-            f"| Variant | Mean Diff | t-stat | Significant (α=0.05) |",
-            f"|---------|-----------|--------|---------------------|",
+            "",
+            "| Variant | Mean Diff | McNemar p | Paired bootstrap 95% CI |",
+            "|---------|-----------|-----------|-------------------------|",
         ])
 
         for name, report in report_list[1:]:
@@ -398,11 +465,16 @@ def _generate_comparison_report(
                 for r in report.results
             ]
             sig = statistical_significance(baseline_scores, exp_scores)
+            mcnemar = mcnemar_exact(
+                [bool(score) for score in baseline_scores],
+                [bool(score) for score in exp_scores],
+            )
+            low, high = paired_bootstrap_interval(baseline_scores, exp_scores)
             lines.append(
                 f"| {name} "
                 f"| {sig['mean_diff']:+.4f} "
-                f"| {sig['t_statistic']:.3f} "
-                f"| {'Yes' if sig['significant'] else 'No'} |"
+                f"| {mcnemar['p_value']:.4f} "
+                f"| [{low:+.4f}, {high:+.4f}] |"
             )
 
         lines.append("")

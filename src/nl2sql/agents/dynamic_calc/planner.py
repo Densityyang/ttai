@@ -6,14 +6,14 @@ from langchain_core.messages import SystemMessage
 
 from src.nl2sql.agents.dynamic_calc.prompts import PLANNER_SYSTEM_PROMPT
 from src.nl2sql.agents.dynamic_calc.schemas import DynamicCalcPlan
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 
 logger = logging.getLogger(__name__)
 
 
 async def generate_calc_plan(question: str) -> DynamicCalcPlan:
     """基于用户问题生成动态计算计划。"""
-    llm = get_llm().with_structured_output(DynamicCalcPlan, method="function_calling")
+    llm = get_legacy_model().with_structured_output(DynamicCalcPlan, method="function_calling")
 
     try:
         plan: DynamicCalcPlan = await llm.ainvoke([  # type: ignore[assignment]

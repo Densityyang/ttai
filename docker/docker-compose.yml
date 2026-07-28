@@ -1,11 +1,30 @@
-version: "3.9"
 services:
-  nl2sql:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    env_file:
-      - ../.env
-    ports:
-      - "8000:8000"
-    command: ["uv", "run", "python", "main.py", "prod"]
+  api-a:
+    extends:
+      file: compose.base.yml
+      service: api-a
+    environment:
+      SERVICE_MODE: infra-dev
+      MODEL_REQUIRED: "false"
+    volumes:
+      - ../src:/app/src:ro
+      - ../configs:/app/configs:ro
+  api-b:
+    extends:
+      file: compose.base.yml
+      service: api-b
+    environment:
+      SERVICE_MODE: infra-dev
+      MODEL_REQUIRED: "false"
+    volumes:
+      - ../src:/app/src:ro
+      - ../configs:/app/configs:ro
+  nginx:
+    extends:
+      file: compose.base.yml
+      service: nginx
+
+networks:
+  app_internal:
+    driver: bridge
+    internal: true

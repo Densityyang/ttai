@@ -15,7 +15,7 @@ from langchain_core.messages import SystemMessage
 from langchain_core.tools import BaseTool
 
 from src.nl2sql.agents.codeact_engine.plan_card import DataFetchStep
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +197,7 @@ async def _generate_fetch_sql(step: DataFetchStep, schema_info: str) -> str | No
         schema_info=schema_info or "（无可用 schema 信息）",
     )
 
-    llm = get_llm()
+    llm = get_legacy_model()
     response = await llm.ainvoke([SystemMessage(content=prompt)])
     return _extract_sql(str(response.content))
 

@@ -24,7 +24,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from src.core.observer import create_monitored_config
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 from src.nl2sql.infra.runtime.registry import (
     get_or_create_codeact_graph,
     get_or_create_dynamic_calc_graph,
@@ -332,11 +332,20 @@ async def codeact_dynamic_calculation(question: str) -> str:
 
 
 async def _invoke_codeact_agent(normalized_question: str) -> str:
-    runnable = await get_or_create_codeact_graph()
+    config = get_agent_config()
+    available, reason = config.codeact_capability()
+    if not available:
+        return f"Dynamic calculation is unavailable: {reason}."
+    if config.codeact_mode == "trusted-template":
+        runnable = await get_or_create_dynamic_calc_graph()
+        run_name = "trusted_template_calculation"
+    else:
+        runnable = await get_or_create_codeact_graph()
+        run_name = "codeact_engine"
     return await _invoke_sql_runnable(
         normalized_question=normalized_question,
         runnable=runnable,
-        run_name="codeact_engine",
+        run_name=run_name,
     )
 
 
@@ -352,12 +361,12 @@ async def create_supervisor(checkpointer: BaseCheckpointSaver) -> Any:
     3. 调用子 Agent 工具
     """
     logger.info("开始创建 Supervisor Agent")
-    llm = get_llm()
+    llm = get_legacy_model()
 
     agent_config = get_agent_config()
     # 二分类路由：Path A (标准语义查询) + Path B (HITL + CodeAct 动态计算)
     active_tools: list[Any] = [query_database_with_semantic_sql]
-    if agent_config.enable_dynamic_calc:
+    if agent_config.codeact_capability()[0]:
         active_tools.append(codeact_dynamic_calculation)
 
     supervisor = create_agent(

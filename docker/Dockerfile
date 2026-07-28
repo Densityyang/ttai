@@ -3,6 +3,7 @@ FROM python:3.13-slim AS builder
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
     VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH"
 
@@ -16,6 +17,7 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
+COPY benchmarks ./benchmarks
 COPY configs ./configs
 COPY main.py ./
 RUN uv sync --frozen --no-dev
@@ -37,6 +39,7 @@ RUN groupadd --system app && useradd --system --gid app --create-home app
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder --chown=app:app /build/src ./src
+COPY --from=builder --chown=app:app /build/benchmarks ./benchmarks
 COPY --from=builder --chown=app:app /build/configs ./configs
 COPY --from=builder --chown=app:app /build/main.py ./
 

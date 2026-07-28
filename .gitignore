@@ -48,6 +48,8 @@ logs/
 *.log
 .traces/
 *.trace
+benchmarks/results/*
+var/backups/
 
 # Vector store data
 .vector_store/

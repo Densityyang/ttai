@@ -17,7 +17,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 from src.nl2sql.infra.store.graph_rag import expand_with_graph_rag
 
 from .experience_store import get_experience_store
@@ -224,7 +224,7 @@ def _create_generate_node(tools: list[BaseTool]) -> Any:
         if exp_section:
             system_prompt += exp_section
 
-        llm = get_llm()
+        llm = get_legacy_model()
         question_msgs = [msg for msg in state["messages"] if msg.type in ("human", "system")]
         all_msgs = [SystemMessage(content=system_prompt)] + question_msgs
 
@@ -294,7 +294,7 @@ async def diagnose_and_repair_node(state: SqlGeneratorState) -> dict[str, Any]:
         repair_hint = ""
 
     prompt = _DIAGNOSE_PROMPT.format(sql=sql, error=error, schema=schema) + repair_hint
-    llm = get_llm()
+    llm = get_legacy_model()
 
     response = await llm.ainvoke([SystemMessage(content=prompt)])
     repaired_sql = _extract_sql(str(response.content))
@@ -307,7 +307,7 @@ async def diagnose_and_repair_node(state: SqlGeneratorState) -> dict[str, Any]:
 
 async def format_node(state: SqlGeneratorState) -> dict[str, Any]:
     """格式化成功的查询结果为用户友好的回答，并记录经验。"""
-    llm = get_llm()
+    llm = get_legacy_model()
     question_msgs = [msg for msg in state["messages"] if msg.type == "human"]
     question = str(question_msgs[-1].content) if question_msgs else ""
 

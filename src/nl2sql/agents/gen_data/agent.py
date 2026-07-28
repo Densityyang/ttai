@@ -7,7 +7,7 @@ from typing import Any
 from langchain.agents import create_agent
 
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 from src.nl2sql.infra.store.database import get_nl2sql_db_manager
 
 from .middleware import PrefetchRAGAndSchemaMiddleware
@@ -38,7 +38,7 @@ async def build_gen_data_agent(
         database_url=database_url,
         schema=agent_config.nl2sql_db_schema,
     )
-    model = get_llm()
+    model = get_legacy_model()
 
     tools = create_gen_data_tools(db_manager)
     middleware = [PrefetchRAGAndSchemaMiddleware(db_manager=db_manager)]

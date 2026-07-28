@@ -14,7 +14,7 @@ from src.nl2sql.agents.sql_agent.graph import (
     get_sql_agent_graph as get_semantic_sql_agent_graph,
 )
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.infra.llm.factory import get_llm
+from src.nl2sql.infra.llm.gateway import get_legacy_model
 
 
 async def get_or_create_sql_graph(
@@ -77,12 +77,15 @@ async def get_or_create_codeact_graph(
 
 async def warmup_runtime() -> None:
     """预热默认运行时对象。"""
-    get_llm()
+    get_legacy_model()
     await get_or_create_semantic_sql_graph()
 
     config = get_agent_config()
-    if config.enable_dynamic_calc:
-        await get_or_create_dynamic_calc_graph()
+    if config.codeact_capability()[0]:
+        if config.codeact_mode == "trusted-template":
+            await get_or_create_dynamic_calc_graph()
+        else:
+            await get_or_create_codeact_graph()
 
     if config.enable_graph_rag:
         from src.nl2sql.infra.store.graph_rag import get_schema_relation_graph

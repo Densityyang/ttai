@@ -184,9 +184,9 @@ async def generate_global_summary(
     Returns:
         摘要文本
     """
-    from src.nl2sql.infra.llm.factory import get_llm
+    from src.nl2sql.infra.llm.gateway import get_legacy_model
 
-    llm = get_llm()
+    llm = get_legacy_model()
 
     content_parts: list[str] = []
     for msg in messages:
