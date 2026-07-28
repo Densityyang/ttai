@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _load_yaml(relative_path: str) -> dict[str, object]:
-    return yaml.safe_load((ROOT / relative_path).read_text(encoding="utf-8"))
+def _load_yaml(relative_path: str) -> dict[str, Any]:
+    loaded = yaml.safe_load((ROOT / relative_path).read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise TypeError(f"expected mapping in {relative_path}")
+    return cast(dict[str, Any], loaded)
 
 
 def test_compose_profiles_have_two_api_instances_and_external_product_network() -> None:
