@@ -173,15 +173,30 @@ async def _engine_from_request(request: Request) -> Any:
     if container is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="runtime unavailable")
     from src.core.settings import get_settings
+    from src.nl2sql.infra.llm.gateway import model_gateway_available
 
-    if get_settings().service_mode == "product" and not getattr(container, "audit_available", False):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="control audit is unavailable",
+    if get_settings().service_mode == "product":
+        readiness = (
+            container.readiness_report(model_available=model_gateway_available())
+            if hasattr(container, "readiness_report")
+            else {"status": "not_ready"}
         )
+        if readiness.get("status") != "ready":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="runtime dependencies are unavailable",
+            )
     get_engine = getattr(container, "get_engine", None)
     if callable(get_engine):
-        return await cast(Callable[[], Awaitable[Any]], get_engine)()
+        from src.nl2sql.container import RuntimeDependencyUnavailable
+
+        try:
+            return await cast(Callable[[], Awaitable[Any]], get_engine)()
+        except RuntimeDependencyUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="runtime dependency unavailable",
+            ) from exc
     # Compatibility with test doubles from the v2-contract PR.
     return await container.get_supervisor()
 
@@ -316,6 +331,7 @@ def register_v2_routes(app: FastAPI) -> None:
 
     @router.get("/capabilities", response_model=CapabilityResponse)
     async def capabilities(
+        request: Request,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> CapabilityResponse:
         del auth_user
@@ -323,20 +339,27 @@ def register_v2_routes(app: FastAPI) -> None:
         from src.nl2sql.infra.llm.gateway import model_gateway_available
 
         codeact_available, codeact_reason = config.codeact_capability()
-        degradation_reasons = []
-        if not model_gateway_available():
+        model_available = model_gateway_available()
+        container = getattr(request.app.state, "container", None)
+        readiness = (
+            container.readiness_report(model_available=model_available)
+            if container is not None and hasattr(container, "readiness_report")
+            else {"degradation_reasons": ("runtime_container_unavailable",)}
+        )
+        degradation_reasons = list(readiness.get("degradation_reasons", ()))
+        if not model_available:
             degradation_reasons.append("model provider is not configured")
         if codeact_reason:
             degradation_reasons.append(codeact_reason)
 
         return CapabilityResponse(
-            model=model_gateway_available(),
+            model=model_available,
             embedding=False,
             semantic_release=False,
             graph_rag=config.enable_graph_rag,
-            hitl=True,
+            hitl=bool(getattr(container, "checkpoint_available", False)),
             codeact=codeact_available,
-            degradation_reasons=tuple(degradation_reasons),
+            degradation_reasons=tuple(dict.fromkeys(degradation_reasons)),
         )
 
     app.include_router(router)

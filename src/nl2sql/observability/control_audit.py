@@ -38,6 +38,19 @@ class ControlAuditStore:
         import asyncpg
 
         pool = await asyncpg.create_pool(database_url, min_size=1, max_size=4)
+        try:
+            schema_ready = await pool.fetchval(
+                """
+                SELECT to_regclass('public.audit_events') IS NOT NULL
+                   AND to_regclass('public.audit_outbox') IS NOT NULL
+                """
+            )
+        except Exception:
+            await pool.close()
+            raise
+        if not schema_ready:
+            await pool.close()
+            raise ControlAuditUnavailable("control audit schema is not migrated")
         return cls(pool, close_callback=pool.close)
 
     async def close(self) -> None:

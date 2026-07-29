@@ -3,16 +3,30 @@ services:
     environment:
       SERVICE_MODE: infra-dev
       MODEL_REQUIRED: "false"
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
     volumes:
       - ../src:/app/src:ro
       - ../configs:/app/configs:ro
+    networks:
+      edge_net:
+      control_net:
+      data_net:
+      egress_net:
   api-b:
     environment:
       SERVICE_MODE: infra-dev
       MODEL_REQUIRED: "false"
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
     volumes:
       - ../src:/app/src:ro
       - ../configs:/app/configs:ro
+    networks:
+      edge_net:
+      control_net:
+      data_net:
+      egress_net:
 
   control-postgres:
     image: pgvector/pgvector:pg17
@@ -24,8 +38,13 @@ services:
       - control_pgdata:/var/lib/postgresql/data
     secrets:
       - control_owner_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U control_owner -d ttai_control"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     networks:
-      - app_internal
+      control_net:
 
   checkpoint-postgres:
     image: postgres:17-alpine
@@ -37,8 +56,13 @@ services:
       - checkpoint_pgdata:/var/lib/postgresql/data
     secrets:
       - checkpoint_owner_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U checkpoint_owner -d ttai_checkpoint"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     networks:
-      - app_internal
+      control_net:
 
   business-postgres:
     image: postgres:17-alpine
@@ -50,17 +74,22 @@ services:
       - business_pgdata:/var/lib/postgresql/data
     secrets:
       - business_owner_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U business_owner -d ttai_business"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
     networks:
-      - app_internal
+      data_net:
 
   migrate:
     image: postgres:17-alpine
     profiles: ["ops"]
     depends_on:
       control-postgres:
-        condition: service_started
+        condition: service_healthy
       checkpoint-postgres:
-        condition: service_started
+        condition: service_healthy
     environment:
       CONTROL_MIGRATOR_DATABASE_URL_FILE: /run/secrets/control_migrator_database_url
       CHECKPOINT_MIGRATOR_DATABASE_URL_FILE: /run/secrets/checkpoint_migrator_database_url
@@ -72,7 +101,7 @@ services:
       - control_migrator_database_url
       - checkpoint_migrator_database_url
     networks:
-      - app_internal
+      control_net:
 
   indexer:
     build:
@@ -81,7 +110,7 @@ services:
     profiles: ["ops"]
     depends_on:
       control-postgres:
-        condition: service_started
+        condition: service_healthy
     environment:
       CONTROL_DATABASE_URL_FILE: /run/secrets/control_app_database_url
     command: ["python", "-m", "src.nl2sql.semantic.indexer"]
@@ -90,7 +119,8 @@ services:
     secrets:
       - control_app_database_url
     networks:
-      - app_internal
+      control_net:
+      egress_net:
 
   benchmark:
     build:
@@ -99,9 +129,9 @@ services:
     profiles: ["benchmark"]
     depends_on:
       control-postgres:
-        condition: service_started
+        condition: service_healthy
       business-postgres:
-        condition: service_started
+        condition: service_healthy
     environment:
       CONTROL_DATABASE_URL_FILE: /run/secrets/control_app_database_url
       BENCHMARK_MAX_CONCURRENCY: ${BENCHMARK_MAX_CONCURRENCY:-4}
@@ -112,7 +142,9 @@ services:
     secrets:
       - control_app_database_url
     networks:
-      - app_internal
+      control_net:
+      data_net:
+      egress_net:
 
   backup:
     image: postgres:17-alpine
@@ -128,7 +160,7 @@ services:
     secrets:
       - control_backup_database_url
     networks:
-      - app_internal
+      control_net:
 
   restore-test:
     image: postgres:17-alpine
@@ -143,13 +175,22 @@ services:
     secrets:
       - control_restore_database_url
     networks:
-      - app_internal
+      control_net:
+
+networks:
+  data_net:
+    driver: bridge
+    internal: true
 
 volumes:
   control_pgdata:
+    name: tt_ai_control_pgdata
   checkpoint_pgdata:
+    name: tt_ai_checkpoint_pgdata
   business_pgdata:
+    name: tt_ai_business_pgdata
   control_backups:
+    name: tt_ai_control_backups
 
 secrets:
   control_owner_password:

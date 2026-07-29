@@ -5,7 +5,7 @@ from typing import Any, cast
 import pytest
 
 from src.nl2sql.infra.governance.query_gateway import QueryGateway
-from src.nl2sql.observability.control_audit import ControlAuditStore
+from src.nl2sql.observability.control_audit import ControlAuditStore, ControlAuditUnavailable
 from src.nl2sql.observability.trace import TraceEnvelope, TraceEvent
 
 
@@ -27,6 +27,20 @@ class _UnavailableAudit:
         del kwargs
 
 
+class _Pool:
+    def __init__(self, schema_ready: bool) -> None:
+        self.schema_ready = schema_ready
+        self.closed = False
+
+    async def fetchval(self, query: str) -> bool:
+        assert "audit_events" in query
+        assert "audit_outbox" in query
+        return self.schema_ready
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 @pytest.mark.asyncio
 async def test_control_audit_writes_event_and_outbox_without_raw_sql() -> None:
     connection = _Connection()
@@ -39,6 +53,22 @@ async def test_control_audit_writes_event_and_outbox_without_raw_sql() -> None:
     assert event_args[2] == "sql"
     assert "SELECT" not in str(event_args)
     assert connection.calls[1][1][3] == "nl2sql.trace"
+
+
+@pytest.mark.asyncio
+async def test_control_audit_open_fails_closed_when_migrations_are_missing(monkeypatch) -> None:
+    import asyncpg
+
+    pool = _Pool(schema_ready=False)
+
+    async def create_pool(*args: object, **kwargs: object) -> _Pool:
+        del args, kwargs
+        return pool
+
+    monkeypatch.setattr(asyncpg, "create_pool", create_pool)
+    with pytest.raises(ControlAuditUnavailable, match="not migrated"):
+        await ControlAuditStore.open("postgresql://redacted")
+    assert pool.closed is True
 
 
 @pytest.mark.asyncio

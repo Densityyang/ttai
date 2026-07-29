@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     api_port: int = Field(default=9001, description="API ????")
     service_mode: Literal["infra-dev", "product"] = Field(default="infra-dev")
     model_required: bool = Field(default=False)
+    cors_allowed_origins: str = Field(
+        default="http://localhost:3000,http://127.0.0.1:3000",
+        description="Comma-separated browser origins allowed to call the API.",
+    )
+    cors_allow_credentials: bool = Field(default=True)
 
     # ??? RAG ???????????????????? false?
     rag_startup_sync_strict: bool = Field(
@@ -111,6 +116,19 @@ class Settings(BaseSettings):
         if self.memory_backend == "postgresql" and not self.checkpoint_database_url:
             raise ValueError("MEMORY_BACKEND=postgresql ????? CHECKPOINT_DATABASE_URL")
         return self
+
+    @model_validator(mode="after")
+    def validate_cors_settings(self) -> "Settings":
+        origins = self.cors_origins
+        if self.cors_allow_credentials and "*" in origins:
+            raise ValueError("CORS wildcard is forbidden when credentials are enabled")
+        if self.service_mode == "product" and not origins:
+            raise ValueError("CORS_ALLOWED_ORIGINS must be explicit in product mode")
+        return self
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
 
 
 @lru_cache

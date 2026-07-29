@@ -39,7 +39,8 @@ jobs:
       - name: Render Compose configuration
         run: |
           : > .env
-          docker compose -f docker/docker-compose.yml config --no-interpolate > "${RUNNER_TEMP}/compose.yaml"
+          docker compose -f docker/compose.base.yml -f docker/compose.dev.yml -f docker/compose.test.yml config --no-interpolate > "${RUNNER_TEMP}/compose-test.yaml"
+          docker compose -f docker/compose.base.yml -f docker/compose.prod.yml config --no-interpolate > "${RUNNER_TEMP}/compose-product.yaml"
       - name: Scan worktree and rendered Compose configuration
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/repo:ro" zricethezav/gitleaks:v8.30.0 dir /repo --config /repo/.gitleaks.toml --redact=100
@@ -76,3 +77,57 @@ jobs:
         uses: anchore/sbom-action@v0.24.0
         with:
           image: tt-ai:${{ github.sha }}
+
+  compose-contract:
+    runs-on: ubuntu-latest
+    env:
+      TTAI_PORT: "18080"
+      TT_API_BASE_URL: https://tt-api.invalid
+      CORS_ALLOWED_ORIGINS: https://app.invalid
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose profiles
+        run: |
+          docker compose -f docker/compose.base.yml config --quiet
+          docker compose -f docker/compose.base.yml -f docker/compose.dev.yml -f docker/compose.test.yml config --quiet
+          docker compose -f docker/compose.base.yml -f docker/compose.prod.yml config --quiet
+          docker compose -f docker/compose.release.yml config --no-interpolate --quiet
+      - name: Validate Nginx configuration
+        run: >-
+          docker run --rm
+          --add-host api-a:127.0.0.1
+          --add-host api-b:127.0.0.1
+          -v "$PWD/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"
+          nginx:1.27-alpine nginx -t
+      - name: Start dual API test profile
+        run: |
+          docker compose -f docker/compose.base.yml -f docker/compose.dev.yml -f docker/compose.test.yml up -d --build api-a api-b nginx
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent "http://127.0.0.1:${TTAI_PORT}/healthz" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose -f docker/compose.base.yml -f docker/compose.dev.yml -f docker/compose.test.yml ps
+          exit 1
+      - name: Verify APIs have no host ports and Nginx fails over
+        run: |
+          api_a_id="$(docker compose -f docker/compose.base.yml -f docker/compose.dev.yml -f docker/compose.test.yml ps -q api-a)"
+          if [ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' "$api_a_id")" -ne 0 ]; then
+            echo "api-a unexpectedly publishes a host port"
+            exit 1
+          fi
+          docker compose -f docker/compose.base.yml -f docker/compose.dev.yml -f docker/compose.test.yml stop api-a
+          for attempt in $(seq 1 15); do
+            if curl --fail --silent "http://127.0.0.1:${TTAI_PORT}/healthz" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose -f docker/compose.base.yml -f docker/compose.dev.yml -f docker/compose.test.yml logs --no-color
+      - name: Stop Compose profile
+        if: always()
+        run: docker compose -f docker/compose.base.yml -f docker/compose.dev.yml -f docker/compose.test.yml down --remove-orphans

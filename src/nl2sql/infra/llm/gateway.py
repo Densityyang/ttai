@@ -289,7 +289,14 @@ def build_model_gateway() -> ModelGateway:
 
 def model_gateway_available() -> bool:
     """Return whether a provider credential is configured without making a network call."""
-    return bool(_secret("DEEPSEEK_API_KEY") or _secret("NVIDIA_API_KEY") or get_settings().openai_api_key)
+    try:
+        return bool(
+            _secret("DEEPSEEK_API_KEY")
+            or _secret("NVIDIA_API_KEY")
+            or get_settings().openai_api_key
+        )
+    except ValueError:
+        return False
 
 
 def get_legacy_model(

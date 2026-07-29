@@ -5,19 +5,37 @@ services:
       MODEL_REQUIRED: "false"
       AUTH_ENABLED: "false"
       LANGFUSE_ENABLED: "false"
+      CORS_ALLOWED_ORIGINS: http://testserver
   api-b:
     environment:
       SERVICE_MODE: infra-dev
       MODEL_REQUIRED: "false"
       AUTH_ENABLED: "false"
       LANGFUSE_ENABLED: "false"
+      CORS_ALLOWED_ORIGINS: http://testserver
 
   control-postgres:
     environment:
       POSTGRES_DB: ttai_control_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U control_owner -d ttai_control_test"]
   checkpoint-postgres:
     environment:
       POSTGRES_DB: ttai_checkpoint_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U checkpoint_owner -d ttai_checkpoint_test"]
   business-postgres:
     environment:
       POSTGRES_DB: ttai_business_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U business_owner -d ttai_business_test"]
+
+volumes:
+  control_pgdata:
+    name: tt_ai_test_control_pgdata
+  checkpoint_pgdata:
+    name: tt_ai_test_checkpoint_pgdata
+  business_pgdata:
+    name: tt_ai_test_business_pgdata
+  control_backups:
+    name: tt_ai_test_control_backups

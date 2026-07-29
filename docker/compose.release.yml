@@ -7,11 +7,30 @@ services:
     environment:
       SERVICE_MODE: product
       MODEL_REQUIRED: "true"
+      MEMORY_BACKEND: postgresql
+      AUTH_ENABLED: "true"
+      TT_API_BASE_URL: ${TT_API_BASE_URL:?TT_API_BASE_URL must be set for product}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS must be set for product}
       CODEACT_MODE: disabled
       ENABLE_DYNAMIC_CALC: "false"
+      DATABASE_URL_FILE: /run/secrets/business_ro_database_url
+      CONTROL_DATABASE_URL_FILE: /run/secrets/control_app_database_url
+      CHECKPOINT_DATABASE_URL_FILE: /run/secrets/checkpoint_app_database_url
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      NVIDIA_API_KEY_FILE: /run/secrets/nvidia_nim_api_key
+      EMBEDDING_API_KEY_FILE: /run/secrets/embedding_api_key
+    secrets:
+      - business_ro_database_url
+      - control_app_database_url
+      - checkpoint_app_database_url
+      - deepseek_api_key
+      - nvidia_nim_api_key
+      - embedding_api_key
     networks:
-      - app_internal
+      - edge_net
+      - control_net
       - business_external_net
+      - egress_net
 
   api-b:
     extends:
@@ -21,11 +40,30 @@ services:
     environment:
       SERVICE_MODE: product
       MODEL_REQUIRED: "true"
+      MEMORY_BACKEND: postgresql
+      AUTH_ENABLED: "true"
+      TT_API_BASE_URL: ${TT_API_BASE_URL:?TT_API_BASE_URL must be set for product}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS must be set for product}
       CODEACT_MODE: disabled
       ENABLE_DYNAMIC_CALC: "false"
+      DATABASE_URL_FILE: /run/secrets/business_ro_database_url
+      CONTROL_DATABASE_URL_FILE: /run/secrets/control_app_database_url
+      CHECKPOINT_DATABASE_URL_FILE: /run/secrets/checkpoint_app_database_url
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      NVIDIA_API_KEY_FILE: /run/secrets/nvidia_nim_api_key
+      EMBEDDING_API_KEY_FILE: /run/secrets/embedding_api_key
+    secrets:
+      - business_ro_database_url
+      - control_app_database_url
+      - checkpoint_app_database_url
+      - deepseek_api_key
+      - nvidia_nim_api_key
+      - embedding_api_key
     networks:
-      - app_internal
+      - edge_net
+      - control_net
       - business_external_net
+      - egress_net
 
   nginx:
     extends:
@@ -46,7 +84,7 @@ services:
       - control_migrator_database_url
       - checkpoint_migrator_database_url
     networks:
-      - app_internal
+      - control_net
 
   indexer:
     image: ${TTAI_IMAGE_REF:?TTAI_IMAGE_REF must be an immutable image reference}
@@ -59,7 +97,8 @@ services:
     secrets:
       - control_app_database_url
     networks:
-      - app_internal
+      - control_net
+      - egress_net
 
   backup:
     image: ${MIGRATION_IMAGE_REF:-postgres:17-alpine}
@@ -70,12 +109,14 @@ services:
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
     command: ["/bin/sh", "/scripts/backup.sh"]
     volumes:
-      - ${BACKUP_HOST_DIR:-../var/backups}:/backups
+      - type: bind
+        source: ${BACKUP_HOST_DIR:-../var/backups}
+        target: /backups
       - ./scripts:/scripts:ro
     secrets:
       - control_backup_database_url
     networks:
-      - app_internal
+      - control_net
 
   restore-test:
     image: ${MIGRATION_IMAGE_REF:-postgres:17-alpine}
@@ -85,22 +126,39 @@ services:
       BACKUP_FILE: /backups/latest.dump
     command: ["/bin/sh", "/scripts/restore-test.sh"]
     volumes:
-      - ${BACKUP_HOST_DIR:-../var/backups}:/backups:ro
+      - type: bind
+        source: ${BACKUP_HOST_DIR:-../var/backups}
+        target: /backups
+        read_only: true
       - ./scripts:/scripts:ro
     secrets:
       - control_restore_database_url
     networks:
-      - app_internal
+      - control_net
 
 networks:
-  app_internal:
+  edge_net:
+    driver: bridge
+  control_net:
     driver: bridge
     internal: true
+  egress_net:
+    driver: bridge
   business_external_net:
     external: true
     name: ${BUSINESS_EXTERNAL_NETWORK:-business_external_net}
 
 secrets:
+  business_ro_database_url:
+    file: ../secrets/database/business_ro_database_url
+  checkpoint_app_database_url:
+    file: ../secrets/database/checkpoint_app_database_url
+  deepseek_api_key:
+    file: ../secrets/providers/deepseek_api_key
+  nvidia_nim_api_key:
+    file: ../secrets/providers/nvidia_nim_api_key
+  embedding_api_key:
+    file: ../secrets/providers/embedding_api_key
   control_migrator_database_url:
     file: ../secrets/database/control_migrator_database_url
   checkpoint_migrator_database_url:

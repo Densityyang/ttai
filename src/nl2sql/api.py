@@ -24,8 +24,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from src.nl2sql.container import AppContainer
 
     container = AppContainer()
-    await container.start()
     app.state.container = container
+    await container.start()
     try:
         yield
     finally:
@@ -88,13 +88,18 @@ async def stream_blocks(
         output = event.get("data", {}).get("output")
         if not isinstance(output, dict):
             continue
-        for block in extract_blocks(output):
+        for sequence, block in enumerate(extract_blocks(output), start=1):
+            event_id = f"{stream_id}:{sequence}"
             payload = {
-                "id": stream_id,
+                "id": event_id,
                 "created": created,
                 "thread_id": thread_id,
                 "block": block,
             }
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            yield (
+                f"id: {event_id}\n"
+                "event: block\n"
+                f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            )
         sent_blocks = True
-    yield "data: [DONE]\n\n"
+    yield f"id: {stream_id}:done\nevent: done\ndata: [DONE]\n\n"
