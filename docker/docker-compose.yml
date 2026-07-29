@@ -4,8 +4,10 @@ services:
       file: compose.base.yml
       service: api-a
     environment:
+      API_PORT: "8000"
       SERVICE_MODE: infra-dev
       MODEL_REQUIRED: "false"
+      AUTH_ENABLED: "false"
     volumes:
       - ../src:/app/src:ro
       - ../configs:/app/configs:ro
@@ -14,8 +16,10 @@ services:
       file: compose.base.yml
       service: api-b
     environment:
+      API_PORT: "8000"
       SERVICE_MODE: infra-dev
       MODEL_REQUIRED: "false"
+      AUTH_ENABLED: "false"
     volumes:
       - ../src:/app/src:ro
       - ../configs:/app/configs:ro
@@ -25,6 +29,10 @@ services:
       service: nginx
 
 networks:
-  app_internal:
+  edge_net:
+    driver: bridge
+  control_net:
     driver: bridge
     internal: true
+  egress_net:
+    driver: bridge

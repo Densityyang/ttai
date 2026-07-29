@@ -5,22 +5,27 @@ x-api-common: &api-common
     context: ..
     dockerfile: docker/Dockerfile
   restart: unless-stopped
-  env_file:
-    - path: ../.env
-      required: false
+  stop_grace_period: 30s
   environment:
+    API_PORT: "8000"
     SERVICE_MODE: ${SERVICE_MODE:-infra-dev}
     MODEL_REQUIRED: ${MODEL_REQUIRED:-false}
   expose:
     - "8000"
   healthcheck:
-    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2)"]
     interval: 10s
     timeout: 3s
     retries: 6
     start_period: 15s
   networks:
-    - app_internal
+    edge_net:
+    control_net:
+    egress_net:
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
 
 services:
   api-a:
@@ -34,19 +39,39 @@ services:
   nginx:
     image: nginx:1.27-alpine
     restart: unless-stopped
+    stop_grace_period: 15s
     depends_on:
       api-a:
         condition: service_healthy
       api-b:
         condition: service_healthy
     ports:
-      - "${TTAI_PORT:-8000}:8080"
+      - "${TTAI_BIND_ADDRESS:-0.0.0.0}:${TTAI_PORT:-8000}:8080"
     volumes:
       - ../nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     networks:
-      - app_internal
+      edge_net:
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETGID
+      - SETUID
 
 networks:
-  app_internal:
+  edge_net:
+    driver: bridge
+  control_net:
     driver: bridge
     internal: true
+  egress_net:
+    driver: bridge

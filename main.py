@@ -38,10 +38,18 @@ def create_app():
     # ????
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=settings.cors_origins,
+        allow_credentials=settings.cors_allow_credentials,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=[
+            "Accept",
+            "Authorization",
+            "Content-Type",
+            "Idempotency-Key",
+            "Last-Event-ID",
+            "X-Request-ID",
+            "X-Trace-ID",
+        ],
     )
 
     @app.get("/healthz", include_in_schema=False)
@@ -52,21 +60,17 @@ def create_app():
     async def readyz():
         from src.nl2sql.infra.llm.gateway import model_gateway_available
 
-        model_ready = model_gateway_available()
         container = getattr(app.state, "container", None)
-        audit_ready = settings.service_mode != "product" or bool(
-            getattr(container, "audit_available", False)
-        )
-        ready = (not settings.model_required or model_ready) and audit_ready
-        payload = {
-            "status": "ready" if ready else "not_ready",
-            "service_mode": settings.service_mode,
-            "components": {
-                "model": "ready" if model_ready else "unavailable",
-                "control_audit": "ready" if audit_ready else "unavailable",
-            },
-        }
-        if ready:
+        if container is None:
+            payload = {
+                "status": "not_ready",
+                "service_mode": settings.service_mode,
+                "components": {},
+                "degradation_reasons": ["runtime_container_unavailable"],
+            }
+        else:
+            payload = container.readiness_report(model_available=model_gateway_available())
+        if payload["status"] == "ready":
             return payload
         from fastapi.responses import JSONResponse
 
