@@ -47,18 +47,18 @@ def _settings() -> Settings:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "path",
+    ("method", "path"),
     [
-        "/api/v2/nl2sql/queries",
-        "/api/v2/nl2sql/threads/11111111-1111-1111-1111-111111111111",
-        "/api/v2/nl2sql/threads/11111111-1111-1111-1111-111111111111/history",
-        "/api/v2/nl2sql/threads/11111111-1111-1111-1111-111111111111/actions",
-        "/api/v2/nl2sql/feedback",
-        "/api/v2/nl2sql/capabilities",
+        ("POST", "/api/v2/nl2sql/queries"),
+        ("GET", "/api/v2/nl2sql/threads/11111111-1111-1111-1111-111111111111"),
+        ("GET", "/api/v2/nl2sql/threads/11111111-1111-1111-1111-111111111111/history"),
+        ("POST", "/api/v2/nl2sql/threads/11111111-1111-1111-1111-111111111111/actions"),
+        ("POST", "/api/v2/nl2sql/feedback"),
+        ("GET", "/api/v2/nl2sql/capabilities"),
     ],
 )
-async def test_non_stream_v2_routes_require_invoke_permission(path: str) -> None:
-    request = _request(path)
+async def test_non_stream_v2_routes_require_invoke_permission(method: str, path: str) -> None:
+    request = _request(path, method=method)
 
     with pytest.raises(HTTPException) as denied:
         await require_nl2sql_permission(request, _user([]), _settings())
@@ -88,8 +88,16 @@ async def test_stream_v2_route_requires_stream_permission() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unmapped_v2_route_fails_closed() -> None:
-    request = _request("/api/v2/nl2sql/future-endpoint")
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/v2/nl2sql/future-endpoint"),
+        ("POST", "/api/v2/nl2sql/threads/11111111-1111-1111-1111-111111111111/admin"),
+        ("DELETE", "/api/v2/nl2sql/threads/11111111-1111-1111-1111-111111111111"),
+    ],
+)
+async def test_unmapped_v2_route_fails_closed(method: str, path: str) -> None:
+    request = _request(path, method=method)
 
     with pytest.raises(HTTPException) as denied:
         await require_nl2sql_permission(request, _user(["*"]), _settings())
