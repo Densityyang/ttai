@@ -16,6 +16,8 @@ from src.core.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
+_V2_NL2SQL_PREFIX = "/api/v2/nl2sql"
+
 
 def _get_trace_id(request: Request) -> str:
     return (
@@ -35,6 +37,29 @@ def _has_permission(user_permissions: list[str], required_permission: str) -> bo
 
     # tt-api 常见超级权限表达，表示全量权限。
     return "*" in user_permissions or "*.*.*" in user_permissions
+
+
+def _required_nl2sql_permission(path: str, settings: Settings) -> str | None:
+    """Resolve the permission for every authenticated NL2SQL v2 route.
+
+    Returning ``None`` is intentional: the caller treats an unmapped route as
+    a policy configuration error and fails closed. This prevents newly added
+    endpoints from silently inheriting the previous empty-permission behavior.
+    """
+
+    normalized_path = path.rstrip("/") or "/"
+    if normalized_path == f"{_V2_NL2SQL_PREFIX}/queries/stream":
+        return settings.auth_required_permission_stream
+    if normalized_path == f"{_V2_NL2SQL_PREFIX}/queries":
+        return settings.auth_required_permission_invoke
+    if normalized_path.startswith(f"{_V2_NL2SQL_PREFIX}/threads/"):
+        return settings.auth_required_permission_invoke
+    if normalized_path in {
+        f"{_V2_NL2SQL_PREFIX}/feedback",
+        f"{_V2_NL2SQL_PREFIX}/capabilities",
+    }:
+        return settings.auth_required_permission_invoke
+    return None
 
 
 def _to_http_exception(error: AuthError) -> HTTPException:
@@ -120,20 +145,24 @@ async def require_nl2sql_permission(
     settings: Settings = Depends(get_settings),
 ) -> AuthUser:
     path = request.url.path
-    path_permission_map = {
-        "/invoke": settings.auth_required_permission_invoke,
-        "/stream": settings.auth_required_permission_stream,
-        "/stream_events": settings.auth_required_permission_stream,
-    }
-    permission = next(
-        (
-            required
-            for suffix, required in path_permission_map.items()
-            if path.endswith(suffix)
-        ),
-        "",
-    )
+    permission = _required_nl2sql_permission(path, settings)
     trace_id = _get_trace_id(request)
+
+    if permission is None or not permission.strip():
+        logger.error(
+            "auth permission policy missing trace_id=%s user_id=%s method=%s path=%s",
+            trace_id,
+            user.user_id,
+            request.method,
+            path,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "AUTH_PERMISSION_POLICY_MISSING",
+                "message": "No access policy is configured for this endpoint",
+            },
+        )
 
     if _has_permission(user.permissions, permission):
         request.state.auth_user = user

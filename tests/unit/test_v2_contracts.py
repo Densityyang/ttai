@@ -7,7 +7,7 @@ from uuid import UUID
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import ValidationError
 
 import src.nl2sql.v2 as v2
@@ -38,6 +38,21 @@ class FakeSupervisor:
         state = await self.aget_state(config)
         if state.values:
             yield state
+
+
+class CapturingSupervisor(FakeSupervisor):
+    def __init__(self, owned_thread: str) -> None:
+        super().__init__(owned_thread)
+        self.last_config: dict[str, object] | None = None
+
+    async def ainvoke(
+        self,
+        values: dict[str, object],
+        config: dict[str, object],
+    ) -> dict[str, object]:
+        del values
+        self.last_config = config
+        return {"messages": [AIMessage(content="ok")]}
 
 
 class FakeContainer:
@@ -113,6 +128,27 @@ def test_query_payload_limits_and_tenant_rejection() -> None:
         )
 
 
+def test_query_payload_limits_count_total_and_utf8_bytes() -> None:
+    QueryRequest.model_validate(
+        {"messages": [{"role": "user", "content": "界" * 2730}]}
+    )
+
+    with pytest.raises(ValidationError, match="8 KiB"):
+        QueryRequest.model_validate(
+            {"messages": [{"role": "user", "content": "界" * 2731}]}
+        )
+
+    with pytest.raises(ValidationError, match="at most 20 items"):
+        QueryRequest.model_validate(
+            {"messages": [{"role": "user", "content": "x"}] * 21}
+        )
+
+    with pytest.raises(ValidationError, match="total at most 32 KiB"):
+        QueryRequest.model_validate(
+            {"messages": [{"role": "user", "content": "x" * 7000}] * 5}
+        )
+
+
 def test_thread_namespace_is_safe_for_user_ids_with_delimiters() -> None:
     namespaced = internal_thread_id(_context_for("alice:engineering"))
     assert namespaced == f"default:alice%3Aengineering:{THREAD_ID}"
@@ -126,6 +162,43 @@ def test_runtime_config_propagates_request_identity_to_subgraphs() -> None:
     context = cast(dict[str, str], configurable["request_context"])
     assert identity["user_id"] == "alice"
     assert context["thread_id"] == str(THREAD_ID)
+
+
+def test_query_api_propagates_authenticated_identity_to_runtime() -> None:
+    supervisor = CapturingSupervisor(internal_thread_id(_context_for("alice")))
+    app = _app_for(supervisor)
+
+    async def alice_dependency() -> AuthUser:
+        return AuthUser(
+            user_id="alice",
+            telephone=None,
+            roles=["analyst"],
+            permissions=["nl2sql:invoke"],
+        )
+
+    app.dependency_overrides[require_nl2sql_permission] = alice_dependency
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v2/nl2sql/queries",
+            headers={"x-request-id": "22222222-2222-2222-2222-222222222222"},
+            json={
+                "thread_id": str(THREAD_ID),
+                "messages": [{"role": "user", "content": "show revenue"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert supervisor.last_config is not None
+    configurable = cast(dict[str, object], supervisor.last_config["configurable"])
+    identity = cast(dict[str, object], configurable["request_identity"])
+    assert configurable["thread_id"] == f"default:alice:{THREAD_ID}"
+    assert identity == {
+        "request_id": "22222222-2222-2222-2222-222222222222",
+        "user_id": "alice",
+        "roles": ["analyst"],
+        "permissions": ["nl2sql:invoke"],
+        "auth_epoch": None,
+    }
 
 
 def test_capabilities_explain_when_codeact_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
