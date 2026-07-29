@@ -112,7 +112,8 @@ jobs:
           exit 1
       - name: Verify APIs have no host ports and Nginx fails over
         run: |
-          if docker compose -f docker/compose.base.yml -f docker/compose.dev.yml -f docker/compose.test.yml port api-a 8000 2>/dev/null | grep -q .; then
+          api_a_id="$(docker compose -f docker/compose.base.yml -f docker/compose.dev.yml -f docker/compose.test.yml ps -q api-a)"
+          if [ "$(docker inspect --format '{{len .HostConfig.PortBindings}}' "$api_a_id")" -ne 0 ]; then
             echo "api-a unexpectedly publishes a host port"
             exit 1
           fi
