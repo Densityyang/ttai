@@ -109,7 +109,9 @@ services:
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
     command: ["/bin/sh", "/scripts/backup.sh"]
     volumes:
-      - ${BACKUP_HOST_DIR:-../var/backups}:/backups
+      - type: bind
+        source: ${BACKUP_HOST_DIR:-../var/backups}
+        target: /backups
       - ./scripts:/scripts:ro
     secrets:
       - control_backup_database_url
@@ -124,7 +126,10 @@ services:
       BACKUP_FILE: /backups/latest.dump
     command: ["/bin/sh", "/scripts/restore-test.sh"]
     volumes:
-      - ${BACKUP_HOST_DIR:-../var/backups}:/backups:ro
+      - type: bind
+        source: ${BACKUP_HOST_DIR:-../var/backups}
+        target: /backups
+        read_only: true
       - ./scripts:/scripts:ro
     secrets:
       - control_restore_database_url

@@ -124,7 +124,14 @@ def test_release_compose_pins_app_image_and_keeps_ops_profiles() -> None:
     for service_name in ("api-a", "api-b", "indexer"):
         assert "TTAI_IMAGE_REF" in release["services"][service_name]["image"]
     assert release["services"]["migrate"]["profiles"] == ["ops"]
-    assert release["services"]["backup"]["volumes"][0].endswith(":/backups")
+    backup_volume = release["services"]["backup"]["volumes"][0]
+    restore_volume = release["services"]["restore-test"]["volumes"][0]
+    assert backup_volume == {
+        "type": "bind",
+        "source": "${BACKUP_HOST_DIR:-../var/backups}",
+        "target": "/backups",
+    }
+    assert restore_volume == {**backup_volume, "read_only": True}
     assert release["networks"]["business_external_net"]["external"] is True
 
 
