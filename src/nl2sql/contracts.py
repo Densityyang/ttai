@@ -69,8 +69,13 @@ class ExecutionReceipt(StrictContract):
     elapsed_ms: int = Field(ge=0)
     row_count: int = Field(ge=0)
     plan_cost: float | None = Field(default=None, ge=0)
+    estimated_rows: int | None = Field(default=None, ge=0)
     masking_applied: bool = False
+    masked_columns: tuple[str, ...] = ()
     error_taxonomy: str | None = None
+    sql_fingerprint: str = ""
+    policy_version: str = ""
+    policy_outcome: Literal["allow", "deny"] = "deny"
 
 
 class AnswerArtifact(StrictContract):

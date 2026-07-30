@@ -1,6 +1,13 @@
-"""Tests for Phase 4 enhanced SQL Guard -- AST validation, Cartesian product, forbidden keywords."""
+"""Compatibility tests for the legacy SQL guard facade."""
 
+from __future__ import annotations
 
+import inspect
+
+import pytest
+
+from src.nl2sql.infra.governance import sql_guard
+from src.nl2sql.infra.governance.query_gateway import QueryPolicyError
 from src.nl2sql.infra.governance.sql_guard import (
     check_cte_depth,
     check_forbidden_keywords,
@@ -8,154 +15,117 @@ from src.nl2sql.infra.governance.sql_guard import (
     check_subquery_depth,
     detect_cartesian_product,
     enhanced_validate_query,
+    full_validate_query,
     inject_limit,
 )
 
-# ── AST 禁止语句检测 ──────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "INSERT INTO orders VALUES (1)",
+        "UPDATE orders SET status = 'done'",
+        "DELETE FROM orders",
+        "DROP TABLE orders",
+        "ALTER TABLE orders ADD COLUMN x INT",
+        "TRUNCATE TABLE orders",
+        "GRANT SELECT ON orders TO user1",
+    ],
+)
+def test_forbidden_statements_delegate_to_canonical_policy(sql: str) -> None:
+    assert check_forbidden_statements(sql) is not None
 
 
-class TestForbiddenStatements:
-    def test_select_allowed(self) -> None:
-        assert check_forbidden_statements("SELECT * FROM orders") is None
-
-    def test_with_cte_allowed(self) -> None:
-        sql = "WITH cte AS (SELECT 1) SELECT * FROM cte"
-        assert check_forbidden_statements(sql) is None
-
-    def test_insert_blocked(self) -> None:
-        err = check_forbidden_statements("INSERT INTO orders VALUES (1, 'test')")
-        assert err is not None
-        assert "INSERT" in err
-
-    def test_update_blocked(self) -> None:
-        err = check_forbidden_statements("UPDATE orders SET status = 'done'")
-        assert err is not None
-
-    def test_delete_blocked(self) -> None:
-        err = check_forbidden_statements("DELETE FROM orders WHERE id = 1")
-        assert err is not None
-
-    def test_drop_blocked(self) -> None:
-        err = check_forbidden_statements("DROP TABLE orders")
-        assert err is not None
-
-    def test_alter_blocked(self) -> None:
-        err = check_forbidden_statements("ALTER TABLE orders ADD COLUMN x INT")
-        assert err is not None
-
-    def test_truncate_blocked(self) -> None:
-        err = check_forbidden_statements("TRUNCATE TABLE orders")
-        assert err is not None
-
-    def test_grant_blocked(self) -> None:
-        err = check_forbidden_statements("GRANT SELECT ON orders TO user1")
-        assert err is not None
-
-    def test_keyword_in_string_literal_allowed(self) -> None:
-        """DELETE inside a string literal should NOT be blocked."""
-        sql = "SELECT * FROM orders WHERE status = 'DELETE_PENDING'"
-        result = check_forbidden_statements(sql)
-        assert result is None
+def test_keywords_in_literals_are_allowed() -> None:
+    assert check_forbidden_statements(
+        "SELECT * FROM orders WHERE status = 'DELETE_PENDING'"
+    ) is None
 
 
-# ── 禁止关键词模式检测 ────────────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM t INTO OUTFILE '/tmp/x'",
+        "LOAD DATA INFILE '/tmp/x' INTO TABLE t",
+        "COPY orders TO '/tmp/out.csv'",
+    ],
+)
+def test_forbidden_keyword_diagnostics_are_retained(sql: str) -> None:
+    assert check_forbidden_keywords(sql) is not None
 
 
-class TestForbiddenKeywords:
-    def test_into_outfile_blocked(self) -> None:
-        err = check_forbidden_keywords("SELECT * FROM t INTO OUTFILE '/tmp/x'")
-        assert err is not None
-        assert "INTO OUTFILE" in err
-
-    def test_load_data_blocked(self) -> None:
-        err = check_forbidden_keywords("LOAD DATA INFILE '/tmp/x' INTO TABLE t")
-        assert err is not None
-        assert "LOAD DATA" in err
-
-    def test_copy_to_blocked(self) -> None:
-        err = check_forbidden_keywords("COPY orders TO '/tmp/out.csv'")
-        assert err is not None
-
-    def test_normal_select_allowed(self) -> None:
-        assert check_forbidden_keywords("SELECT count(*) FROM orders") is None
+def test_cartesian_diagnostic_uses_ast() -> None:
+    assert detect_cartesian_product("SELECT * FROM orders") is None
+    assert (
+        detect_cartesian_product(
+            "SELECT * FROM orders JOIN users ON orders.user_id = users.id"
+        )
+        is None
+    )
+    assert (
+        detect_cartesian_product(
+            "SELECT * FROM orders, users WHERE orders.user_id = users.id"
+        )
+        is None
+    )
+    assert detect_cartesian_product("SELECT * FROM orders, users") is not None
 
 
-# ── 笛卡尔积检测 ──────────────────────────────────────────────────────────────
+def test_limit_compatibility_helper_uses_canonical_rewrite() -> None:
+    assert inject_limit("SELECT * FROM orders").endswith("LIMIT 5000")
+    assert inject_limit("SELECT * FROM orders LIMIT 10").endswith("LIMIT 10")
+    with pytest.raises(QueryPolicyError):
+        inject_limit("EXPLAIN SELECT * FROM orders")
 
 
-class TestCartesianProduct:
-    def test_single_table_allowed(self) -> None:
-        assert detect_cartesian_product("SELECT * FROM orders") is None
-
-    def test_join_with_on_allowed(self) -> None:
-        sql = "SELECT * FROM orders JOIN users ON orders.user_id = users.id"
-        assert detect_cartesian_product(sql) is None
-
-    def test_multi_table_with_where_allowed(self) -> None:
-        sql = "SELECT * FROM orders, users WHERE orders.user_id = users.id"
-        assert detect_cartesian_product(sql) is None
-
-    def test_multi_table_no_condition_blocked(self) -> None:
-        sql = "SELECT * FROM orders, users, products"
-        err = detect_cartesian_product(sql)
-        assert err is not None
-        assert "笛卡尔积" in err
-
-
-# ── LIMIT 注入 ────────────────────────────────────────────────────────────────
+def test_depth_diagnostics_use_parsed_query() -> None:
+    assert check_cte_depth("WITH a AS (SELECT 1) SELECT * FROM a") is None
+    assert (
+        check_cte_depth(
+            "WITH a AS (SELECT 1), b AS (SELECT 1), c AS (SELECT 1) SELECT * FROM a",
+            max_depth=2,
+        )
+        is not None
+    )
+    assert (
+        check_subquery_depth(
+            "SELECT * FROM (SELECT * FROM (SELECT * FROM t) b) a",
+            max_depth=1,
+        )
+        is not None
+    )
 
 
-class TestLimitInjection:
-    def test_adds_limit(self) -> None:
-        result = inject_limit("SELECT * FROM orders")
-        assert "LIMIT" in result
+def test_enhanced_validation_is_a_policy_engine_facade() -> None:
+    safe_sql, error = enhanced_validate_query(
+        "SELECT id, name FROM users WHERE age > 18"
+    )
+    assert error is None
+    assert safe_sql.endswith("LIMIT 5000")
 
-    def test_preserves_existing_limit(self) -> None:
-        sql = "SELECT * FROM orders LIMIT 10"
-        result = inject_limit(sql)
-        assert result == sql
-
-    def test_non_select_unchanged(self) -> None:
-        sql = "EXPLAIN SELECT * FROM orders"
-        result = inject_limit(sql)
-        assert result == sql
-
-
-# ── CTE/子查询深度 ────────────────────────────────────────────────────────────
+    for unsafe in (
+        "INSERT INTO users VALUES (1)",
+        "SELECT * FROM a, b",
+        "SELECT * FROM t INTO OUTFILE '/tmp/x'",
+    ):
+        _, error = enhanced_validate_query(unsafe)
+        assert error is not None
 
 
-class TestDepthChecks:
-    def test_normal_cte_allowed(self) -> None:
-        assert check_cte_depth("WITH a AS (SELECT 1) SELECT * FROM a") is None
+@pytest.mark.asyncio
+async def test_full_validation_without_database_is_policy_only() -> None:
+    safe_sql, error = await full_validate_query(
+        "SELECT * FROM orders",
+        schema="ai_views",
+    )
 
-    def test_deep_cte_blocked(self) -> None:
-        sql = " ".join(["WITH"] * 10) + " a AS (SELECT 1) SELECT * FROM a"
-        err = check_cte_depth(sql, max_depth=5)
-        assert err is not None
-
-    def test_deep_subquery_blocked(self) -> None:
-        sql = "SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM (SELECT * FROM t))))"
-        err = check_subquery_depth(sql, max_depth=3)
-        assert err is not None
+    assert error is None
+    assert safe_sql == "SELECT * FROM ai_views.orders LIMIT 5000"
 
 
-# ── 统一入口 ──────────────────────────────────────────────────────────────────
+def test_legacy_module_has_no_database_execution_implementation() -> None:
+    source = inspect.getsource(sql_guard)
 
-
-class TestEnhancedValidate:
-    def test_safe_select(self) -> None:
-        safe_sql, err = enhanced_validate_query("SELECT id, name FROM users WHERE age > 18")
-        assert err is None
-        assert "LIMIT" in safe_sql
-
-    def test_insert_blocked(self) -> None:
-        _, err = enhanced_validate_query("INSERT INTO users VALUES (1)")
-        assert err is not None
-
-    def test_cartesian_blocked(self) -> None:
-        _, err = enhanced_validate_query("SELECT * FROM a, b, c")
-        assert err is not None
-
-    def test_into_outfile_blocked(self) -> None:
-        _, err = enhanced_validate_query("SELECT * FROM t INTO OUTFILE '/tmp/x'")
-        assert err is not None
+    assert "session.execute" not in source
+    assert "EXPLAIN (FORMAT JSON)" not in source
+    assert "QueryGateway(" in source

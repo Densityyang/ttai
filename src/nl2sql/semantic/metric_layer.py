@@ -1,6 +1,7 @@
 """指标语义层：指标匹配与指标结果查询。"""
 
 import re
+from datetime import date
 from typing import Any
 
 from src.nl2sql.infra.store.database import DatabaseManager
@@ -44,12 +45,17 @@ class MetricSemanticLayer:
         """查询指标结果。"""
         normalized_aggregation = _normalize_aggregation(aggregation)
         normalized_target_grain = _normalize_grain(target_grain) if target_grain else None
+        start_date_value = _parse_iso_date(start_date, field_name="start_date")
+        end_date_value = _parse_iso_date(end_date, field_name="end_date")
+        if start_date_value > end_date_value:
+            raise ValueError("start_date must not be later than end_date")
 
         if normalized_aggregation and normalized_target_grain and normalized_target_grain != _normalize_grain(time_grain):
             aggregate_fn = "AVG" if normalized_aggregation == "avg" else "SUM"
             sql = (
                 "SELECT "
-                "date_trunc(:target_grain, time_value::timestamp)::date AS period, "
+                "date_trunc(CAST(:target_grain AS text), "
+                "time_value::timestamp)::date AS period, "
                 f"{aggregate_fn}(value::numeric) AS value, "
                 "MAX(unit) AS unit "
                 "FROM v_metric_result "
@@ -63,8 +69,8 @@ class MetricSemanticLayer:
             params = {
                 "metric_code": metric_code,
                 "time_grain": _normalize_grain(time_grain),
-                "start_date": start_date,
-                "end_date": end_date,
+                "start_date": start_date_value,
+                "end_date": end_date_value,
                 "target_grain": normalized_target_grain,
             }
             rows = await self._db_manager.execute_query(sql, params)
@@ -93,8 +99,8 @@ class MetricSemanticLayer:
         params = {
             "metric_code": metric_code,
             "time_grain": _normalize_grain(time_grain),
-            "start_date": start_date,
-            "end_date": end_date,
+            "start_date": start_date_value,
+            "end_date": end_date_value,
         }
         rows = await self._db_manager.execute_query(sql, params)
 
@@ -197,3 +203,10 @@ def _normalize_aggregation(aggregation: str | None) -> str | None:
     if value in {"sum", "avg"}:
         return value
     return None
+
+
+def _parse_iso_date(value: str, *, field_name: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an ISO-8601 date") from exc
