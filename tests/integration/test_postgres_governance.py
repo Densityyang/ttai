@@ -515,8 +515,23 @@ def test_roles_migrations_backup_restore_and_hitl_resume(
         timeout=120,
     )
     for database_name in ("control", "checkpoint"):
-        assert (backup_dir / database_name / "latest.dump").stat().st_size > 0
-        assert (backup_dir / database_name / "latest.dump.sha256").stat().st_size > 0
+        _docker(
+            "run",
+            "--rm",
+            "--mount",
+            _mount(backup_dir, "/backups"),
+            "postgres:17-alpine",
+            "/bin/sh",
+            "-ec",
+            "cd /backups/$1 && "
+            "test -s latest.dump && "
+            "test -s latest.dump.sha256 && "
+            "sha256sum -c latest.dump.sha256 && "
+            "pg_restore --list latest.dump >/dev/null",
+            "verify-backup",
+            database_name,
+            timeout=60,
+        )
 
     _run_migration_container(stack, backup_dir)
 
