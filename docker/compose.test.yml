@@ -37,5 +37,5 @@ volumes:
     name: tt_ai_test_checkpoint_pgdata
   business_pgdata:
     name: tt_ai_test_business_pgdata
-  control_backups:
-    name: tt_ai_test_control_backups
+  database_backups:
+    name: tt_ai_test_database_backups

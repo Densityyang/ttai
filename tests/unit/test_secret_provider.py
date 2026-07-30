@@ -46,6 +46,18 @@ def test_group_writable_secret_file_is_rejected(tmp_path: Path) -> None:
         SecretProvider({"TOKEN_FILE": str(secret_file)}).get("TOKEN")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mount flags are unavailable on Windows")
+def test_read_only_mount_accepts_docker_desktop_mode_bits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret_file = tmp_path / "docker-secret"
+    secret_file.write_text("secret", encoding="utf-8")
+    secret_file.chmod(0o777)
+    monkeypatch.setattr("src.core.secrets._is_read_only_filesystem", lambda path: True)
+
+    assert SecretProvider({"TOKEN_FILE": str(secret_file)}).get("TOKEN") == "secret"
+
+
 def test_default_is_used_when_no_environment_value_exists() -> None:
     assert SecretProvider({}).get("UNSET", "fallback") == "fallback"
 

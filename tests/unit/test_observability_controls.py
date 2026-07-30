@@ -67,7 +67,7 @@ async def test_control_audit_open_fails_closed_when_migrations_are_missing(monke
 
     monkeypatch.setattr(asyncpg, "create_pool", create_pool)
     with pytest.raises(ControlAuditUnavailable, match="not migrated"):
-        await ControlAuditStore.open("postgresql://redacted")
+        await ControlAuditStore.open("postgresql://control_app:redacted@db/control")
     assert pool.closed is True
 
 

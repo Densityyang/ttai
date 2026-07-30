@@ -11,9 +11,9 @@ from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
-    create_async_engine,
 )
 
+from src.core.database import DatabasePurpose, create_runtime_async_engine
 from src.core.settings import get_settings
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.infra.governance.query_gateway import (
@@ -41,6 +41,7 @@ class DatabaseManager:
         schema: str | None = None,
     ):
         settings = get_settings()
+        self._settings = settings
         self.database_url = database_url or settings.database_url
         self.timeout_seconds = int(os.getenv("NL2SQL_QUERY_TIMEOUT_SECONDS", "30"))
         self.max_query_results = int(os.getenv("NL2SQL_MAX_QUERY_RESULTS", "200"))
@@ -63,7 +64,12 @@ class DatabaseManager:
         """建立数据库连接并加载 schema 信息。"""
         if not self.database_url:
             raise ValueError("DATABASE_URL 未设置")
-        self._engine = create_async_engine(self.database_url)
+        self._engine = create_runtime_async_engine(
+            self.database_url,
+            purpose=DatabasePurpose.BUSINESS_READ_ONLY,
+            application_name="ttai-business-query",
+            settings=self._settings,
+        )
         self._session_factory = async_sessionmaker(self._engine, class_=AsyncSession, expire_on_commit=False)
         self._query_gateway = QueryGateway(
             self._session_factory,

@@ -78,6 +78,22 @@ jobs:
         with:
           image: tt-ai:${{ github.sha }}
 
+  postgres-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONUTF8: "1"
+      TTAI_RUN_POSTGRES_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv python install 3.13
+      - run: uv sync --frozen --all-groups
+      - name: Verify PostgreSQL roles, migrations, recovery, and HITL resume
+        run: uv run pytest -vv -s tests/integration/test_postgres_governance.py
+
   compose-contract:
     runs-on: ubuntu-latest
     env:

@@ -34,6 +34,10 @@ def test_infra_dev_is_ready_without_a_model(monkeypatch) -> None:
 def test_product_requires_a_model_for_readiness(monkeypatch) -> None:
     monkeypatch.setenv("SERVICE_MODE", "product")
     monkeypatch.setenv("MODEL_REQUIRED", "true")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://business_reader:test@business.invalid/business",
+    )
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
@@ -52,6 +56,10 @@ def test_product_rejects_process_local_checkpoint_backend(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_REQUIRED", "true")
     monkeypatch.setenv("MEMORY_BACKEND", "memory")
     monkeypatch.setenv("AUTH_ENABLED", "false")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://business_reader:test@business.invalid/business",
+    )
     monkeypatch.setenv("DEEPSEEK_API_KEY", "configured-for-capability-test")
     monkeypatch.delenv("CONTROL_DATABASE_URL", raising=False)
     monkeypatch.delenv("CONTROL_DATABASE_URL_FILE", raising=False)

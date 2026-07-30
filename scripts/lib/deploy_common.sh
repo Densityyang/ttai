@@ -44,6 +44,7 @@ require_absolute_backup_dir() {
   [[ "$backup_dir" = /* ]] || die "BACKUP_HOST_DIR must be an absolute path"
   [[ "$backup_dir" != "$ROOT_DIR"/*/docker/* ]] || die "backup directory may not be inside the image source tree"
   mkdir -p "$backup_dir"
+  chmod 0700 "$backup_dir"
 }
 
 image_ref_from_manifest() {

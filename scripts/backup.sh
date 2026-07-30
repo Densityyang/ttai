@@ -11,5 +11,8 @@ BACKUP_HOST_DIR="${BACKUP_HOST_DIR:-$ROOT_DIR/var/backups}"
 require_absolute_backup_dir "$BACKUP_HOST_DIR"
 export BACKUP_HOST_DIR
 compose --profile ops run --rm backup
-test -s "$BACKUP_HOST_DIR/latest.dump"
-printf 'backup written to %s\n' "$BACKUP_HOST_DIR/latest.dump"
+test -s "$BACKUP_HOST_DIR/control/latest.dump"
+test -s "$BACKUP_HOST_DIR/checkpoint/latest.dump"
+test -s "$BACKUP_HOST_DIR/control/latest.dump.sha256"
+test -s "$BACKUP_HOST_DIR/checkpoint/latest.dump.sha256"
+printf 'control and checkpoint backups written to %s\n' "$BACKUP_HOST_DIR"

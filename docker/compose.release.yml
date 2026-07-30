@@ -26,6 +26,11 @@ services:
       - deepseek_api_key
       - nvidia_nim_api_key
       - embedding_api_key
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+      checkpoint-postgres:
+        condition: service_healthy
     networks:
       - edge_net
       - control_net
@@ -59,6 +64,11 @@ services:
       - deepseek_api_key
       - nvidia_nim_api_key
       - embedding_api_key
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+      checkpoint-postgres:
+        condition: service_healthy
     networks:
       - edge_net
       - control_net
@@ -70,16 +80,101 @@ services:
       file: compose.base.yml
       service: nginx
 
+  control-postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ttai_control
+      POSTGRES_USER: control_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/control_owner_password
+      DB_APP_ROLE: control_app
+      DB_APP_PASSWORD_FILE: /run/secrets/control_app_password
+      DB_APP_PRIVILEGES: readwrite
+      DB_MIGRATOR_ROLE: control_migrator
+      DB_MIGRATOR_PASSWORD_FILE: /run/secrets/control_migrator_password
+      DB_BACKUP_ROLE: control_backup
+      DB_BACKUP_PASSWORD_FILE: /run/secrets/control_backup_password
+      DB_REQUIRED_EXTENSION: vector
+      DB_RESTORE_TEST_DATABASE: ttai_control_restore_test
+      DB_RESTORE_ROLE: control_migrator
+    volumes:
+      - control_pgdata:/var/lib/postgresql/data
+      - ./initdb/roles.sh:/docker-entrypoint-initdb.d/010-roles.sh:ro
+    secrets:
+      - control_owner_password
+      - control_app_password
+      - control_migrator_password
+      - control_backup_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U control_owner -d ttai_control"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - control_net
+
+  checkpoint-postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ttai_checkpoint
+      POSTGRES_USER: checkpoint_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/checkpoint_owner_password
+      DB_APP_ROLE: checkpoint_app
+      DB_APP_PASSWORD_FILE: /run/secrets/checkpoint_app_password
+      DB_APP_PRIVILEGES: readwrite
+      DB_MIGRATOR_ROLE: checkpoint_migrator
+      DB_MIGRATOR_PASSWORD_FILE: /run/secrets/checkpoint_migrator_password
+      DB_BACKUP_ROLE: checkpoint_backup
+      DB_BACKUP_PASSWORD_FILE: /run/secrets/checkpoint_backup_password
+      DB_RESTORE_TEST_DATABASE: ttai_checkpoint_restore_test
+      DB_RESTORE_ROLE: checkpoint_migrator
+    volumes:
+      - checkpoint_pgdata:/var/lib/postgresql/data
+      - ./initdb/roles.sh:/docker-entrypoint-initdb.d/010-roles.sh:ro
+    secrets:
+      - checkpoint_owner_password
+      - checkpoint_app_password
+      - checkpoint_migrator_password
+      - checkpoint_backup_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U checkpoint_owner -d ttai_checkpoint"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - control_net
+
   migrate:
-    image: ${MIGRATION_IMAGE_REF:-postgres:17-alpine}
+    image: ${TTAI_IMAGE_REF:?TTAI_IMAGE_REF must be an immutable image reference}
     profiles: ["ops"]
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+      checkpoint-postgres:
+        condition: service_healthy
     environment:
       CONTROL_MIGRATOR_DATABASE_URL_FILE: /run/secrets/control_migrator_database_url
       CHECKPOINT_MIGRATOR_DATABASE_URL_FILE: /run/secrets/checkpoint_migrator_database_url
-    command: ["/bin/sh", "/scripts/migrate.sh"]
+      CHECKPOINT_SNAPSHOT_REQUIRED: "true"
+      CHECKPOINT_SNAPSHOT_FILE: /backups/checkpoint/latest.dump
+    entrypoint: ["/app/docker/scripts/migrate.sh"]
+    command: ["--phase", "expand"]
     volumes:
-      - ./migrations:/migrations:ro
-      - ./scripts:/scripts:ro
+      - type: bind
+        source: ${BACKUP_HOST_DIR:-../var/backups}
+        target: /backups
+        read_only: true
     secrets:
       - control_migrator_database_url
       - checkpoint_migrator_database_url
@@ -101,12 +196,18 @@ services:
       - egress_net
 
   backup:
-    image: ${MIGRATION_IMAGE_REF:-postgres:17-alpine}
+    image: postgres:17-alpine
     profiles: ["ops"]
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+      checkpoint-postgres:
+        condition: service_healthy
     environment:
-      DATABASE_URL_FILE: /run/secrets/control_backup_database_url
+      CONTROL_BACKUP_DATABASE_URL_FILE: /run/secrets/control_backup_database_url
+      CHECKPOINT_BACKUP_DATABASE_URL_FILE: /run/secrets/checkpoint_backup_database_url
       BACKUP_DIR: /backups
-      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-7}
     command: ["/bin/sh", "/scripts/backup.sh"]
     volumes:
       - type: bind
@@ -115,15 +216,22 @@ services:
       - ./scripts:/scripts:ro
     secrets:
       - control_backup_database_url
+      - checkpoint_backup_database_url
     networks:
       - control_net
 
   restore-test:
-    image: ${MIGRATION_IMAGE_REF:-postgres:17-alpine}
+    image: postgres:17-alpine
     profiles: ["ops"]
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+      checkpoint-postgres:
+        condition: service_healthy
     environment:
-      DATABASE_URL_FILE: /run/secrets/control_restore_database_url
-      BACKUP_FILE: /backups/latest.dump
+      CONTROL_RESTORE_DATABASE_URL_FILE: /run/secrets/control_restore_database_url
+      CHECKPOINT_RESTORE_DATABASE_URL_FILE: /run/secrets/checkpoint_restore_database_url
+      BACKUP_DIR: /backups
     command: ["/bin/sh", "/scripts/restore-test.sh"]
     volumes:
       - type: bind
@@ -133,6 +241,7 @@ services:
       - ./scripts:/scripts:ro
     secrets:
       - control_restore_database_url
+      - checkpoint_restore_database_url
     networks:
       - control_net
 
@@ -147,6 +256,12 @@ networks:
   business_external_net:
     external: true
     name: ${BUSINESS_EXTERNAL_NETWORK:-business_external_net}
+
+volumes:
+  control_pgdata:
+    name: ${CONTROL_PGDATA_VOLUME:-tt_ai_control_pgdata}
+  checkpoint_pgdata:
+    name: ${CHECKPOINT_PGDATA_VOLUME:-tt_ai_checkpoint_pgdata}
 
 secrets:
   business_ro_database_url:
@@ -169,3 +284,23 @@ secrets:
     file: ../secrets/database/control_backup_database_url
   control_restore_database_url:
     file: ../secrets/database/control_restore_database_url
+  checkpoint_backup_database_url:
+    file: ../secrets/database/checkpoint_backup_database_url
+  checkpoint_restore_database_url:
+    file: ../secrets/database/checkpoint_restore_database_url
+  control_owner_password:
+    file: ../secrets/database/control_owner_password
+  control_app_password:
+    file: ../secrets/database/control_app_password
+  control_migrator_password:
+    file: ../secrets/database/control_migrator_password
+  control_backup_password:
+    file: ../secrets/database/control_backup_password
+  checkpoint_owner_password:
+    file: ../secrets/database/checkpoint_owner_password
+  checkpoint_app_password:
+    file: ../secrets/database/checkpoint_app_password
+  checkpoint_migrator_password:
+    file: ../secrets/database/checkpoint_migrator_password
+  checkpoint_backup_password:
+    file: ../secrets/database/checkpoint_backup_password

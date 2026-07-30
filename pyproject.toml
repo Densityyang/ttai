@@ -5,6 +5,7 @@ description = "NL2SQL service with layered architecture"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "alembic>=1.16.5",
     "asyncpg>=0.31.0",
     "faiss-cpu>=1.7.0",
     "fastapi>=0.128.7",
@@ -67,3 +68,4 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 timeout = 60
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = ["postgres_integration: isolated Docker PostgreSQL contract tests"]

@@ -10,7 +10,8 @@ require_deploy_environment
 [[ "${1:-}" == "--confirm-restore" ]] || die "restore test requires explicit --confirm-restore"
 BACKUP_HOST_DIR="${BACKUP_HOST_DIR:-$ROOT_DIR/var/backups}"
 require_absolute_backup_dir "$BACKUP_HOST_DIR"
-test -s "$BACKUP_HOST_DIR/latest.dump" || die "latest.dump is missing"
+test -s "$BACKUP_HOST_DIR/control/latest.dump" || die "control/latest.dump is missing"
+test -s "$BACKUP_HOST_DIR/checkpoint/latest.dump" || die "checkpoint/latest.dump is missing"
 export BACKUP_HOST_DIR
 compose --profile ops run --rm restore-test
-printf 'restore rehearsal completed from %s\n' "$BACKUP_HOST_DIR/latest.dump"
+printf 'control and checkpoint restore rehearsal completed from %s\n' "$BACKUP_HOST_DIR"

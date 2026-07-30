@@ -86,6 +86,17 @@ def test_dev_databases_are_healthy_isolated_and_use_distinct_named_volumes() -> 
     for service_name in ("control-postgres", "checkpoint-postgres", "business-postgres"):
         assert "pg_isready" in " ".join(services[service_name]["healthcheck"]["test"])
         assert "ports" not in services[service_name]
+        assert "./initdb/roles.sh:/docker-entrypoint-initdb.d/010-roles.sh:ro" in services[
+            service_name
+        ]["volumes"]
+
+    assert services["business-postgres"]["environment"]["DB_APP_PRIVILEGES"] == "readonly"
+    assert services["business-postgres"]["environment"]["DB_APP_ROLE"] == "business_reader"
+    for database_name in ("control", "checkpoint"):
+        environment = services[f"{database_name}-postgres"]["environment"]
+        assert environment["DB_APP_ROLE"] == f"{database_name}_app"
+        assert environment["DB_MIGRATOR_ROLE"] == f"{database_name}_migrator"
+        assert environment["DB_BACKUP_ROLE"] == f"{database_name}_backup"
 
     volume_names = {
         dev["volumes"]["control_pgdata"]["name"],
@@ -121,9 +132,23 @@ def test_benchmark_is_an_explicit_one_shot_compose_profile() -> None:
 
 def test_release_compose_pins_app_image_and_keeps_ops_profiles() -> None:
     release = _load_yaml("docker/compose.release.yml")
-    for service_name in ("api-a", "api-b", "indexer"):
+    for service_name in ("api-a", "api-b", "indexer", "migrate"):
         assert "TTAI_IMAGE_REF" in release["services"][service_name]["image"]
     assert release["services"]["migrate"]["profiles"] == ["ops"]
+    assert release["services"]["migrate"]["command"] == ["--phase", "expand"]
+    assert release["services"]["migrate"]["user"] == "0:0"
+    assert release["services"]["migrate"]["read_only"] is True
+    assert release["services"]["migrate"]["cap_drop"] == ["ALL"]
+    assert release["services"]["migrate"]["cap_add"] == ["DAC_READ_SEARCH"]
+    assert release["services"]["migrate"]["security_opt"] == ["no-new-privileges:true"]
+    assert release["services"]["migrate"]["environment"]["CHECKPOINT_SNAPSHOT_REQUIRED"] == (
+        "true"
+    )
+    assert release["services"]["control-postgres"]["volumes"][0].startswith("control_pgdata:")
+    assert release["services"]["checkpoint-postgres"]["volumes"][0].startswith(
+        "checkpoint_pgdata:"
+    )
+    assert "business-postgres" not in release["services"]
     backup_volume = release["services"]["backup"]["volumes"][0]
     restore_volume = release["services"]["restore-test"]["volumes"][0]
     assert backup_volume == {
@@ -133,6 +158,9 @@ def test_release_compose_pins_app_image_and_keeps_ops_profiles() -> None:
     }
     assert restore_volume == {**backup_volume, "read_only": True}
     assert release["networks"]["business_external_net"]["external"] is True
+    assert release["services"]["backup"]["environment"]["BACKUP_RETENTION_DAYS"].endswith(
+        ":-7}"
+    )
 
 
 def test_nginx_contract_has_failover_limits_safe_logs_and_sse_headers() -> None:

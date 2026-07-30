@@ -12,6 +12,8 @@ from collections.abc import Awaitable, Callable
 from typing import Protocol
 from uuid import uuid4
 
+from src.core.database import DatabasePurpose, validate_application_database_url
+from src.core.settings import get_settings
 from src.nl2sql.observability.trace import TraceEvent, fingerprint
 
 
@@ -37,7 +39,24 @@ class ControlAuditStore:
     async def open(cls, database_url: str) -> "ControlAuditStore":
         import asyncpg
 
-        pool = await asyncpg.create_pool(database_url, min_size=1, max_size=4)
+        validate_application_database_url(database_url, DatabasePurpose.CONTROL_APP)
+        settings = get_settings()
+        pool = await asyncpg.create_pool(
+            database_url,
+            min_size=1,
+            max_size=settings.database_pool_size + settings.database_max_overflow,
+            timeout=settings.database_connect_timeout_seconds,
+            command_timeout=settings.database_statement_timeout_ms / 1000,
+            max_inactive_connection_lifetime=settings.database_pool_recycle_seconds,
+            server_settings={
+                "application_name": "ttai-control-audit",
+                "statement_timeout": str(settings.database_statement_timeout_ms),
+                "lock_timeout": str(settings.database_lock_timeout_ms),
+                "idle_in_transaction_session_timeout": str(
+                    settings.database_idle_transaction_timeout_ms
+                ),
+            },
+        )
         try:
             schema_ready = await pool.fetchval(
                 """
