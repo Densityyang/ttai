@@ -22,10 +22,24 @@ class SecretProvider:
             if path.is_symlink() or not path.is_file():
                 raise ValueError(f"{file_name} must reference a readable regular file")
             mode = stat.S_IMODE(path.stat().st_mode)
-            if os.name != "nt" and mode & (stat.S_IWGRP | stat.S_IWOTH):
+            if (
+                os.name != "nt"
+                and mode & (stat.S_IWGRP | stat.S_IWOTH)
+                and not _is_read_only_filesystem(path)
+            ):
                 raise ValueError(f"{file_name} must not be writable by group or others")
             value = path.read_text(encoding="utf-8").rstrip("\r\n")
             if not value.strip():
                 raise ValueError(f"{file_name} resolved to an empty secret")
             return value
         return self._environ.get(name, default)
+
+
+def _is_read_only_filesystem(path: Path) -> bool:
+    """Recognize read-only Docker secret mounts even when their mode is reported as 0777."""
+
+    try:
+        read_only_flag = getattr(os, "ST_RDONLY", 1)
+        return bool(os.statvfs(path).f_flag & read_only_flag)
+    except (AttributeError, OSError):
+        return False

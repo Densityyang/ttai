@@ -84,9 +84,20 @@ def test_release_scripts_have_confirmation_and_immutable_guards() -> None:
     assert "--confirm-restore" in scripts["restore-test.sh"]
     common = (ROOT / "scripts/lib/deploy_common.sh").read_text(encoding="utf-8")
     assert "@" in common and "image_ref_from_manifest" in scripts["deploy.sh"]
-    assert "latest" not in scripts["deploy.sh"]
+    assert ":latest" not in scripts["deploy.sh"]
+    assert scripts["deploy.sh"].index("010-roles.sh") < scripts["deploy.sh"].index(
+        "run --rm backup"
+    )
+    assert scripts["deploy.sh"].index("run --rm backup") < scripts["deploy.sh"].index(
+        "run --rm migrate"
+    )
     assert "legacy" not in scripts["rollback.sh"].lower()
     backup_container = (ROOT / "docker/scripts/backup.sh").read_text(encoding="utf-8")
     restore_container = (ROOT / "docker/scripts/restore-test.sh").read_text(encoding="utf-8")
-    assert "latest.dump" in backup_container
+    assert "control/latest.dump" in scripts["backup.sh"]
+    assert "checkpoint/latest.dump" in scripts["backup.sh"]
+    assert "CONTROL_BACKUP_DATABASE_URL_FILE" in backup_container
+    assert "CHECKPOINT_BACKUP_DATABASE_URL_FILE" in backup_container
     assert "--exit-on-error" in restore_container
+    assert "--single-transaction" in restore_container
+    assert "*_restore_test" in restore_container

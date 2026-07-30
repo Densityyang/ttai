@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     control_database_url: str | None = Field(default=None)
     checkpoint_database_url: str | None = Field(default=None)
     backup_retention_days: int = Field(default=7, ge=1, le=365)
+    database_pool_size: int = Field(default=3, ge=1, le=50)
+    database_max_overflow: int = Field(default=2, ge=0, le=50)
+    database_pool_timeout_seconds: float = Field(default=3.0, gt=0, le=60)
+    database_pool_recycle_seconds: int = Field(default=900, ge=30, le=86_400)
+    database_connect_timeout_seconds: int = Field(default=3, ge=1, le=60)
+    database_statement_timeout_ms: int = Field(default=30_000, ge=100, le=900_000)
+    database_lock_timeout_ms: int = Field(default=3_000, ge=100, le=60_000)
+    database_idle_transaction_timeout_ms: int = Field(
+        default=30_000,
+        ge=1_000,
+        le=900_000,
+    )
 
     # LLM
     openai_api_key: str = Field(default="", description="OpenAI API Key")
@@ -115,6 +127,23 @@ class Settings(BaseSettings):
     def validate_memory_backend(self) -> "Settings":
         if self.memory_backend == "postgresql" and not self.checkpoint_database_url:
             raise ValueError("MEMORY_BACKEND=postgresql ????? CHECKPOINT_DATABASE_URL")
+        return self
+
+    @model_validator(mode="after")
+    def validate_product_database_roles(self) -> "Settings":
+        if self.service_mode != "product":
+            return self
+
+        from src.core.database import DatabasePurpose, validate_application_database_url
+
+        required_urls = {
+            DatabasePurpose.BUSINESS_READ_ONLY: self.database_url,
+            DatabasePurpose.CONTROL_APP: self.control_database_url,
+            DatabasePurpose.CHECKPOINT_APP: self.checkpoint_database_url,
+        }
+        for purpose, database_url in required_urls.items():
+            if database_url:
+                validate_application_database_url(database_url, purpose)
         return self
 
     @model_validator(mode="after")

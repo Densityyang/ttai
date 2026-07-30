@@ -11,7 +11,10 @@ from typing import Any, Callable, Iterable, Sequence
 from uuid import uuid4
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from src.core.database import DatabasePurpose, create_runtime_async_engine
+from src.core.settings import get_settings
 
 
 class SemanticReleaseState(StrEnum):
@@ -158,7 +161,12 @@ class ControlSemanticReleasePublisher:
     """Persist validated semantic releases and atomically move the control-DB pointer."""
 
     def __init__(self, database_url: str) -> None:
-        self._engine: AsyncEngine = create_async_engine(database_url, pool_pre_ping=True)
+        self._engine: AsyncEngine = create_runtime_async_engine(
+            database_url,
+            purpose=DatabasePurpose.CONTROL_APP,
+            application_name="ttai-semantic-publisher",
+            settings=get_settings(),
+        )
 
     async def close(self) -> None:
         await self._engine.dispose()

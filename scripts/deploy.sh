@@ -15,11 +15,23 @@ MANIFEST="${1:-${RELEASE_MANIFEST:-}}"
 require_manifest "$MANIFEST"
 
 export TTAI_IMAGE_REF="$(image_ref_from_manifest "$MANIFEST")"
+BACKUP_HOST_DIR="${BACKUP_HOST_DIR:-$ROOT_DIR/var/backups}"
+require_absolute_backup_dir "$BACKUP_HOST_DIR"
+export BACKUP_HOST_DIR
 compose config --quiet
-compose pull api-a api-b
+compose pull api-a api-b control-postgres checkpoint-postgres backup restore-test
 
-# Upgrade order is deliberate: schema, semantic candidate, API instances, then Nginx.
-compose --profile ops run --rm migrate
+# Upgrade order is deliberate: checkpoint snapshot, expand migrations, semantic
+# candidate, API instances, then Nginx. The cloud business database stays read-only.
+compose up -d --wait control-postgres checkpoint-postgres
+# Re-run the idempotent role bootstrap so upgrades from pre-PR3 named volumes
+# receive the separated app/migrator/backup roles as well as fresh volumes.
+compose exec -T control-postgres /bin/sh /docker-entrypoint-initdb.d/010-roles.sh
+compose exec -T checkpoint-postgres /bin/sh /docker-entrypoint-initdb.d/010-roles.sh
+compose --profile ops run --rm backup
+test -s "$BACKUP_HOST_DIR/control/latest.dump"
+test -s "$BACKUP_HOST_DIR/checkpoint/latest.dump"
+compose --profile ops run --rm migrate --phase expand
 if [[ "${RUN_SEMANTIC_INDEXER:-0}" == "1" ]]; then
   compose --profile ops run --rm indexer
 fi

@@ -19,6 +19,9 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 COPY benchmarks ./benchmarks
 COPY configs ./configs
+COPY docker/alembic ./docker/alembic
+COPY docker/migrations ./docker/migrations
+COPY docker/scripts/migrate.sh ./docker/scripts/migrate.sh
 COPY main.py ./
 RUN uv sync --frozen --no-dev
 
@@ -34,13 +37,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH"
 
-RUN groupadd --system app && useradd --system --gid app --create-home app
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system app \
+    && useradd --system --gid app --create-home app
 
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder --chown=app:app /build/src ./src
 COPY --from=builder --chown=app:app /build/benchmarks ./benchmarks
 COPY --from=builder --chown=app:app /build/configs ./configs
+COPY --from=builder --chown=app:app /build/docker/alembic ./docker/alembic
+COPY --from=builder --chown=app:app /build/docker/migrations ./docker/migrations
+COPY --from=builder --chown=app:app --chmod=755 /build/docker/scripts/migrate.sh ./docker/scripts/migrate.sh
 COPY --from=builder --chown=app:app /build/main.py ./
 
 USER app

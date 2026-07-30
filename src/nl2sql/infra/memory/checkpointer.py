@@ -6,6 +6,7 @@ from typing import Any
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 
+from src.core.database import DatabasePurpose, build_psycopg_runtime_dsn
 from src.core.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ class CheckpointerManager:
             raise RuntimeError("Checkpointer ????????? init()")
         return self._checkpointer
 
-    async def init(self, *, setup: bool = True) -> None:
+    async def init(self, *, setup: bool = False) -> None:
         """????? checkpointer"""
         if self._checkpointer is not None:
             return
@@ -45,9 +46,13 @@ class CheckpointerManager:
                             "memory_backend=postgresql ????? CHECKPOINT_DATABASE_URL"
                         )
                     # from_conn_string ??????????
-                    self._postgres_context = AsyncPostgresSaver.from_conn_string(
-                        settings.checkpoint_database_url
+                    checkpoint_url = build_psycopg_runtime_dsn(
+                        settings.checkpoint_database_url,
+                        purpose=DatabasePurpose.CHECKPOINT_APP,
+                        application_name="ttai-checkpoint",
+                        settings=settings,
                     )
+                    self._postgres_context = AsyncPostgresSaver.from_conn_string(checkpoint_url)
                     # ?????
                     checkpointer = await self._postgres_context.__aenter__()
                     if setup:
