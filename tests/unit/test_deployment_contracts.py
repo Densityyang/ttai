@@ -35,6 +35,24 @@ def test_base_compose_exposes_only_nginx_and_uses_readiness_healthchecks() -> No
     assert base["networks"]["edge_net"].get("internal") is not True
 
 
+def test_two_api_bootstrap_sql_active_concurrency_does_not_exceed_eight() -> None:
+    base = _load_yaml("docker/compose.base.yml")
+    active_defaults: list[int] = []
+    for service_name in ("api-a", "api-b"):
+        environment = base["services"][service_name]["environment"]
+        active_value = environment["QUERY_GATEWAY_SQL_ACTIVE_CONCURRENCY"]
+        assert active_value == "${QUERY_GATEWAY_SQL_ACTIVE_CONCURRENCY:-4}"
+        assert environment["QUERY_GATEWAY_SQL_WAIT_QUEUE_SIZE"] == (
+            "${QUERY_GATEWAY_SQL_WAIT_QUEUE_SIZE:-8}"
+        )
+        assert environment["QUERY_GATEWAY_SQL_WAIT_TIMEOUT_SECONDS"] == (
+            "${QUERY_GATEWAY_SQL_WAIT_TIMEOUT_SECONDS:-3}"
+        )
+        active_defaults.append(int(active_value.removesuffix("}").rsplit(":-", 1)[1]))
+
+    assert sum(active_defaults) <= 8
+
+
 def test_product_profile_uses_external_business_network_and_file_secrets() -> None:
     product = _load_yaml("docker/compose.prod.yml")
     assert product["networks"]["business_external_net"]["external"] is True

@@ -21,15 +21,9 @@ from src.nl2sql.infra.governance.query_gateway import (
     QueryGatewayError,
     QueryReceipt,
 )
-from src.nl2sql.infra.store.sql_utils import mask_sql_literals_and_comments
 
 _SCHEMA_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ROLE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_SQL_IDENTIFIER_PATTERN = r'(?:[A-Za-z_][A-Za-z0-9_]*|"(?:""|[^"])+")'
-_SCHEMA_QUALIFIED_FROM_JOIN_PATTERN = re.compile(
-    rf"\b(?:FROM|JOIN)\s+(?:ONLY\s+)?(?P<schema>{_SQL_IDENTIFIER_PATTERN})\s*\.\s*(?P<relation>{_SQL_IDENTIFIER_PATTERN})",
-    re.IGNORECASE | re.DOTALL,
-)
 
 
 class DatabaseManager:
@@ -75,10 +69,15 @@ class DatabaseManager:
             self._session_factory,
             schema=self._schema,
             timeout_seconds=self.timeout_seconds,
+            plan_timeout_ms=int(os.getenv("NL2SQL_EXPLAIN_TIMEOUT_MS", "3000")),
+            lock_timeout_ms=self._settings.database_lock_timeout_ms,
+            idle_timeout_ms=self._settings.database_idle_transaction_timeout_ms,
             max_rows=self.max_query_results,
             max_plan_cost=float(os.getenv("NL2SQL_MAX_PLAN_COST", "500000")),
             max_plan_rows=int(os.getenv("NL2SQL_MAX_PLAN_ROWS", "100000")),
             max_result_bytes=int(os.getenv("NL2SQL_MAX_RESULT_BYTES", "1000000")),
+            readonly_role=_extract_role_from_database_url(self.database_url)
+            or "business_reader",
         )
         await self._load_schema_info()
 
@@ -182,13 +181,15 @@ class DatabaseManager:
             raise RuntimeError("DatabaseManager connection is not initialized")
         return await self._query_gateway.execute(sql, params)
 
-    async def validate_query(self, sql: str) -> tuple[bool, str | None]:
+    async def validate_query(
+        self,
+        sql: str,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[bool, str | None]:
         """检查 SQL 是否安全且可执行（Phase 4 增强：AST 校验 + 成本估算）。"""
-        if self._schema and _has_forbidden_schema_reference(sql, allowed_schema=self._schema):
-            return False, f"only schema `{self._schema}` may be queried"
         if self._query_gateway is None:
             return False, "DatabaseManager connection is not initialized"
-        receipt = await self._query_gateway.preflight(sql)
+        receipt = await self._query_gateway.preflight(sql, params)
         return receipt.accepted, receipt.error.message if receipt.error else None
 
 
@@ -260,24 +261,6 @@ def _normalize_schema(schema: str | None) -> str | None:
         raise ValueError(f"非法 schema 标识符: {schema}")
 
     return normalized
-
-
-def _has_forbidden_schema_reference(sql: str, allowed_schema: str) -> bool:
-    masked_sql = mask_sql_literals_and_comments(sql)
-    normalized_allowed_schema = allowed_schema.lower()
-
-    for match in _SCHEMA_QUALIFIED_FROM_JOIN_PATTERN.finditer(masked_sql):
-        schema_name = _normalize_sql_identifier(match.group("schema")).lower()
-        if schema_name != normalized_allowed_schema:
-            return True
-    return False
-
-
-def _normalize_sql_identifier(identifier: str) -> str:
-    stripped = identifier.strip()
-    if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
-        return stripped[1:-1].replace('""', '"')
-    return stripped
 
 
 def _resolve_ai_views_grantee_roles(database_url: str) -> list[str]:
