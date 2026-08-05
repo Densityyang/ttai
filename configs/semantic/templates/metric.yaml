@@ -1,0 +1,27 @@
+# Schema-v3 metric authoring template. Copy this block into the metric index
+# maintained by the business owner; no Python changes are required.
+schema_version: 3
+asset_type: metric
+asset_id: complaint.first_response_rate.area.day
+status: active
+domain: complaint
+owner: business-department
+metric_key: complaint_first_response_rate_area_day
+display_name: 投诉首响及时率
+aliases:
+  - 投诉首响及时率
+kind: derived
+source_relation: ai_views.v_metric_result
+dependencies:
+  - complaint_first_response_on_time_count_area_day
+  - complaint_calc_total_count_area_day
+calculation_template_id: ratio
+calculation_template_version: "1.0"
+formula: "CASE WHEN {denominator} > 0 THEN {numerator} / {denominator} ELSE NULL END"
+decimal_scale: 4
+rounding: half_up
+unit: percent
+null_strategy: return_null
+zero_strategy: return_null
+sensitivity: internal
+freshness_sla_seconds: 86400

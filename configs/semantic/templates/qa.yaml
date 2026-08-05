@@ -1,0 +1,21 @@
+# Schema-v3 QA authoring template.
+schema_version: 3
+asset_type: qa
+asset_id: qa.complaint-first-response-rate
+case_id: qa-complaint-first-response-rate
+status: active
+domain: complaint
+owner: business-department
+metric_keys:
+  - complaint_first_response_rate_area_day
+question: 投诉首响及时率是多少？
+sql: |-
+  SELECT time_value, area_id, value, unit, status
+  FROM gold_metric_result
+  WHERE metric_code = 'complaint_first_response_rate_area_day'
+    AND time_grain = 'day'
+  ORDER BY time_value DESC
+  LIMIT 100
+answer: 返回指标值、单位和数据状态。
+sensitivity: internal
+freshness_sla_seconds: 86400
