@@ -94,7 +94,7 @@ services:
       DB_MIGRATOR_PASSWORD_FILE: /run/secrets/control_migrator_password
       DB_BACKUP_ROLE: control_backup
       DB_BACKUP_PASSWORD_FILE: /run/secrets/control_backup_password
-      DB_REQUIRED_EXTENSION: vector
+      DB_REQUIRED_EXTENSIONS: "vector pg_trgm"
       DB_RESTORE_TEST_DATABASE: ttai_control_restore_test
       DB_RESTORE_ROLE: control_migrator
     volumes:

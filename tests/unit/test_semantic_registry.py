@@ -85,14 +85,43 @@ def test_missing_active_release_never_builds_indexes_on_demand() -> None:
 
 def test_control_migration_persists_release_pointer_and_retrieval_indexes() -> None:
     root = Path(__file__).resolve().parents[2]
-    migration = (root / "docker/migrations/control/002_semantic_registry.sql").read_text(encoding="utf-8")
+    base_migration = (root / "docker/migrations/control/002_semantic_registry.sql").read_text(
+        encoding="utf-8"
+    )
+    v3_migration = (root / "docker/migrations/control/004_semantic_registry_v3.sql").read_text(
+        encoding="utf-8"
+    )
 
-    assert "semantic_releases" in migration
-    assert "semantic_documents" in migration
-    assert "semantic_release_pointers" in migration
-    assert "TSVECTOR" in migration
-    assert "VECTOR" in migration
-    assert "semantic_releases_one_active" in migration
+    assert "semantic_releases" in base_migration
+    assert "semantic_documents" in base_migration
+    assert "semantic_release_pointers" in base_migration
+    assert "TSVECTOR" in base_migration
+    assert "VECTOR" in base_migration
+    assert "semantic_releases_one_active" in base_migration
+    assert "CREATE EXTENSION IF NOT EXISTS pg_trgm" in v3_migration
+    assert "semantic_release_version_seq" in v3_migration
+    assert "ALTER COLUMN release_id DROP NOT NULL" in v3_migration
+    assert "VALUES ('active', NULL)" in v3_migration
+    for table in (
+        "semantic_assets",
+        "semantic_aliases",
+        "semantic_edges",
+        "schema_snapshots",
+        "semantic_validation_issues",
+        "source_freshness",
+    ):
+        assert f"CREATE TABLE IF NOT EXISTS {table}" in v3_migration
+    assert "normalized_alias gin_trgm_ops" in v3_migration
+
+
+def test_durable_publisher_uses_sequence_and_locks_pointer_row() -> None:
+    root = Path(__file__).resolve().parents[2]
+    registry = (root / "src/nl2sql/semantic/registry.py").read_text(encoding="utf-8")
+
+    assert "SELECT COALESCE(MAX(version), 0) + 1" not in registry
+    assert "SELECT nextval('semantic_release_version_seq')" in registry
+    assert "FROM semantic_release_pointers" in registry
+    assert "FOR UPDATE" in registry
 
 
 def test_control_database_uses_a_pgvector_enabled_image() -> None:
