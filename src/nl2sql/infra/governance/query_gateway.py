@@ -27,6 +27,11 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from src.nl2sql.contracts import ExecutionReceipt, PolicyDecision
+from src.nl2sql.infra.governance.semaphore import (
+    CapacityExceededError,
+    ConcurrencyGovernor,
+    get_concurrency_governor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,7 @@ class QueryErrorCode(StrEnum):
     PLAN_FAILED = "plan_failed"
     COST_EXCEEDED = "cost_exceeded"
     ROWS_EXCEEDED = "rows_exceeded"
+    CAPACITY_EXCEEDED = "capacity_exceeded"
     TIMEOUT = "timeout"
     CONNECTION_ERROR = "connection_error"
     TRANSIENT_DATABASE_ERROR = "transient_database_error"
@@ -487,6 +493,7 @@ class QueryGateway:
         datasource: str = "business_postgres",
         readonly_role: str = "business_reader",
         audit_sink: QueryAuditSink | None = None,
+        concurrency_governor: ConcurrencyGovernor | None = None,
     ) -> None:
         if schema and not _SAFE_IDENTIFIER.fullmatch(schema):
             raise ValueError("invalid schema identifier")
@@ -512,10 +519,16 @@ class QueryGateway:
         self._datasource = datasource
         self._readonly_role = readonly_role
         self._audit_sink = audit_sink
+        self._concurrency_governor = concurrency_governor
         self._policy = PolicyEngine(max_rows=max_rows, allowed_schema=schema)
 
     def prepare(self, sql: str) -> PreparedQuery:
         return self._policy.prepare(sql)
+
+    def _capacity_governor(self) -> ConcurrencyGovernor:
+        if self._concurrency_governor is None:
+            self._concurrency_governor = get_concurrency_governor()
+        return self._concurrency_governor
 
     async def preflight(
         self,
@@ -523,6 +536,19 @@ class QueryGateway:
         params: dict[str, Any] | None = None,
     ) -> QueryReceipt:
         started = time.perf_counter()
+        try:
+            async with self._capacity_governor().acquire("sql"):
+                return await self._preflight_locked(sql, params, started=started)
+        except CapacityExceededError as exc:
+            return self._capacity_rejection(sql, exc, started)
+
+    async def _preflight_locked(
+        self,
+        sql: str,
+        params: dict[str, Any] | None,
+        *,
+        started: float,
+    ) -> QueryReceipt:
         try:
             prepared = self.prepare(sql)
             bound = self._policy.validate_params(prepared, params)
@@ -568,11 +594,11 @@ class QueryGateway:
                     started,
                 )
 
-        from src.nl2sql.infra.governance.semaphore import get_concurrency_governor
-
-        governor = get_concurrency_governor()
-        async with governor.acquire("sql"):
-            receipt = await self._execute_locked(sql, params, started=started)
+        try:
+            async with self._capacity_governor().acquire("sql"):
+                receipt = await self._execute_locked(sql, params, started=started)
+        except CapacityExceededError as exc:
+            receipt = self._capacity_rejection(sql, exc, started)
 
         if self._audit_sink is not None:
             try:
@@ -864,6 +890,20 @@ class QueryGateway:
             data_scope=prepared.data_scope,
             estimated_cost=estimated_cost,
             estimated_rows=estimated_rows,
+        )
+
+    def _capacity_rejection(
+        self,
+        sql: str,
+        exc: CapacityExceededError,
+        started: float,
+    ) -> QueryReceipt:
+        return self._rejected(
+            sql,
+            QueryErrorCode.CAPACITY_EXCEEDED,
+            str(exc),
+            started,
+            retryable=True,
         )
 
     def _rejected(

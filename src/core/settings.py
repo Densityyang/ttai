@@ -44,6 +44,24 @@ class Settings(BaseSettings):
         ge=1_000,
         le=900_000,
     )
+    query_gateway_sql_active_concurrency: int = Field(
+        default=4,
+        ge=1,
+        le=4,
+        description="Per-API bootstrap ceiling for active business SQL queries.",
+    )
+    query_gateway_sql_wait_queue_size: int = Field(
+        default=8,
+        ge=0,
+        le=1_024,
+        description="Per-API bounded waiting queue for business SQL capacity.",
+    )
+    query_gateway_sql_wait_timeout_seconds: float = Field(
+        default=3.0,
+        gt=0,
+        le=60,
+        description="Maximum wait for QueryGateway SQL capacity.",
+    )
 
     # LLM
     openai_api_key: str = Field(default="", description="OpenAI API Key")
