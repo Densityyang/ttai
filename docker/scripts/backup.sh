@@ -44,6 +44,7 @@ backup_database() {
       --no-owner \
       --no-privileges \
       --exclude-extension=vector \
+      --exclude-extension=pg_trgm \
       --file "$temporary_file"
   else
     pg_dump --dbname "$database_url" \

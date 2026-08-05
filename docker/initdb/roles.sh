@@ -209,12 +209,13 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'database_name')
 SQL
 fi
 
-if test -n "${DB_REQUIRED_EXTENSION:-}"; then
-  create_extension "$POSTGRES_DB" "$DB_REQUIRED_EXTENSION"
+required_extensions="${DB_REQUIRED_EXTENSIONS:-${DB_REQUIRED_EXTENSION:-}}"
+for extension_name in $required_extensions; do
+  create_extension "$POSTGRES_DB" "$extension_name"
   if test -n "${DB_RESTORE_TEST_DATABASE:-}"; then
-    create_extension "$DB_RESTORE_TEST_DATABASE" "$DB_REQUIRED_EXTENSION"
+    create_extension "$DB_RESTORE_TEST_DATABASE" "$extension_name"
   fi
-fi
+done
 
 configure_database_privileges "$POSTGRES_DB"
 if test -n "${DB_RESTORE_TEST_DATABASE:-}"; then

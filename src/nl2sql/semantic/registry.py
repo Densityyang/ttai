@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable, Sequence
 from uuid import uuid4
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from src.core.database import DatabasePurpose, create_runtime_async_engine
 from src.core.settings import get_settings
@@ -160,13 +160,23 @@ class SemanticRegistry:
 class ControlSemanticReleasePublisher:
     """Persist validated semantic releases and atomically move the control-DB pointer."""
 
-    def __init__(self, database_url: str) -> None:
-        self._engine: AsyncEngine = create_runtime_async_engine(
-            database_url,
-            purpose=DatabasePurpose.CONTROL_APP,
-            application_name="ttai-semantic-publisher",
-            settings=get_settings(),
-        )
+    def __init__(
+        self,
+        database_url: str | None = None,
+        *,
+        engine: AsyncEngine | None = None,
+    ) -> None:
+        if (database_url is None) == (engine is None):
+            raise ValueError("provide exactly one of database_url or engine")
+        if engine is not None:
+            self._engine = engine
+        else:
+            self._engine = create_runtime_async_engine(
+                database_url or "",
+                purpose=DatabasePurpose.CONTROL_APP,
+                application_name="ttai-semantic-publisher",
+                settings=get_settings(),
+            )
 
     async def close(self) -> None:
         await self._engine.dispose()
@@ -184,12 +194,11 @@ class ControlSemanticReleasePublisher:
             raise SemanticReleaseError("semantic release validation failed")
 
         async with self._engine.begin() as connection:
-            version_result = await connection.execute(text("SELECT COALESCE(MAX(version), 0) + 1 FROM semantic_releases"))
-            version = int(version_result.scalar_one())
-            active_result = await connection.execute(
-                text("SELECT release_id::text FROM semantic_release_pointers WHERE pointer_name = 'active'")
+            previous_release_id = await _lock_active_pointer(connection)
+            version_result = await connection.execute(
+                text("SELECT nextval('semantic_release_version_seq')")
             )
-            previous_release_id = active_result.scalar_one_or_none()
+            version = int(version_result.scalar_one())
             release = replace(candidate, version=version, previous_release_id=previous_release_id)
             await connection.execute(
                 text(
@@ -247,10 +256,9 @@ class ControlSemanticReleasePublisher:
             await connection.execute(
                 text(
                     """
-                    INSERT INTO semantic_release_pointers (pointer_name, release_id)
-                    VALUES ('active', CAST(:release_id AS uuid))
-                    ON CONFLICT (pointer_name) DO UPDATE
-                    SET release_id = EXCLUDED.release_id, updated_at = now()
+                    UPDATE semantic_release_pointers
+                    SET release_id = CAST(:release_id AS uuid), updated_at = now()
+                    WHERE pointer_name = 'active'
                     """
                 ),
                 {"release_id": release.release_id},
@@ -264,6 +272,7 @@ class ControlSemanticReleasePublisher:
     async def rollback(self, release_id: str) -> SemanticRelease:
         """Atomically move the active pointer to a previously validated release."""
         async with self._engine.begin() as connection:
+            active_release_id = await _lock_active_pointer(connection)
             target = (
                 await connection.execute(
                     text(
@@ -282,9 +291,17 @@ class ControlSemanticReleasePublisher:
                 raise SemanticReleaseError("rollback target does not exist")
             if str(target["state"]) not in {SemanticReleaseState.RETIRED, SemanticReleaseState.VALIDATED}:
                 raise SemanticReleaseError("rollback target must be retired or validated")
-            await connection.execute(
-                text("UPDATE semantic_releases SET state = 'retired' WHERE state = 'active'")
-            )
+            if active_release_id is not None:
+                await connection.execute(
+                    text(
+                        """
+                        UPDATE semantic_releases
+                        SET state = 'retired'
+                        WHERE release_id = CAST(:release_id AS uuid) AND state = 'active'
+                        """
+                    ),
+                    {"release_id": active_release_id},
+                )
             await connection.execute(
                 text(
                     """
@@ -298,10 +315,9 @@ class ControlSemanticReleasePublisher:
             await connection.execute(
                 text(
                     """
-                    INSERT INTO semantic_release_pointers (pointer_name, release_id)
-                    VALUES ('active', CAST(:release_id AS uuid))
-                    ON CONFLICT (pointer_name) DO UPDATE
-                    SET release_id = EXCLUDED.release_id, updated_at = now()
+                    UPDATE semantic_release_pointers
+                    SET release_id = CAST(:release_id AS uuid), updated_at = now()
+                    WHERE pointer_name = 'active'
                     """
                 ),
                 {"release_id": release_id},
@@ -458,6 +474,31 @@ class ControlSemanticReleasePublisher:
             )
             for row in rows
         ]
+
+
+async def _lock_active_pointer(connection: AsyncConnection) -> str | None:
+    """Lock the permanent pointer row before reading or changing its target."""
+    await connection.execute(
+        text(
+            """
+            INSERT INTO semantic_release_pointers (pointer_name, release_id)
+            VALUES ('active', NULL)
+            ON CONFLICT (pointer_name) DO NOTHING
+            """
+        )
+    )
+    result = await connection.execute(
+        text(
+            """
+            SELECT release_id::text
+            FROM semantic_release_pointers
+            WHERE pointer_name = 'active'
+            FOR UPDATE
+            """
+        )
+    )
+    release_id = result.scalar_one()
+    return str(release_id) if release_id is not None else None
 
 
 def _checksum(documents: tuple[SemanticDocument, ...]) -> str:

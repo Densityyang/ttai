@@ -16,6 +16,13 @@ from urllib.parse import quote
 import pytest
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from src.nl2sql.semantic.registry import (
+    ControlSemanticReleasePublisher,
+    SemanticDocument,
+    SemanticReleaseError,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 RUN_INTEGRATION = os.environ.get("TTAI_RUN_POSTGRES_INTEGRATION") == "1"
@@ -161,7 +168,7 @@ def postgres_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[st
             "migrator": "control_migrator",
             "backup": "control_backup",
             "privileges": "readwrite",
-            "extension": "vector",
+            "extension": "vector pg_trgm",
             "restore_database": "ttai_control_restore_test",
         },
         "checkpoint": {
@@ -455,6 +462,41 @@ def test_roles_migrations_backup_restore_and_hitl_resume(
     )
     assert all(line.endswith("|f|f|f|f") for line in role_flags.stdout.splitlines() if line)
 
+    semantic_extensions = _psql(
+        stack,
+        "control",
+        control["app"],
+        control["app_password"],
+        "SELECT extname FROM pg_extension WHERE extname IN ('pg_trgm', 'vector') ORDER BY extname;",
+    )
+    assert semantic_extensions.stdout.strip().splitlines() == ["pg_trgm", "vector"]
+    semantic_tables = _psql(
+        stack,
+        "control",
+        control["app"],
+        control["app_password"],
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+        "AND tablename IN ('semantic_assets', 'semantic_aliases', 'semantic_edges', "
+        "'schema_snapshots', 'semantic_validation_issues', 'source_freshness') "
+        "ORDER BY tablename;",
+    )
+    assert semantic_tables.stdout.strip().splitlines() == [
+        "schema_snapshots",
+        "semantic_aliases",
+        "semantic_assets",
+        "semantic_edges",
+        "semantic_validation_issues",
+        "source_freshness",
+    ]
+    control_app_dsn = _dsn(
+        control["app"],
+        control["app_password"],
+        "127.0.0.1",
+        control["port"],
+        control["database"],
+    )
+    _run_async(_exercise_semantic_release_registry(control_app_dsn))
+
     checkpoint_app_dsn = _dsn(
         checkpoint["app"],
         checkpoint["app_password"],
@@ -614,6 +656,61 @@ async def _load_pending_approval(database_url: str, config: dict[str, Any]) -> A
         restored = await saver.aget_tuple(config)
     assert restored is not None
     return restored.checkpoint["channel_values"]["approval"]
+
+
+async def _exercise_semantic_release_registry(database_url: str) -> None:
+    async_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(async_url, pool_size=3, max_overflow=0, pool_pre_ping=True)
+    publisher = ControlSemanticReleasePublisher(engine=engine)
+    try:
+        releases = await asyncio.gather(
+            *(
+                publisher.publish(
+                    [
+                        SemanticDocument(
+                            document_id=f"concurrent-{index}",
+                            content=f"semantic release {index}",
+                            metadata={"domain": "complaint"},
+                        )
+                    ],
+                    change_summary=f"concurrent release {index}",
+                    validation_report={"ok": True, "candidate": index},
+                )
+                for index in range(3)
+            )
+        )
+        versions = sorted(release.version for release in releases)
+        assert len(set(versions)) == 3
+        assert versions == list(range(versions[0], versions[0] + 3))
+
+        active = await publisher.read_active()
+        assert active is not None
+        assert active.version == versions[-1]
+        active_before_failure = active.release_id
+        with pytest.raises(SemanticReleaseError, match="validation failed"):
+            await publisher.publish(
+                [
+                    SemanticDocument(
+                        document_id="invalid-candidate",
+                        content="must never become active",
+                        metadata={"domain": "complaint"},
+                    )
+                ],
+                change_summary="invalid release",
+                validation_report={"ok": False},
+            )
+        active_after_failure = await publisher.read_active()
+        assert active_after_failure is not None
+        assert active_after_failure.release_id == active_before_failure
+
+        rollback_target = min(releases, key=lambda release: release.version)
+        rolled_back = await publisher.rollback(rollback_target.release_id)
+        assert rolled_back.release_id == rollback_target.release_id
+        active_after_rollback = await publisher.read_active()
+        assert active_after_rollback is not None
+        assert active_after_rollback.release_id == rollback_target.release_id
+    finally:
+        await publisher.close()
 
 
 def _run_async(coroutine: Any) -> Any:
