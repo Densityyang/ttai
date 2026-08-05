@@ -1,0 +1,26 @@
+# Schema-v3 AI view authoring template.
+schema_version: 3
+asset_type: view
+asset_id: view.v_complaint_order
+status: active
+domain: complaint
+name: v_complaint_order
+owner: data-platform
+source_table: silver_fault_reporting_order
+source_alias: fro
+joins:
+  - table: vadmin_area
+    alias: area
+    type: left
+    join_condition: fro.area_id = area.id
+columns:
+  - fro.id
+  - fro.first_arrival_time
+  - fro.archive_time
+  - area.name AS area_name
+filters:
+  - column: fro.is_valid_for_metrics
+    operator: eq
+    value: true
+sensitivity: internal
+freshness_sla_seconds: 86400
