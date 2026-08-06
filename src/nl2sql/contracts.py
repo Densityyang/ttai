@@ -105,7 +105,10 @@ class ModelRequest(StrictContract):
         pattern=r"^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$",
     )
     messages: list[dict[str, Any]] = Field(min_length=1, max_length=64)
-    tool_schema: dict[str, Any] | None = None
+    tool_schema: dict[str, Any] | None = Field(
+        default=None,
+        description="JSON Schema for a requested structured model output.",
+    )
     deadline_ms: int = Field(ge=1, le=120_000)
     token_budget: int = Field(ge=1, le=1_000_000)
     cost_budget: float = Field(ge=0)
@@ -139,6 +142,10 @@ class ModelReceipt(StrictContract):
     profile_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
     prompt_version: str = Field(min_length=1, max_length=128)
     prompt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output_schema_checksum: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     content: str = ""
     estimated_cost: float = Field(default=0, ge=0)
 
