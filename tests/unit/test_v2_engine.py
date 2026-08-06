@@ -50,6 +50,8 @@ async def test_explicit_engine_records_route_and_receipt_without_supervisor_loop
 
     assert result["route_record"]["route"] == "fast"
     assert result["model_receipt"]["profile_version"] == "test-v1"
+    assert len(result["model_receipt"]["profile_checksum"]) == 64
+    assert result["model_receipt"]["prompt_version"] == "v2-engine-v1"
     assert result["messages"][-1].content == "Revenue plan"
 
 
@@ -79,3 +81,7 @@ async def test_explicit_engine_records_typed_query_policy_and_answer_trace_event
 
     assert [event.stage for event in sink.events] == ["query", "policy", "answer"]  # type: ignore[attr-defined]
     assert result["trace_events"][-1]["stage"] == "answer"
+    answer_attributes = result["trace_events"][-1]["attributes"]
+    assert answer_attributes["prompt_version"] == "v2-engine-v1"
+    assert len(answer_attributes["prompt_hash"]) == 64
+    assert answer_attributes["prompt_hash"] != "[REDACTED]"
