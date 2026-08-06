@@ -32,6 +32,7 @@ def test_control_and_checkpoint_have_independent_alembic_chains() -> None:
         "001_control_schema",
         "002_semantic_registry",
         "003_audit_outbox",
+        "004_semantic_registry_v3",
     ]
     assert [path.stem for path in checkpoint_revisions] == ["001_checkpoint_schema"]
 
@@ -78,6 +79,7 @@ def test_backup_and_restore_cover_both_state_databases_with_integrity_guards() -
     assert "flock --nonblock" in backup
     assert "sha256sum" in backup
     assert "pg_restore --list" in backup
+    assert "--exclude-extension=pg_trgm" in backup
     assert "--no-owner" in backup and "--no-privileges" in backup
     assert "backup checksum mismatch" in restore
     assert "--single-transaction" in restore

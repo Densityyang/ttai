@@ -41,11 +41,15 @@ class CallBudget:
             and self.cost_used + cost <= self.cost_budget
         )
 
+    def begin_attempt(self) -> None:
+        if self.attempts >= self.max_attempts:
+            raise BudgetExceeded("attempt_budget_exhausted")
+        self.attempts += 1
+
     def charge(self, *, input_tokens: int, output_tokens: int, cost: float) -> None:
         tokens = input_tokens + output_tokens
         if not self.can_charge(tokens=tokens, cost=cost):
             raise BudgetExceeded("model_call_budget_exceeded")
-        self.attempts += 1
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
         self.cost_used += cost

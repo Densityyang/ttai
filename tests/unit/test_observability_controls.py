@@ -85,9 +85,18 @@ async def test_query_gateway_fails_closed_when_required_control_audit_is_unavail
 def test_trace_schema_redacts_sensitive_attributes_and_covers_all_stages() -> None:
     trace = TraceEnvelope(trace_id="trace-1")
     for stage in ("query", "retrieval", "candidate", "policy", "sql", "answer"):
-        trace.record(stage, "observed", prompt="private", rows=[{"token": "secret"}])  # type: ignore[arg-type]
+        trace.record(
+            stage,  # type: ignore[arg-type]
+            "observed",
+            prompt="private",
+            prompt_hash="a" * 64,
+            prompt_version="prompt-v1",
+            rows=[{"token": "secret"}],
+        )
 
     assert [event.stage for event in trace.events] == ["query", "retrieval", "candidate", "policy", "sql", "answer"]
     assert all(event.attributes["prompt"] == "[REDACTED]" for event in trace.events)
     assert all(event.attributes["rows"] == "[REDACTED]" for event in trace.events)
+    assert all(event.attributes["prompt_hash"] == "a" * 64 for event in trace.events)
+    assert all(event.attributes["prompt_version"] == "prompt-v1" for event in trace.events)
     assert TraceEvent.model_validate(trace.events[0]).trace_id == "trace-1"

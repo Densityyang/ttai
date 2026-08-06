@@ -579,8 +579,9 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
             "pool.fetchval",
             "self._connection.execute",
         },
-        "src/nl2sql/semantic/registry.py": {"connection.execute"},
-        "src/nl2sql/agents/codeact_engine/graph.py": {"sandbox.execute"},
+            "src/nl2sql/semantic/registry.py": {"connection.execute"},
+            "src/nl2sql/semantic/schema_snapshot.py": {"connection.execute"},
+            "src/nl2sql/agents/codeact_engine/graph.py": {"sandbox.execute"},
         "src/nl2sql/agents/dynamic_calc/graph.py": {
             "executor.execute",
             "trusted_template_registry.execute",
