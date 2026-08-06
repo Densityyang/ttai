@@ -93,6 +93,7 @@ def create_v2_engine(
             token_budget=budget.token_budget,
             cost_budget=budget.cost_budget,
             data_classification="internal",
+            prompt_version="v2-engine-v1",
             plan_reason="deep_or_shadow_route" if stage == "plan" else None,
         )
         try:
@@ -111,6 +112,11 @@ def create_v2_engine(
             input_tokens=receipt.usage.get("input_tokens", 0),
             output_tokens=receipt.usage.get("output_tokens", 0),
             estimated_cost=receipt.estimated_cost,
+            model_alias=receipt.alias,
+            model_profile_version=receipt.profile_version,
+            model_profile_checksum=receipt.profile_checksum,
+            prompt_version=receipt.prompt_version,
+            prompt_hash=receipt.prompt_hash,
             answer_hash=fingerprint(answer),
         )
         await _persist_new_events(trace_sink, trace.events[-1:])

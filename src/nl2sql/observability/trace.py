@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 TraceStage = Literal["query", "retrieval", "candidate", "policy", "sql", "answer"]
 _SENSITIVE_KEYS = frozenset({"authorization", "password", "secret", "token", "api_key", "prompt", "rows"})
+_SAFE_PROMPT_METADATA = frozenset({"prompt_hash", "prompt_version"})
 
 
 class _TraceModel(BaseModel):
@@ -50,7 +51,9 @@ def _sanitize_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
     safe: dict[str, Any] = {}
     for key, value in attributes.items():
         normalized = key.lower().replace("-", "_")
-        if normalized in _SENSITIVE_KEYS or any(part in normalized for part in _SENSITIVE_KEYS):
+        if normalized in _SAFE_PROMPT_METADATA and isinstance(value, str):
+            safe[key] = value[:512]
+        elif normalized in _SENSITIVE_KEYS or any(part in normalized for part in _SENSITIVE_KEYS):
             safe[key] = "[REDACTED]"
         elif isinstance(value, str):
             safe[key] = value[:512]

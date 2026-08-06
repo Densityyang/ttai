@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+ModelStage = Literal["classify", "retrieve", "plan", "generate_sql", "verify", "answer"]
+ModelDataClassification = Literal["public", "internal", "confidential", "restricted"]
 
 
 class StrictContract(BaseModel):
@@ -95,25 +98,53 @@ class ErrorEnvelope(StrictContract):
 
 
 class ModelRequest(StrictContract):
-    stage: Literal["classify", "retrieve", "plan", "generate_sql", "verify", "answer"]
-    alias: str
-    messages: list[dict[str, Any]]
+    stage: ModelStage
+    alias: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$",
+    )
+    messages: list[dict[str, Any]] = Field(min_length=1, max_length=64)
     tool_schema: dict[str, Any] | None = None
-    deadline_ms: int = Field(ge=1)
-    token_budget: int = Field(ge=1)
+    deadline_ms: int = Field(ge=1, le=120_000)
+    token_budget: int = Field(ge=1, le=1_000_000)
     cost_budget: float = Field(ge=0)
-    data_classification: str
+    data_classification: ModelDataClassification
+    prompt_version: str = Field(min_length=1, max_length=128)
     plan_reason: str | None = Field(default=None, max_length=1024)
 
 
+class ModelFailure(StrictContract):
+    """Safe, typed model failure details suitable for API and trace metadata."""
+
+    code: str = Field(min_length=1, max_length=128)
+    retryable: bool = False
+    provider: str | None = Field(default=None, min_length=1, max_length=128)
+    status_code: int | None = Field(default=None, ge=100, le=599)
+    attempted_providers: tuple[str, ...] = ()
+    causes: tuple[str, ...] = ()
+
+
 class ModelReceipt(StrictContract):
-    provider: str
-    resolved_model: str
+    alias: str = Field(min_length=1, max_length=128)
+    stage: ModelStage
+    provider: str = Field(min_length=1, max_length=128)
+    resolved_model: str = Field(min_length=1, max_length=256)
     latency_ms: int = Field(ge=0)
     usage: dict[str, int] = Field(default_factory=dict)
-    finish_reason: str
+    finish_reason: str = Field(min_length=1, max_length=128)
     retries: int = Field(default=0, ge=0)
     fallback_used: bool = False
-    profile_version: str
+    profile_version: str = Field(min_length=1, max_length=128)
+    profile_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    prompt_version: str = Field(min_length=1, max_length=128)
+    prompt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     content: str = ""
     estimated_cost: float = Field(default=0, ge=0)
+
+    @field_validator("usage")
+    @classmethod
+    def validate_usage(cls, value: dict[str, int]) -> dict[str, int]:
+        if any(not key or amount < 0 for key, amount in value.items()):
+            raise ValueError("model usage keys must be non-empty and values non-negative")
+        return value
