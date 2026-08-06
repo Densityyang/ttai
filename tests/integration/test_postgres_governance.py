@@ -16,8 +16,17 @@ from urllib.parse import quote
 import pytest
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from src.nl2sql.semantic.authoring import (
+    AuthoringIR,
+    JoinDefinition,
+    MetricAsset,
+    ViewAsset,
+    validate_authoring_ir,
+)
+from src.nl2sql.semantic.materialization import PARSER_VERSION, materialize_authoring_ir
 from src.nl2sql.semantic.registry import (
     ControlSemanticReleasePublisher,
     SemanticDocument,
@@ -709,6 +718,106 @@ async def _exercise_semantic_release_registry(database_url: str) -> None:
         active_after_rollback = await publisher.read_active()
         assert active_after_rollback is not None
         assert active_after_rollback.release_id == rollback_target.release_id
+
+        ir = AuthoringIR(
+            metrics=(
+                MetricAsset(
+                    asset_id="metric.complaint_count",
+                    metric_key="complaint_count",
+                    display_name="投诉量",
+                    source_relation="public.complaints",
+                    aliases=("投诉数量",),
+                    source_columns=("id",),
+                    domain="complaint",
+                    owner="complaint-analytics",
+                    sensitivity="internal",
+                    freshness_sla_seconds=3600,
+                    legacy_metadata_inferred=True,
+                ),
+            ),
+            views=(
+                ViewAsset(
+                    asset_id="view.complaint_detail",
+                    name="complaint_detail",
+                    source_relation="public.complaints",
+                    source_alias="c",
+                    columns=("c.id", "u.name"),
+                    joins=(
+                        JoinDefinition(
+                            table="public.users",
+                            alias="u",
+                            join_condition="c.user_id = u.id",
+                        ),
+                    ),
+                    domain="complaint",
+                    owner="data-platform",
+                    sensitivity="internal",
+                    freshness_sla_seconds=3600,
+                ),
+            ),
+        )
+        report = validate_authoring_ir(
+            ir,
+            relation_columns={
+                "public.complaints": {"id", "user_id"},
+                "public.users": {"id", "name"},
+            },
+        )
+        assert report.ok
+        typed_release = await publisher.publish_candidate(
+            materialize_authoring_ir(ir, report),
+            change_summary="typed semantic materialization",
+        )
+        assert typed_release.parser_version == PARSER_VERSION
+
+        async with engine.connect() as connection:
+            counts = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT
+                          (SELECT count(*) FROM semantic_assets
+                           WHERE release_id = CAST(:release_id AS uuid)) AS assets,
+                          (SELECT count(*) FROM semantic_aliases
+                           WHERE release_id = CAST(:release_id AS uuid)) AS aliases,
+                          (SELECT count(*) FROM semantic_edges
+                           WHERE release_id = CAST(:release_id AS uuid)
+                             AND status = 'approved') AS approved_edges,
+                          (SELECT count(*) FROM semantic_validation_issues
+                           WHERE release_id = CAST(:release_id AS uuid)) AS validation_issues
+                        """
+                    ),
+                    {"release_id": typed_release.release_id},
+                )
+            ).mappings().one()
+            alias_asset_id = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT asset_id
+                        FROM semantic_aliases
+                        WHERE release_id = CAST(:release_id AS uuid)
+                          AND normalized_alias = :normalized_alias
+                        """
+                    ),
+                    {
+                        "release_id": typed_release.release_id,
+                        "normalized_alias": "投诉量",
+                    },
+                )
+            ).scalar_one()
+
+        assert dict(counts) == {
+            "assets": 4,
+            "aliases": 8,
+            "approved_edges": 3,
+            "validation_issues": 1,
+        }
+        assert alias_asset_id == "metric.complaint_count"
+        active_after_typed_publish = await publisher.read_active()
+        assert active_after_typed_publish is not None
+        assert active_after_typed_publish.release_id == typed_release.release_id
+        assert active_after_typed_publish.parser_version == PARSER_VERSION
     finally:
         await publisher.close()
 

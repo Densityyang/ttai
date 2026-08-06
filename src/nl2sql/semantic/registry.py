@@ -33,6 +33,64 @@ class SemanticDocument:
 
 
 @dataclass(frozen=True)
+class SemanticAssetRecord:
+    asset_id: str
+    asset_type: str
+    status: str
+    domain: str
+    owner: str
+    sensitivity: str
+    content: str
+    payload: dict[str, Any]
+    embedding: tuple[float, ...] | None = None
+
+
+@dataclass(frozen=True)
+class SemanticAliasRecord:
+    asset_id: str
+    alias: str
+    normalized_alias: str
+    language: str = "und"
+
+
+@dataclass(frozen=True)
+class SemanticEdgeRecord:
+    edge_id: str
+    source_asset_id: str
+    target_asset_id: str
+    edge_type: str
+    status: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SemanticValidationIssueRecord:
+    code: str
+    severity: str
+    message: str
+    asset_id: str | None = None
+    path: str = ""
+    owner: str = "unassigned"
+    details: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class SemanticReleaseCandidate:
+    checksum: str
+    documents: tuple[SemanticDocument, ...]
+    validation_report: dict[str, Any]
+    assets: tuple[SemanticAssetRecord, ...] = ()
+    aliases: tuple[SemanticAliasRecord, ...] = ()
+    edges: tuple[SemanticEdgeRecord, ...] = ()
+    validation_issues: tuple[SemanticValidationIssueRecord, ...] = ()
+    schema_version: int = 3
+    parser_version: str = "legacy-semantic-indexer-v1"
+    schema_snapshot_id: str | None = None
+    embedding_profile: str | None = None
+    embedding_dimension: int | None = None
+
+
+@dataclass(frozen=True)
 class SemanticRelease:
     release_id: str
     version: int
@@ -43,6 +101,11 @@ class SemanticRelease:
     change_summary: str
     previous_release_id: str | None
     created_at: datetime
+    schema_version: int = 3
+    parser_version: str = "legacy-semantic-indexer-v1"
+    schema_snapshot_id: str | None = None
+    embedding_profile: str | None = None
+    embedding_dimension: int | None = None
 
 
 class SemanticReleaseError(RuntimeError):
@@ -189,9 +252,46 @@ class ControlSemanticReleasePublisher:
         validation_report: dict[str, Any],
     ) -> SemanticRelease:
         registry = SemanticRegistry()
-        candidate = registry.create_draft(documents, change_summary=change_summary)
-        if validation_report.get("ok") is not True:
-            raise SemanticReleaseError("semantic release validation failed")
+        preview = registry.create_draft(documents, change_summary=change_summary)
+        embedding_dimension = _embedding_dimension(preview.documents, ())
+        embedding_profile = (
+            str(validation_report.get("embedding_model", "")).strip()
+            if embedding_dimension is not None
+            else None
+        )
+        candidate = SemanticReleaseCandidate(
+            checksum=preview.checksum,
+            documents=preview.documents,
+            validation_report=dict(validation_report),
+            embedding_profile=embedding_profile or None,
+            embedding_dimension=embedding_dimension,
+        )
+        return await self.publish_candidate(candidate, change_summary=change_summary)
+
+    async def publish_candidate(
+        self,
+        candidate: SemanticReleaseCandidate,
+        *,
+        change_summary: str,
+    ) -> SemanticRelease:
+        """Persist one validated candidate and atomically activate the complete typed release."""
+        _validate_release_candidate(candidate)
+        release = SemanticRelease(
+            release_id=str(uuid4()),
+            version=0,
+            checksum=candidate.checksum,
+            state=SemanticReleaseState.DRAFT,
+            documents=candidate.documents,
+            validation_report=None,
+            change_summary=change_summary.strip(),
+            previous_release_id=None,
+            created_at=datetime.now(UTC),
+            schema_version=candidate.schema_version,
+            parser_version=candidate.parser_version,
+            schema_snapshot_id=candidate.schema_snapshot_id,
+            embedding_profile=candidate.embedding_profile,
+            embedding_dimension=candidate.embedding_dimension,
+        )
 
         async with self._engine.begin() as connection:
             previous_release_id = await _lock_active_pointer(connection)
@@ -199,17 +299,21 @@ class ControlSemanticReleasePublisher:
                 text("SELECT nextval('semantic_release_version_seq')")
             )
             version = int(version_result.scalar_one())
-            release = replace(candidate, version=version, previous_release_id=previous_release_id)
+            release = replace(release, version=version, previous_release_id=previous_release_id)
             await connection.execute(
                 text(
                     """
                     INSERT INTO semantic_releases (
                       release_id, version, checksum, state, validation_report,
-                      change_summary, previous_release_id, validated_at
+                      change_summary, previous_release_id, validated_at,
+                      schema_version, parser_version, schema_snapshot_id,
+                      embedding_profile, embedding_dimension
                     ) VALUES (
                       CAST(:release_id AS uuid), :version, :checksum, 'validated',
                       CAST(:validation_report AS jsonb), :change_summary,
-                      CAST(:previous_release_id AS uuid), now()
+                      CAST(:previous_release_id AS uuid), now(),
+                      :schema_version, :parser_version, CAST(:schema_snapshot_id AS uuid),
+                      :embedding_profile, :embedding_dimension
                     )
                     """
                 ),
@@ -217,33 +321,17 @@ class ControlSemanticReleasePublisher:
                     "release_id": release.release_id,
                     "version": release.version,
                     "checksum": release.checksum,
-                    "validation_report": json.dumps(validation_report),
+                    "validation_report": json.dumps(candidate.validation_report),
                     "change_summary": release.change_summary,
                     "previous_release_id": previous_release_id,
+                    "schema_version": candidate.schema_version,
+                    "parser_version": candidate.parser_version,
+                    "schema_snapshot_id": candidate.schema_snapshot_id,
+                    "embedding_profile": candidate.embedding_profile,
+                    "embedding_dimension": candidate.embedding_dimension,
                 },
             )
-            for document in release.documents:
-                await connection.execute(
-                    text(
-                        """
-                        INSERT INTO semantic_documents (
-                          release_id, document_id, content, metadata, lexical, embedding
-                        )
-                        VALUES (
-                          CAST(:release_id AS uuid), :document_id, :content,
-                          CAST(:metadata AS jsonb), to_tsvector('simple', :content),
-                          CAST(:embedding AS vector)
-                        )
-                        """
-                    ),
-                    {
-                        "release_id": release.release_id,
-                        "document_id": document.document_id,
-                        "content": document.content,
-                        "metadata": json.dumps(document.metadata),
-                        "embedding": _vector_literal(document.embedding),
-                    },
-                )
+            await _persist_release_candidate(connection, release.release_id, candidate)
             if previous_release_id is not None:
                 await connection.execute(
                     text("UPDATE semantic_releases SET state = 'retired' WHERE release_id = CAST(:release_id AS uuid)"),
@@ -266,7 +354,7 @@ class ControlSemanticReleasePublisher:
         return replace(
             release,
             state=SemanticReleaseState.ACTIVE,
-            validation_report=validation_report,
+            validation_report=candidate.validation_report,
         )
 
     async def rollback(self, release_id: str) -> SemanticRelease:
@@ -278,7 +366,9 @@ class ControlSemanticReleasePublisher:
                     text(
                         """
                         SELECT release_id::text, version, checksum, state, previous_release_id::text,
-                               created_at, change_summary, validation_report
+                               created_at, change_summary, validation_report,
+                               schema_version, parser_version, schema_snapshot_id::text,
+                               embedding_profile, embedding_dimension
                         FROM semantic_releases
                         WHERE release_id = CAST(:release_id AS uuid)
                         FOR UPDATE
@@ -354,6 +444,23 @@ class ControlSemanticReleasePublisher:
                 str(target["previous_release_id"]) if target["previous_release_id"] is not None else None
             ),
             created_at=target["created_at"],
+            schema_version=int(target["schema_version"]),
+            parser_version=str(target["parser_version"]),
+            schema_snapshot_id=(
+                str(target["schema_snapshot_id"])
+                if target["schema_snapshot_id"] is not None
+                else None
+            ),
+            embedding_profile=(
+                str(target["embedding_profile"])
+                if target["embedding_profile"] is not None
+                else None
+            ),
+            embedding_dimension=(
+                int(target["embedding_dimension"])
+                if target["embedding_dimension"] is not None
+                else None
+            ),
         )
 
     async def read_active(self) -> SemanticRelease | None:
@@ -364,7 +471,9 @@ class ControlSemanticReleasePublisher:
                         """
                         SELECT r.release_id::text, r.version, r.checksum, r.state,
                                r.validation_report, r.change_summary,
-                               r.previous_release_id::text, r.created_at
+                               r.previous_release_id::text, r.created_at,
+                               r.schema_version, r.parser_version, r.schema_snapshot_id::text,
+                               r.embedding_profile, r.embedding_dimension
                         FROM semantic_release_pointers p
                         JOIN semantic_releases r ON r.release_id = p.release_id
                         WHERE p.pointer_name = 'active' AND r.state = 'active'
@@ -408,6 +517,23 @@ class ControlSemanticReleasePublisher:
                 else None
             ),
             created_at=release_row["created_at"],
+            schema_version=int(release_row["schema_version"]),
+            parser_version=str(release_row["parser_version"]),
+            schema_snapshot_id=(
+                str(release_row["schema_snapshot_id"])
+                if release_row["schema_snapshot_id"] is not None
+                else None
+            ),
+            embedding_profile=(
+                str(release_row["embedding_profile"])
+                if release_row["embedding_profile"] is not None
+                else None
+            ),
+            embedding_dimension=(
+                int(release_row["embedding_dimension"])
+                if release_row["embedding_dimension"] is not None
+                else None
+            ),
         )
 
     async def search_lexical(self, query: str, *, limit: int) -> list[SemanticDocument]:
@@ -474,6 +600,255 @@ class ControlSemanticReleasePublisher:
             )
             for row in rows
         ]
+
+
+_ASSET_TYPES = {"domain", "metric", "dimension", "relation", "example", "policy", "qa", "view"}
+_ASSET_STATUSES = {"active", "retired", "error"}
+_EDGE_TYPES = {"approved_join", "metric_dependency", "lineage"}
+_EDGE_STATUSES = {"approved", "retired", "rejected"}
+_ISSUE_SEVERITIES = {"error", "warning"}
+
+
+def _validate_release_candidate(candidate: SemanticReleaseCandidate) -> None:
+    if candidate.validation_report.get("ok") is not True:
+        raise SemanticReleaseError("semantic release validation failed")
+    if not candidate.checksum.strip():
+        raise SemanticReleaseError("semantic release checksum must not be empty")
+    if candidate.schema_version != 3:
+        raise SemanticReleaseError("semantic release schema_version must be 3")
+    if not candidate.parser_version.strip():
+        raise SemanticReleaseError("semantic release parser_version must not be empty")
+
+    document_ids = [document.document_id for document in candidate.documents]
+    if not document_ids:
+        raise SemanticReleaseError("a semantic release requires at least one document")
+    if len(document_ids) != len(set(document_ids)):
+        raise SemanticReleaseError("semantic document ids must be unique")
+    if any(not document.document_id.strip() or not document.content.strip() for document in candidate.documents):
+        raise SemanticReleaseError("semantic documents require non-empty ids and content")
+
+    asset_ids = [asset.asset_id for asset in candidate.assets]
+    if len(asset_ids) != len(set(asset_ids)):
+        raise SemanticReleaseError("semantic asset ids must be unique")
+    document_id_set = set(document_ids)
+    for asset in candidate.assets:
+        if not all(
+            value.strip()
+            for value in (asset.asset_id, asset.domain, asset.owner, asset.sensitivity, asset.content)
+        ):
+            raise SemanticReleaseError("semantic assets require complete identity and governance metadata")
+        if asset.asset_type not in _ASSET_TYPES:
+            raise SemanticReleaseError(f"unsupported semantic asset type: {asset.asset_type}")
+        if asset.status not in _ASSET_STATUSES:
+            raise SemanticReleaseError(f"unsupported semantic asset status: {asset.status}")
+        if asset.asset_id not in document_id_set:
+            raise SemanticReleaseError(f"semantic asset is missing its compatibility document: {asset.asset_id}")
+
+    asset_id_set = set(asset_ids)
+    normalized_aliases: set[str] = set()
+    for alias in candidate.aliases:
+        if alias.asset_id not in asset_id_set:
+            raise SemanticReleaseError(f"semantic alias references an unknown asset: {alias.asset_id}")
+        if not alias.alias.strip() or not alias.normalized_alias.strip():
+            raise SemanticReleaseError("semantic aliases must not be empty")
+        if alias.normalized_alias in normalized_aliases:
+            raise SemanticReleaseError(f"duplicate normalized semantic alias: {alias.normalized_alias}")
+        normalized_aliases.add(alias.normalized_alias)
+
+    edge_ids: set[str] = set()
+    for edge in candidate.edges:
+        if edge.edge_id in edge_ids:
+            raise SemanticReleaseError(f"duplicate semantic edge id: {edge.edge_id}")
+        edge_ids.add(edge.edge_id)
+        if edge.source_asset_id not in asset_id_set or edge.target_asset_id not in asset_id_set:
+            raise SemanticReleaseError(f"semantic edge references an unknown asset: {edge.edge_id}")
+        if edge.source_asset_id == edge.target_asset_id:
+            raise SemanticReleaseError(f"semantic edge must not be self-referential: {edge.edge_id}")
+        if edge.edge_type not in _EDGE_TYPES:
+            raise SemanticReleaseError(f"unsupported semantic edge type: {edge.edge_type}")
+        if edge.status not in _EDGE_STATUSES:
+            raise SemanticReleaseError(f"unsupported semantic edge status: {edge.status}")
+
+    for issue in candidate.validation_issues:
+        if issue.asset_id is not None and issue.asset_id not in asset_id_set:
+            raise SemanticReleaseError(f"semantic issue references an unknown asset: {issue.asset_id}")
+        if issue.severity not in _ISSUE_SEVERITIES:
+            raise SemanticReleaseError(f"unsupported semantic issue severity: {issue.severity}")
+        if not issue.code.strip() or not issue.message.strip() or not issue.owner.strip():
+            raise SemanticReleaseError("semantic validation issues require code, message, and owner")
+
+    report_issues = candidate.validation_report.get("issues")
+    if isinstance(report_issues, list) and len(report_issues) != len(candidate.validation_issues):
+        raise SemanticReleaseError("semantic validation issues do not match the validation report")
+    report_schema_version = candidate.validation_report.get("schema_version")
+    if report_schema_version is not None and int(report_schema_version) != candidate.schema_version:
+        raise SemanticReleaseError("semantic candidate and validation report schema versions differ")
+
+    embedding_dimension = _embedding_dimension(candidate.documents, candidate.assets)
+    if embedding_dimension is None:
+        if candidate.embedding_profile is not None or candidate.embedding_dimension is not None:
+            raise SemanticReleaseError("embedding contract exists without semantic embeddings")
+    elif (
+        not candidate.embedding_profile
+        or candidate.embedding_dimension != embedding_dimension
+    ):
+        raise SemanticReleaseError("semantic embeddings require one matching model profile and dimension")
+
+
+def _embedding_dimension(
+    documents: Sequence[SemanticDocument],
+    assets: Sequence[SemanticAssetRecord],
+) -> int | None:
+    vectors = [
+        embedding
+        for embedding in (
+            *(document.embedding for document in documents),
+            *(asset.embedding for asset in assets),
+        )
+        if embedding is not None
+    ]
+    if not vectors:
+        return None
+    dimensions = {len(vector) for vector in vectors}
+    if 0 in dimensions:
+        raise SemanticReleaseError("semantic embedding must not be empty")
+    if len(dimensions) != 1:
+        raise SemanticReleaseError("semantic embeddings must use one fixed dimension")
+    return dimensions.pop()
+
+
+async def _persist_release_candidate(
+    connection: AsyncConnection,
+    release_id: str,
+    candidate: SemanticReleaseCandidate,
+) -> None:
+    await connection.execute(
+        text(
+            """
+            INSERT INTO semantic_documents (
+              release_id, document_id, content, metadata, lexical, embedding
+            ) VALUES (
+              CAST(:release_id AS uuid), :document_id, :content,
+              CAST(:metadata AS jsonb), to_tsvector('simple', :content),
+              CAST(:embedding AS vector)
+            )
+            """
+        ),
+        [
+            {
+                "release_id": release_id,
+                "document_id": document.document_id,
+                "content": document.content,
+                "metadata": json.dumps(document.metadata),
+                "embedding": _vector_literal(document.embedding),
+            }
+            for document in candidate.documents
+        ],
+    )
+    if candidate.assets:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO semantic_assets (
+                  release_id, asset_id, asset_type, status, domain,
+                  owner, sensitivity, content, payload, embedding
+                ) VALUES (
+                  CAST(:release_id AS uuid), :asset_id, :asset_type, :status, :domain,
+                  :owner, :sensitivity, :content, CAST(:payload AS jsonb),
+                  CAST(:embedding AS vector)
+                )
+                """
+            ),
+            [
+                {
+                    "release_id": release_id,
+                    "asset_id": asset.asset_id,
+                    "asset_type": asset.asset_type,
+                    "status": asset.status,
+                    "domain": asset.domain,
+                    "owner": asset.owner,
+                    "sensitivity": asset.sensitivity,
+                    "content": asset.content,
+                    "payload": json.dumps(asset.payload),
+                    "embedding": _vector_literal(asset.embedding),
+                }
+                for asset in candidate.assets
+            ],
+        )
+    if candidate.aliases:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO semantic_aliases (
+                  release_id, asset_id, alias, normalized_alias, language
+                ) VALUES (
+                  CAST(:release_id AS uuid), :asset_id, :alias, :normalized_alias, :language
+                )
+                """
+            ),
+            [
+                {
+                    "release_id": release_id,
+                    "asset_id": alias.asset_id,
+                    "alias": alias.alias,
+                    "normalized_alias": alias.normalized_alias,
+                    "language": alias.language,
+                }
+                for alias in candidate.aliases
+            ],
+        )
+    if candidate.edges:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO semantic_edges (
+                  release_id, edge_id, source_asset_id, target_asset_id,
+                  edge_type, status, payload
+                ) VALUES (
+                  CAST(:release_id AS uuid), :edge_id, :source_asset_id, :target_asset_id,
+                  :edge_type, :status, CAST(:payload AS jsonb)
+                )
+                """
+            ),
+            [
+                {
+                    "release_id": release_id,
+                    "edge_id": edge.edge_id,
+                    "source_asset_id": edge.source_asset_id,
+                    "target_asset_id": edge.target_asset_id,
+                    "edge_type": edge.edge_type,
+                    "status": edge.status,
+                    "payload": json.dumps(edge.payload),
+                }
+                for edge in candidate.edges
+            ],
+        )
+    if candidate.validation_issues:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO semantic_validation_issues (
+                  release_id, asset_id, code, severity, message, path, owner, details
+                ) VALUES (
+                  CAST(:release_id AS uuid), :asset_id, :code, :severity,
+                  :message, :path, :owner, CAST(:details AS jsonb)
+                )
+                """
+            ),
+            [
+                {
+                    "release_id": release_id,
+                    "asset_id": issue.asset_id,
+                    "code": issue.code,
+                    "severity": issue.severity,
+                    "message": issue.message,
+                    "path": issue.path,
+                    "owner": issue.owner,
+                    "details": json.dumps(issue.details or {}),
+                }
+                for issue in candidate.validation_issues
+            ],
+        )
 
 
 async def _lock_active_pointer(connection: AsyncConnection) -> str | None:
