@@ -150,7 +150,7 @@ def test_benchmark_is_an_explicit_one_shot_compose_profile() -> None:
 
 def test_release_compose_pins_app_image_and_keeps_ops_profiles() -> None:
     release = _load_yaml("docker/compose.release.yml")
-    for service_name in ("api-a", "api-b", "indexer", "migrate"):
+    for service_name in ("api-a", "api-b", "indexer", "migrate", "schema-snapshot"):
         assert "TTAI_IMAGE_REF" in release["services"][service_name]["image"]
     assert release["services"]["migrate"]["profiles"] == ["ops"]
     assert release["services"]["migrate"]["command"] == ["--phase", "expand"]
@@ -179,6 +179,43 @@ def test_release_compose_pins_app_image_and_keeps_ops_profiles() -> None:
     assert release["services"]["backup"]["environment"]["BACKUP_RETENTION_DAYS"].endswith(
         ":-7}"
     )
+
+
+def test_schema_snapshot_is_a_bounded_one_shot_ops_service() -> None:
+    dev = _load_yaml("docker/compose.dev.yml")
+    release = _load_yaml("docker/compose.release.yml")
+
+    for compose, business_network in (
+        (dev, "data_net"),
+        (release, "business_external_net"),
+    ):
+        service = compose["services"]["schema-snapshot"]
+        assert service["profiles"] == ["ops"]
+        assert service["command"] == [
+            "python",
+            "-m",
+            "src.nl2sql.semantic.schema_snapshot",
+        ]
+        assert service["read_only"] is True
+        assert service["cap_drop"] == ["ALL"]
+        assert service["security_opt"] == ["no-new-privileges:true"]
+        assert set(service["secrets"]) == {
+            "business_ro_database_url",
+            "control_app_database_url",
+        }
+        assert service["environment"]["DATABASE_URL_FILE"] == (
+            "/run/secrets/business_ro_database_url"
+        )
+        assert service["environment"]["CONTROL_DATABASE_URL_FILE"] == (
+            "/run/secrets/control_app_database_url"
+        )
+        assert service["environment"]["SCHEMA_SNAPSHOT_MAX_RELATIONS"].endswith(
+            ":-64}"
+        )
+        assert {"control_net", business_network}.issubset(service["networks"])
+
+    api_source = (ROOT / "src/nl2sql/api.py").read_text(encoding="utf-8")
+    assert "schema_snapshot" not in api_source
 
 
 def test_nginx_contract_has_failover_limits_safe_logs_and_sse_headers() -> None:

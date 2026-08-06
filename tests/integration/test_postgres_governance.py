@@ -32,6 +32,15 @@ from src.nl2sql.semantic.registry import (
     SemanticDocument,
     SemanticReleaseError,
 )
+from src.nl2sql.semantic.schema_snapshot import (
+    ControlSchemaSnapshotStore,
+    PostgresSchemaSnapshotCollector,
+    RelationPolicy,
+    SchemaRequirement,
+    SchemaSnapshotState,
+    bind_schema_snapshot,
+    validate_schema_snapshot,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 RUN_INTEGRATION = os.environ.get("TTAI_RUN_POSTGRES_INTEGRATION") == "1"
@@ -378,7 +387,16 @@ def test_roles_migrations_backup_restore_and_hitl_resume(
         business["owner"],
         business["owner_password"],
         "CREATE TABLE orders (id integer PRIMARY KEY, amount integer NOT NULL);"
-        "INSERT INTO orders VALUES (1, 42);",
+        "CREATE TABLE users (id integer PRIMARY KEY, name text NOT NULL);"
+        "CREATE TABLE complaints ("
+        "id integer PRIMARY KEY, "
+        "user_id integer NOT NULL REFERENCES users(id), "
+        "created_at timestamptz NOT NULL DEFAULT now()"
+        ");"
+        "CREATE INDEX complaints_user_id_idx ON complaints(user_id);"
+        "INSERT INTO orders VALUES (1, 42);"
+        "INSERT INTO users VALUES (1, 'integration user');"
+        "INSERT INTO complaints (id, user_id) VALUES (1, 1);",
     )
     selected = _psql(
         stack,
@@ -504,7 +522,19 @@ def test_roles_migrations_backup_restore_and_hitl_resume(
         control["port"],
         control["database"],
     )
-    _run_async(_exercise_semantic_release_registry(control_app_dsn))
+    business_app_dsn = _dsn(
+        business["app"],
+        business["app_password"],
+        "127.0.0.1",
+        business["port"],
+        business["database"],
+    )
+    _run_async(
+        _exercise_semantic_release_registry(
+            control_app_dsn,
+            business_app_dsn,
+        )
+    )
 
     checkpoint_app_dsn = _dsn(
         checkpoint["app"],
@@ -667,10 +697,30 @@ async def _load_pending_approval(database_url: str, config: dict[str, Any]) -> A
     return restored.checkpoint["channel_values"]["approval"]
 
 
-async def _exercise_semantic_release_registry(database_url: str) -> None:
-    async_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
-    engine = create_async_engine(async_url, pool_size=3, max_overflow=0, pool_pre_ping=True)
-    publisher = ControlSemanticReleasePublisher(engine=engine)
+async def _exercise_semantic_release_registry(
+    control_database_url: str,
+    business_database_url: str,
+) -> None:
+    control_async_url = control_database_url.replace(
+        "postgresql://", "postgresql+asyncpg://", 1
+    )
+    business_async_url = business_database_url.replace(
+        "postgresql://", "postgresql+asyncpg://", 1
+    )
+    control_engine = create_async_engine(
+        control_async_url,
+        pool_size=3,
+        max_overflow=0,
+        pool_pre_ping=True,
+    )
+    business_engine = create_async_engine(
+        business_async_url,
+        pool_size=1,
+        max_overflow=0,
+        pool_pre_ping=True,
+    )
+    publisher = ControlSemanticReleasePublisher(engine=control_engine)
+    snapshot_store = ControlSchemaSnapshotStore(engine=control_engine)
     try:
         releases = await asyncio.gather(
             *(
@@ -756,21 +806,72 @@ async def _exercise_semantic_release_registry(database_url: str) -> None:
                 ),
             ),
         )
-        report = validate_authoring_ir(
-            ir,
-            relation_columns={
-                "public.complaints": {"id", "user_id"},
-                "public.users": {"id", "name"},
+        snapshot_candidate = await PostgresSchemaSnapshotCollector(
+            business_engine,
+            max_relations=8,
+        ).collect(
+            source_identifier="integration-business",
+            approved_schemas=("public",),
+            approved_relations=("public.complaints", "public.users"),
+            policies={
+                "public.complaints": RelationPolicy(
+                    sensitivity="restricted",
+                    sensitive_columns=("user_id",),
+                    aggregate_coverage=("metric.complaint_count",),
+                    freshness_sla_seconds=3_600,
+                ),
+                "public.users": RelationPolicy(
+                    sensitivity="internal",
+                    sensitive_columns=("name",),
+                    freshness_sla_seconds=3_600,
+                ),
             },
         )
+        report = validate_authoring_ir(
+            ir,
+            relation_columns=snapshot_candidate.relation_columns(),
+        )
         assert report.ok
-        typed_release = await publisher.publish_candidate(
+        snapshot_report = validate_schema_snapshot(
+            snapshot_candidate,
+            requirements=(
+                SchemaRequirement("public.complaints", ("id", "user_id")),
+                SchemaRequirement("public.users", ("id", "name")),
+            ),
+        )
+        assert snapshot_report.ok
+        snapshot = await snapshot_store.publish(snapshot_candidate, snapshot_report)
+        assert snapshot.state is SchemaSnapshotState.VALIDATED
+        assert await snapshot_store.publish(snapshot_candidate, snapshot_report) == snapshot
+        assert {relation.relation_id for relation in snapshot.candidate.relations} == {
+            "public.complaints",
+            "public.users",
+        }
+        complaints = next(
+            relation
+            for relation in snapshot.candidate.relations
+            if relation.relation_id == "public.complaints"
+        )
+        assert complaints.primary_key == ("id",)
+        assert complaints.foreign_keys[0].target_relation_id == "public.users"
+        assert {index.name for index in complaints.indexes} >= {
+            "complaints_pkey",
+            "complaints_user_id_idx",
+        }
+
+        typed_candidate = bind_schema_snapshot(
             materialize_authoring_ir(ir, report),
+            snapshot,
+        )
+        typed_release = await publisher.publish_candidate(
+            typed_candidate,
             change_summary="typed semantic materialization",
         )
         assert typed_release.parser_version == PARSER_VERSION
+        assert typed_release.schema_snapshot_id == snapshot.snapshot_id
+        assert typed_release.schema_snapshot_checksum == snapshot.checksum
 
-        async with engine.connect() as connection:
+        async with control_engine.connect() as connection:
             counts = (
                 await connection.execute(
                     text(
@@ -784,10 +885,16 @@ async def _exercise_semantic_release_registry(database_url: str) -> None:
                            WHERE release_id = CAST(:release_id AS uuid)
                              AND status = 'approved') AS approved_edges,
                           (SELECT count(*) FROM semantic_validation_issues
-                           WHERE release_id = CAST(:release_id AS uuid)) AS validation_issues
+                           WHERE release_id = CAST(:release_id AS uuid)) AS validation_issues,
+                          (SELECT count(*) FROM schema_snapshots
+                           WHERE snapshot_id = CAST(:snapshot_id AS uuid)
+                             AND state = 'validated') AS validated_snapshots
                         """
                     ),
-                    {"release_id": typed_release.release_id},
+                    {
+                        "release_id": typed_release.release_id,
+                        "snapshot_id": snapshot.snapshot_id,
+                    },
                 )
             ).mappings().one()
             alias_asset_id = (
@@ -812,13 +919,18 @@ async def _exercise_semantic_release_registry(database_url: str) -> None:
             "aliases": 8,
             "approved_edges": 3,
             "validation_issues": 1,
+            "validated_snapshots": 1,
         }
         assert alias_asset_id == "metric.complaint_count"
         active_after_typed_publish = await publisher.read_active()
         assert active_after_typed_publish is not None
         assert active_after_typed_publish.release_id == typed_release.release_id
         assert active_after_typed_publish.parser_version == PARSER_VERSION
+        assert active_after_typed_publish.schema_snapshot_id == snapshot.snapshot_id
+        assert active_after_typed_publish.schema_snapshot_checksum == snapshot.checksum
+        assert (await snapshot_store.read_active()) == snapshot
     finally:
+        await business_engine.dispose()
         await publisher.close()
 
 

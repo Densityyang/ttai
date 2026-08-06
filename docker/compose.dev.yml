@@ -150,6 +150,42 @@ services:
     networks:
       control_net:
 
+  schema-snapshot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    profiles: ["ops"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      control-postgres:
+        condition: service_healthy
+      business-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL_FILE: /run/secrets/business_ro_database_url
+      CONTROL_DATABASE_URL_FILE: /run/secrets/control_app_database_url
+      SCHEMA_SNAPSHOT_SOURCE_IDENTIFIER: ${SCHEMA_SNAPSHOT_SOURCE_IDENTIFIER:-local-business}
+      SCHEMA_SNAPSHOT_APPROVED_SCHEMAS: ${SCHEMA_SNAPSHOT_APPROVED_SCHEMAS:-public}
+      SCHEMA_SNAPSHOT_APPROVED_RELATIONS: ${SCHEMA_SNAPSHOT_APPROVED_RELATIONS:-}
+      SCHEMA_SNAPSHOT_BASELINE_ID: ${SCHEMA_SNAPSHOT_BASELINE_ID:-}
+      SCHEMA_SNAPSHOT_MAX_RELATIONS: ${SCHEMA_SNAPSHOT_MAX_RELATIONS:-64}
+      SCHEMA_SNAPSHOT_POLICY_FILE: ${SCHEMA_SNAPSHOT_POLICY_FILE:-}
+    command: ["python", "-m", "src.nl2sql.semantic.schema_snapshot"]
+    volumes:
+      - ../configs:/app/configs:ro
+    secrets:
+      - business_ro_database_url
+      - control_app_database_url
+    networks:
+      control_net:
+      data_net:
+
   indexer:
     build:
       context: ..
@@ -274,6 +310,8 @@ secrets:
     file: ../secrets/database/business_owner_password
   business_reader_password:
     file: ../secrets/database/business_reader_password
+  business_ro_database_url:
+    file: ../secrets/database/business_ro_database_url
   control_migrator_database_url:
     file: ../secrets/database/control_migrator_database_url
   control_app_database_url:

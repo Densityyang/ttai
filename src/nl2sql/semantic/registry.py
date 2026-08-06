@@ -86,6 +86,7 @@ class SemanticReleaseCandidate:
     schema_version: int = 3
     parser_version: str = "legacy-semantic-indexer-v1"
     schema_snapshot_id: str | None = None
+    schema_snapshot_checksum: str | None = None
     embedding_profile: str | None = None
     embedding_dimension: int | None = None
 
@@ -104,6 +105,7 @@ class SemanticRelease:
     schema_version: int = 3
     parser_version: str = "legacy-semantic-indexer-v1"
     schema_snapshot_id: str | None = None
+    schema_snapshot_checksum: str | None = None
     embedding_profile: str | None = None
     embedding_dimension: int | None = None
 
@@ -289,11 +291,13 @@ class ControlSemanticReleasePublisher:
             schema_version=candidate.schema_version,
             parser_version=candidate.parser_version,
             schema_snapshot_id=candidate.schema_snapshot_id,
+            schema_snapshot_checksum=candidate.schema_snapshot_checksum,
             embedding_profile=candidate.embedding_profile,
             embedding_dimension=candidate.embedding_dimension,
         )
 
         async with self._engine.begin() as connection:
+            await _validate_schema_snapshot_binding(connection, candidate)
             previous_release_id = await _lock_active_pointer(connection)
             version_result = await connection.execute(
                 text("SELECT nextval('semantic_release_version_seq')")
@@ -365,13 +369,16 @@ class ControlSemanticReleasePublisher:
                 await connection.execute(
                     text(
                         """
-                        SELECT release_id::text, version, checksum, state, previous_release_id::text,
-                               created_at, change_summary, validation_report,
-                               schema_version, parser_version, schema_snapshot_id::text,
-                               embedding_profile, embedding_dimension
-                        FROM semantic_releases
-                        WHERE release_id = CAST(:release_id AS uuid)
-                        FOR UPDATE
+                        SELECT r.release_id::text, r.version, r.checksum, r.state,
+                               r.previous_release_id::text, r.created_at, r.change_summary,
+                               r.validation_report, r.schema_version, r.parser_version,
+                               r.schema_snapshot_id::text,
+                               s.checksum AS schema_snapshot_checksum,
+                               r.embedding_profile, r.embedding_dimension
+                        FROM semantic_releases r
+                        LEFT JOIN schema_snapshots s ON s.snapshot_id = r.schema_snapshot_id
+                        WHERE r.release_id = CAST(:release_id AS uuid)
+                        FOR UPDATE OF r
                         """
                     ),
                     {"release_id": release_id},
@@ -451,6 +458,11 @@ class ControlSemanticReleasePublisher:
                 if target["schema_snapshot_id"] is not None
                 else None
             ),
+            schema_snapshot_checksum=(
+                str(target["schema_snapshot_checksum"])
+                if target["schema_snapshot_checksum"] is not None
+                else None
+            ),
             embedding_profile=(
                 str(target["embedding_profile"])
                 if target["embedding_profile"] is not None
@@ -473,9 +485,11 @@ class ControlSemanticReleasePublisher:
                                r.validation_report, r.change_summary,
                                r.previous_release_id::text, r.created_at,
                                r.schema_version, r.parser_version, r.schema_snapshot_id::text,
+                               s.checksum AS schema_snapshot_checksum,
                                r.embedding_profile, r.embedding_dimension
                         FROM semantic_release_pointers p
                         JOIN semantic_releases r ON r.release_id = p.release_id
+                        LEFT JOIN schema_snapshots s ON s.snapshot_id = r.schema_snapshot_id
                         WHERE p.pointer_name = 'active' AND r.state = 'active'
                         """
                     )
@@ -522,6 +536,11 @@ class ControlSemanticReleasePublisher:
             schema_snapshot_id=(
                 str(release_row["schema_snapshot_id"])
                 if release_row["schema_snapshot_id"] is not None
+                else None
+            ),
+            schema_snapshot_checksum=(
+                str(release_row["schema_snapshot_checksum"])
+                if release_row["schema_snapshot_checksum"] is not None
                 else None
             ),
             embedding_profile=(
@@ -618,6 +637,12 @@ def _validate_release_candidate(candidate: SemanticReleaseCandidate) -> None:
         raise SemanticReleaseError("semantic release schema_version must be 3")
     if not candidate.parser_version.strip():
         raise SemanticReleaseError("semantic release parser_version must not be empty")
+    snapshot_id = (candidate.schema_snapshot_id or "").strip()
+    snapshot_checksum = (candidate.schema_snapshot_checksum or "").strip()
+    if bool(snapshot_id) != bool(snapshot_checksum):
+        raise SemanticReleaseError("semantic release schema snapshot binding is incomplete")
+    if candidate.assets and not snapshot_id:
+        raise SemanticReleaseError("typed semantic releases require a validated schema snapshot")
 
     document_ids = [document.document_id for document in candidate.documents]
     if not document_ids:
@@ -693,6 +718,33 @@ def _validate_release_candidate(candidate: SemanticReleaseCandidate) -> None:
         or candidate.embedding_dimension != embedding_dimension
     ):
         raise SemanticReleaseError("semantic embeddings require one matching model profile and dimension")
+
+
+async def _validate_schema_snapshot_binding(
+    connection: AsyncConnection,
+    candidate: SemanticReleaseCandidate,
+) -> None:
+    if candidate.schema_snapshot_id is None:
+        return
+    row = (
+        await connection.execute(
+            text(
+                """
+                SELECT checksum, state
+                FROM schema_snapshots
+                WHERE snapshot_id = CAST(:snapshot_id AS uuid)
+                FOR SHARE
+                """
+            ),
+            {"snapshot_id": candidate.schema_snapshot_id},
+        )
+    ).mappings().one_or_none()
+    if row is None:
+        raise SemanticReleaseError("semantic release schema snapshot does not exist")
+    if str(row["state"]) != "validated":
+        raise SemanticReleaseError("semantic release schema snapshot is not validated")
+    if str(row["checksum"]) != candidate.schema_snapshot_checksum:
+        raise SemanticReleaseError("semantic release schema snapshot checksum mismatch")
 
 
 def _embedding_dimension(
