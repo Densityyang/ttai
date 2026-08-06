@@ -545,7 +545,9 @@ def get_legacy_model(
     temperature: float = 0,
     streaming: bool = True,
 ) -> Any:
-    """Compatibility bridge for retired graphs that are not reachable from v2."""
+    """Compatibility bridge for retired non-product graphs only."""
+    if get_settings().service_mode == "product":
+        raise ModelPolicyDenied("legacy_model_disabled_in_product")
     from src.nl2sql.infra.llm.factory import build_legacy_provider_model
 
     return build_legacy_provider_model(model_name, openai_base_url, temperature, streaming)

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.nl2sql.contracts import ModelRequest
+from src.nl2sql.infra.llm import gateway as gateway_module
 from src.nl2sql.infra.llm.gateway import (
     FakeProvider,
     ModelGateway,
@@ -182,6 +185,24 @@ async def test_invalid_structured_output_preserves_only_safe_receipt_metadata() 
     assert "unsafe raw value" not in str(raised.value)
     assert raised.value.__context__ is None
     assert budget.tokens_used == 10
+
+
+def test_product_mode_denies_legacy_model_bridge_before_loading_the_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory_module = "src.nl2sql.infra.llm.factory"
+    monkeypatch.delitem(sys.modules, factory_module, raising=False)
+    monkeypatch.setattr(
+        gateway_module,
+        "get_settings",
+        lambda: SimpleNamespace(service_mode="product"),
+    )
+
+    with pytest.raises(ModelPolicyDenied, match="legacy_model_disabled_in_product") as raised:
+        gateway_module.get_legacy_model()
+
+    assert raised.value.code == "legacy_model_disabled_in_product"
+    assert factory_module not in sys.modules
 
 
 def test_profile_checksum_is_canonical_and_covers_routing_policy() -> None:
