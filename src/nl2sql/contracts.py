@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ModelStage = Literal["classify", "retrieve", "plan", "generate_sql", "verify", "answer"]
 ModelDataClassification = Literal["public", "internal", "confidential", "restricted"]
+RouteName = Literal["fast", "standard", "deep"]
+PolicyLifecycle = Literal["bootstrap", "calibrated", "frozen"]
 
 
 class StrictContract(BaseModel):
@@ -56,6 +60,102 @@ class QueryPlan(StrictContract):
     filters: tuple[str, ...] = ()
     grain: str | None = None
     risk: Literal["low", "medium", "high"] = "low"
+
+
+class RoutePolicy(StrictContract):
+    """Versioned routing thresholds that can be replayed with a request."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: str = Field(min_length=1, max_length=128)
+    state: PolicyLifecycle
+    fast_max_risk: int = Field(ge=0, le=100)
+    fast_min_confidence: float = Field(ge=0, le=1)
+    fast_max_tables: int = Field(ge=1)
+    standard_max_risk: int = Field(ge=0, le=100)
+    standard_min_confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def validate_threshold_order(self) -> RoutePolicy:
+        if self.fast_max_risk > self.standard_max_risk:
+            raise ValueError("fast risk threshold cannot exceed standard")
+        if self.fast_min_confidence < self.standard_min_confidence:
+            raise ValueError("fast confidence threshold cannot be lower than standard")
+        return self
+
+    @property
+    def checksum(self) -> str:
+        return _contract_checksum(self)
+
+
+class RouteBudget(StrictContract):
+    """Hard resource limits for one route under a versioned policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    deadline_ms: int = Field(ge=1, le=120_000)
+    max_model_calls: int = Field(ge=0)
+    max_sql_candidates: int = Field(ge=1)
+    max_sql_executions: int = Field(ge=1)
+    max_join_hops: int = Field(ge=0)
+    max_repairs: int = Field(ge=0)
+
+
+class RoutingBudgetPolicy(StrictContract):
+    """Replayable route budgets; bootstrap values must be calibrated before release."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: str = Field(min_length=1, max_length=128)
+    state: PolicyLifecycle
+    routes: dict[RouteName, RouteBudget]
+    reserve_ms: int = Field(ge=1)
+    max_same_sql: int = Field(ge=1)
+    max_same_error: int = Field(ge=1)
+    max_retryable_provider_errors: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_complete_route_policy(self) -> RoutingBudgetPolicy:
+        expected = {"fast", "standard", "deep"}
+        if set(self.routes) != expected:
+            raise ValueError("routing budget policy must define fast, standard, and deep")
+        if self.reserve_ms >= min(route.deadline_ms for route in self.routes.values()):
+            raise ValueError("response reserve must be lower than every route deadline")
+        return self
+
+    @property
+    def checksum(self) -> str:
+        return _contract_checksum(self)
+
+
+class RouteBudgetUsage(StrictContract):
+    model_calls: int = Field(default=0, ge=0)
+    sql_candidates: int = Field(default=0, ge=0)
+    sql_executions: int = Field(default=0, ge=0)
+    join_hops: int = Field(default=0, ge=0)
+    repairs: int = Field(default=0, ge=0)
+    retryable_provider_errors: int = Field(default=0, ge=0)
+
+
+class RouteBudgetRecord(StrictContract):
+    """Secret-free checkpoint record for route call accounting and loop breakers."""
+
+    policy_version: str = Field(min_length=1, max_length=128)
+    policy_state: PolicyLifecycle
+    policy_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    route: RouteName
+    limits: RouteBudget
+    usage: RouteBudgetUsage = Field(default_factory=RouteBudgetUsage)
+    sql_fingerprint_counts: dict[str, int] = Field(default_factory=dict)
+    error_counts: dict[str, int] = Field(default_factory=dict)
+    stop_reason: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @field_validator("sql_fingerprint_counts", "error_counts")
+    @classmethod
+    def validate_counter_map(cls, value: dict[str, int]) -> dict[str, int]:
+        if any(not key or count < 1 for key, count in value.items()):
+            raise ValueError("counter keys must be non-empty and counts positive")
+        return value
 
 
 class QueryCandidate(StrictContract):
@@ -155,3 +255,13 @@ class ModelReceipt(StrictContract):
         if any(not key or amount < 0 for key, amount in value.items()):
             raise ValueError("model usage keys must be non-empty and values non-negative")
         return value
+
+
+def _contract_checksum(contract: BaseModel) -> str:
+    payload = json.dumps(
+        contract.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

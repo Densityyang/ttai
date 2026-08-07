@@ -7,7 +7,7 @@ have been recorded.
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, NotRequired, Protocol, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, Protocol, TypedDict, cast
 
 from langchain_core.messages import AIMessage, AnyMessage
 from langchain_core.runnables.config import var_child_runnable_config
@@ -17,18 +17,26 @@ from langgraph.graph.message import add_messages
 from langgraph.types import interrupt
 
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.contracts import ModelRequest
-from src.nl2sql.infra.llm.gateway import ModelGateway, ModelGatewayError
+from src.nl2sql.contracts import ModelRequest, RouteName, RoutePolicy, RoutingBudgetPolicy
+from src.nl2sql.infra.llm.gateway import ModelGateway, ModelGatewayError, ModelPolicyDenied
 from src.nl2sql.observability.trace import TraceEnvelope, TraceEvent, fingerprint
-from src.nl2sql.orchestration.budget import BudgetExceeded, CallBudget
-from src.nl2sql.orchestration.routing import RiskSignals, choose_route
+from src.nl2sql.orchestration.budget import (
+    BudgetExceeded,
+    CallBudget,
+    RouteBudgetLedger,
+    bootstrap_routing_budget_policy,
+    should_stop,
+)
+from src.nl2sql.orchestration.routing import RiskSignals, bootstrap_route_policy, choose_route
 
 
 class V2EngineState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     route_record: NotRequired[dict[str, object]]
+    budget_record: NotRequired[dict[str, object]]
     model_receipt: NotRequired[dict[str, object]]
     degradation_flags: NotRequired[list[str]]
+    stop_reason: NotRequired[str]
     pending_answer: NotRequired[str]
     needs_hitl: NotRequired[bool]
     hitl_version: NotRequired[int]
@@ -46,14 +54,23 @@ def create_v2_engine(
     checkpointer: BaseCheckpointSaver,
     model_gateway: ModelGateway,
     trace_sink: TraceSink | None = None,
+    route_policy: RoutePolicy | None = None,
+    budget_policy: RoutingBudgetPolicy | None = None,
 ) -> Any:
+    resolved_route_policy = route_policy or bootstrap_route_policy()
+    resolved_budget_policy = budget_policy or bootstrap_routing_budget_policy()
     graph = StateGraph(V2EngineState)
 
     async def route_node(state: V2EngineState) -> dict[str, object]:
         question = _question(state)
         signals = _signals(question)
         confidence = 0.9 if signals.score <= 20 else 0.7 if signals.score <= 60 else 0.45
-        decision = choose_route(signals=signals, confidence=confidence)
+        decision = choose_route(
+            signals=signals,
+            confidence=confidence,
+            policy=resolved_route_policy,
+        )
+        budget = RouteBudgetLedger(route=decision.route, policy=resolved_budget_policy)
         trace = _trace(state)
         trace.record(
             "query",
@@ -61,9 +78,24 @@ def create_v2_engine(
             question_fingerprint=fingerprint(question),
             question_length=len(question),
         )
-        trace.record("policy", "route_selected", route=decision.route, risk=signals.score, confidence=confidence)
+        trace.record(
+            "policy",
+            "route_selected",
+            route=decision.route,
+            risk=signals.score,
+            confidence=confidence,
+            reason=decision.reason,
+            route_policy_version=decision.policy_version,
+            route_policy_checksum=decision.policy_checksum,
+            budget_policy_version=resolved_budget_policy.version,
+            budget_policy_checksum=resolved_budget_policy.checksum,
+        )
         await _persist_new_events(trace_sink, trace.events[-2:])
-        return {"route_record": decision.replay_record(), "trace_events": _events(trace)}
+        return {
+            "route_record": decision.replay_record(),
+            "budget_record": budget.checkpoint_record().model_dump(mode="json"),
+            "trace_events": _events(trace),
+        }
 
     async def model_node(state: V2EngineState) -> dict[str, object]:
         config = get_agent_config()
@@ -71,12 +103,43 @@ def create_v2_engine(
         configurable = runtime.get("configurable", {}) if isinstance(runtime, dict) else {}
         raw_context = configurable.get("request_context", {}) if isinstance(configurable, dict) else {}
         request_deadline_ms = raw_context.get("deadline_ms") if isinstance(raw_context, dict) else None
+        route = cast(RouteName, str(state.get("route_record", {}).get("route", "standard")))
+        route_budget = _route_budget_from_state(
+            state,
+            route=route,
+            policy=resolved_budget_policy,
+        )
         deadline_ms = min(
             config.v2_request_deadline_ms,
             request_deadline_ms if isinstance(request_deadline_ms, int) else config.v2_request_deadline_ms,
+            route_budget.limits.deadline_ms,
         )
-        route = str(state.get("route_record", {}).get("route", "standard"))
         is_shadow = bool(configurable.get("shadow_mode")) if isinstance(configurable, dict) else False
+        if route == "fast":
+            stop_reason = route_budget.halt("fast_model_call_blocked")
+            trace = _trace(state)
+            trace.record(
+                "policy",
+                "model_call_blocked",
+                route=route,
+                reason=stop_reason,
+                budget_policy_version=resolved_budget_policy.version,
+            )
+            await _persist_new_events(trace_sink, trace.events[-1:])
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "Deterministic Fast execution is unavailable for this request; "
+                            "model invocation was blocked."
+                        )
+                    )
+                ],
+                "budget_record": route_budget.checkpoint_record().model_dump(mode="json"),
+                "stop_reason": stop_reason,
+                "degradation_flags": ["FastModelCallBlocked"],
+                "trace_events": _events(trace),
+            }
         alias = "plan.standard" if is_shadow or route == "deep" else "fast.default"
         stage = "plan" if alias == "plan.standard" else "answer"
         budget = CallBudget(
@@ -85,6 +148,25 @@ def create_v2_engine(
             cost_budget=config.v2_cost_budget,
             max_attempts=config.v2_max_model_attempts,
         )
+        stop_reason = should_stop(budget=budget, policy=resolved_budget_policy)
+        if stop_reason is not None:
+            route_budget.halt(stop_reason)
+            return {
+                "messages": [AIMessage(content="The request budget is unavailable for this route.")],
+                "budget_record": route_budget.checkpoint_record().model_dump(mode="json"),
+                "stop_reason": stop_reason,
+                "degradation_flags": ["BudgetExceeded"],
+            }
+        try:
+            route_budget.begin_model_call()
+        except BudgetExceeded as exc:
+            stop_reason = route_budget.stop_reason or route_budget.halt(str(exc))
+            return {
+                "messages": [AIMessage(content="The request budget is unavailable for this route.")],
+                "budget_record": route_budget.checkpoint_record().model_dump(mode="json"),
+                "stop_reason": stop_reason,
+                "degradation_flags": [type(exc).__name__],
+            }
         request = ModelRequest(
             stage=stage,
             alias=alias,
@@ -99,9 +181,48 @@ def create_v2_engine(
         try:
             receipt = await model_gateway.invoke(request, budget)
         except (ModelGatewayError, BudgetExceeded) as exc:
+            error_code = exc.code if isinstance(exc, ModelGatewayError) else str(exc)
+            if isinstance(exc, ModelGatewayError):
+                route_budget.record_error(
+                    error_code,
+                    policy_denied=isinstance(exc, ModelPolicyDenied),
+                    retryable_provider=exc.retryable,
+                )
+            stop_reason = route_budget.stop_reason or route_budget.halt(error_code)
+            trace = _trace(state)
+            trace.record(
+                "policy",
+                "model_stopped",
+                route=route,
+                reason=stop_reason,
+                error_code=error_code,
+                model_calls=route_budget.model_calls,
+            )
+            await _persist_new_events(trace_sink, trace.events[-1:])
             return {
                 "messages": [AIMessage(content="Model service is unavailable for this request.")],
                 "degradation_flags": [type(exc).__name__],
+                "budget_record": route_budget.checkpoint_record().model_dump(mode="json"),
+                "stop_reason": stop_reason,
+                "trace_events": _events(trace),
+            }
+        retry_stop_reason = route_budget.record_provider_retries(receipt.retries)
+        if retry_stop_reason is not None:
+            trace = _trace(state)
+            trace.record(
+                "policy",
+                "model_stopped",
+                route=route,
+                reason=retry_stop_reason,
+                model_calls=route_budget.model_calls,
+            )
+            await _persist_new_events(trace_sink, trace.events[-1:])
+            return {
+                "messages": [AIMessage(content="Model service is unavailable for this request.")],
+                "degradation_flags": ["ProviderRetryBudgetExceeded"],
+                "budget_record": route_budget.checkpoint_record().model_dump(mode="json"),
+                "stop_reason": retry_stop_reason,
+                "trace_events": _events(trace),
             }
         answer = f"{'Shadow plan (no business SQL executed): ' if is_shadow else ''}{receipt.content}"
         trace = _trace(state)
@@ -118,10 +239,14 @@ def create_v2_engine(
             prompt_version=receipt.prompt_version,
             prompt_hash=receipt.prompt_hash,
             answer_hash=fingerprint(answer),
+            route=route,
+            model_calls=route_budget.model_calls,
+            budget_policy_version=resolved_budget_policy.version,
         )
         await _persist_new_events(trace_sink, trace.events[-1:])
         result: dict[str, object] = {
             "model_receipt": receipt.model_dump(mode="json"),
+            "budget_record": route_budget.checkpoint_record().model_dump(mode="json"),
             "trace_events": _events(trace),
         }
         if route == "deep" and not is_shadow:
@@ -233,6 +358,21 @@ def _events(trace: TraceEnvelope) -> list[dict[str, object]]:
     return [event.model_dump(mode="json") for event in trace.events]
 
 
+def _route_budget_from_state(
+    state: V2EngineState,
+    *,
+    route: RouteName,
+    policy: RoutingBudgetPolicy,
+) -> RouteBudgetLedger:
+    record = state.get("budget_record")
+    if isinstance(record, dict):
+        ledger = RouteBudgetLedger.from_record(policy=policy, record=record)
+        if ledger.route != route:
+            raise ValueError("checkpoint route does not match the active route decision")
+        return ledger
+    return RouteBudgetLedger(route=route, policy=policy)
+
+
 def _trace_id(state: V2EngineState) -> str:
     runtime = var_child_runnable_config.get()
     configurable = runtime.get("configurable", {}) if isinstance(runtime, dict) else {}
@@ -257,4 +397,7 @@ def _signals(question: str) -> RiskSignals:
         ambiguous_metric_or_filter=any(token in lower for token in ("可能", "大概", "全部")),
         dynamic_calculation=any(token in lower for token in ("同比", "环比", "排名", "自定义计算")),
         unknown_explain_cost=True,
+        # Until a deterministic compiler/executor is wired, a low-risk request
+        # must be promoted to Standard instead of spending a model call on Fast.
+        requires_model=True,
     )
