@@ -20,7 +20,7 @@ from src.nl2sql.v2 import QueryRequest, register_v1_gone_routes, register_v2_rou
 THREAD_ID = UUID("11111111-1111-1111-1111-111111111111")
 
 
-class FakeSupervisor:
+class FakeEngine:
     def __init__(self, owned_thread: str) -> None:
         self.owned_thread = owned_thread
 
@@ -40,7 +40,7 @@ class FakeSupervisor:
             yield state
 
 
-class CapturingSupervisor(FakeSupervisor):
+class CapturingEngine(FakeEngine):
     def __init__(self, owned_thread: str) -> None:
         super().__init__(owned_thread)
         self.last_config: dict[str, object] | None = None
@@ -56,11 +56,17 @@ class CapturingSupervisor(FakeSupervisor):
 
 
 class FakeContainer:
-    def __init__(self, supervisor: FakeSupervisor) -> None:
-        self._supervisor = supervisor
+    def __init__(self, engine: FakeEngine) -> None:
+        self._engine = engine
 
-    async def get_supervisor(self) -> FakeSupervisor:
-        return self._supervisor
+    async def get_engine(self) -> FakeEngine:
+        return self._engine
+
+
+class MissingEngineContainer:
+    def readiness_report(self, *, model_available: bool) -> dict[str, str]:
+        del model_available
+        return {"status": "ready"}
 
 
 def _context_for(user_id: str) -> RequestContext:
@@ -76,9 +82,9 @@ def _context_for(user_id: str) -> RequestContext:
     )
 
 
-def _app_for(supervisor: FakeSupervisor) -> FastAPI:
+def _app_for(engine: FakeEngine) -> FastAPI:
     app = FastAPI()
-    app.state.container = FakeContainer(supervisor)
+    app.state.container = FakeContainer(engine)
     register_v2_routes(app)
     register_v1_gone_routes(app)
     return app
@@ -87,7 +93,7 @@ def _app_for(supervisor: FakeSupervisor) -> FastAPI:
 def test_thread_state_is_namespaced_by_owner() -> None:
     alice = AuthUser(user_id="alice", telephone=None, roles=["analyst"], permissions=["*"])
     bob = AuthUser(user_id="bob", telephone=None, roles=["analyst"], permissions=["*"])
-    app = _app_for(FakeSupervisor(internal_thread_id(_context_for("alice"))))
+    app = _app_for(FakeEngine(internal_thread_id(_context_for("alice"))))
 
     async def alice_dependency() -> AuthUser:
         return alice
@@ -108,7 +114,7 @@ def test_thread_state_is_namespaced_by_owner() -> None:
 
 
 def test_legacy_routes_return_migration_error() -> None:
-    app = _app_for(FakeSupervisor(internal_thread_id(_context_for("alice"))))
+    app = _app_for(FakeEngine(internal_thread_id(_context_for("alice"))))
     with TestClient(app) as client:
         response = client.post("/nl2sql/invoke")
     assert response.status_code == 410
@@ -149,6 +155,30 @@ def test_query_payload_limits_count_total_and_utf8_bytes() -> None:
         )
 
 
+def test_query_rejects_a_container_without_the_typed_engine_boundary() -> None:
+    app = FastAPI()
+    app.state.container = MissingEngineContainer()
+    register_v2_routes(app)
+
+    async def user_dependency() -> AuthUser:
+        return AuthUser(
+            user_id="alice",
+            telephone=None,
+            roles=["analyst"],
+            permissions=["nl2sql:invoke"],
+        )
+
+    app.dependency_overrides[require_nl2sql_permission] = user_dependency
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v2/nl2sql/queries",
+            json={"messages": [{"role": "user", "content": "show revenue"}]},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "runtime engine unavailable"}
+
+
 def test_thread_namespace_is_safe_for_user_ids_with_delimiters() -> None:
     namespaced = internal_thread_id(_context_for("alice:engineering"))
     assert namespaced == f"default:alice%3Aengineering:{THREAD_ID}"
@@ -165,8 +195,8 @@ def test_runtime_config_propagates_request_identity_to_subgraphs() -> None:
 
 
 def test_query_api_propagates_authenticated_identity_to_runtime() -> None:
-    supervisor = CapturingSupervisor(internal_thread_id(_context_for("alice")))
-    app = _app_for(supervisor)
+    engine = CapturingEngine(internal_thread_id(_context_for("alice")))
+    app = _app_for(engine)
 
     async def alice_dependency() -> AuthUser:
         return AuthUser(
@@ -188,8 +218,8 @@ def test_query_api_propagates_authenticated_identity_to_runtime() -> None:
         )
 
     assert response.status_code == 200
-    assert supervisor.last_config is not None
-    configurable = cast(dict[str, object], supervisor.last_config["configurable"])
+    assert engine.last_config is not None
+    configurable = cast(dict[str, object], engine.last_config["configurable"])
     identity = cast(dict[str, object], configurable["request_identity"])
     assert configurable["thread_id"] == f"default:alice:{THREAD_ID}"
     assert identity == {
@@ -205,7 +235,7 @@ def test_capabilities_explain_when_codeact_is_disabled(monkeypatch: pytest.Monke
     from src.nl2sql.config.settings import AgentConfig
     from src.nl2sql.infra.llm import gateway
 
-    app = _app_for(FakeSupervisor(internal_thread_id(_context_for("alice"))))
+    app = _app_for(FakeEngine(internal_thread_id(_context_for("alice"))))
     monkeypatch.setattr(v2, "get_agent_config", lambda: AgentConfig(_env_file=None))
     monkeypatch.setattr(gateway, "model_gateway_available", lambda: True)
 

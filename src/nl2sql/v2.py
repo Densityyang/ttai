@@ -187,18 +187,20 @@ async def _engine_from_request(request: Request) -> Any:
                 detail="runtime dependencies are unavailable",
             )
     get_engine = getattr(container, "get_engine", None)
-    if callable(get_engine):
-        from src.nl2sql.container import RuntimeDependencyUnavailable
+    if not callable(get_engine):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="runtime engine unavailable",
+        )
+    from src.nl2sql.container import RuntimeDependencyUnavailable
 
-        try:
-            return await cast(Callable[[], Awaitable[Any]], get_engine)()
-        except RuntimeDependencyUnavailable as exc:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="runtime dependency unavailable",
-            ) from exc
-    # Compatibility with test doubles from the v2-contract PR.
-    return await container.get_supervisor()
+    try:
+        return await cast(Callable[[], Awaitable[Any]], get_engine)()
+    except RuntimeDependencyUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="runtime dependency unavailable",
+        ) from exc
 
 
 def register_v2_routes(app: FastAPI) -> None:

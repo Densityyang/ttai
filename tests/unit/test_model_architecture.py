@@ -44,6 +44,24 @@ def test_external_model_clients_are_confined_to_the_gateway_compatibility_bounda
     assert offenders == []
 
 
+def test_legacy_provider_factory_is_only_loaded_by_the_guarded_gateway_bridge() -> None:
+    root = Path(__file__).resolve().parents[2]
+    factory_module = "src.nl2sql.infra.llm.factory"
+    importers: list[str] = []
+    for path in (root / "src").rglob("*.py"):
+        relative = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == factory_module:
+                importers.append(relative)
+            elif isinstance(node, ast.Import) and any(
+                alias.name == factory_module for alias in node.names
+            ):
+                importers.append(relative)
+
+    assert importers == ["src/nl2sql/infra/llm/gateway.py"]
+
+
 def test_raw_chat_completion_http_calls_are_gateway_only() -> None:
     root = Path(__file__).resolve().parents[2]
     gateway = "src/nl2sql/infra/llm/gateway.py"
@@ -61,7 +79,12 @@ def test_v2_runtime_uses_explicit_engine_not_supervisor() -> None:
     root = Path(__file__).resolve().parents[2]
     container = (root / "src/nl2sql/container.py").read_text(encoding="utf-8")
     v2_api = (root / "src/nl2sql/v2.py").read_text(encoding="utf-8")
+    legacy_registry = (root / "src/nl2sql/infra/runtime/registry.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "create_v2_engine" in container
     assert "create_supervisor" not in container
     assert "_engine_from_request" in v2_api
+    assert "get_supervisor" not in v2_api
+    assert "get_legacy_model" not in legacy_registry
