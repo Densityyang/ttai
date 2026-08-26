@@ -26,7 +26,7 @@ dependencies = [
     "pydantic-settings>=2.14.2",
     "sqlalchemy>=2.0.46",
     "sqlglot>=26.0.0",
-    "sqlparse>=0.5.0",
+    "sqlparse>=0.6.0",
     "sse-starlette>=3.2.0",
     "structlog>=25.5.0",
     "typer>=0.15.0",
@@ -43,7 +43,7 @@ default = true
 
 [dependency-groups]
 dev = [
-    "pip>=26.1.2",
+    "pip>=26.2",
     "paramiko>=3.0.0",
     "pip-audit>=2.9.0",
     "pyright>=1.1.400",
