@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Literal
+from datetime import date
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 ModelStage = Literal["classify", "retrieve", "plan", "generate_sql", "verify", "answer"]
 ModelDataClassification = Literal["public", "internal", "confidential", "restricted"]
@@ -45,21 +46,368 @@ class PolicyDecision(StrictContract):
     reason: str | None = None
 
 
+class TimeRange(StrictContract):
+    """Explicit business time boundary; free-text dates never reach execution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    start: date
+    end: date
+    timezone: str = Field(default="Asia/Shanghai", min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_order(self) -> TimeRange:
+        if self.end < self.start:
+            raise ValueError("time range end cannot be before start")
+        return self
+
+
+class BoundFilter(StrictContract):
+    """A typed filter bound to a semantic field, never an SQL fragment."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    field_ref: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_.-]*$",
+    )
+    operator: Literal[
+        "eq",
+        "ne",
+        "in",
+        "between",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "is_null",
+        "is_not_null",
+    ]
+    value: JsonValue | None = None
+    source: Literal["user", "entity_alias", "semantic_default"]
+
+    @model_validator(mode="after")
+    def validate_operator_value(self) -> BoundFilter:
+        if self.value is not None:
+            try:
+                json.dumps(self.value, allow_nan=False, ensure_ascii=False)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("filter value must be finite JSON") from exc
+        if self.operator in {"is_null", "is_not_null"}:
+            if self.value is not None:
+                raise ValueError(f"{self.operator} filter must not carry a value")
+            return self
+        if self.value is None:
+            raise ValueError(f"{self.operator} filter requires a value")
+        if self.operator == "in" and (
+            not isinstance(self.value, list) or not self.value
+        ):
+            raise ValueError("in filter requires a non-empty JSON array")
+        if self.operator == "between" and (
+            not isinstance(self.value, list) or len(self.value) != 2
+        ):
+            raise ValueError("between filter requires a two-item JSON array")
+        return self
+
+
 class ContextBundle(StrictContract):
-    semantic_version: str
-    schema_slice: dict[str, Any] = Field(default_factory=dict)
-    evidence_ids: tuple[str, ...] = ()
-    token_cost: int = Field(ge=0)
-    confidence: float = Field(ge=0, le=1)
+    """Policy-filtered, release-bound semantic context safe for checkpointing."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    semantic_release_id: UUID
+    schema_snapshot_id: UUID
+    domains: tuple[str, ...] = Field(min_length=1, max_length=8)
+    asset_ids: tuple[str, ...] = Field(min_length=1, max_length=20)
+    approved_relation_ids: tuple[str, ...] = Field(default=(), max_length=8)
+    approved_edge_ids: tuple[str, ...] = Field(default=(), max_length=16)
+    resolution_status: Literal["resolved", "ambiguous", "incomplete", "conflict"]
+    unresolved_slots: tuple[str, ...] = Field(default=(), max_length=16)
+    conflict_ids: tuple[str, ...] = Field(default=(), max_length=16)
+    degradation_flags: tuple[str, ...] = Field(default=(), max_length=16)
+    token_cost: int = Field(default=0, ge=0, le=10_000)
+    evidence_count: int = Field(default=0, ge=0, le=20)
+
+    @field_validator(
+        "domains",
+        "asset_ids",
+        "approved_relation_ids",
+        "approved_edge_ids",
+        "unresolved_slots",
+        "conflict_ids",
+        "degradation_flags",
+    )
+    @classmethod
+    def validate_unique_non_empty_values(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item.strip() for item in value):
+            raise ValueError("context identifiers must be non-empty")
+        if len(set(value)) != len(value):
+            raise ValueError("context identifiers must be unique")
+        return value
+
+    @property
+    def checksum(self) -> str:
+        return _contract_checksum(self)
 
 
 class QueryPlan(StrictContract):
-    intent: str
-    metric: str | None = None
-    dimensions: tuple[str, ...] = ()
-    filters: tuple[str, ...] = ()
-    grain: str | None = None
-    risk: Literal["low", "medium", "high"] = "low"
+    """Untrusted declarative proposal; it cannot execute without validation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["3.0"] = "3.0"
+    intent: Literal["metric", "trend", "comparison", "ranking", "detail"]
+    domain: str = Field(min_length=1, max_length=128)
+    metric_keys: tuple[str, ...] = Field(min_length=1, max_length=16)
+    dimensions: tuple[str, ...] = Field(default=(), max_length=16)
+    filters: tuple[BoundFilter, ...] = Field(default=(), max_length=32)
+    time_range: TimeRange
+    grain: Literal["hour", "day", "week", "month", "quarter", "year"]
+    source_strategy: Literal["aggregate_first", "detail_required"]
+    required_permissions: tuple[str, ...] = Field(default=(), max_length=32)
+    unresolved_slots: tuple[str, ...] = Field(default=(), max_length=16)
+
+    @field_validator(
+        "metric_keys",
+        "dimensions",
+        "required_permissions",
+        "unresolved_slots",
+    )
+    @classmethod
+    def validate_unique_plan_values(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item.strip() for item in value):
+            raise ValueError("query plan identifiers must be non-empty")
+        if len(set(value)) != len(value):
+            raise ValueError("query plan identifiers must be unique")
+        return value
+
+    @property
+    def checksum(self) -> str:
+        return _contract_checksum(self)
+
+
+PlanStepId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
+PlanInputName = Annotated[
+    str,
+    Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$"),
+]
+PlanInputRef = Annotated[
+    str,
+    Field(
+        max_length=256,
+        pattern=(
+            r"^[a-z][a-z0-9_-]{0,63}"
+            r"(?:\.(?:[A-Za-z_][A-Za-z0-9_-]{0,63}|[0-9]+))*$"
+        ),
+    ),
+]
+
+
+class FetchMetricStep(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["fetch_metric"] = "fetch_metric"
+    step_id: PlanStepId
+    metric_keys: tuple[str, ...] = Field(min_length=1, max_length=16)
+    depends_on: tuple[PlanStepId, ...] = Field(default=(), max_length=16)
+
+    @field_validator("metric_keys", "depends_on")
+    @classmethod
+    def validate_unique_fetch_values(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("fetch metric values must be unique")
+        return value
+
+
+class TrustedCalculationStep(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["trusted_calculation"] = "trusted_calculation"
+    step_id: PlanStepId
+    template_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    input_refs: dict[PlanInputName, PlanInputRef] = Field(min_length=1, max_length=32)
+    depends_on: tuple[PlanStepId, ...] = Field(min_length=1, max_length=16)
+
+    @field_validator("depends_on")
+    @classmethod
+    def validate_unique_calculation_dependencies(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("calculation dependencies must be unique")
+        return value
+
+
+class VerifyStep(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["verify"] = "verify"
+    step_id: PlanStepId
+    input_refs: tuple[PlanInputRef, ...] = Field(min_length=1, max_length=32)
+    invariant_ids: tuple[str, ...] = Field(min_length=1, max_length=32)
+    depends_on: tuple[PlanStepId, ...] = Field(min_length=1, max_length=16)
+
+    @field_validator("input_refs", "invariant_ids", "depends_on")
+    @classmethod
+    def validate_unique_verify_values(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("verify values must be unique")
+        return value
+
+
+PlanStep = Annotated[
+    FetchMetricStep | TrustedCalculationStep | VerifyStep,
+    Field(discriminator="kind"),
+]
+
+
+class ExecutionPlan(StrictContract):
+    """Registered typed DAG compiled from one validated QueryPlan."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    query_plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    semantic_release_id: UUID
+    schema_snapshot_id: UUID
+    policy_version: str = Field(min_length=1, max_length=128)
+    steps: tuple[PlanStep, ...] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_typed_dag(self) -> ExecutionPlan:
+        step_ids = [step.step_id for step in self.steps]
+        if len(set(step_ids)) != len(step_ids):
+            raise ValueError("execution plan step ids must be unique")
+        known = set(step_ids)
+        dependencies: dict[str, set[str]] = {}
+        for step in self.steps:
+            current = set(step.depends_on)
+            if step.step_id in current:
+                raise ValueError("execution plan step cannot depend on itself")
+            unknown = current - known
+            if unknown:
+                raise ValueError(f"execution plan dependency is unknown: {sorted(unknown)[0]}")
+            dependencies[step.step_id] = current
+            refs: tuple[str, ...]
+            if isinstance(step, TrustedCalculationStep):
+                refs = tuple(step.input_refs.values())
+            elif isinstance(step, VerifyStep):
+                refs = step.input_refs
+            else:
+                refs = ()
+            for ref in refs:
+                root = ref.split(".", 1)[0]
+                if root not in known:
+                    raise ValueError(f"execution plan input ref is unknown: {root}")
+                if root not in current:
+                    raise ValueError(
+                        f"execution plan input ref must be declared as a dependency: {root}"
+                    )
+
+        resolved: set[str] = set()
+        pending = dict(dependencies)
+        while pending:
+            ready = sorted(step_id for step_id, deps in pending.items() if deps <= resolved)
+            if not ready:
+                raise ValueError("execution plan dependencies contain a cycle")
+            for step_id in ready:
+                resolved.add(step_id)
+                pending.pop(step_id)
+        return self
+
+    @property
+    def checksum(self) -> str:
+        return _contract_checksum(self)
+
+
+class PlanValidationIssue(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(min_length=1, max_length=128)
+    path: str = Field(default="", max_length=256)
+    safe_message: str = Field(min_length=1, max_length=512)
+
+
+class PlanValidationRecord(StrictContract):
+    """Replayable result of validating a query or compiled execution plan."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    policy_version: str = Field(min_length=1, max_length=128)
+    policy_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    outcome: Literal["allow", "deny", "clarify", "approval"]
+    query_plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    context_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    issues: tuple[PlanValidationIssue, ...] = Field(default=(), max_length=32)
+
+    @model_validator(mode="after")
+    def validate_outcome_issues(self) -> PlanValidationRecord:
+        if self.outcome == "allow" and self.issues:
+            raise ValueError("allow validation record cannot contain issues")
+        if self.outcome != "allow" and not self.issues:
+            raise ValueError("non-allow validation record must contain issues")
+        return self
+
+
+class PlanStepReceipt(StrictContract):
+    """Secret-free execution metadata; row values and SQL are never checkpointed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    step_id: PlanStepId
+    kind: Literal["fetch_metric", "trusted_calculation", "verify"]
+    status: Literal["succeeded", "failed"]
+    elapsed_ms: int = Field(ge=0)
+    output_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    error_code: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_step_status(self) -> PlanStepReceipt:
+        if self.status == "succeeded" and self.error_code is not None:
+            raise ValueError("successful step cannot contain an error code")
+        if self.status == "succeeded" and self.output_digest is None:
+            raise ValueError("successful step requires an output digest")
+        if self.status == "failed" and self.error_code is None:
+            raise ValueError("failed step requires an error code")
+        if self.status == "failed" and self.output_digest is not None:
+            raise ValueError("failed step cannot contain an output digest")
+        return self
+
+
+class PlanExecutionRecord(StrictContract):
+    """Checkpoint-safe summary emitted by the typed PlanExecutor."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    execution_plan_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: Literal["succeeded", "failed", "deadline_exceeded"]
+    step_receipts: tuple[PlanStepReceipt, ...] = Field(default=(), max_length=16)
+    output_step_ids: tuple[PlanStepId, ...] = Field(default=(), max_length=16)
+    stop_reason: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_execution_status(self) -> PlanExecutionRecord:
+        if self.status == "succeeded" and self.stop_reason is not None:
+            raise ValueError("successful execution cannot contain a stop reason")
+        if self.status != "succeeded" and self.stop_reason is None:
+            raise ValueError("failed execution requires a stop reason")
+        receipt_ids = tuple(receipt.step_id for receipt in self.step_receipts)
+        if len(set(receipt_ids)) != len(receipt_ids):
+            raise ValueError("execution step receipts must be unique")
+        successful_ids = tuple(
+            receipt.step_id
+            for receipt in self.step_receipts
+            if receipt.status == "succeeded"
+        )
+        if self.output_step_ids != successful_ids:
+            raise ValueError("execution outputs must match successful step receipts")
+        if self.status == "succeeded" and (
+            not self.step_receipts
+            or any(receipt.status != "succeeded" for receipt in self.step_receipts)
+        ):
+            raise ValueError("successful execution requires only successful step receipts")
+        return self
 
 
 class RoutePolicy(StrictContract):
@@ -260,6 +608,7 @@ class ModelReceipt(StrictContract):
 def _contract_checksum(contract: BaseModel) -> str:
     payload = json.dumps(
         contract.model_dump(mode="json"),
+        allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,

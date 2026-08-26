@@ -18,6 +18,7 @@ class RiskSignals:
     dynamic_calculation: bool = False
     unknown_explain_cost: bool = False
     requires_model: bool = False
+    fast_budget_available: bool = True
 
     def __post_init__(self) -> None:
         if self.table_count < 1:
@@ -60,7 +61,7 @@ class RouteDecision:
 
 def bootstrap_route_policy() -> RoutePolicy:
     return RoutePolicy(
-        version="route.bootstrap.v1",
+        version="route.bootstrap.v2",
         state="bootstrap",
         fast_max_risk=20,
         fast_min_confidence=0.85,
@@ -86,7 +87,11 @@ def choose_route(
         and confidence >= resolved_policy.fast_min_confidence
         and signals.table_count <= resolved_policy.fast_max_tables
     )
-    if fast_candidate and not signals.requires_model:
+    if (
+        fast_candidate
+        and not signals.requires_model
+        and signals.fast_budget_available
+    ):
         route: Route = "fast"
         reason = "low_risk_high_confidence"
     elif (
@@ -94,7 +99,14 @@ def choose_route(
         and confidence >= resolved_policy.standard_min_confidence
     ):
         route = "standard"
-        reason = "model_required" if fast_candidate else "bounded_risk"
+        if (
+            fast_candidate
+            and not signals.requires_model
+            and not signals.fast_budget_available
+        ):
+            reason = "fast_budget_unavailable"
+        else:
+            reason = "model_required" if fast_candidate else "bounded_risk"
     else:
         route = "deep"
         reason = "high_risk_or_low_confidence"

@@ -76,7 +76,7 @@ async def test_explicit_engine_promotes_model_required_fast_candidate_to_standar
 
     assert result["route_record"]["route"] == "standard"
     assert result["route_record"]["reason"] == "model_required"
-    assert result["route_record"]["policy_version"] == "route.bootstrap.v1"
+    assert result["route_record"]["policy_version"] == "route.bootstrap.v2"
     assert result["model_receipt"]["profile_version"] == "test-v1"
     assert len(result["model_receipt"]["profile_checksum"]) == 64
     assert result["model_receipt"]["prompt_version"] == "v2-engine-v1"

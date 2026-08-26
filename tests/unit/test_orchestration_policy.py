@@ -22,6 +22,12 @@ from src.nl2sql.orchestration.routing import (
     [
         (RiskSignals(), 0.90, "fast", "low_risk_high_confidence"),
         (RiskSignals(requires_model=True), 0.90, "standard", "model_required"),
+        (
+            RiskSignals(fast_budget_available=False),
+            0.90,
+            "standard",
+            "fast_budget_unavailable",
+        ),
         (RiskSignals(table_count=2), 0.90, "standard", "bounded_risk"),
         (
             RiskSignals(
@@ -47,7 +53,7 @@ def test_bootstrap_route_truth_table_is_replayable(
 
     assert decision.route == route
     assert decision.reason == reason
-    assert decision.policy_version == "route.bootstrap.v1"
+    assert decision.policy_version == "route.bootstrap.v2"
     assert len(decision.policy_checksum) == 64
     assert (
         choose_route(signals=signals, confidence=confidence, policy=policy).replay_record()
