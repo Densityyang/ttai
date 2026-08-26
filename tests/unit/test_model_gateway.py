@@ -1,24 +1,37 @@
 from __future__ import annotations
 
 import json
+import sys
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.nl2sql.contracts import ModelRequest
+from src.nl2sql.infra.llm import gateway as gateway_module
 from src.nl2sql.infra.llm.gateway import (
     FakeProvider,
     ModelGateway,
+    ModelOutputInvalid,
     ModelPolicyDenied,
     ModelProfile,
     ModelTarget,
     OpenAICompatibleProvider,
     ProviderResponse,
     ProviderUnavailable,
+    StructuredOutputMode,
 )
 from src.nl2sql.orchestration.budget import BudgetExceeded, CallBudget, should_stop
 from src.nl2sql.orchestration.routing import RiskSignals, choose_route
 from src.nl2sql.orchestration.shadow import is_shadow_sample
+
+
+class _StructuredAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    answer: str
+    confidence: float = Field(ge=0, le=1)
 
 
 def _request(*, alias: str, stage: str = "answer") -> ModelRequest:
@@ -67,6 +80,31 @@ def _gateway() -> ModelGateway:
     return ModelGateway(providers={"primary": primary, "fallback": fallback}, profiles=profiles)
 
 
+def _structured_gateway(content: str) -> ModelGateway:
+    provider = FakeProvider(
+        {
+            "small": ProviderResponse(
+                content=content,
+                model="small-resolved",
+                usage={"input_tokens": 4, "output_tokens": 6},
+                finish_reason="stop",
+            )
+        }
+    )
+    return ModelGateway(
+        providers={"fake": provider},
+        profiles={
+            "fast.default": ModelProfile(
+                "fast.default",
+                "test-v1",
+                frozenset({"answer"}),
+                ModelTarget("fake", "small", "small"),
+                None,
+            )
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_gateway_uses_only_configured_small_fallback() -> None:
     receipt = await _gateway().invoke(
@@ -82,7 +120,89 @@ async def test_gateway_uses_only_configured_small_fallback() -> None:
     assert receipt.profile_checksum == _gateway().profile_checksum("fast.default")
     assert receipt.prompt_version == "test-prompt-v1"
     assert len(receipt.prompt_hash) == 64
+    assert receipt.output_schema_checksum is None
     assert "show revenue" not in receipt.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_gateway_validates_structured_output_and_keeps_a_replayable_receipt() -> None:
+    gateway = _structured_gateway('{"answer":"Revenue is stable","confidence":0.8}')
+    budget = CallBudget(deadline_ms=1_000, token_budget=100, cost_budget=1, max_attempts=1)
+
+    result = await gateway.invoke_structured(
+        _request(alias="fast.default"),
+        budget,
+        _StructuredAnswer,
+    )
+
+    assert result.output == _StructuredAnswer(answer="Revenue is stable", confidence=0.8)
+    assert result.receipt.resolved_model == "small-resolved"
+    assert len(result.receipt.output_schema_checksum or "") == 64
+    assert _StructuredAnswer.model_validate_json(result.receipt.content) == result.output
+    assert result.receipt.usage == {"input_tokens": 4, "output_tokens": 6}
+    assert budget.attempts == 1
+    assert budget.tokens_used == 10
+
+
+@pytest.mark.asyncio
+async def test_structured_schema_mismatch_is_denied_before_the_model_call() -> None:
+    gateway = _structured_gateway('{"answer":"unused","confidence":0.5}')
+    request = _request(alias="fast.default").model_copy(
+        update={"tool_schema": {"title": "Different", "type": "string"}}
+    )
+    budget = CallBudget(deadline_ms=1_000, token_budget=100, cost_budget=1, max_attempts=1)
+
+    with pytest.raises(ModelPolicyDenied, match="structured_output_schema_mismatch"):
+        await gateway.invoke_structured(request, budget, _StructuredAnswer)
+
+    assert budget.attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_structured_output_preserves_only_safe_receipt_metadata() -> None:
+    gateway = _structured_gateway('{"answer":"unsafe raw value","confidence":2.0}')
+    budget = CallBudget(deadline_ms=1_000, token_budget=100, cost_budget=1, max_attempts=1)
+
+    with pytest.raises(ModelOutputInvalid) as raised:
+        await gateway.invoke_structured(
+            _request(alias="fast.default"),
+            budget,
+            _StructuredAnswer,
+        )
+
+    assert raised.value.failure.model_dump(mode="json") == {
+        "code": "model_output_validation_failed",
+        "retryable": False,
+        "provider": "fake",
+        "status_code": None,
+        "attempted_providers": ["fake"],
+        "causes": ["less_than_equal"],
+    }
+    assert raised.value.receipt.content == ""
+    assert raised.value.receipt.resolved_model == "small-resolved"
+    assert raised.value.receipt.usage == {"input_tokens": 4, "output_tokens": 6}
+    assert len(raised.value.receipt.output_schema_checksum or "") == 64
+    assert "unsafe raw value" not in str(raised.value)
+    assert raised.value.__context__ is None
+    assert budget.tokens_used == 10
+
+
+def test_product_mode_denies_legacy_model_bridge_before_loading_the_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory_module = "src.nl2sql.infra.llm.factory"
+    monkeypatch.delitem(sys.modules, factory_module, raising=False)
+    monkeypatch.setattr(
+        gateway_module,
+        "get_settings",
+        lambda: SimpleNamespace(service_mode="product"),
+    )
+
+    with pytest.raises(ModelPolicyDenied, match="legacy_model_disabled_in_product") as raised:
+        gateway_module.get_legacy_model()
+
+    assert raised.value.code == "legacy_model_disabled_in_product"
+    assert factory_module not in sys.modules
 
 
 def test_profile_checksum_is_canonical_and_covers_routing_policy() -> None:
@@ -369,6 +489,62 @@ async def test_openai_compatible_adapter_classifies_http_failures(
     assert raised.value.code == expected_code
     assert raised.value.retryable is retryable
     assert raised.value.failure.status_code == status_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["json_schema", "json_object"])
+async def test_openai_compatible_adapter_translates_structured_output_mode(
+    mode: StructuredOutputMode,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "model": "small-resolved",
+                "choices": [
+                    {
+                        "message": {"content": '{"answer":"ok","confidence":1}'},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+            },
+        )
+
+    provider = OpenAICompatibleProvider(
+        "primary",
+        "https://provider.invalid/v1",
+        "test",
+        transport=httpx.MockTransport(handler),
+        structured_output_mode=mode,
+    )
+    schema = _StructuredAnswer.model_json_schema()
+
+    await provider.complete(
+        model="small",
+        messages=[{"role": "user", "content": "hello"}],
+        timeout_ms=1_000,
+        max_output_tokens=10,
+        response_schema=schema,
+    )
+
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    if mode == "json_schema":
+        assert payload["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "_StructuredAnswer",
+                "strict": True,
+                "schema": schema,
+            },
+        }
+    else:
+        assert payload["response_format"] == {"type": "json_object"}
 
 
 @pytest.mark.asyncio

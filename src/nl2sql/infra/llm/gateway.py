@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import Any, Protocol
+from typing import Any, Generic, Literal, Protocol, TypeVar
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from src.core.secrets import SecretProvider
 from src.core.settings import get_settings
@@ -17,6 +19,9 @@ from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import ModelFailure, ModelReceipt, ModelRequest, ModelStage
 from src.nl2sql.infra.llm.profiles import ModelProfile, ModelTarget
 from src.nl2sql.orchestration.budget import BudgetExceeded, CallBudget, should_stop
+
+StructuredOutputMode = Literal["json_schema", "json_object"]
+StructuredT = TypeVar("StructuredT", bound=BaseModel)
 
 
 class ModelGatewayError(RuntimeError):
@@ -76,6 +81,20 @@ class ProviderUnavailable(ModelGatewayError):
         )
 
 
+class ModelOutputInvalid(ModelGatewayError):
+    """Structured output failed local validation after a billable model call."""
+
+    def __init__(self, receipt: ModelReceipt, issues: tuple[str, ...]) -> None:
+        self.receipt = receipt.model_copy(update={"content": ""})
+        super().__init__(
+            "model_output_validation_failed",
+            retryable=False,
+            provider=receipt.provider,
+            attempted_providers=(receipt.provider,),
+            causes=issues,
+        )
+
+
 @dataclass(frozen=True)
 class ProviderResponse:
     content: str
@@ -84,12 +103,24 @@ class ProviderResponse:
     finish_reason: str
 
 
+@dataclass(frozen=True)
+class StructuredModelResult(Generic[StructuredT]):
+    output: StructuredT
+    receipt: ModelReceipt
+
+
 class ProviderAdapter(Protocol):
     @property
     def provider_name(self) -> str: ...
 
     async def complete(
-        self, *, model: str, messages: list[dict[str, Any]], timeout_ms: int, max_output_tokens: int
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        timeout_ms: int,
+        max_output_tokens: int,
+        response_schema: dict[str, Any] | None = None,
     ) -> ProviderResponse: ...
 
     async def list_models(self) -> tuple[str, ...]: ...
@@ -103,6 +134,11 @@ class OpenAICompatibleProvider:
     transport: httpx.AsyncBaseTransport | None = field(
         default=None, repr=False, compare=False
     )
+    structured_output_mode: StructuredOutputMode = "json_schema"
+
+    def __post_init__(self) -> None:
+        if self.structured_output_mode not in {"json_schema", "json_object"}:
+            raise ValueError("unsupported structured output mode")
 
     async def complete(
         self,
@@ -111,6 +147,7 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, Any]],
         timeout_ms: int,
         max_output_tokens: int,
+        response_schema: dict[str, Any] | None = None,
     ) -> ProviderResponse:
         try:
             async with httpx.AsyncClient(
@@ -121,12 +158,13 @@ class OpenAICompatibleProvider:
                 response = await client.post(
                     "/chat/completions",
                     headers={"Authorization": f"Bearer {self.api_key}"},
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "stream": False,
-                        "max_tokens": max_output_tokens,
-                    },
+                    json=_completion_payload(
+                        model=model,
+                        messages=messages,
+                        max_output_tokens=max_output_tokens,
+                        response_schema=response_schema,
+                        structured_output_mode=self.structured_output_mode,
+                    ),
                 )
                 response.raise_for_status()
         except (httpx.TimeoutException, TimeoutError) as exc:
@@ -234,9 +272,15 @@ class FakeProvider:
     provider_name: str = "fake"
 
     async def complete(
-        self, *, model: str, messages: list[dict[str, Any]], timeout_ms: int, max_output_tokens: int
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        timeout_ms: int,
+        max_output_tokens: int,
+        response_schema: dict[str, Any] | None = None,
     ) -> ProviderResponse:
-        del messages, timeout_ms, max_output_tokens
+        del messages, timeout_ms, max_output_tokens, response_schema
         try:
             response = self.responses[model]
         except KeyError as exc:
@@ -340,9 +384,32 @@ class ModelGateway:
             profile_checksum=profile.checksum,
             prompt_version=request.prompt_version,
             prompt_hash=_prompt_hash(request),
+            output_schema_checksum=_schema_checksum(request.tool_schema),
             content=response.content,
             estimated_cost=cost,
         )
+
+    async def invoke_structured(
+        self,
+        request: ModelRequest,
+        budget: CallBudget,
+        response_model: type[StructuredT],
+    ) -> StructuredModelResult[StructuredT]:
+        """Invoke one profile and validate its JSON output against a Pydantic model."""
+        response_schema = response_model.model_json_schema()
+        if request.tool_schema is not None and request.tool_schema != response_schema:
+            raise ModelPolicyDenied("structured_output_schema_mismatch")
+        structured_request = request.model_copy(update={"tool_schema": response_schema})
+        receipt = await self.invoke(structured_request, budget)
+        try:
+            output = response_model.model_validate_json(receipt.content)
+        except ValidationError as exc:
+            issues = tuple(
+                sorted({str(issue.get("type") or "validation_error") for issue in exc.errors()})
+            ) or ("validation_error",)
+        else:
+            return StructuredModelResult(output=output, receipt=receipt)
+        raise ModelOutputInvalid(receipt, issues)
 
     async def _invoke_target(
         self, target: ModelTarget, request: ModelRequest, budget: CallBudget
@@ -369,6 +436,7 @@ class ModelGateway:
                 messages=request.messages,
                 timeout_ms=timeout_ms,
                 max_output_tokens=remaining_tokens,
+                response_schema=request.tool_schema,
             )
         except ProviderUnavailable:
             circuit.failures += 1
@@ -418,9 +486,19 @@ def build_model_gateway() -> ModelGateway:
     nvidia_key = _secret("NVIDIA_API_KEY")
     providers: dict[str, ProviderAdapter] = {}
     if deepseek_key:
-        providers["deepseek"] = OpenAICompatibleProvider("deepseek", config.deepseek_base_url, deepseek_key)
+        providers["deepseek"] = OpenAICompatibleProvider(
+            "deepseek",
+            config.deepseek_base_url,
+            deepseek_key,
+            structured_output_mode="json_object",
+        )
     if nvidia_key:
-        providers["nvidia"] = OpenAICompatibleProvider("nvidia", config.nvidia_nim_base_url, nvidia_key)
+        providers["nvidia"] = OpenAICompatibleProvider(
+            "nvidia",
+            config.nvidia_nim_base_url,
+            nvidia_key,
+            structured_output_mode="json_object",
+        )
     nvidia_fallback = (
         ModelTarget("nvidia", config.nvidia_nim_model_fast, "small")
         if nvidia_key and config.nvidia_nim_model_fast
@@ -467,7 +545,9 @@ def get_legacy_model(
     temperature: float = 0,
     streaming: bool = True,
 ) -> Any:
-    """Compatibility bridge for retired graphs that are not reachable from v2."""
+    """Compatibility bridge for retired non-product graphs only."""
+    if get_settings().service_mode == "product":
+        raise ModelPolicyDenied("legacy_model_disabled_in_product")
     from src.nl2sql.infra.llm.factory import build_legacy_provider_model
 
     return build_legacy_provider_model(model_name, openai_base_url, temperature, streaming)
@@ -492,13 +572,58 @@ def _prompt_hash(request: ModelRequest) -> str:
         mode="json",
         include={"messages", "tool_schema"},
     )
+    return _json_checksum(payload)
+
+
+def _schema_checksum(schema: dict[str, Any] | None) -> str | None:
+    return _json_checksum(schema) if schema is not None else None
+
+
+def _json_checksum(value: object) -> str:
     encoded = json.dumps(
-        payload,
+        value,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _completion_payload(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    max_output_tokens: int,
+    response_schema: dict[str, Any] | None,
+    structured_output_mode: StructuredOutputMode,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "max_tokens": max_output_tokens,
+    }
+    if response_schema is None:
+        return payload
+    if structured_output_mode == "json_object":
+        payload["response_format"] = {"type": "json_object"}
+        return payload
+    payload["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": _schema_name(response_schema),
+            "strict": True,
+            "schema": response_schema,
+        },
+    }
+    return payload
+
+
+def _schema_name(schema: dict[str, Any]) -> str:
+    title = schema.get("title")
+    raw_name = title if isinstance(title, str) and title.strip() else "structured_output"
+    normalized = re.sub(r"[^A-Za-z0-9_-]+", "_", raw_name.strip())
+    return (normalized or "structured_output")[:64]
 
 
 def _enforce_budget_envelope(request: ModelRequest, budget: CallBudget) -> None:
