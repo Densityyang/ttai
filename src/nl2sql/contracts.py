@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date
+from datetime import date, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -47,7 +47,7 @@ class PolicyDecision(StrictContract):
 
 
 class TimeRange(StrictContract):
-    """Explicit business time boundary; free-text dates never reach execution."""
+    """Inclusive business dates; compilers use [start midnight, end + 1 day)."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -360,6 +360,9 @@ class PlanStepReceipt(StrictContract):
     status: Literal["succeeded", "failed"]
     elapsed_ms: int = Field(ge=0)
     output_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    data_as_of: datetime | None = None
+    freshness_status: Literal["fresh", "stale", "unknown"] = "unknown"
     error_code: str | None = Field(default=None, min_length=1, max_length=128)
 
     @model_validator(mode="after")
@@ -527,6 +530,9 @@ class ExecutionReceipt(StrictContract):
     sql_fingerprint: str = ""
     policy_version: str = ""
     policy_outcome: Literal["allow", "deny"] = "deny"
+    rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    data_as_of: datetime | None = None
+    freshness_status: Literal["fresh", "stale", "unknown"] = "unknown"
 
 
 class AnswerArtifact(StrictContract):

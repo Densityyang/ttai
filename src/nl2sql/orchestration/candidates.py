@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any, Literal, Sequence
 
@@ -64,7 +66,14 @@ class CandidateDecision:
 
 def rowset_sha256(rowset: Sequence[dict[str, Any]]) -> str:
     """Hash a canonical, typed rowset rather than a natural-language rendering."""
-    normalized = [_normalize_value(row) for row in rowset]
+    if any(not isinstance(row, dict) or any(not isinstance(key, str) for key in row) for row in rowset):
+        raise ValueError("rowset must contain string-keyed rows")
+    if rowset and any(set(row) != set(rowset[0]) for row in rowset):
+        raise ValueError("rowset columns must be consistent")
+    normalized = sorted(
+        (_normalize_value(row) for row in rowset),
+        key=lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
     payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -144,11 +153,29 @@ def _normalize_value(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("nonfinite float is not canonical")
         return {"$float": format(value, ".17g")}
     if isinstance(value, Decimal):
-        return {"$decimal": format(value, "f")}
+        if not value.is_finite():
+            raise ValueError("nonfinite decimal is not canonical")
+        # String normalization avoids Decimal.normalize() context rounding.
+        rendered = format(value, "f")
+        if "." in rendered:
+            rendered = rendered.rstrip("0").rstrip(".")
+        return {"$decimal": "0" if value == 0 else rendered}
+    if isinstance(value, datetime):
+        aware = value.tzinfo is not None and value.utcoffset() is not None
+        return {"$datetime_utc" if aware else "$datetime_local": (
+            value.astimezone(UTC) if aware else value
+        ).isoformat(timespec="microseconds")}
+    if isinstance(value, date):
+        return {"$date": value.isoformat()}
     if isinstance(value, dict):
-        return {str(key): _normalize_value(item) for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("canonical object keys must be strings")
+        # Tag containers to prevent a business object impersonating a scalar tag.
+        return {"$object": [[key, _normalize_value(item)] for key, item in sorted(value.items())]}
     if isinstance(value, (list, tuple)):
         return [_normalize_value(item) for item in value]
-    return {"$type": type(value).__name__, "$value": str(value)}
+    raise ValueError("unsupported canonical value type")
