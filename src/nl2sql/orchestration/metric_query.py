@@ -1,4 +1,4 @@
-"""One deterministic, release-bound count path through QueryGateway.
+"""Deterministic, release-bound aggregate queries through QueryGateway.
 
 Only deployment code supplies sources, eligibility policies and identity. Plans
 cannot select physical names, executable expressions, or disable predicates.
@@ -10,10 +10,11 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, model_validator
 
 from src.nl2sql.contracts import ContextBundle, FetchMetricStep, QueryPlan, RequestIdentity
 from src.nl2sql.infra.governance.query_gateway import QueryGateway
@@ -43,6 +44,23 @@ class EligibilityPolicy(FrozenContract):
     predicates: tuple[Predicate, ...] = ()
 
 
+class OrganizationDimensionBinding(FrozenContract):
+    """Deployment maps semantic organization scopes to stable ID columns only."""
+
+    dimension: Literal["city_company", "area", "team"]
+    field: Identifier | None = None
+    value_type: Literal["text", "integer"] | None = None
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> OrganizationDimensionBinding:
+        if self.dimension == "city_company":
+            if self.field is not None or self.value_type is not None:
+                raise ValueError("city company is a total scope without an ID column")
+        elif self.field is None or self.value_type is None:
+            raise ValueError("area/team require a typed stable ID column")
+        return self
+
+
 class RelationBinding(FrozenContract):
     source_ref: ContractId
     relation_asset_id: str = Field(min_length=1)
@@ -53,6 +71,17 @@ class RelationBinding(FrozenContract):
     approved: Literal[True]
     timestamp_kind: Literal["timestamp", "timestamptz"]
     max_days: int = Field(default=366, ge=1, le=3660)
+    organization_dimensions: tuple[OrganizationDimensionBinding, ...] = (
+        OrganizationDimensionBinding(dimension="city_company"),
+    )
+
+    @model_validator(mode="after")
+    def unique_dimensions(self) -> RelationBinding:
+        names = [item.dimension for item in self.organization_dimensions]
+        fields = [item.field for item in self.organization_dimensions if item.field is not None]
+        if len(set(names)) != len(names) or len(set(fields)) != len(fields):
+            raise ValueError("duplicate organization dimension binding")
+        return self
 
     @property
     def relation_id(self) -> str:
@@ -68,6 +97,8 @@ class CompiledMetricQuery:
     snapshot_checksum: str
     query_plan: QueryPlan = field(repr=False)
     context: ContextBundle = field(repr=False)
+    operation: Literal["count", "ratio"] = "count"
+    dimension: OrganizationDimensionBinding | None = None
 
 
 class MetricQueryCompiler:
@@ -96,7 +127,7 @@ class MetricQueryCompiler:
         )
         if validation.outcome != "allow":
             raise PlanStepError("metric_plan_denied")
-        if len(plan.metric_keys) != 1 or plan.intent not in {"metric", "trend"}:
+        if len(plan.metric_keys) != 1 or plan.intent not in {"metric", "trend", "comparison", "ranking"}:
             raise PlanStepError("metric_operation_unsupported")
         release = await self._read_active()
         if (release is None or release.state != SemanticReleaseState.ACTIVE
@@ -147,8 +178,13 @@ class MetricQueryCompiler:
         columns = {column.name: column.data_type.lower() for column in relation.columns}
         predicates = (Predicate(field="is_valid_for_metrics", operator="is_true"),
                       *policy.predicates, *metric.predicates)
-        used = {metric.business_time_column, *(item.field for item in predicates),
+        formula_predicates = (*predicates, *metric.formula_predicates)
+        dimension, filter_dimensions = _organization_scope(plan, metric, binding)
+        used = {metric.business_time_column, *(item.field for item in formula_predicates),
                 *(item.field for item in metric.filters)}
+        used.update(item.field for item in filter_dimensions.values() if item.field is not None)
+        if dimension is not None and dimension.field is not None:
+            used.add(dimension.field)
         if (not used <= set(binding.allowed_columns) or not used <= columns.keys()
                 or used & set(relation.sensitive_columns)):
             raise PlanStepError("metric_column_unapproved")
@@ -158,9 +194,14 @@ class MetricQueryCompiler:
                           else {"timestamp with time zone", "timestamptz"})
         if time_type not in expected_types or any(
             item.operator == "is_true" and columns[item.field] not in {"boolean", "bool"}
-            for item in predicates
+            for item in formula_predicates
         ):
             raise PlanStepError("metric_column_type_mismatch")
+        for rule in metric.filters:
+            _validate_column_type(rule.value_type, columns[rule.field])
+        for organization in (*filter_dimensions.values(), *((dimension,) if dimension else ())):
+            assert organization.field is not None and organization.value_type is not None
+            _validate_column_type(organization.value_type, columns[organization.field])
         if (plan.grain not in metric.supported_grains
                 or any(item not in metric.supported_dimensions for item in plan.dimensions)):
             raise PlanStepError("metric_grain_or_dimension_unsupported")
@@ -182,32 +223,82 @@ class MetricQueryCompiler:
         params: dict[str, Any] = {"start_at": start, "end_at": end}
         business_time = _quote(metric.business_time_column)
         where = [f"{business_time} >= :start_at", f"{business_time} < :end_at"]
-        where.extend(f'{_quote(item.field)} IS {"TRUE" if item.operator == "is_true" else "NULL"}'
-                     for item in predicates)
+        where.extend(_predicate_sql(item) for item in predicates)
+        if dimension is not None:
+            assert dimension.field is not None
+            where.append(f"{_quote(dimension.field)} IS NOT NULL")
         filters = {item.field: item for item in metric.filters}
+        seen_filters: set[str] = set()
         for index, item in enumerate(plan.filters):
-            rule = filters.get(item.field_ref)
-            if rule is None or item.operator != "eq":
+            if item.field_ref in seen_filters:
                 raise PlanStepError("metric_filter_unsupported")
-            if ((rule.value_type == "text" and not isinstance(item.value, str))
-                    or (rule.value_type == "integer" and type(item.value) is not int)):
-                raise PlanStepError("metric_filter_type_mismatch")
+            seen_filters.add(item.field_ref)
+            organization = filter_dimensions.get(item.field_ref)
+            rule = filters.get(item.field_ref)
+            if organization is not None:
+                assert organization.field is not None and organization.value_type is not None
+                field_name, value_type = organization.field, organization.value_type
+                if item.operator not in {"eq", "in"}:
+                    raise PlanStepError("metric_filter_unsupported")
+            elif rule is not None and item.operator == "eq":
+                field_name, value_type = rule.field, rule.value_type
+            else:
+                raise PlanStepError("metric_filter_unsupported")
             key = f"filter_{index}"
-            where.append(f"{_quote(rule.field)} = :{key}")
-            params[key] = item.value
+            values = item.value if item.operator == "in" else [item.value]
+            if not isinstance(values, list) or not 1 <= len(values) <= 100:
+                raise PlanStepError("metric_filter_list_invalid")
+            for value in values:
+                _validate_filter_value(value, value_type, columns[field_name])
+            if item.operator == "in":
+                if len(set(values)) != len(values):
+                    raise PlanStepError("metric_filter_list_invalid")
+                keys = [f"{key}_{position}" for position in range(len(values))]
+                where.append(f"{_quote(field_name)} IN ({', '.join(':' + name for name in keys)})")
+                params.update(zip(keys, values, strict=True))
+            else:
+                where.append(f"{_quote(field_name)} = :{key}")
+                params[key] = item.value
         group = ""
+        order = ""
+        prefix = ""
         select = "COUNT(*) AS value"
         if plan.intent == "trend":
             local_time = (f"{business_time} AT TIME ZONE 'Asia/Shanghai'"
                           if binding.timestamp_kind == "timestamptz" else business_time)
             # grain is a typed allowlist, not a raw SQL fragment.
             bucket = f"DATE_TRUNC('{plan.grain}', {local_time})"
-            select = f"{bucket} AS period, {select}"
-            group = f" GROUP BY {bucket} ORDER BY period"
-        sql = (f"SELECT {select} FROM {_quote(binding.schema_name)}.{_quote(binding.relation_name)}"
+            prefix = f"{bucket} AS period, "
+            group = f" GROUP BY {bucket}"
+            order = " ORDER BY period"
+        elif dimension is not None:
+            assert dimension.field is not None
+            identifier = _quote(dimension.field)
+            if dimension.value_type == "text":
+                identifier += ' COLLATE "C"'
+            prefix = f"{identifier} AS dimension_id, "
+            group = f" GROUP BY {identifier}"
+            order = " ORDER BY dimension_id"
+            if plan.intent == "ranking":
+                # QueryGateway accepts a literal LIMIT. It comes exclusively from
+                # the validated finite integer, never from a question or filter.
+                order = f" ORDER BY value DESC NULLS LAST, dimension_id LIMIT {plan.ranking_limit}"
+        if metric.ratio is not None:
+            denominator = " AND ".join(_predicate_sql(item) for item in metric.ratio.denominator_predicates)
+            numerator = " AND ".join(_predicate_sql(item) for item in metric.ratio.numerator_predicates)
+            select = (f"COUNT(*) FILTER (WHERE {denominator} AND {numerator}) AS numerator, "
+                      f"COUNT(*) FILTER (WHERE {denominator}) AS denominator")
+        sql = (f"SELECT {prefix}{select} FROM {_quote(binding.schema_name)}.{_quote(binding.relation_name)}"
                f" WHERE {' AND '.join(where)}{group}")
+        if metric.ratio is not None:
+            output_prefix = "period, " if plan.intent == "trend" else "dimension_id, " if dimension else ""
+            sql = (f"SELECT {output_prefix}numerator, denominator, "
+                   "ROUND(100 * CAST(numerator AS numeric) / NULLIF(denominator, 0), 2) AS value, "
+                   "CASE WHEN denominator = 0 THEN 'no_data' ELSE 'success' END AS status "
+                   f"FROM ({sql}) AS metric_counts")
+        sql += order
         return CompiledMetricQuery(sql, params, release.release_id, snapshot.snapshot_id,
-                                   snapshot.checksum, plan, context)
+                                   snapshot.checksum, plan, context, metric.operation, dimension)
 
 
 class GatewayMetricStepRunner:
@@ -232,23 +323,28 @@ class GatewayMetricStepRunner:
             current = await self._compiler.compile(query.query_plan, query.context)
             if (current.sql != query.sql or current.params != query.params
                     or current.snapshot_checksum != query.snapshot_checksum
+                    or current.operation != query.operation or current.dimension != query.dimension
                     or self._gateway.prepare(current.sql).fingerprint != prepared.sql_fingerprint):
                 raise PlanStepError("metric_prepared_query_changed")
             result = await self._gateway.execute(current.sql, current.params)
         if not result.accepted:
             raise PlanStepError("metric_gateway_denied")
-        if result.max_rows is not None and result.row_count >= result.max_rows:
+        # Reaching an explicit top-N boundary is complete for a ranking, but
+        # reaching a stricter gateway cap may have discarded requested rows.
+        ranking_complete = (query.query_plan.intent == "ranking"
+                            and result.max_rows is not None
+                            and query.query_plan.ranking_limit <= result.max_rows)
+        if result.max_rows is not None and (
+            result.row_count > result.max_rows
+            or (result.row_count == result.max_rows and not ranking_complete)
+        ):
             raise PlanStepError("metric_result_may_be_truncated")
-        expected_columns = {"value", "period"} if query.query_plan.intent == "trend" else {"value"}
-        if (result.row_count != len(result.rows)
-                or (query.query_plan.intent == "metric" and len(result.rows) != 1)
-                or any(set(row) != expected_columns or type(row.get("value")) is not int
-                       or row["value"] < 0
-                       or ("period" in row and not isinstance(row["period"], datetime))
-                       for row in result.rows)):
+        if result.row_count != len(result.rows):
             raise PlanStepError("metric_result_shape_invalid")
+        _validate_rows(result.rows, query)
         digest = rowset_sha256(result.rows)
-        # Count returns an integer even at zero. A trend with no buckets is no_data.
+        # Decimal is an exact two-place JSON string; hash the typed database
+        # rowset before serialization so decimal and text remain distinct.
         rows: list[JsonValue] = []
         for row in result.rows:
             json_row: dict[str, JsonValue] = {}
@@ -257,11 +353,19 @@ class GatewayMetricStepRunner:
                     json_row[key] = value
                 elif isinstance(value, datetime):
                     json_row[key] = value.isoformat()
+                elif isinstance(value, Decimal):
+                    json_row[key] = format(value, ".2f")
+                elif value is None or isinstance(value, str):
+                    json_row[key] = value
                 else:
                     raise PlanStepError("metric_result_shape_invalid")
             rows.append(json_row)
         receipt = result.execution_receipt.model_copy(update={"rowset_sha256": digest})
-        output: dict[str, JsonValue] = {"rows": rows, "no_data": not rows}
+        output: dict[str, JsonValue] = {
+            "rows": rows,
+            "no_data": not rows or (query.operation == "ratio"
+                                    and all(row["status"] == "no_data" for row in result.rows)),
+        }
         return MetricStepResult(value=output, receipt=receipt)
 
 
@@ -273,3 +377,136 @@ def metric_plan_executor(compiler: MetricQueryCompiler, gateway: QueryGateway) -
 def _quote(identifier: str) -> str:
     # All identifiers originate from typed, deployment-controlled contracts.
     return f'"{identifier}"'
+
+
+def _predicate_sql(predicate: Predicate) -> str:
+    operation = {"is_true": "TRUE", "is_null": "NULL", "is_not_null": "NOT NULL"}
+    return f"{_quote(predicate.field)} IS {operation[predicate.operator]}"
+
+
+def _organization_scope(
+    plan: QueryPlan, metric: MetricContract, binding: RelationBinding,
+) -> tuple[OrganizationDimensionBinding | None, dict[str, OrganizationDimensionBinding]]:
+    bindings = {item.dimension: item for item in binding.organization_dimensions}
+    if any(item not in metric.supported_dimensions or item not in bindings for item in plan.dimensions):
+        raise PlanStepError("metric_grain_or_dimension_unsupported")
+    if len(plan.dimensions) > 1:
+        raise PlanStepError("metric_dimension_combination_unsupported")
+    dimension_name = next(iter(plan.dimensions), None)
+    grouped = plan.intent in {"comparison", "ranking"}
+    if grouped and (dimension_name is None or dimension_name == "city_company"):
+        raise PlanStepError("metric_operation_unsupported")
+    if not grouped and any(item != "city_company" for item in plan.dimensions):
+        raise PlanStepError("metric_dimension_combination_unsupported")
+    dimension = bindings[dimension_name] if grouped and dimension_name is not None else None
+    organization_filters = {}
+    for item in plan.filters:
+        if item.field_ref in {"city_company", "area", "team"}:
+            if (item.source != "entity_alias"
+                    or item.field_ref == "city_company" or item.field_ref not in bindings
+                    or item.field_ref not in metric.supported_dimensions):
+                raise PlanStepError("metric_filter_unsupported")
+            organization_filters[item.field_ref] = bindings[item.field_ref]
+    scopes = set(plan.dimensions) | set(organization_filters)
+    if len(scopes) > 1:
+        raise PlanStepError("metric_dimension_combination_unsupported")
+    # Ordinary YAML filters cannot provide a second route to physical org IDs.
+    org_fields = {item.field for item in bindings.values() if item.field is not None}
+    if any(item.field in org_fields | {"city_company", "area", "team"} for item in metric.filters):
+        raise PlanStepError("metric_filter_unsupported")
+    return dimension, organization_filters
+
+
+def _validate_column_type(value_type: str, column_type: str) -> None:
+    allowed = ({"text", "character varying", "varchar"} if value_type == "text"
+               else {"smallint", "int2", "integer", "int4", "bigint", "int8"})
+    if column_type not in allowed:
+        raise PlanStepError("metric_column_type_mismatch")
+
+
+def _validate_filter_value(value: Any, value_type: str, column_type: str) -> None:
+    if value_type == "text":
+        valid = isinstance(value, str) and 1 <= len(value) <= 256 and "\x00" not in value
+    else:
+        bits = 16 if column_type in {"smallint", "int2"} else 32 if column_type in {"integer", "int4"} else 64
+        valid = type(value) is int and -(2 ** (bits - 1)) <= value < 2 ** (bits - 1)
+    if not valid:
+        raise PlanStepError("metric_filter_type_mismatch")
+
+
+def _validate_rows(rows: list[dict[str, Any]], query: CompiledMetricQuery) -> None:
+    plan = query.query_plan
+    expected = {"value"} if query.operation == "count" else {"numerator", "denominator", "value", "status"}
+    if plan.intent == "trend":
+        expected.add("period")
+    if query.dimension is not None:
+        expected.add("dimension_id")
+    if ((plan.intent == "metric" and len(rows) != 1)
+            or (plan.intent == "ranking" and len(rows) > plan.ranking_limit)):
+        raise PlanStepError("metric_result_shape_invalid")
+    keys: list[Any] = []
+    for row in rows:
+        if set(row) != expected:
+            raise PlanStepError("metric_result_shape_invalid")
+        value = row["value"]
+        if query.operation == "count":
+            if type(value) is not int or value < 0:
+                raise PlanStepError("metric_result_shape_invalid")
+        else:
+            _validate_ratio_row(row)
+        if "period" in row:
+            period = row["period"]
+            if (not isinstance(period, datetime) or period.tzinfo is not None
+                    or period.time() != time.min
+                    or (plan.grain == "month" and period.day != 1)):
+                raise PlanStepError("metric_result_shape_invalid")
+            first = plan.time_range.start
+            if plan.grain == "month":
+                first = first.replace(day=1)
+            if not first <= period.date() <= plan.time_range.end:
+                raise PlanStepError("metric_result_shape_invalid")
+            keys.append(period)
+        if query.dimension is not None:
+            identifier = row["dimension_id"]
+            value_type = query.dimension.value_type
+            if ((value_type == "text" and (not isinstance(identifier, str) or not identifier
+                                          or len(identifier) > 256 or "\x00" in identifier))
+                    or (value_type == "integer" and (type(identifier) is not int
+                                                     or not -(2 ** 63) <= identifier < 2 ** 63))):
+                raise PlanStepError("metric_result_shape_invalid")
+            keys.append(identifier)
+    if len(set(keys)) != len(keys):
+        raise PlanStepError("metric_result_shape_invalid")
+    if plan.intent == "ranking":
+        # Stable passes preserve ascending ID ties without Decimal arithmetic
+        # (unary minus would round under the caller's ambient context).
+        ordered = sorted(rows, key=lambda row: row["dimension_id"])
+        ordered = sorted(ordered, key=lambda row: (
+            row["value"] is not None, row["value"] if row["value"] is not None else 0,
+        ), reverse=True)
+        if rows != ordered:
+            raise PlanStepError("metric_result_shape_invalid")
+    elif keys != sorted(keys):
+        raise PlanStepError("metric_result_shape_invalid")
+
+
+def _validate_ratio_row(row: dict[str, Any]) -> None:
+    numerator, denominator, value = row["numerator"], row["denominator"], row["value"]
+    if (type(numerator) is not int or type(denominator) is not int
+            or not 0 <= numerator <= denominator <= 2 ** 63 - 1):
+        raise PlanStepError("metric_result_shape_invalid")
+    if denominator == 0:
+        valid = value is None and row["status"] == "no_data"
+    else:
+        # PostgreSQL COUNT is int8; this precision is ample for exact rounding
+        # of its ratio. Never use the ambient Decimal context or binary float.
+        with localcontext() as context:
+            context.prec = 64
+            expected = (Decimal(100) * numerator / denominator).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP,
+            )
+        valid = (isinstance(value, Decimal) and value.is_finite()
+                 and value.as_tuple().exponent == -2
+                 and value == expected and row["status"] == "success")
+    if not valid:
+        raise PlanStepError("metric_result_shape_invalid")

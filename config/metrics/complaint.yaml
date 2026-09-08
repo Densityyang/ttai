@@ -19,3 +19,30 @@ metrics:
     assistant_enabled: true
     daily_report_enabled: false
     benchmark_eligible: false
+  - metric_key: complaint_first_response_rate
+    display_name: 投诉首响及时率
+    # Approved target: acceptance period, valid completed bandwidth orders.
+    # Owner, approver, deployment source and freshness remain unapproved.
+    release_status: pending_source
+    source_ref: complaint_orders
+    formula_version: complaint_first_response_rate.v1
+    eligibility_policy_id: work_order_metric_eligibility_v1
+    operation: ratio
+    business_time_column: acceptance_time
+    supported_grains: [day, month]
+    supported_dimensions: [city_company, area, team]
+    ratio:
+      denominator_predicates:
+        - {field: has_valid_bandwidth, operator: is_true}
+        - {field: completion_time, operator: is_not_null}
+      numerator_predicates:
+        - {field: is_first_response_on_time, operator: is_true}
+      unit: percent
+      value_scale: '0_100'
+      decimal_places: 2
+      zero_denominator_policy: no_data
+    required_permissions: [nl2sql:invoke]
+    assistant_enabled: true
+    daily_report_enabled: true
+    daily_report_order: 14
+    benchmark_eligible: false

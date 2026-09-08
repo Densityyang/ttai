@@ -23,7 +23,7 @@ from src.nl2sql.semantic.metric_contract import (
 )
 from src.nl2sql.semantic.registry import SemanticReleaseState
 from src.nl2sql.semantic.schema_snapshot import SchemaSnapshotState
-from tests.metric_fixtures import MetricAuthority, seed_contract
+from tests.metric_fixtures import MetricAuthority, ratio_contract, seed_contract
 
 
 def test_catalog_addition_requires_no_python_and_preserves_channels() -> None:
@@ -110,14 +110,15 @@ async def test_unknown_or_out_of_bounds_plans_fail(changes: dict[str, Any], code
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["count", "ratio"])
 @pytest.mark.parametrize("case", [
     "missing_release", "retired_release", "other_release", "missing_snapshot", "retired_snapshot",
     "checksum", "missing_contract", "invalid_contract", "inactive_contract", "missing_binding",
     "missing_policy", "permission", "relation_context", "relation_release", "relation_snapshot",
     "column", "sensitive", "timestamp_type", "boolean_type",
 ])
-async def test_trusted_authority_fails_closed(case: str) -> None:
-    authority = MetricAuthority()
+async def test_trusted_authority_fails_closed(case: str, operation: str) -> None:
+    authority = MetricAuthority(ratio_contract() if operation == "ratio" else seed_contract())
     assert authority.release is not None and authority.snapshot is not None
     options: dict[str, Any] = {}
     if case == "missing_release":

@@ -23,7 +23,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from src.nl2sql.contracts import TimeRange
+from src.nl2sql.contracts import BoundFilter, TimeRange
 from src.nl2sql.infra.governance.query_gateway import (
     QueryErrorCode,
     QueryGateway,
@@ -34,7 +34,7 @@ from src.nl2sql.orchestration.budget import RouteBudgetLedger
 from src.nl2sql.orchestration.metric_query import metric_plan_executor
 from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
 from src.nl2sql.semantic.metric_layer import MetricSemanticLayer
-from tests.metric_fixtures import MetricAuthority
+from tests.metric_fixtures import MetricAuthority, ratio_contract, seed_contract
 
 RUN_INTEGRATION = os.environ.get("TTAI_RUN_POSTGRES_INTEGRATION") == "1"
 
@@ -188,12 +188,17 @@ def gateway_postgres() -> Iterator[_GatewayPostgres]:
             category text,
             priority integer,
             area text,
-            team text
+            team text,
+            is_first_response_on_time boolean,
+            area_id text,
+            team_id integer
         );
         CREATE INDEX complaint_time ON ai_views.complaint_orders (acceptance_time);
         -- Generated synthetic cases: Shanghai leap-day boundaries, NULL flags,
         -- finished rows, and a city placeholder with NULL area/team.
         INSERT INTO ai_views.complaint_orders
+            (acceptance_time, completion_time, is_valid_for_metrics,
+             has_valid_bandwidth, category, priority, area, team)
         SELECT CASE n
             WHEN 1 THEN '2024-02-28 15:59:59+00'::timestamptz
             WHEN 3 THEN '2024-02-29 15:59:59+00'::timestamptz
@@ -207,6 +212,30 @@ def gateway_postgres() -> Iterator[_GatewayPostgres]:
             CASE WHEN n = 11 THEN NULL ELSE 'synthetic-area' END,
             CASE WHEN n = 11 THEN NULL ELSE 'synthetic-team' END
         FROM generate_series(1, 11) AS generated(n);
+        -- Slice 2 uses another leap year so Slice 1 expectations stay intact.
+        -- Stable synthetic IDs only; n=6 is the city-company placeholder.
+        INSERT INTO ai_views.complaint_orders
+            (acceptance_time, completion_time, is_valid_for_metrics,
+             has_valid_bandwidth, is_first_response_on_time, area_id, team_id)
+        SELECT CASE n
+            WHEN 1 THEN '2028-02-28 15:59:59+00'::timestamptz
+            WHEN 3 THEN '2028-02-29 15:59:59+00'::timestamptz
+            WHEN 11 THEN '2028-02-29 16:00:00+00'::timestamptz
+            WHEN 12 THEN NULL
+            ELSE '2028-02-28 16:00:00+00'::timestamptz END,
+            CASE WHEN n = 13 THEN NULL ELSE '2028-03-02 00:00:00+00'::timestamptz END,
+            CASE WHEN n = 8 THEN NULL ELSE n <> 7 END,
+            CASE WHEN n = 10 THEN NULL ELSE n <> 9 END,
+            CASE WHEN n = 14 THEN NULL ELSE n NOT IN (3, 15) END,
+            CASE WHEN n = 6 THEN NULL
+                 WHEN n IN (1, 2, 3, 11, 12) THEN 'area-a'
+                 WHEN n = 4 THEN 'area-b' WHEN n = 5 THEN 'area-c'
+                 WHEN n IN (14, 15) THEN 'area-d' ELSE 'area-e' END,
+            CASE WHEN n = 6 THEN NULL
+                 WHEN n IN (1, 2, 3, 11, 12) THEN 1
+                 WHEN n = 4 THEN 2 WHEN n = 5 THEN 3
+                 WHEN n IN (14, 15) THEN 4 ELSE 5 END
+        FROM generate_series(1, 15) AS generated(n);
         ANALYZE ai_views.complaint_orders;
         CREATE ROLE {reader} LOGIN PASSWORD '{reader_password}';
         CREATE ROLE {probe} LOGIN PASSWORD '{probe_password}';
@@ -285,6 +314,163 @@ async def test_real_postgres_parameter_binding_masking_and_read_only_receipt(
     assert read_only.rows == [{"read_only": "on"}]
     assert literal_colon.accepted
     assert literal_colon.rows == [{"bound": 7, "literal": ":not_a_bind"}]
+
+
+async def _slice2_execute(
+    gateway: QueryGateway, authority: MetricAuthority, **changes: Any,
+) -> Any:
+    plan = authority.plan(time_range=TimeRange(start=date(2028, 2, 29), end=date(2028, 2, 29)), **changes)
+    validator = PlanValidator()
+    validation = validator.validate_query_plan(plan=plan, context=authority.context, identity=authority.identity)
+    execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
+    budget = RouteBudgetLedger(route="standard")
+    assert validator.validate_execution_plan(
+        execution_plan=execution, query_plan=plan, context=authority.context, route_budget=budget.limits,
+    ).outcome == "allow"
+    result = await metric_plan_executor(authority.compiler(), gateway).execute(
+        query_plan=plan, context=authority.context, execution_plan=execution, budget=budget, deadline_ms=10000,
+    )
+    assert budget.sql_executions == 1
+    return result
+
+
+def _organization_filter(dimension: str, value: Any, operator: str = "eq") -> BoundFilter:
+    return BoundFilter.model_validate(dict(
+        field_ref=dimension, value=value, operator=operator, source="entity_alias",
+    ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("filters", "expected"), [
+    ((), {"numerator": 4, "denominator": 7, "value": "57.14", "status": "success"}),
+    ((_organization_filter("area", "area-d"),), {"numerator": 0, "denominator": 2, "value": "0.00", "status": "success"}),
+    ((_organization_filter("team", 5),), {"numerator": 0, "denominator": 0, "value": None, "status": "no_data"}),
+    ((_organization_filter("area", "unknown-id"),), {"numerator": 0, "denominator": 0, "value": None, "status": "no_data"}),
+    ((_organization_filter("area", ["area-a", "area-b"], "in"),), {"numerator": 2, "denominator": 3, "value": "66.67", "status": "success"}),
+    ((_organization_filter("team", [1, 2], "in"),), {"numerator": 2, "denominator": 3, "value": "66.67", "status": "success"}),
+    ((_organization_filter("area", "成都"),), {"numerator": 0, "denominator": 0, "value": None, "status": "no_data"}),
+    ((_organization_filter("area", ["x'; DROP TABLE complaint_orders; --"], "in"),), {"numerator": 0, "denominator": 0, "value": None, "status": "no_data"}),
+])
+async def test_pr07a_ratio_real_gateway_scalar_nulls_and_binds(
+    gateway_postgres: _GatewayPostgres, filters: tuple[BoundFilter, ...], expected: dict[str, Any],
+) -> None:
+    authority = MetricAuthority(ratio_contract())
+    engine, gateway = _gateway(gateway_postgres.reader_url, max_rows=200)
+    try:
+        result = await _slice2_execute(gateway, authority, filters=filters)
+        assert result.record.status == "succeeded", result.record
+        assert result.outputs["fetch_metrics"] == {"rows": [expected], "no_data": expected["status"] == "no_data"}
+        receipt = result.record.step_receipts[0]
+        assert receipt.rowset_sha256 is not None
+        assert receipt.data_as_of is None and receipt.freshness_status == "unknown"
+        checkpoint = result.record.model_dump_json()
+        assert all(token not in checkpoint for token in ("SELECT", "filter_0", "start_at", "area-a", "57.14"))
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dimension", ["area", "team"])
+@pytest.mark.parametrize("intent", ["comparison", "ranking"])
+async def test_pr07a_ratio_real_gateway_organizations_and_ranking_ties(
+    gateway_postgres: _GatewayPostgres, dimension: str, intent: str,
+) -> None:
+    authority = MetricAuthority(ratio_contract())
+    engine, gateway = _gateway(gateway_postgres.reader_url, max_rows=200)
+    try:
+        result = await _slice2_execute(gateway, authority, intent=intent, dimensions=(dimension,),
+                                       **({"result_limit": 2} if intent == "ranking" else {}))
+        assert result.record.status == "succeeded", result.record
+        rows = result.outputs["fetch_metrics"]["rows"]
+        ids = ["area-a", "area-b", "area-c", "area-d", "area-e"] if dimension == "area" else [1, 2, 3, 4, 5]
+        if intent == "ranking":
+            assert [row["dimension_id"] for row in rows] == ids[1:3]
+            assert [row["value"] for row in rows] == ["100.00", "100.00"]
+        else:
+            assert [row["dimension_id"] for row in rows] == ids
+            assert [row["value"] for row in rows] == ["50.00", "100.00", "100.00", "0.00", None]
+            assert sum(row["denominator"] for row in rows) == 6  # city total = 7
+            assert sum(row["numerator"] for row in rows) == 3  # city total = 4
+            assert rows[-1]["status"] == "no_data"
+        assert not result.outputs["fetch_metrics"]["no_data"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("grain", "start", "end", "expected"), [
+    ("day", date(2028, 2, 28), date(2028, 3, 1), [
+        ("2028-02-28T00:00:00", 1, 1, "100.00"),
+        ("2028-02-29T00:00:00", 4, 7, "57.14"),
+        ("2028-03-01T00:00:00", 1, 1, "100.00"),
+    ]),
+    ("month", date(2028, 2, 28), date(2028, 3, 1), [
+        ("2028-02-01T00:00:00", 5, 8, "62.50"), ("2028-03-01T00:00:00", 1, 1, "100.00"),
+    ]),
+    ("month", date(2028, 2, 29), date(2028, 2, 29), [("2028-02-01T00:00:00", 4, 7, "57.14")]),
+    ("day", date(2028, 1, 1), date(2028, 1, 1), []),
+])
+async def test_pr07a_ratio_real_gateway_period_attribution_and_no_widening(
+    gateway_postgres: _GatewayPostgres, grain: str, start: date, end: date,
+    expected: list[tuple[str, int, int, str]],
+) -> None:
+    authority = MetricAuthority(ratio_contract())
+    engine, gateway = _gateway(gateway_postgres.reader_url, max_rows=200)
+    try:
+        plan = authority.plan(intent="trend", grain=grain, time_range=TimeRange(start=start, end=end))
+        validation = PlanValidator().validate_query_plan(plan=plan, context=authority.context, identity=authority.identity)
+        execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
+        result = await metric_plan_executor(authority.compiler(), gateway).execute(
+            query_plan=plan, context=authority.context, execution_plan=execution,
+            budget=RouteBudgetLedger(route="standard"), deadline_ms=10000,
+        )
+        assert result.record.status == "succeeded", result.record
+        output = result.outputs["fetch_metrics"]
+        assert output["rows"] == [dict(period=p, numerator=n, denominator=d, value=v, status="success") for p, n, d, v in expected]
+        assert output["no_data"] == (not expected)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent", ["comparison", "ranking"])
+async def test_pr07a_count_real_gateway_organization_extension(
+    gateway_postgres: _GatewayPostgres, intent: str,
+) -> None:
+    authority = MetricAuthority(seed_contract(supported_dimensions=("city_company", "area", "team")))
+    engine, gateway = _gateway(gateway_postgres.reader_url, max_rows=200)
+    try:
+        result = await _slice2_execute(gateway, authority, intent=intent, dimensions=("team",))
+        assert result.record.status == "succeeded", result.record
+        assert result.outputs["fetch_metrics"] == {"rows": [{"dimension_id": 5, "value": 1}], "no_data": False}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("intent", "limit", "succeeded"), [
+    ("comparison", None, False), ("ranking", 2, False), ("ranking", 1, True),
+])
+async def test_pr07a_real_gateway_row_limit_contact_fails_closed(
+    gateway_postgres: _GatewayPostgres, intent: str, limit: int | None, succeeded: bool,
+) -> None:
+    authority = MetricAuthority(ratio_contract())
+    engine, gateway = _gateway(gateway_postgres.reader_url, max_rows=1)
+    try:
+        result = await _slice2_execute(gateway, authority, intent=intent, dimensions=("area",),
+                                       **({"result_limit": limit} if intent == "ranking" else {}))
+        if succeeded:
+            assert result.record.status == "succeeded", result.record
+            assert result.outputs["fetch_metrics"]["rows"] == [
+                dict(dimension_id="area-b", numerator=1, denominator=1,
+                     value="100.00", status="success"),
+            ]
+        else:
+            assert result.record.status == "failed"
+            assert result.record.stop_reason == "metric_result_may_be_truncated"
+            assert result.outputs == {}
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

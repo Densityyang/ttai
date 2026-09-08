@@ -1,4 +1,4 @@
-"""YAML count contracts compiled into the existing semantic authoring IR.
+"""YAML count/ratio contracts compiled into the existing semantic authoring IR.
 
 Publication still uses authoring validation, materialization, and the active
 semantic release. Loading this file alone never authorizes execution.
@@ -23,7 +23,18 @@ class FrozenContract(BaseModel):
 
 class Predicate(FrozenContract):
     field: Identifier
-    operator: Literal["is_true", "is_null"]
+    operator: Literal["is_true", "is_null", "is_not_null"]
+
+
+class RatioDefinition(FrozenContract):
+    """Numerator is a subset of the explicit denominator, never a formula string."""
+
+    denominator_predicates: tuple[Predicate, ...] = Field(min_length=1)
+    numerator_predicates: tuple[Predicate, ...] = Field(min_length=1)
+    unit: Literal["percent"]
+    value_scale: Literal["0_100"]
+    decimal_places: Literal[2]
+    zero_denominator_policy: Literal["no_data"]
 
 
 class FilterField(FrozenContract):
@@ -45,11 +56,12 @@ class MetricContract(FrozenContract):
     source_ref: ContractId
     formula_version: ContractId
     eligibility_policy_id: ContractId
-    operation: Literal["count"] = "count"
+    operation: Literal["count", "ratio"] = "count"
+    ratio: RatioDefinition | None = None
     business_time_column: Identifier
     timezone: Literal["Asia/Shanghai"] = "Asia/Shanghai"
     supported_grains: tuple[Literal["day", "month"], ...] = ("day", "month")
-    supported_dimensions: tuple[Literal["city_company"], ...] = ("city_company",)
+    supported_dimensions: tuple[Literal["city_company", "area", "team"], ...] = ("city_company",)
     predicates: tuple[Predicate, ...] = ()
     filters: tuple[FilterField, ...] = ()
     required_permissions: tuple[str, ...] = Field(min_length=1)
@@ -57,6 +69,11 @@ class MetricContract(FrozenContract):
 
     @model_validator(mode="after")
     def validate_definition(self) -> MetricContract:
+        if (self.operation == "ratio") != (self.ratio is not None):
+            raise ValueError("ratio requires a ratio definition; count cannot carry one")
+        if (not self.supported_dimensions
+                or len(set(self.supported_dimensions)) != len(self.supported_dimensions)):
+            raise ValueError("supported dimensions must be nonempty and unique")
         if self.release_status == "active" and (
             not self.owner or not self.owner.strip() or not self.approver or not self.approver.strip()
         ):
@@ -74,6 +91,12 @@ class MetricContract(FrozenContract):
     @property
     def asset_id(self) -> str:
         return f"metric.{self.metric_key}"
+
+    @property
+    def formula_predicates(self) -> tuple[Predicate, ...]:
+        return self.predicates + (() if self.ratio is None else (
+            *self.ratio.denominator_predicates, *self.ratio.numerator_predicates,
+        ))
 
 
 class MetricCatalog(FrozenContract):
@@ -112,7 +135,7 @@ def metric_catalog_ir(catalog: MetricCatalog, *, relations: dict[str, str]) -> A
             domain=contract.domain,
             source_columns=tuple(sorted({
                 "is_valid_for_metrics", contract.business_time_column,
-                *(item.field for item in contract.predicates),
+                *(item.field for item in contract.formula_predicates),
                 *(item.field for item in contract.filters),
             })),
             owner=contract.owner,

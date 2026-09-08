@@ -10,6 +10,7 @@ from src.nl2sql.contracts import ContextBundle, QueryPlan, RequestIdentity, Time
 from src.nl2sql.orchestration.metric_query import (
     EligibilityPolicy,
     MetricQueryCompiler,
+    OrganizationDimensionBinding,
     RelationBinding,
 )
 from src.nl2sql.semantic.authoring import validate_authoring_ir
@@ -47,6 +48,16 @@ def seed_contract(**changes: Any) -> MetricContract:
     return MetricContract.model_validate(payload)
 
 
+def ratio_contract(**changes: Any) -> MetricContract:
+    source = Path(__file__).resolve().parents[1] / "config/metrics/complaint.yaml"
+    seed = load_metric_catalog(source.read_text(encoding="utf-8")).metrics[1]
+    payload = seed.model_dump(mode="json")
+    payload.update(owner="synthetic-owner", approver="synthetic-approver",
+                   release_status="active", freshness_sla_seconds=86400)
+    payload.update(changes)
+    return MetricContract.model_validate(payload)
+
+
 class MetricAuthority:
     def __init__(self, metric: MetricContract | None = None, *, timestamptz: bool = True) -> None:
         self.metric = metric or seed_contract()
@@ -55,6 +66,7 @@ class MetricAuthority:
             "completion_time": "timestamp with time zone",
             "is_valid_for_metrics": "boolean", "has_valid_bandwidth": "boolean",
             "category": "text", "priority": "integer",
+            "is_first_response_on_time": "boolean", "area_id": "text", "team_id": "integer",
         }
         relation = RelationSnapshot(
             relation_id=RELATION, schema_name="ai_views", relation_name="complaint_orders",
@@ -87,6 +99,11 @@ class MetricAuthority:
             schema_name="ai_views", relation_name="complaint_orders",
             allowed_columns=tuple(types), required_permissions=("metrics:read",), approved=True,
             timestamp_kind="timestamptz" if timestamptz else "timestamp",
+            organization_dimensions=(
+                OrganizationDimensionBinding(dimension="city_company"),
+                OrganizationDimensionBinding(dimension="area", field="area_id", value_type="text"),
+                OrganizationDimensionBinding(dimension="team", field="team_id", value_type="integer"),
+            ),
         )
         self.identity = RequestIdentity(request_id=UUID(RELEASE_ID), user_id="synthetic-reader",
                                         permissions=frozenset({"metrics:read", "nl2sql:invoke"}))

@@ -165,8 +165,20 @@ class QueryPlan(StrictContract):
     time_range: TimeRange
     grain: Literal["hour", "day", "week", "month", "quarter", "year"]
     source_strategy: Literal["aggregate_first", "detail_required"]
+    # Ranking defaults to ten; other intents must leave this unset.
+    result_limit: int | None = Field(default=None, strict=True, ge=1, le=100)
     required_permissions: tuple[str, ...] = Field(default=(), max_length=32)
     unresolved_slots: tuple[str, ...] = Field(default=(), max_length=16)
+
+    @model_validator(mode="after")
+    def validate_result_limit(self) -> QueryPlan:
+        if self.intent != "ranking" and self.result_limit is not None:
+            raise ValueError("result_limit is only supported for ranking")
+        return self
+
+    @property
+    def ranking_limit(self) -> int:
+        return self.result_limit if self.result_limit is not None else 10
 
     @field_validator(
         "metric_keys",
