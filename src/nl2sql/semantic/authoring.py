@@ -99,6 +99,8 @@ class MetricAsset:
     raw_text: str = ""
     legacy_metadata_inferred: bool = False
 
+    execution_contract: dict[str, Any] | None = None
+
     @property
     def asset_type(self) -> AssetType:
         return AssetType.METRIC
@@ -1348,6 +1350,8 @@ def _sort_issues(issues: Iterable[AuthoringIssue]) -> list[AuthoringIssue]:
 
 def _asset_payload(asset: AuthoringAsset) -> dict[str, Any]:
     payload = asdict(asset)
+    if payload.get("execution_contract") is None:
+        payload.pop("execution_contract", None)
     payload.pop("raw_text", None)
     payload.pop("raw_payload", None)
     payload.pop("source_line", None)

@@ -212,6 +212,7 @@ class PlanExecutor:
 
         outputs: dict[str, JsonValue] = {}
         receipts: list[PlanStepReceipt] = []
+        gateway_receipts: dict[str, ExecutionReceipt] = {}
         current_step: PlanStep | None = None
         current_started = 0.0
         try:
@@ -226,6 +227,7 @@ class PlanExecutor:
                             outputs=outputs,
                             budget=budget,
                             timeout_ms=timeout_ms,
+                            gateway_receipts=gateway_receipts,
                         )
                     except asyncio.CancelledError:
                         raise
@@ -269,6 +271,7 @@ class PlanExecutor:
                             outputs=outputs,
                         )
                     outputs[current_step.step_id] = output
+                    gateway_receipt = gateway_receipts.get(current_step.step_id)
                     receipts.append(
                         PlanStepReceipt(
                             step_id=current_step.step_id,
@@ -276,6 +279,9 @@ class PlanExecutor:
                             status="succeeded",
                             elapsed_ms=_elapsed_ms(current_started),
                             output_digest=_json_digest(output),
+                            rowset_sha256=gateway_receipt.rowset_sha256 if gateway_receipt else None,
+                            data_as_of=gateway_receipt.data_as_of if gateway_receipt else None,
+                            freshness_status=gateway_receipt.freshness_status if gateway_receipt else "unknown",
                         )
                     )
         except TimeoutError:
@@ -314,6 +320,7 @@ class PlanExecutor:
         outputs: dict[str, JsonValue],
         budget: RouteBudgetLedger,
         timeout_ms: int,
+        gateway_receipts: dict[str, ExecutionReceipt],
     ) -> JsonValue:
         if isinstance(step, FetchMetricStep):
             prepared = await self._metric_runner.prepare(
@@ -343,6 +350,7 @@ class PlanExecutor:
                 raise PlanStepError(
                     result.receipt.error_taxonomy or "query_gateway_policy_denied"
                 )
+            gateway_receipts[step.step_id] = result.receipt
             return _json_value(result.value)
 
         if isinstance(step, TrustedCalculationStep):
