@@ -1,0 +1,1256 @@
+# REPAIR_SERVICE 业务域指标配置
+metrics:
+  # ============ 无维度指标（日粒度）============
+  - name: repair_service_total_count_day
+    display_name: 报修服务工单总数（日）
+    description: 报修服务工单日度总数（无维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+
+  - name: repair_service_in_transit_count_day
+    display_name: 报修服务在途工单数（日）
+    description: 报修服务工单日度在途数量（无维度，竣工时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 在途
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: repair_service_archived_count_day
+    display_name: 报修服务已归档工单数（日）
+    description: 报修服务工单日度已归档数量（无维度，竣工时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 已归档
+    time_grain: day
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 无维度指标（月粒度）============
+  - name: repair_service_total_count_month
+    display_name: 报修服务工单总数（月）
+    description: 报修服务工单月度总数（无维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+    time_grain: month
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+
+  - name: repair_service_in_transit_count_month
+    display_name: 报修服务在途工单数（月）
+    description: 报修服务工单月度在途数量（无维度，竣工时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 在途
+    time_grain: month
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: repair_service_archived_count_month
+    display_name: 报修服务已归档工单数（月）
+    description: 报修服务工单月度已归档数量（无维度，竣工时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 已归档
+    time_grain: month
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 及时工单数指标 - 区县维度 ============
+  - name: repair_service_archive_on_time_count_area_day
+    display_name: 报修服务归档及时工单数（区县-日）
+    description: 报修服务工单归档及时数量（区县维度，日粒度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 时效
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_archive_on_time
+        operator: eq
+        value: true
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 及时工单数指标 - 班组维度 ============
+  - name: repair_service_archive_on_time_count_team_day
+    display_name: 报修服务归档及时工单数（班组-日）
+    description: 报修服务工单归档及时数量（班组维度，日粒度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 时效
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_archive_on_time
+        operator: eq
+        value: true
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 工单总数指标 - 区县维度 ============
+  - name: repair_service_total_count_area_day
+    display_name: 报修服务工单总数（区县-日）
+    description: 报修服务工单日度总数（区县维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+
+  - name: repair_service_in_transit_count_area_day
+    display_name: 报修服务在途工单数（区县-日）
+    description: 报修服务工单日度在途数量（区县维度，竣工时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 在途
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: repair_service_archived_count_area_day
+    display_name: 报修服务已归档工单数（区县-日）
+    description: 报修服务工单日度已归档数量（区县维度，竣工时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 已归档
+    time_grain: day
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 工单总数指标 - 班组维度 ============
+  - name: repair_service_total_count_team_day
+    display_name: 报修服务工单总数（班组-日）
+    description: 报修服务工单日度总数（班组维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+
+  - name: repair_service_in_transit_count_team_day
+    display_name: 报修服务在途工单数（班组-日）
+    description: 报修服务工单日度在途数量（班组维度，竣工时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 在途
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: repair_service_archived_count_team_day
+    display_name: 报修服务已归档工单数（班组-日）
+    description: 报修服务工单日度已归档数量（班组维度，竣工时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 已归档
+    time_grain: day
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 月度指标 - 区县维度 ============
+  - name: repair_service_total_count_area_month
+    display_name: 报修服务工单总数（区县-月）
+    description: 报修服务工单月度总数（区县维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+    time_grain: month
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+
+  - name: repair_service_in_transit_count_area_month
+    display_name: 报修服务在途工单数（区县-月）
+    description: 报修服务工单月度在途数量（区县维度，竣工时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 在途
+    time_grain: month
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: repair_service_archived_count_area_month
+    display_name: 报修服务已归档工单数（区县-月）
+    description: 报修服务工单月度已归档数量（区县维度，竣工时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 已归档
+    time_grain: month
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 月度指标 - 班组维度 ============
+  - name: repair_service_total_count_team_month
+    display_name: 报修服务工单总数（班组-月）
+    description: 报修服务工单月度总数（班组维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+    time_grain: month
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+
+  - name: repair_service_in_transit_count_team_month
+    display_name: 报修服务在途工单数（班组-月）
+    description: 报修服务工单月度在途数量（班组维度，竣工时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 在途
+    time_grain: month
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: repair_service_archived_count_team_month
+    display_name: 报修服务已归档工单数（班组-月）
+    description: 报修服务工单月度已归档数量（班组维度，竣工时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 已归档
+    time_grain: month
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 投诉工单总数（用于报修占比计算） - 区县维度 ============
+  - name: fault_reporting_total_count_area_day
+    display_name: 投诉工单总数（区县-日）
+    description: 投诉工单日度总数（区县维度，报修占比使用）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+
+  # ============ 投诉工单总数（用于报修占比计算） - 班组维度 ============
+  - name: fault_reporting_total_count_team_day
+    display_name: 投诉工单总数（班组-日）
+    description: 投诉工单日度总数（班组维度，报修占比使用）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+
+  # ============ KPI 指标 - 区县维度 ============
+  - name: repair_service_archive_rate_area_day
+    display_name: 报修服务归档及时率（区县-日）
+    description: 报修服务工单归档及时率（区县维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: repair_service_archive_on_time_count_area_day
+      total: repair_service_calc_total_count_area_day
+
+  - name: repair_service_order_ratio_area_day
+    display_name: 报修服务工单占比（区县-日）
+    description: 报修服务工单数占全部报修+投诉工单数的比例（区县维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {repair} IS NULL OR {fault} IS NULL
+        THEN NULL
+        WHEN (CAST({repair} AS DECIMAL) + CAST({fault} AS DECIMAL)) > 0
+        THEN ROUND((CAST({repair} AS DECIMAL) / (CAST({repair} AS DECIMAL) + CAST({fault} AS DECIMAL))) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      repair: repair_service_calc_total_count_area_day
+      fault: fault_reporting_calc_total_count_area_day
+
+  # ============ KPI 指标 - 班组维度 ============
+  - name: repair_service_archive_rate_team_day
+    display_name: 报修服务归档及时率（班组-日）
+    description: 报修服务工单归档及时率（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: repair_service_archive_on_time_count_team_day
+      total: repair_service_calc_total_count_team_day
+
+  - name: repair_service_order_ratio_team_day
+    display_name: 报修服务工单占比（班组-日）
+    description: 报修服务工单数占全部报修+投诉工单数的比例（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - repair_service
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {repair} IS NULL OR {fault} IS NULL
+        THEN NULL
+        WHEN (CAST({repair} AS DECIMAL) + CAST({fault} AS DECIMAL)) > 0
+        THEN ROUND((CAST({repair} AS DECIMAL) / (CAST({repair} AS DECIMAL) + CAST({fault} AS DECIMAL))) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      repair: repair_service_calc_total_count_team_day
+      fault: fault_reporting_calc_total_count_team_day
+
+  # ============ 全局总览 (Overall) ============
+  - name: repair_service_total_count_overall_day
+    display_name: 报修服务工单总数（全局-日）
+    description: 报修服务工单日度总数（全局维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    time_column: report_time
+    aggregation:
+      operation: count
+      column: id
+
+  - name: repair_service_in_transit_count_overall_day
+    display_name: 报修服务在途工单数（全局-日）
+    description: 报修服务工单日度在途数量（全局维度，竣工时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 在途, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    time_column: report_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: repair_service_archived_count_overall_day
+    display_name: 报修服务已归档工单数（全局-日）
+    description: 报修服务工单日度已归档数量（全局维度，竣工时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 已归档, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    time_column: completion_receipt_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+
+  - name: repair_service_archive_on_time_count_overall_day
+    display_name: 报修服务归档及时工单数（全局-日）
+    description: 报修服务工单归档及时数量（全局维度，日粒度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 时效, overall]
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_archive_on_time
+        operator: eq
+        value: true
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 投诉工单总数（用于报修占比计算） - 全局维度 ============
+  - name: fault_reporting_total_count_overall_day
+    display_name: 投诉工单总数（全局-日）
+    description: 投诉工单日度总数（全局维度，报修占比使用）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, overall]
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+
+  # ============ 辅助计算指标 - 报修/投诉分母(归档) ============
+  - name: repair_service_calc_total_count_area_day
+    display_name: 报修计算分母（区县-日）
+    description: 用于报修及时率计算的分母（区县维度，日粒度，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, calc]
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  - name: repair_service_calc_total_count_team_day
+    display_name: 报修计算分母（班组-日）
+    description: 用于报修及时率计算的分母（班组维度，日粒度，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, calc]
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  - name: repair_service_calc_total_count_overall_day
+    display_name: 报修计算分母（全局-日）
+    description: 用于报修及时率计算的分母（全局维度，日粒度，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, calc]
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  - name: fault_reporting_calc_total_count_area_day
+    display_name: 投诉计算分母（区县-日）
+    description: 用于报修占比计算的分母（区县维度，日粒度，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, calc]
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: not_null
+
+  - name: fault_reporting_calc_total_count_team_day
+    display_name: 投诉计算分母（班组-日）
+    description: 用于报修占比计算的分母（班组维度，日粒度，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, calc]
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: not_null
+
+  - name: fault_reporting_calc_total_count_overall_day
+    display_name: 投诉计算分母（全局-日）
+    description: 用于报修占比计算的分母（全局维度，日粒度，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, calc]
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: not_null
+
+  # ============ KPI 指标 - 全局维度 ============
+  - name: repair_service_archive_rate_overall_day
+    display_name: 报修服务归档及时率（全局-日）
+    description: 报修服务工单归档及时率（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 时效, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: repair_service_archive_on_time_count_overall_day
+      total: repair_service_calc_total_count_overall_day
+
+  - name: repair_service_order_ratio_overall_day
+    display_name: 报修服务工单占比（全局-日）
+    description: 报修服务工单数占全部报修+投诉工单数的比例（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {repair} IS NULL OR {fault} IS NULL
+        THEN NULL
+        WHEN (CAST({repair} AS DECIMAL) + CAST({fault} AS DECIMAL)) > 0
+        THEN ROUND((CAST({repair} AS DECIMAL) / (CAST({repair} AS DECIMAL) + CAST({fault} AS DECIMAL))) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      repair: repair_service_calc_total_count_overall_day
+      fault: fault_reporting_calc_total_count_overall_day
+
+  - name: repair_service_total_count_month_overall
+    display_name: 报修服务工单总数（全局-月）
+    description: 报修服务工单月度总数（全局维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    time_column: report_time
+    aggregation:
+      operation: count
+      column: id
+
+  - name: repair_service_in_transit_count_month_overall
+    display_name: 报修服务在途工单数（全局-月）
+    description: 报修服务工单月度在途数量（全局维度，竣工时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 在途, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    time_column: report_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: repair_service_archived_count_month_overall
+    display_name: 报修服务已归档工单数（全局-月）
+    description: 报修服务工单月度已归档数量（全局维度，竣工时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 已归档, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    time_column: completion_receipt_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 小热线重要场景上门率（日） ============
+  - name: small_hotline_important_scene_dispatch_count_area_day
+    display_name: 小热线重要场景派单分母（区县-日）
+    description: 2091报障详情命中重要场景且是否派单原始值不为否的工单数
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 小热线, 重要场景, 上门率, calc]
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_small_hotline_important_scene
+        operator: eq
+        value: true
+      - column: is_dispatch_not_no
+        operator: eq
+        value: true
+
+  - name: small_hotline_important_scene_onsite_count_area_day
+    display_name: 小热线重要场景需上门数（区县-日）
+    description: 小热线重要场景派单分母中，报修服务场景为客户报修-需上门的工单数
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 小热线, 重要场景, 上门率, calc]
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_small_hotline_important_scene
+        operator: eq
+        value: true
+      - column: is_dispatch_not_no
+        operator: eq
+        value: true
+      - column: current_repair_service
+        operator: like
+        value: "客户报修-需上门%"
+
+  - name: small_hotline_important_scene_onsite_rate_area_day
+    display_name: 小热线重要场景上门率（区县-日）
+    description: 小热线重要场景需上门数除以派单分母
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 小热线, 重要场景, 上门率, kpi]
+    time_grain: day
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({onsite}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      onsite: small_hotline_important_scene_onsite_count_area_day
+      total: small_hotline_important_scene_dispatch_count_area_day
+
+  - name: small_hotline_important_scene_dispatch_count_team_day
+    display_name: 小热线重要场景派单分母（班组-日）
+    description: 2091报障详情命中重要场景且是否派单原始值不为否的工单数
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 小热线, 重要场景, 上门率, calc]
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_small_hotline_important_scene
+        operator: eq
+        value: true
+      - column: is_dispatch_not_no
+        operator: eq
+        value: true
+
+  - name: small_hotline_important_scene_onsite_count_team_day
+    display_name: 小热线重要场景需上门数（班组-日）
+    description: 小热线重要场景派单分母中，报修服务场景为客户报修-需上门的工单数
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 小热线, 重要场景, 上门率, calc]
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_small_hotline_important_scene
+        operator: eq
+        value: true
+      - column: is_dispatch_not_no
+        operator: eq
+        value: true
+      - column: current_repair_service
+        operator: like
+        value: "客户报修-需上门%"
+
+  - name: small_hotline_important_scene_onsite_rate_team_day
+    display_name: 小热线重要场景上门率（班组-日）
+    description: 小热线重要场景需上门数除以派单分母
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 小热线, 重要场景, 上门率, kpi]
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({onsite}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      onsite: small_hotline_important_scene_onsite_count_team_day
+      total: small_hotline_important_scene_dispatch_count_team_day
+
+  - name: small_hotline_important_scene_dispatch_count_overall_day
+    display_name: 小热线重要场景派单分母（全局-日）
+    description: 2091报障详情命中重要场景且是否派单原始值不为否的工单数
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 小热线, 重要场景, 上门率, calc, overall]
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_small_hotline_important_scene
+        operator: eq
+        value: true
+      - column: is_dispatch_not_no
+        operator: eq
+        value: true
+
+  - name: small_hotline_important_scene_onsite_count_overall_day
+    display_name: 小热线重要场景需上门数（全局-日）
+    description: 小热线重要场景派单分母中，报修服务场景为客户报修-需上门的工单数
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 小热线, 重要场景, 上门率, calc, overall]
+    time_grain: day
+    time_column: report_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_repair_service
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_small_hotline_important_scene
+        operator: eq
+        value: true
+      - column: is_dispatch_not_no
+        operator: eq
+        value: true
+      - column: current_repair_service
+        operator: like
+        value: "客户报修-需上门%"
+
+  - name: small_hotline_important_scene_onsite_rate_overall_day
+    display_name: 小热线重要场景上门率（全局-日）
+    description: 小热线重要场景需上门数除以派单分母
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [repair_service, 小热线, 重要场景, 上门率, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({onsite}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      onsite: small_hotline_important_scene_onsite_count_overall_day
+      total: small_hotline_important_scene_dispatch_count_overall_day
