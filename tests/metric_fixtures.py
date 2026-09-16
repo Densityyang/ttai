@@ -8,10 +8,14 @@ from uuid import UUID
 
 from src.nl2sql.contracts import ContextBundle, QueryPlan, RequestIdentity, TimeRange
 from src.nl2sql.orchestration.metric_query import (
+    AggregateColumns,
+    AggregateContract,
     EligibilityPolicy,
     MetricQueryCompiler,
     OrganizationDimensionBinding,
     RelationBinding,
+    SourceFreshnessRecord,
+    aggregate_definition_checksum,
 )
 from src.nl2sql.semantic.authoring import validate_authoring_ir
 from src.nl2sql.semantic.materialization import materialize_authoring_ir
@@ -143,3 +147,61 @@ class MetricAuthority:
         assert self.snapshot is not None
         relation = replace(self.snapshot.candidate.relations[0], **changes)
         self.snapshot = replace(self.snapshot, candidate=replace(self.snapshot.candidate, relations=(relation,)))
+
+
+class AggregateAuthority(MetricAuthority):
+    """Portable synthetic target, deliberately unrelated to legacy Gold tables."""
+
+    def __init__(self, metric: MetricContract | None = None) -> None:
+        super().__init__(metric)
+        assert self.snapshot is not None and self.release is not None
+        mapping = AggregateColumns(
+            metric_key="metric_key", formula_version="formula_version", release_id="release_id",
+            snapshot_id="snapshot_id", checkpoint="checkpoint", time="day_at", grain="grain",
+            dimension="dimension", value="value", numerator="numerator", denominator="denominator",
+            status="status", data_as_of="data_as_of",
+        )
+        types = {name: "text" for name in mapping.model_dump().values()}
+        types.update(day_at="timestamp with time zone", data_as_of="timestamp with time zone",
+                     value="numeric", numerator="bigint", denominator="bigint", area_id="text", team_id="integer")
+        relation = replace(self.snapshot.candidate.relations[0],
+                           relation_id="ai_views.approved_daily_facts", relation_name="approved_daily_facts",
+                           columns=tuple(ColumnSnapshot(key, value, True, index)
+                                         for index, (key, value) in enumerate(types.items(), 1)),
+                           indexes=(), aggregate_coverage=(self.metric.metric_key,))
+        self.snapshot = replace(self.snapshot, candidate=replace(self.snapshot.candidate,
+                                relations=(*self.snapshot.candidate.relations, relation)))
+        relation_doc = next(doc for doc in self.release.documents if doc.metadata.get("asset_type") == "relation")
+        aggregate_asset = "relation.approved_daily_facts"
+        self.release = replace(self.release, documents=(*self.release.documents,
+                               replace(relation_doc, document_id=aggregate_asset,
+                                       content="relation ai_views.approved_daily_facts")))
+        self.context = self.context.model_copy(update={
+            "approved_relation_ids": (*self.context.approved_relation_ids, aggregate_asset),
+        })
+        self.aggregate_binding = RelationBinding(
+            source_ref=self.binding.source_ref, source_id="approved_daily_facts", relation_asset_id=aggregate_asset,
+            schema_name="ai_views", relation_name="approved_daily_facts", allowed_columns=tuple(types),
+            required_permissions=self.binding.required_permissions, approved=True, timestamp_kind="timestamptz",
+            organization_dimensions=self.binding.organization_dimensions,
+            aggregate=AggregateContract(metric_key=self.metric.metric_key, formula_version=self.metric.formula_version,
+                                        operation=self.metric.operation, columns=mapping, unique_daily_facts=True,
+                                        metric_contract_sha256=aggregate_definition_checksum(self.metric),
+                                        eligibility_policy_sha256=aggregate_definition_checksum(
+                                            EligibilityPolicy(policy_id=self.metric.eligibility_policy_id))),
+        )
+        self.freshness = {
+            source: SourceFreshnessRecord(source_id=source, status="fresh", data_as_of=NOW,
+                                         checkpoint="synthetic.checkpoint.v1", release_id=RELEASE_ID,
+                                         snapshot_id=SNAPSHOT_ID, snapshot_checksum=self.snapshot.checksum)
+            for source in (self.binding.deployment_source_id, self.aggregate_binding.deployment_source_id)
+        }
+
+    async def read_freshness(self, source_id: str) -> SourceFreshnessRecord | None:
+        return self.freshness.get(source_id)
+
+    def compiler(self, **overrides: Any) -> MetricQueryCompiler:
+        options: dict[str, Any] = dict(bindings=(self.binding, self.aggregate_binding),
+                                       read_freshness=self.read_freshness, clock=lambda: NOW)
+        options.update(overrides)
+        return super().compiler(**options)

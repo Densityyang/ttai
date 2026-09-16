@@ -282,6 +282,12 @@ class PlanExecutor:
                             rowset_sha256=gateway_receipt.rowset_sha256 if gateway_receipt else None,
                             data_as_of=gateway_receipt.data_as_of if gateway_receipt else None,
                             freshness_status=gateway_receipt.freshness_status if gateway_receipt else "unknown",
+                            source_kind=gateway_receipt.source_kind if gateway_receipt else None,
+                            source_id=gateway_receipt.source_id if gateway_receipt else None,
+                            selection_reason=gateway_receipt.selection_reason if gateway_receipt else None,
+                            source_degradation=gateway_receipt.source_degradation if gateway_receipt else (),
+                            source_checkpoint=gateway_receipt.source_checkpoint if gateway_receipt else None,
+                            semantic_signature=gateway_receipt.semantic_signature if gateway_receipt else None,
                         )
                     )
         except TimeoutError:

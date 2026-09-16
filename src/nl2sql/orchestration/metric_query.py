@@ -7,9 +7,11 @@ cannot select physical names, executable expressions, or disable predicates.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -36,6 +38,14 @@ from src.nl2sql.semantic.metric_contract import (
 from src.nl2sql.semantic.registry import SemanticRelease, SemanticReleaseState
 from src.nl2sql.semantic.schema_snapshot import SchemaSnapshot, SchemaSnapshotState
 
+_SOURCE_REJECTIONS = frozenset({
+    "metric_permission_denied", "metric_relation_unapproved", "metric_aggregate_coverage_unapproved",
+    "metric_aggregate_sensitivity_denied", "metric_column_unapproved", "metric_column_type_mismatch",
+    "metric_scan_rows_exceeded", "metric_time_index_required", "metric_time_range_too_large",
+    "metric_grain_or_dimension_unsupported", "metric_dimension_combination_unsupported",
+    "metric_aggregate_sla_missing", "metric_freshness_evidence_invalid", "metric_freshness_authority_mismatch",
+})
+
 
 class EligibilityPolicy(FrozenContract):
     policy_id: ContractId
@@ -61,6 +71,71 @@ class OrganizationDimensionBinding(FrozenContract):
         return self
 
 
+class AggregateColumns(FrozenContract):
+    """Daily additive facts; every field is a column identifier, never SQL."""
+
+    metric_key: Identifier
+    formula_version: Identifier
+    release_id: Identifier
+    snapshot_id: Identifier
+    checkpoint: Identifier
+    time: Identifier
+    grain: Identifier
+    dimension: Identifier
+    value: Identifier
+    numerator: Identifier
+    denominator: Identifier
+    status: Identifier
+    data_as_of: Identifier
+
+    @model_validator(mode="after")
+    def unique_columns(self) -> AggregateColumns:
+        names = tuple(self.model_dump().values())
+        if len(set(names)) != len(names):
+            raise ValueError("aggregate roles require distinct columns")
+        return self
+
+
+class AggregateContract(FrozenContract):
+    metric_key: ContractId
+    formula_version: ContractId
+    operation: Literal["count", "ratio"]
+    columns: AggregateColumns
+    # Approval attests one row per day/scope/stable ID/filter combination.
+    unique_daily_facts: Literal[True]
+    # Approval covers the complete executable definition, including additional
+    # deployment eligibility. A version label alone cannot attest equivalence.
+    metric_contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    eligibility_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SourceFreshnessRecord(FrozenContract):
+    source_id: ContractId
+    status: Literal["fresh", "stale", "unknown"]
+    data_as_of: datetime | None = None
+    checked_at: datetime | None = None
+    checkpoint: ContractId | None = None
+    release_id: str | None = None
+    snapshot_id: str | None = None
+    snapshot_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def fresh_requires_evidence(self) -> SourceFreshnessRecord:
+        for instant in (self.data_as_of, self.checked_at):
+            if instant is not None and (instant.tzinfo is None or instant.utcoffset() is None):
+                raise ValueError("freshness timestamps must be timezone aware")
+        if (self.checked_at is not None and self.data_as_of is not None
+                and self.data_as_of > self.checked_at):
+            raise ValueError("watermark cannot follow its observation")
+        if self.status == "fresh" and (
+            self.data_as_of is None or self.data_as_of.tzinfo is None
+            or self.checkpoint is None or self.release_id is None
+            or self.snapshot_id is None or self.snapshot_checksum is None
+        ):
+            raise ValueError("fresh source requires versioned watermark evidence")
+        return self
+
+
 class RelationBinding(FrozenContract):
     source_ref: ContractId
     relation_asset_id: str = Field(min_length=1)
@@ -71,6 +146,12 @@ class RelationBinding(FrozenContract):
     approved: Literal[True]
     timestamp_kind: Literal["timestamp", "timestamptz"]
     max_days: int = Field(default=366, ge=1, le=3660)
+    source_id: ContractId | None = None
+    aggregate: AggregateContract | None = None
+    allow_detail_fallback: bool = False
+    allow_detail_required: bool = True
+    max_estimated_rows: int = Field(default=1_000_000, ge=1)
+    bootstrap_scan_max_rows: int | None = Field(default=None, ge=1)
     organization_dimensions: tuple[OrganizationDimensionBinding, ...] = (
         OrganizationDimensionBinding(dimension="city_company"),
     )
@@ -87,6 +168,10 @@ class RelationBinding(FrozenContract):
     def relation_id(self) -> str:
         return f"{self.schema_name}.{self.relation_name}"
 
+    @property
+    def deployment_source_id(self) -> str:
+        return self.source_id or self.source_ref
+
 
 @dataclass(frozen=True)
 class CompiledMetricQuery:
@@ -99,6 +184,12 @@ class CompiledMetricQuery:
     context: ContextBundle = field(repr=False)
     operation: Literal["count", "ratio"] = "count"
     dimension: OrganizationDimensionBinding | None = None
+    source_kind: Literal["approved_aggregate", "approved_detail"] = "approved_detail"
+    source_id: str = ""
+    selection_reason: str = "approved_detail"
+    degradation: tuple[str, ...] = ()
+    freshness: SourceFreshnessRecord | None = None
+    semantic_signature: str = ""
 
 
 class MetricQueryCompiler:
@@ -110,14 +201,22 @@ class MetricQueryCompiler:
         bindings: tuple[RelationBinding, ...],
         eligibility_policies: tuple[EligibilityPolicy, ...],
         identity: RequestIdentity,
+        read_freshness: Callable[[str], Awaitable[SourceFreshnessRecord | None]] | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._read_active = read_active
         self._read_snapshot = read_snapshot
-        self._bindings = {item.source_ref: item for item in bindings}
+        bindings = tuple(RelationBinding.model_validate_json(item.model_dump_json()) for item in bindings)
+        eligibility_policies = tuple(
+            EligibilityPolicy.model_validate_json(item.model_dump_json()) for item in eligibility_policies
+        )
+        self._bindings = {item.deployment_source_id: item for item in bindings}
         self._policies = {item.policy_id: item for item in eligibility_policies}
         if len(self._bindings) != len(bindings) or len(self._policies) != len(eligibility_policies):
             raise ValueError("duplicate deployment binding or eligibility policy")
         self._identity = RequestIdentity.model_validate_json(identity.model_dump_json())
+        self._read_freshness = read_freshness
+        self._clock = clock
 
     async def compile(self, plan: QueryPlan, context: ContextBundle) -> CompiledMetricQuery:
         plan = QueryPlan.model_validate_json(plan.model_dump_json())
@@ -153,10 +252,24 @@ class MetricQueryCompiler:
                 or document.metadata.get("owner") != metric.owner
                 or metric.release_status != "active" or not metric.assistant_enabled):
             raise PlanStepError("metric_contract_inactive")
-        binding = self._bindings.get(metric.source_ref)
         policy = self._policies.get(metric.eligibility_policy_id)
-        if binding is None or policy is None:
+        if policy is None:
             raise PlanStepError("metric_source_or_policy_missing")
+        if ("*" not in self._identity.permissions
+                and not set(metric.required_permissions) <= self._identity.permissions):
+            raise PlanStepError("metric_permission_denied")
+        evaluated_at = self._clock()
+        if (not isinstance(evaluated_at, datetime) or evaluated_at.tzinfo is None
+                or evaluated_at.utcoffset() != timedelta(0)):
+            raise PlanStepError("metric_evaluation_clock_invalid")
+        return await self._select_source(plan, context, metric, policy, release, snapshot, evaluated_at)
+
+    def _compile_source(
+        self, plan: QueryPlan, context: ContextBundle, metric: MetricContract,
+        policy: EligibilityPolicy, release: SemanticRelease, snapshot: SchemaSnapshot,
+        binding: RelationBinding, freshness: SourceFreshnessRecord,
+        reason: str, degradation: tuple[str, ...],
+    ) -> CompiledMetricQuery:
         permissions = set(metric.required_permissions) | set(binding.required_permissions)
         if (any(not permission.strip() for permission in permissions)
                 or ("*" not in self._identity.permissions
@@ -175,28 +288,49 @@ class MetricQueryCompiler:
         if len(relation_docs) != 1 or len(relations) != 1:
             raise PlanStepError("metric_relation_unapproved")
         relation = relations[0]
+        if binding.aggregate is not None and relation.sensitivity not in {"public", "internal"}:
+            raise PlanStepError("metric_aggregate_sensitivity_denied")
+        if binding.aggregate is not None and metric.metric_key not in relation.aggregate_coverage:
+            raise PlanStepError("metric_aggregate_coverage_unapproved")
         columns = {column.name: column.data_type.lower() for column in relation.columns}
+        aggregate = binding.aggregate
+        business_time_column = aggregate.columns.time if aggregate else metric.business_time_column
         predicates = (Predicate(field="is_valid_for_metrics", operator="is_true"),
                       *policy.predicates, *metric.predicates)
         formula_predicates = (*predicates, *metric.formula_predicates)
         dimension, filter_dimensions = _organization_scope(plan, metric, binding)
-        used = {metric.business_time_column, *(item.field for item in formula_predicates),
+        used = {business_time_column, *(item.field for item in formula_predicates),
                 *(item.field for item in metric.filters)}
+        if aggregate:
+            used = {*aggregate.columns.model_dump().values(), *(item.field for item in metric.filters)}
         used.update(item.field for item in filter_dimensions.values() if item.field is not None)
         if dimension is not None and dimension.field is not None:
             used.add(dimension.field)
         if (not used <= set(binding.allowed_columns) or not used <= columns.keys()
                 or used & set(relation.sensitive_columns)):
             raise PlanStepError("metric_column_unapproved")
-        time_type = columns[metric.business_time_column]
+        time_type = columns[business_time_column]
         expected_types = ({"timestamp without time zone", "timestamp"}
                           if binding.timestamp_kind == "timestamp"
                           else {"timestamp with time zone", "timestamptz"})
         if time_type not in expected_types or any(
             item.operator == "is_true" and columns[item.field] not in {"boolean", "bool"}
-            for item in formula_predicates
+            for item in (() if aggregate else formula_predicates)
         ):
             raise PlanStepError("metric_column_type_mismatch")
+        if aggregate:
+            _validate_aggregate_columns(aggregate.columns, columns)
+        else:
+            indexed = any(index.columns and index.columns[0] == business_time_column
+                          and index.predicate is None for index in relation.indexes)
+            # Arbitrary partition expressions and partial predicates are not
+            # sufficient index evidence. Bootstrap scans require explicit caps.
+            bootstrap = (binding.bootstrap_scan_max_rows is not None
+                         and 0 <= relation.estimated_rows <= binding.bootstrap_scan_max_rows)
+            if relation.estimated_rows < 0 or relation.estimated_rows > binding.max_estimated_rows:
+                raise PlanStepError("metric_scan_rows_exceeded")
+            if not indexed and not bootstrap:
+                raise PlanStepError("metric_time_index_required")
         for rule in metric.filters:
             _validate_column_type(rule.value_type, columns[rule.field])
         for organization in (*filter_dimensions.values(), *((dimension,) if dimension else ())):
@@ -221,9 +355,25 @@ class MetricQueryCompiler:
             start = start.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
             end = end.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
         params: dict[str, Any] = {"start_at": start, "end_at": end}
-        business_time = _quote(metric.business_time_column)
+        business_time = _quote(business_time_column)
         where = [f"{business_time} >= :start_at", f"{business_time} < :end_at"]
-        where.extend(_predicate_sql(item) for item in predicates)
+        if aggregate:
+            assert freshness is not None
+            scope = dimension.dimension if dimension else next(iter(filter_dimensions), "city_company")
+            for key, column, value in (
+                ("metric", aggregate.columns.metric_key, metric.metric_key),
+                ("formula", aggregate.columns.formula_version, metric.formula_version),
+                ("release", aggregate.columns.release_id, release.release_id),
+                ("snapshot", aggregate.columns.snapshot_id, snapshot.snapshot_id),
+                ("checkpoint", aggregate.columns.checkpoint, freshness.checkpoint),
+                ("data_as_of", aggregate.columns.data_as_of, freshness.data_as_of),
+                ("grain", aggregate.columns.grain, "day"),
+                ("dimension", aggregate.columns.dimension, scope),
+            ):
+                params[f"source_{key}"] = value
+                where.append(f"{_quote(column)} = :source_{key}")
+        else:
+            where.extend(_predicate_sql(item) for item in predicates)
         if dimension is not None:
             assert dimension.field is not None
             where.append(f"{_quote(dimension.field)} IS NOT NULL")
@@ -263,6 +413,8 @@ class MetricQueryCompiler:
         order = ""
         prefix = ""
         select = "COUNT(*) AS value"
+        if aggregate:
+            select = f"CAST(COALESCE(SUM({_quote(aggregate.columns.value)}), 0) AS bigint) AS value"
         if plan.intent == "trend":
             local_time = (f"{business_time} AT TIME ZONE 'Asia/Shanghai'"
                           if binding.timestamp_kind == "timestamptz" else business_time)
@@ -288,6 +440,9 @@ class MetricQueryCompiler:
             numerator = " AND ".join(_predicate_sql(item) for item in metric.ratio.numerator_predicates)
             select = (f"COUNT(*) FILTER (WHERE {denominator} AND {numerator}) AS numerator, "
                       f"COUNT(*) FILTER (WHERE {denominator}) AS denominator")
+            if aggregate:
+                select = (f"CAST(COALESCE(SUM({_quote(aggregate.columns.numerator)}), 0) AS bigint) AS numerator, "
+                          f"CAST(COALESCE(SUM({_quote(aggregate.columns.denominator)}), 0) AS bigint) AS denominator")
         sql = (f"SELECT {prefix}{select} FROM {_quote(binding.schema_name)}.{_quote(binding.relation_name)}"
                f" WHERE {' AND '.join(where)}{group}")
         if metric.ratio is not None:
@@ -297,8 +452,99 @@ class MetricQueryCompiler:
                    "CASE WHEN denominator = 0 THEN 'no_data' ELSE 'success' END AS status "
                    f"FROM ({sql}) AS metric_counts")
         sql += order
-        return CompiledMetricQuery(sql, params, release.release_id, snapshot.snapshot_id,
-                                   snapshot.checksum, plan, context, metric.operation, dimension)
+        signature_plan = plan.model_dump(mode="json", exclude={"source_strategy"})
+        signature = hashlib.sha256(json.dumps({
+            "plan": signature_plan, "metric": metric.model_dump(mode="json"),
+            "policy": policy.model_dump(mode="json"), "release": release.release_id,
+            "snapshot": snapshot.snapshot_id, "checksum": snapshot.checksum,
+            "checkpoint": freshness.checkpoint if freshness else None,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return CompiledMetricQuery(
+            sql, params, release.release_id, snapshot.snapshot_id, snapshot.checksum, plan, context,
+            metric.operation, dimension, "approved_aggregate" if aggregate else "approved_detail",
+            binding.deployment_source_id, reason, degradation, freshness, signature,
+        )
+
+    async def _select_source(
+        self, plan: QueryPlan, context: ContextBundle, metric: MetricContract, policy: EligibilityPolicy,
+        release: SemanticRelease, snapshot: SchemaSnapshot, evaluated_at: datetime,
+    ) -> CompiledMetricQuery:
+        sources = sorted((item for item in self._bindings.values() if item.source_ref == metric.source_ref),
+                         key=lambda item: item.deployment_source_id)
+        degradation: list[str] = []
+        blocked: list[str] = []
+        rejected: list[str] = []
+        for source in sources:
+            aggregate = source.aggregate
+            if plan.source_strategy == "detail_required" or aggregate is None:
+                continue
+            if (aggregate.metric_key != metric.metric_key or aggregate.formula_version != metric.formula_version
+                    or aggregate.operation != metric.operation
+                    or aggregate.metric_contract_sha256 != aggregate_definition_checksum(metric)
+                    or aggregate.eligibility_policy_sha256 != aggregate_definition_checksum(policy)):
+                continue
+            try:
+                freshness = await self._freshness(source, metric, release, snapshot, evaluated_at)
+                query = self._compile_source(plan, context, metric, policy, release, snapshot,
+                                             source, freshness, "fresh_approved_aggregate", ())
+                if freshness.status == "fresh":
+                    return query
+                code = "metric_aggregate_freshness_denied"
+                degradation.append(f"aggregate_{freshness.status}")
+            except PlanStepError as exc:
+                if exc.code not in _SOURCE_REJECTIONS:
+                    raise
+                code = exc.code
+                degradation.append(code)
+            rejected.append(code)
+            if not source.allow_detail_fallback:
+                blocked.append(code)
+        if blocked:
+            raise PlanStepError(blocked[0])
+        for source in sources:
+            if source.aggregate is not None:
+                continue
+            if plan.source_strategy == "detail_required" and not source.allow_detail_required:
+                raise PlanStepError("metric_detail_strategy_denied")
+            try:
+                freshness = await self._freshness(source, metric, release, snapshot, evaluated_at)
+                return self._compile_source(
+                    plan, context, metric, policy, release, snapshot, source, freshness,
+                    "approved_detail_fallback" if degradation else "approved_detail",
+                    tuple(sorted(set(degradation))),
+                )
+            except PlanStepError as exc:
+                if exc.code not in _SOURCE_REJECTIONS:
+                    raise
+                rejected.append(exc.code)
+        if rejected:
+            raise PlanStepError(rejected[0])
+        raise PlanStepError("metric_source_or_policy_missing")
+
+    async def _freshness(self, source: RelationBinding, metric: MetricContract, release: SemanticRelease,
+                         snapshot: SchemaSnapshot, evaluated_at: datetime) -> SourceFreshnessRecord:
+        if source.aggregate is not None and metric.freshness_sla_seconds is None:
+            raise PlanStepError("metric_aggregate_sla_missing")
+        record = await self._read_freshness(source.deployment_source_id) if self._read_freshness else None
+        if record is None:
+            return SourceFreshnessRecord(source_id=source.deployment_source_id, status="unknown")
+        try:
+            record = SourceFreshnessRecord.model_validate_json(record.model_dump_json())
+        except ValueError as exc:
+            raise PlanStepError("metric_freshness_evidence_invalid") from exc
+        if (record.source_id != source.deployment_source_id
+                or (record.release_id is not None and record.release_id != release.release_id)
+                or (record.snapshot_id is not None and record.snapshot_id != snapshot.snapshot_id)
+                or (record.snapshot_checksum is not None and record.snapshot_checksum != snapshot.checksum)):
+            raise PlanStepError("metric_freshness_authority_mismatch")
+        if ((record.data_as_of is not None and record.data_as_of > evaluated_at)
+                or (record.checked_at is not None and record.checked_at > evaluated_at)):
+            raise PlanStepError("metric_freshness_evidence_invalid")
+        if (record.status == "fresh" and record.data_as_of is not None
+                and metric.freshness_sla_seconds is not None
+                and evaluated_at - record.data_as_of > timedelta(seconds=metric.freshness_sla_seconds)):
+            return record.model_copy(update={"status": "stale"})
+        return record
 
 
 class GatewayMetricStepRunner:
@@ -324,6 +570,12 @@ class GatewayMetricStepRunner:
             if (current.sql != query.sql or current.params != query.params
                     or current.snapshot_checksum != query.snapshot_checksum
                     or current.operation != query.operation or current.dimension != query.dimension
+                    or current.freshness != query.freshness
+                    or current.semantic_signature != query.semantic_signature
+                    or current.source_id != query.source_id
+                    or current.source_kind != query.source_kind
+                    or current.selection_reason != query.selection_reason
+                    or current.degradation != query.degradation
                     or self._gateway.prepare(current.sql).fingerprint != prepared.sql_fingerprint):
                 raise PlanStepError("metric_prepared_query_changed")
             result = await self._gateway.execute(current.sql, current.params)
@@ -360,7 +612,16 @@ class GatewayMetricStepRunner:
                 else:
                     raise PlanStepError("metric_result_shape_invalid")
             rows.append(json_row)
-        receipt = result.execution_receipt.model_copy(update={"rowset_sha256": digest})
+        payload = result.execution_receipt.model_dump()
+        payload.update(
+            rowset_sha256=digest, source_kind=current.source_kind, source_id=current.source_id,
+            selection_reason=current.selection_reason, source_degradation=current.degradation,
+            semantic_signature=current.semantic_signature,
+            source_checkpoint=current.freshness.checkpoint if current.freshness else None,
+            freshness_status=current.freshness.status if current.freshness else "unknown",
+            data_as_of=current.freshness.data_as_of if current.freshness else None,
+        )
+        receipt = type(result.execution_receipt).model_validate(payload)
         output: dict[str, JsonValue] = {
             "rows": rows,
             "no_data": not rows or (query.operation == "ratio"
@@ -377,6 +638,24 @@ def metric_plan_executor(compiler: MetricQueryCompiler, gateway: QueryGateway) -
 def _quote(identifier: str) -> str:
     # All identifiers originate from typed, deployment-controlled contracts.
     return f'"{identifier}"'
+
+
+def aggregate_definition_checksum(contract: FrozenContract) -> str:
+    """Deployment approval fingerprint for the complete typed definition."""
+    payload = json.dumps(contract.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _validate_aggregate_columns(mapping: AggregateColumns, columns: dict[str, str]) -> None:
+    text_fields = (mapping.metric_key, mapping.formula_version, mapping.release_id, mapping.snapshot_id,
+                   mapping.checkpoint, mapping.grain, mapping.dimension, mapping.status)
+    for name in text_fields:
+        _validate_column_type("text", columns[name])
+    for name in (mapping.numerator, mapping.denominator):
+        _validate_column_type("integer", columns[name])
+    if (columns[mapping.value] not in {"numeric", "decimal", "bigint", "int8", "integer", "int4"}
+            or columns[mapping.data_as_of] not in {"timestamp with time zone", "timestamptz"}):
+        raise PlanStepError("metric_column_type_mismatch")
 
 
 def _predicate_sql(predicate: Predicate) -> str:

@@ -14,6 +14,15 @@ ModelStage = Literal["classify", "retrieve", "plan", "generate_sql", "verify", "
 ModelDataClassification = Literal["public", "internal", "confidential", "restricted"]
 RouteName = Literal["fast", "standard", "deep"]
 PolicyLifecycle = Literal["bootstrap", "calibrated", "frozen"]
+SourceDegradation = Literal[
+    "aggregate_stale", "aggregate_unknown", "metric_permission_denied",
+    "metric_relation_unapproved", "metric_aggregate_coverage_unapproved",
+    "metric_aggregate_sensitivity_denied", "metric_column_unapproved",
+    "metric_column_type_mismatch", "metric_scan_rows_exceeded", "metric_time_index_required",
+    "metric_time_range_too_large", "metric_grain_or_dimension_unsupported",
+    "metric_dimension_combination_unsupported", "metric_aggregate_sla_missing",
+    "metric_freshness_evidence_invalid", "metric_freshness_authority_mismatch",
+]
 
 
 class StrictContract(BaseModel):
@@ -375,6 +384,12 @@ class PlanStepReceipt(StrictContract):
     rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     data_as_of: datetime | None = None
     freshness_status: Literal["fresh", "stale", "unknown"] = "unknown"
+    source_kind: Literal["approved_aggregate", "approved_detail"] | None = None
+    source_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    selection_reason: Literal["fresh_approved_aggregate", "approved_detail_fallback", "approved_detail"] | None = None
+    source_degradation: tuple[SourceDegradation, ...] = ()
+    source_checkpoint: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    semantic_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     error_code: str | None = Field(default=None, min_length=1, max_length=128)
 
     @model_validator(mode="after")
@@ -522,11 +537,11 @@ class RouteBudgetRecord(StrictContract):
 
 
 class QueryCandidate(StrictContract):
-    sql: str
+    sql: str = Field(repr=False, exclude=True)
     fingerprint: str
     validation: tuple[str, ...] = ()
     cost: float | None = Field(default=None, ge=0)
-    score: float = Field(ge=0, le=1)
+    semantic_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class ExecutionReceipt(StrictContract):
@@ -545,6 +560,12 @@ class ExecutionReceipt(StrictContract):
     rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     data_as_of: datetime | None = None
     freshness_status: Literal["fresh", "stale", "unknown"] = "unknown"
+    source_kind: Literal["approved_aggregate", "approved_detail"] | None = None
+    source_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    selection_reason: Literal["fresh_approved_aggregate", "approved_detail_fallback", "approved_detail"] | None = None
+    source_degradation: tuple[SourceDegradation, ...] = ()
+    source_checkpoint: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    semantic_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class AnswerArtifact(StrictContract):

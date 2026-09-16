@@ -34,7 +34,7 @@ from src.nl2sql.orchestration.budget import RouteBudgetLedger
 from src.nl2sql.orchestration.metric_query import metric_plan_executor
 from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
 from src.nl2sql.semantic.metric_layer import MetricSemanticLayer
-from tests.metric_fixtures import MetricAuthority, ratio_contract, seed_contract
+from tests.metric_fixtures import AggregateAuthority, MetricAuthority, ratio_contract, seed_contract
 
 RUN_INTEGRATION = os.environ.get("TTAI_RUN_POSTGRES_INTEGRATION") == "1"
 
@@ -237,6 +237,51 @@ def gateway_postgres() -> Iterator[_GatewayPostgres]:
                  WHEN n IN (14, 15) THEN 4 ELSE 5 END
         FROM generate_series(1, 15) AS generated(n);
         ANALYZE ai_views.complaint_orders;
+        -- Slice 3: immutable synthetic checkpoint, no enterprise Gold schema.
+        CREATE TABLE ai_views.approved_daily_facts AS
+        WITH scoped AS (
+            SELECT DATE_TRUNC('day', acceptance_time AT TIME ZONE 'Asia/Shanghai')
+                       AT TIME ZONE 'Asia/Shanghai' AS day_at,
+                   scope.dimension,
+                   CASE WHEN scope.dimension = 'area' THEN area_id END AS area_id,
+                   CASE WHEN scope.dimension = 'team' THEN team_id END AS team_id,
+                   has_valid_bandwidth, completion_time, is_first_response_on_time
+            FROM ai_views.complaint_orders
+            CROSS JOIN (VALUES ('city_company'), ('area'), ('team')) AS scope(dimension)
+            WHERE is_valid_for_metrics IS TRUE AND acceptance_time IS NOT NULL
+              AND (scope.dimension = 'city_company'
+                   OR (scope.dimension = 'area' AND area_id IS NOT NULL)
+                   OR (scope.dimension = 'team' AND team_id IS NOT NULL))
+        ), counts AS (
+            SELECT day_at, dimension, area_id, team_id,
+                   COUNT(*) FILTER (WHERE has_valid_bandwidth IS TRUE AND completion_time IS NULL) AS in_transit,
+                   COUNT(*) FILTER (WHERE has_valid_bandwidth IS TRUE AND completion_time IS NOT NULL) AS denominator,
+                   COUNT(*) FILTER (WHERE has_valid_bandwidth IS TRUE AND completion_time IS NOT NULL
+                                    AND is_first_response_on_time IS TRUE) AS numerator
+            FROM scoped GROUP BY day_at, dimension, area_id, team_id
+        )
+        SELECT metrics.metric_key, metrics.metric_key || '.v1' AS formula_version,
+               '11111111-1111-1111-1111-111111111111'::text AS release_id,
+               '22222222-2222-2222-2222-222222222222'::text AS snapshot_id,
+               'synthetic.checkpoint.v1'::text AS checkpoint,
+               counts.day_at, 'day'::text AS grain, counts.dimension, counts.area_id, counts.team_id,
+               metrics.value, counts.numerator, counts.denominator,
+               CASE WHEN metrics.metric_key = 'complaint_first_response_rate' AND denominator = 0
+                    THEN 'no_data' ELSE 'success' END::text AS status,
+               '2026-09-01 00:00:00+00'::timestamptz AS data_as_of
+        FROM counts CROSS JOIN LATERAL (
+            VALUES ('complaint_in_transit_count', in_transit::numeric),
+                   ('complaint_first_response_rate', ROUND(100 * numerator::numeric / NULLIF(denominator, 0), 2))
+        ) AS metrics(metric_key, value)
+        WHERE metrics.metric_key <> 'complaint_in_transit_count' OR in_transit > 0;
+        -- A different approved-build checkpoint must never contribute to this
+        -- request's sums, even when all remaining dimensional keys match.
+        INSERT INTO ai_views.approved_daily_facts
+        SELECT metric_key, formula_version, release_id, snapshot_id,
+               'synthetic.checkpoint.other', day_at, grain, dimension, area_id, team_id,
+               COALESCE(value, 0) + 999, numerator + 999, denominator + 999,
+               'success', data_as_of
+        FROM ai_views.approved_daily_facts;
         CREATE ROLE {reader} LOGIN PASSWORD '{reader_password}';
         CREATE ROLE {probe} LOGIN PASSWORD '{probe_password}';
         GRANT CONNECT ON DATABASE {database} TO {reader}, {probe};
@@ -671,5 +716,54 @@ async def test_pr07a_metric_executor_real_gateway_contract(
         assert "SELECT" not in checkpoint and "acceptance_time" not in checkpoint
         assert "synthetic-area" not in checkpoint and "start_at" not in checkpoint
         assert budget.sql_executions == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["count", "ratio"])
+@pytest.mark.parametrize("freshness_status", ["fresh", "stale", "unknown"])
+@pytest.mark.parametrize(("intent", "grain", "dimensions"), [
+    ("metric", "day", ()), ("trend", "day", ()), ("trend", "month", ()),
+    ("comparison", "day", ("area",)), ("ranking", "day", ("team",)),
+])
+async def test_pr07a_synthetic_aggregate_detail_hash_parity(
+    gateway_postgres: _GatewayPostgres, operation: str, intent: str, grain: str, dimensions: tuple[str, ...],
+    freshness_status: str,
+) -> None:
+    metric = (ratio_contract() if operation == "ratio" else
+              seed_contract(supported_dimensions=("city_company", "area", "team")))
+    authority = AggregateAuthority(metric)
+    authority.aggregate_binding = authority.aggregate_binding.model_copy(update={"allow_detail_fallback": True})
+    source = authority.aggregate_binding.deployment_source_id
+    authority.freshness[source] = authority.freshness[source].model_copy(update={"status": freshness_status})
+    engine, gateway = _gateway(gateway_postgres.reader_url, max_rows=200)
+    try:
+        records = []
+        outputs = []
+        for strategy in ("aggregate_first", "detail_required"):
+            plan = authority.plan(intent=intent, grain=grain, dimensions=dimensions, source_strategy=strategy,
+                                  time_range=TimeRange(start=date(2028, 2, 28), end=date(2028, 3, 1)))
+            validation = PlanValidator().validate_query_plan(plan=plan, context=authority.context,
+                                                              identity=authority.identity)
+            execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
+            budget = RouteBudgetLedger(route="standard")
+            result = await metric_plan_executor(authority.compiler(), gateway).execute(
+                query_plan=plan, context=authority.context, execution_plan=execution,
+                budget=budget, deadline_ms=10_000,
+            )
+            assert result.record.status == "succeeded", result.record
+            assert budget.sql_executions == 1
+            records.append(result.record.step_receipts[0])
+            outputs.append(result.outputs)
+            checkpoint = result.record.model_dump_json()
+            assert "SELECT" not in checkpoint and "source_metric" not in checkpoint and "area-a" not in checkpoint
+        assert outputs[0] == outputs[1]
+        assert records[0].rowset_sha256 == records[1].rowset_sha256
+        assert records[0].semantic_signature == records[1].semantic_signature
+        assert records[0].source_kind == ("approved_aggregate" if freshness_status == "fresh" else "approved_detail")
+        assert records[1].source_kind == "approved_detail"
+        assert records[0].source_degradation == (() if freshness_status == "fresh" else (f"aggregate_{freshness_status}",))
+        assert records[0].source_checkpoint == records[1].source_checkpoint == "synthetic.checkpoint.v1"
     finally:
         await engine.dispose()
