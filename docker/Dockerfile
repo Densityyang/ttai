@@ -43,6 +43,10 @@ RUN apt-get update \
         libssl3t64 \
         openssl \
         openssl-provider-legacy \
+    && apt-get install --yes --only-upgrade --no-install-recommends \
+        gzip \
+        libpcre2-8-0 \
+        libsqlite3-0 \
     && python -m pip install --no-cache-dir --upgrade "setuptools>=78.1.1" \
     && python -m pip uninstall --yes pip \
     && rm -rf /var/lib/apt/lists/* \
