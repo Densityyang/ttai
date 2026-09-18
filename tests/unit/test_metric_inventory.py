@@ -43,7 +43,7 @@ EXPECTED_LEGACY_ONLY_KEYS = {
     "installation_same_day_calc_total_count_area_day",
     "installation_same_day_rate_area_day",
 }
-EXPECTED_SNAPSHOT_FINGERPRINT = "6f8f9687eed492e126a30ac71f4936797a3ab93ef1b6c0d3d75c277ceeca31d0"
+EXPECTED_SNAPSHOT_FINGERPRINT = "36d0d2d27d8a426a18f40018c163abe9525b636d3f2f6531328e38e2728c8b8a"
 
 
 def _inventory() -> MetricInventorySnapshot:
@@ -213,3 +213,44 @@ def test_records_are_strict_and_frozen() -> None:
         )
     with pytest.raises(ValidationError):
         snapshot.canonical = ()  # type: ignore[misc]
+
+
+def test_yaml_anchors_and_merge_keys_expand_to_distinct_identities() -> None:
+    """Anchor/merge expansion keeps every merged metric a distinct identity."""
+
+    configured_path = CANONICAL_ROOT / "configured_external_metrics.yaml"
+    fault_path = CANONICAL_ROOT / "fault_delivery_external.yaml"
+    configured = adapt_canonical_yaml_document(
+        yaml.safe_load(configured_path.read_text(encoding="utf-8")),
+        source_file=configured_path.name,
+        source_sha256="1" * 64,
+    )
+    fault = adapt_canonical_yaml_document(
+        yaml.safe_load(fault_path.read_text(encoding="utf-8")),
+        source_file=fault_path.name,
+        source_sha256="2" * 64,
+    )
+
+    assert len(configured) == 36
+    assert len({item.metric_key for item in configured}) == 36
+    assert len({item.display_name for item in configured}) == 36
+    assert sum(item.metric_type == "external" for item in configured) == 35
+    assert len(fault) == 9
+    assert len({item.metric_key for item in fault}) == 9
+    assert len({item.display_name for item in fault}) == 9
+    assert sum(item.metric_type == "external" for item in (*configured, *fault)) == 44
+
+    # The merged h5 group inherits the anchor dimensions, including the typed
+    # required category, while every identity stays distinct.
+    merged = [item for item in configured if item.metric_key.startswith("h5_")]
+    assert len(merged) == 4
+    assert all(
+        any(
+            category.name == "category_code"
+            and category.dimension_type == "category"
+            and category.required
+            for category in item.categories
+        )
+        for item in merged
+    )
+    assert len({tuple(sorted((category.name, category.required) for category in item.categories)) for item in merged}) == 1

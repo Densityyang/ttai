@@ -11,16 +11,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, NoReturn
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-INVENTORY_SCHEMA_VERSION = 1
-FINGERPRINT_SCHEMA_VERSION = "metric-inventory-fingerprint-v1"
-CANONICAL_ADAPTER_VERSION = "canonical-gold-yaml-v1"
+INVENTORY_SCHEMA_VERSION = 2
+FINGERPRINT_SCHEMA_VERSION = "metric-inventory-fingerprint-v2"
+CANONICAL_ADAPTER_VERSION = "canonical-gold-yaml-v2"
 LEGACY_ADAPTER_VERSION = "legacy-semantic-markdown-v1"
 
 EXPECTED_CANONICAL_FILE_COUNT = 10
@@ -35,6 +35,12 @@ EXPECTED_LEGACY_EXACT_OVERLAP_COUNT = 75
 EXPECTED_LEGACY_COMPACT_ALIAS_COUNT = 4
 EXPECTED_LEGACY_ONLY_COUNT = 14
 EXPECTED_TOTAL_COUNT = EXPECTED_CANONICAL_COUNT + EXPECTED_LEGACY_ONLY_COUNT
+
+# Canonical dependency graph and category mapping counts are locked against the
+# copied authoritative Gold YAML.  They are derived, not hand-maintained.
+EXPECTED_CANONICAL_DEPENDENCY_EDGE_COUNT = 113
+EXPECTED_CANONICAL_DEPENDENCY_SOURCE_COUNT = 56
+EXPECTED_CANONICAL_CATEGORY_METRIC_COUNT = 44
 
 _IDENTITY_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -129,6 +135,21 @@ class MetricDimension(_StrictFrozenModel):
     required: bool = False
 
 
+class MetricDependency(_StrictFrozenModel):
+    """One typed canonical dependency reference: label -> canonical target."""
+
+    label: str = Field(min_length=1, pattern=_IDENTITY_RE.pattern)
+    target: str = Field(min_length=1, pattern=_IDENTITY_RE.pattern)
+
+
+class MetricCategory(_StrictFrozenModel):
+    """Explicit typed category dimension; the type is fixed to category."""
+
+    name: str = Field(min_length=1, pattern=_IDENTITY_RE.pattern)
+    dimension_type: Literal["category"] = "category"
+    required: bool = False
+
+
 class MetricInventoryRecord(_StrictFrozenModel):
     """One immutable, non-executable inventory record."""
 
@@ -140,6 +161,8 @@ class MetricInventoryRecord(_StrictFrozenModel):
     tags: tuple[str, ...] = ()
     time_grains: tuple[str, ...] = ()
     dimensions: tuple[MetricDimension, ...] = ()
+    categories: tuple[MetricCategory, ...] = ()
+    dependencies: tuple[MetricDependency, ...] = ()
     value_type: str | None = None
     unit: str | None = None
     rollup_strategy: str | None = None
@@ -160,8 +183,137 @@ class MetricInventoryRecord(_StrictFrozenModel):
             raise ValueError("time grains must be nonempty")
         if len({item.name for item in self.dimensions}) != len(self.dimensions):
             raise ValueError("duplicate dimensions are not silently deduplicated")
+        if len({item.label for item in self.dependencies}) != len(self.dependencies):
+            raise ValueError("duplicate dependency labels are not silently deduplicated")
+        if len({item.name for item in self.categories}) != len(self.categories):
+            raise ValueError("duplicate category dimensions are not silently deduplicated")
+        if self.metric_type == "legacy_only" and (self.dependencies or self.categories):
+            raise ValueError("legacy-only records cannot carry canonical dependency data")
+        expected_categories = _category_projections(self.dimensions)
+        if tuple(sorted(self.categories, key=lambda item: item.name)) != expected_categories:
+            raise ValueError("category projection must match declared category dimensions")
         return self
 
+
+class MetricDependencyIssue(_StrictFrozenModel):
+    """One deterministic canonical dependency graph finding."""
+
+    code: Literal[
+        "unknown_metric_dependency",
+        "self_metric_dependency",
+        "metric_dependency_cycle",
+    ]
+    metric_key: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    label: str | None = None
+    target: str | None = None
+    cycle: tuple[str, ...] = ()
+
+
+class CanonicalDependencyEdge(_StrictFrozenModel):
+    """One typed canonical dependency edge."""
+
+    source: str = Field(min_length=1, pattern=_IDENTITY_RE.pattern)
+    label: str = Field(min_length=1, pattern=_IDENTITY_RE.pattern)
+    target: str = Field(min_length=1, pattern=_IDENTITY_RE.pattern)
+
+
+class CanonicalDependencyGraph(_StrictFrozenModel):
+    """Verified canonical dependency DAG; legacy-only keys never appear."""
+
+    edges: tuple[CanonicalDependencyEdge, ...]
+    topological_order: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def validate_graph(self) -> CanonicalDependencyGraph:
+        if tuple(sorted(self.edges, key=_edge_sort_key)) != self.edges:
+            raise ValueError("dependency edges must use stable order")
+        if len(set(self.topological_order)) != len(self.topological_order):
+            raise ValueError("topological order must not repeat a metric identity")
+        return self
+
+
+def analyze_canonical_dependencies(
+    canonical: Sequence[MetricInventoryRecord],
+) -> tuple[MetricDependencyIssue, ...]:
+    """Return deterministic dependency findings for canonical records only."""
+
+    records = tuple(
+        item for item in canonical if item.provenance.source_kind == "canonical_gold"
+    )
+    identity = {item.metric_key for item in records}
+    issues: list[MetricDependencyIssue] = []
+    graph: dict[str, tuple[str, ...]] = {}
+    for record in records:
+        targets: set[str] = set()
+        for dependency in record.dependencies:
+            if dependency.target == record.metric_key:
+                issues.append(
+                    MetricDependencyIssue(
+                        code="self_metric_dependency",
+                        metric_key=record.metric_key,
+                        label=dependency.label,
+                        target=dependency.target,
+                        message=(
+                            "metric dependency refers to itself: "
+                            f"{record.metric_key} ({dependency.label})"
+                        ),
+                    )
+                )
+                continue
+            if dependency.target not in identity:
+                issues.append(
+                    MetricDependencyIssue(
+                        code="unknown_metric_dependency",
+                        metric_key=record.metric_key,
+                        label=dependency.label,
+                        target=dependency.target,
+                        message=(
+                            "metric dependency does not exist in the canonical "
+                            f"identity set: {dependency.target}"
+                        ),
+                    )
+                )
+                continue
+            targets.add(dependency.target)
+        graph[record.metric_key] = tuple(sorted(targets))
+    issues.extend(_dependency_cycle_issues(graph))
+    return tuple(sorted(issues, key=_dependency_issue_sort_key))
+
+
+def build_canonical_dependency_graph(
+    canonical: Sequence[MetricInventoryRecord],
+) -> CanonicalDependencyGraph:
+    """Return the verified canonical DAG or fail closed on any finding."""
+
+    records = tuple(
+        item for item in canonical if item.provenance.source_kind == "canonical_gold"
+    )
+    issues = analyze_canonical_dependencies(records)
+    if issues:
+        raise InventoryValidationError(
+            "invalid canonical dependency graph: "
+            + "; ".join(issue.message for issue in issues)
+        )
+    identity = sorted(item.metric_key for item in records)
+    edges = tuple(
+        sorted(
+            (
+                CanonicalDependencyEdge(
+                    source=item.metric_key,
+                    label=dependency.label,
+                    target=dependency.target,
+                )
+                for item in records
+                for dependency in item.dependencies
+            ),
+            key=_edge_sort_key,
+        )
+    )
+    return CanonicalDependencyGraph(
+        edges=edges,
+        topological_order=_topological_order(identity, edges),
+    )
 
 class CanonicalSourceSummary(_StrictFrozenModel):
     file_count: int = Field(ge=0)
@@ -245,8 +397,8 @@ class LegacyAdaptation(_StrictFrozenModel):
 class MetricInventorySnapshot(_StrictFrozenModel):
     """Verified immutable 280 canonical + 14 legacy-only inventory snapshot."""
 
-    schema_version: Literal[1] = INVENTORY_SCHEMA_VERSION
-    canonical_adapter_version: Literal["canonical-gold-yaml-v1"] = CANONICAL_ADAPTER_VERSION
+    schema_version: Literal[2] = INVENTORY_SCHEMA_VERSION
+    canonical_adapter_version: Literal["canonical-gold-yaml-v2"] = CANONICAL_ADAPTER_VERSION
     legacy_adapter_version: Literal["legacy-semantic-markdown-v1"] = LEGACY_ADAPTER_VERSION
     canonical: tuple[MetricInventoryRecord, ...]
     legacy: tuple[MetricInventoryRecord, ...]
@@ -255,6 +407,9 @@ class MetricInventorySnapshot(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def validate_snapshot(self) -> MetricInventorySnapshot:
+        dependency_issues = analyze_canonical_dependencies(self.canonical)
+        if dependency_issues:
+            raise ValueError(dependency_issues[0].message)
         canonical_keys = [item.metric_key for item in self.canonical]
         legacy_keys = [item.metric_key for item in self.legacy]
         if len(set(canonical_keys)) != len(canonical_keys):
@@ -301,6 +456,10 @@ class MetricInventorySnapshot(_StrictFrozenModel):
     @property
     def canonical_keys(self) -> frozenset[str]:
         return frozenset(item.metric_key for item in self.canonical)
+
+    @property
+    def dependency_graph(self) -> CanonicalDependencyGraph:
+        return build_canonical_dependency_graph(self.canonical)
 
     @property
     def fingerprint(self) -> str:
@@ -369,6 +528,19 @@ def adapt_canonical_gold(canonical_directory: str | Path) -> CanonicalAdaptation
         records.extend(_adapt_canonical_document(document, source))
 
     _ensure_unique([item.metric_key for item in records], "canonical metric identity")
+    graph = build_canonical_dependency_graph(records)
+    if sum(bool(item.dependencies) for item in records) != EXPECTED_CANONICAL_DEPENDENCY_SOURCE_COUNT:
+        _fail(
+            "canonical dependency source count must be "
+            f"{EXPECTED_CANONICAL_DEPENDENCY_SOURCE_COUNT}"
+        )
+    if len(graph.edges) != EXPECTED_CANONICAL_DEPENDENCY_EDGE_COUNT:
+        _fail(f"canonical dependency edge count must be {EXPECTED_CANONICAL_DEPENDENCY_EDGE_COUNT}")
+    if sum(bool(item.categories) for item in records) != EXPECTED_CANONICAL_CATEGORY_METRIC_COUNT:
+        _fail(
+            "canonical category metric count must be "
+            f"{EXPECTED_CANONICAL_CATEGORY_METRIC_COUNT}"
+        )
     raw_count = sum(item.metric_type == "raw" for item in records)
     derived_count = sum(item.metric_type == "derived" for item in records)
     external_count = sum(item.metric_type == "external" for item in records)
@@ -614,12 +786,15 @@ def _adapt_canonical_metric(
         dimensions = _adapt_dimensions(raw_metric["dimensions"], name)
     else:
         dimensions = ()
+    dependencies = (
+        _adapt_dependencies(raw_metric["dependencies"], name)
+        if "dependencies" in raw_metric
+        else ()
+    )
     if "aggregation" in raw_metric:
         _validate_aggregation(raw_metric["aggregation"], name)
     if "filters" in raw_metric:
         _validate_filters(raw_metric["filters"], name)
-    if "dependencies" in raw_metric:
-        _validate_dependencies(raw_metric["dependencies"], name)
 
     try:
         return MetricInventoryRecord(
@@ -631,6 +806,8 @@ def _adapt_canonical_metric(
             tags=tuple(sorted(tags)),
             time_grains=(time_grain,),
             dimensions=tuple(sorted(dimensions, key=lambda item: (item.name, item.dimension_type, item.required))),
+            categories=_category_projections(dimensions),
+            dependencies=dependencies,
             value_type=value_type,
             unit=unit,
             rollup_strategy=(
@@ -691,14 +868,6 @@ def _validate_filters(value: Any, metric_key: str) -> None:
             _validate_json_value(item["value"], f"filter value for {metric_key}")
 
 
-def _validate_dependencies(value: Any, metric_key: str) -> None:
-    if not isinstance(value, Mapping):
-        _fail(f"dependencies must be a mapping for {metric_key}")
-    for key, dependency in value.items():
-        if not isinstance(key, str) or not _IDENTITY_RE.fullmatch(key):
-            _fail(f"invalid dependency label for {metric_key}")
-        _strict_nonempty_string(dependency, f"dependency value for {metric_key}")
-
 
 def _validate_json_value(value: Any, path: str) -> None:
     if value is None or type(value) in {str, bool, int, float}:
@@ -745,6 +914,8 @@ def _record_payload(record: MetricInventoryRecord) -> dict[str, Any]:
         "tags": list(record.tags),
         "time_grains": list(record.time_grains),
         "dimensions": [item.model_dump(mode="json") for item in record.dimensions],
+        "categories": [item.model_dump(mode="json") for item in record.categories],
+        "dependencies": [item.model_dump(mode="json") for item in record.dependencies],
         "value_type": record.value_type,
         "unit": record.unit,
         "rollup_strategy": record.rollup_strategy,
@@ -780,6 +951,157 @@ def _ensure_unique(values: Collection[str], label: str) -> None:
         _fail(f"duplicate {label}; no silent dedupe")
 
 
+def _category_projections(dimensions: Sequence[MetricDimension]) -> tuple[MetricCategory, ...]:
+    return tuple(
+        sorted(
+            (
+                MetricCategory(name=item.name, required=item.required)
+                for item in dimensions
+                if item.dimension_type == "category"
+            ),
+            key=lambda item: item.name,
+        )
+    )
+
+
+def _adapt_dependencies(value: Any, metric_key: str) -> tuple[MetricDependency, ...]:
+    if not isinstance(value, Mapping):
+        _fail(f"dependencies must be a mapping for {metric_key}")
+    dependencies: list[MetricDependency] = []
+    for key, dependency in value.items():
+        if not isinstance(key, str) or not _IDENTITY_RE.fullmatch(key):
+            _fail(f"invalid dependency label for {metric_key}")
+        target = _strict_nonempty_string(dependency, f"dependency value for {metric_key}")
+        if not _IDENTITY_RE.fullmatch(target):
+            _fail(f"invalid dependency target for {metric_key}: {target}")
+        dependencies.append(MetricDependency(label=key, target=target))
+    _ensure_unique([item.label for item in dependencies], f"dependency label for {metric_key}")
+    return tuple(sorted(dependencies, key=lambda item: (item.label, item.target)))
+
+
+def _edge_sort_key(edge: CanonicalDependencyEdge) -> tuple[str, str, str]:
+    return (edge.source, edge.label, edge.target)
+
+
+def _dependency_issue_sort_key(
+    issue: MetricDependencyIssue,
+) -> tuple[str, str, str, str, tuple[str, ...]]:
+    return (issue.code, issue.metric_key, issue.label or "", issue.target or "", issue.cycle)
+
+
+def _dependency_cycle_issues(
+    graph: Mapping[str, tuple[str, ...]],
+) -> list[MetricDependencyIssue]:
+    issues: list[MetricDependencyIssue] = []
+    for component in _strongly_connected_components(graph):
+        if len(component) < 2:
+            continue
+        cycle = _canonical_cycle(set(component), graph)
+        issues.append(
+            MetricDependencyIssue(
+                code="metric_dependency_cycle",
+                metric_key=cycle[0],
+                cycle=cycle,
+                message="metric dependency cycle detected: " + " -> ".join(cycle),
+            )
+        )
+    return issues
+
+
+def _strongly_connected_components(
+    graph: Mapping[str, tuple[str, ...]],
+) -> list[tuple[str, ...]]:
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    components: list[tuple[str, ...]] = []
+    counter = 0
+
+    for root in sorted(graph):
+        if root in index:
+            continue
+        work: list[tuple[str, int]] = [(root, 0)]
+        while work:
+            node, position = work[-1]
+            if position == 0:
+                index[node] = counter
+                low[node] = counter
+                counter += 1
+                stack.append(node)
+                on_stack.add(node)
+            neighbours = graph.get(node, ())
+            if position < len(neighbours):
+                work[-1] = (node, position + 1)
+                neighbour = neighbours[position]
+                if neighbour not in index:
+                    work.append((neighbour, 0))
+                elif neighbour in on_stack:
+                    low[node] = min(low[node], index[neighbour])
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == index[node]:
+                component: list[str] = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    component.append(member)
+                    if member == node:
+                        break
+                components.append(tuple(sorted(component)))
+    return components
+
+
+def _canonical_cycle(
+    members: set[str], graph: Mapping[str, tuple[str, ...]]
+) -> tuple[str, ...]:
+    start = min(members)
+    parents: dict[str, str | None] = {start: None}
+    queue = [start]
+    while queue:
+        node = queue.pop(0)
+        for neighbour in graph.get(node, ()):
+            if neighbour not in members:
+                continue
+            if neighbour == start:
+                path = [node]
+                parent = parents[path[-1]]
+                while parent is not None:
+                    path.append(parent)
+                    parent = parents[path[-1]]
+                path.reverse()
+                return (*path, start)
+            if neighbour not in parents:
+                parents[neighbour] = node
+                queue.append(neighbour)
+    return (start, start)
+
+
+def _topological_order(
+    identity: Sequence[str], edges: Sequence[CanonicalDependencyEdge]
+) -> tuple[str, ...]:
+    # Dependencies precede dependents: the edge target is the prerequisite.
+    adjacency: dict[str, set[str]] = {key: set() for key in identity}
+    indegree: dict[str, int] = {key: 0 for key in identity}
+    for edge in edges:
+        if edge.source not in adjacency[edge.target]:
+            adjacency[edge.target].add(edge.source)
+            indegree[edge.source] += 1
+    ready = sorted(key for key in identity if indegree[key] == 0)
+    order: list[str] = []
+    while ready:
+        node = ready.pop(0)
+        order.append(node)
+        for neighbour in sorted(adjacency[node]):
+            indegree[neighbour] -= 1
+            if indegree[neighbour] == 0:
+                ready.append(neighbour)
+        ready.sort()
+    return tuple(order)
+
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -803,7 +1125,10 @@ def _fail(message: str) -> NoReturn:
 
 __all__ = [
     "CANONICAL_ADAPTER_VERSION",
+    "EXPECTED_CANONICAL_CATEGORY_METRIC_COUNT",
     "EXPECTED_CANONICAL_COUNT",
+    "EXPECTED_CANONICAL_DEPENDENCY_EDGE_COUNT",
+    "EXPECTED_CANONICAL_DEPENDENCY_SOURCE_COUNT",
     "EXPECTED_CANONICAL_DERIVED_COUNT",
     "EXPECTED_CANONICAL_EXTERNAL_COUNT",
     "EXPECTED_CANONICAL_RAW_COUNT",
@@ -811,10 +1136,15 @@ __all__ = [
     "EXPECTED_TOTAL_COUNT",
     "FINGERPRINT_SCHEMA_VERSION",
     "CanonicalAdaptation",
+    "CanonicalDependencyEdge",
+    "CanonicalDependencyGraph",
     "CanonicalSourceSummary",
     "InventoryValidationError",
     "LegacyAdaptation",
     "LegacySourceSummary",
+    "MetricCategory",
+    "MetricDependency",
+    "MetricDependencyIssue",
     "MetricDimension",
     "MetricInventoryRecord",
     "MetricInventorySnapshot",
@@ -823,5 +1153,7 @@ __all__ = [
     "adapt_canonical_yaml_document",
     "adapt_legacy_semantic",
     "adapt_legacy_semantic_text",
+    "analyze_canonical_dependencies",
+    "build_canonical_dependency_graph",
     "build_metric_inventory",
 ]

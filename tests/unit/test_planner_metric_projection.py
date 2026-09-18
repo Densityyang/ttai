@@ -9,14 +9,18 @@ import pytest
 from src.nl2sql.semantic.metric_inventory import build_metric_inventory
 from src.nl2sql.semantic.planner_metric_projection import (
     CurrentStateSnapshot,
+    ExplicitMetricLifecycle,
+    ExplicitMetricSourceReadiness,
     ExplicitMetricState,
+    LifecycleSnapshot,
     PlannerMetricProjection,
     ProjectionValidationError,
+    SourceReadinessSnapshot,
     project_metric_inventory,
 )
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "v4_p1" / "authoritative"
-EXPECTED_PROJECTION_FINGERPRINT = "eb082b113fca3bd1596a002dd7003291b65f6c3e8570a73dc084f45af6c77157"
+EXPECTED_PROJECTION_FINGERPRINT = "3c6a43c11fe8deb1218d79b4df7196082fe49ce027b8137a19d5e5858fcecd4d"
 
 
 def _inventory():
@@ -139,3 +143,168 @@ def test_projection_fingerprint_changes_for_inventory_or_explicit_state_drift() 
 
     assert project_metric_inventory(changed_snapshot).fingerprint != baseline.fingerprint
     assert project_metric_inventory(snapshot, current_state=state).fingerprint != baseline.fingerprint
+
+
+def test_missing_lifecycle_and_readiness_stay_unspecified() -> None:
+    projection = project_metric_inventory(_inventory())
+
+    assert all(item.lifecycle is None for item in projection.metrics)
+    assert all(item.source_readiness is None for item in projection.metrics)
+    assert all(item.source_readiness_state == "UNSPECIFIED" for item in projection.metrics)
+    assert all(item.planning_readiness == "lifecycle_unspecified" for item in projection.metrics)
+    assert not any(item.is_planner_ready for item in projection.metrics)
+
+
+def test_active_lifecycle_with_pending_source_is_expressible_and_not_ready() -> None:
+    snapshot = _inventory()
+    target = snapshot.canonical[0].metric_key
+    lifecycle = LifecycleSnapshot(
+        source_id="fixture.lifecycle.v1",
+        source_sha256="5" * 64,
+        records=(ExplicitMetricLifecycle(metric_key=target, lifecycle="active"),),
+    )
+    readiness = SourceReadinessSnapshot(
+        source_id="fixture.readiness.v1",
+        source_sha256="6" * 64,
+        records=(ExplicitMetricSourceReadiness(metric_key=target, readiness="pending_source"),),
+    )
+    projection = project_metric_inventory(snapshot, lifecycle=lifecycle, source_readiness=readiness)
+    entry = {item.metric_key: item for item in projection.metrics}[target]
+
+    assert entry.lifecycle == "active"
+    assert entry.source_readiness == "pending_source"
+    assert entry.planning_readiness == "active_pending_source"
+    assert entry.is_planner_ready is False
+    assert entry.source_state == "CURRENT_STATE"
+    assert entry.source_readiness_state == "SOURCE_READINESS"
+    assert projection.lifecycle_fingerprint == lifecycle.fingerprint
+    assert projection.source_readiness_fingerprint == readiness.fingerprint
+    untouched = {item.metric_key: item for item in projection.metrics}[snapshot.canonical[1].metric_key]
+    assert untouched.source_state == "UNSPECIFIED"
+    assert untouched.planning_readiness == "lifecycle_unspecified"
+
+
+def test_only_active_lifecycle_with_ready_source_is_fully_ready() -> None:
+    snapshot = _inventory()
+    target = snapshot.canonical[0].metric_key
+    lifecycle = LifecycleSnapshot(
+        source_id="fixture.lifecycle.v1",
+        source_sha256="7" * 64,
+        records=(ExplicitMetricLifecycle(metric_key=target, lifecycle="active"),),
+    )
+    ready = SourceReadinessSnapshot(
+        source_id="fixture.readiness.v1",
+        source_sha256="8" * 64,
+        records=(ExplicitMetricSourceReadiness(metric_key=target, readiness="ready"),),
+    )
+    projection = project_metric_inventory(snapshot, lifecycle=lifecycle, source_readiness=ready)
+    entry = {item.metric_key: item for item in projection.metrics}[target]
+
+    assert entry.planning_readiness == "ready"
+    assert entry.is_planner_ready is True
+
+
+def test_readiness_without_lifecycle_never_reports_ready() -> None:
+    snapshot = _inventory()
+    target = snapshot.canonical[0].metric_key
+    readiness = SourceReadinessSnapshot(
+        source_id="fixture.readiness.v1",
+        source_sha256="9" * 64,
+        records=(ExplicitMetricSourceReadiness(metric_key=target, readiness="ready"),),
+    )
+    projection = project_metric_inventory(snapshot, source_readiness=readiness)
+    entry = {item.metric_key: item for item in projection.metrics}[target]
+
+    assert entry.source_readiness == "ready"
+    assert entry.planning_readiness == "lifecycle_unspecified"
+    assert entry.is_planner_ready is False
+
+
+def test_explicit_inputs_are_type_checked() -> None:
+    snapshot = _inventory()
+    with pytest.raises(TypeError, match="lifecycle must be LifecycleSnapshot"):
+        project_metric_inventory(snapshot, lifecycle={"records": []})  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="source_readiness must be SourceReadinessSnapshot"):
+        project_metric_inventory(snapshot, source_readiness={"records": []})  # type: ignore[arg-type]
+
+
+def test_contradictory_and_unknown_explicit_inputs_fail_closed() -> None:
+    snapshot = _inventory()
+    target = snapshot.canonical[0].metric_key
+    current = CurrentStateSnapshot(
+        source_id="fixture.current-state.v1",
+        source_sha256="a" * 64,
+        records=(ExplicitMetricState(metric_key=target, state="active"),),
+    )
+    lifecycle = LifecycleSnapshot(
+        source_id="fixture.lifecycle.v1",
+        source_sha256="b" * 64,
+        records=(ExplicitMetricLifecycle(metric_key=target, lifecycle="active"),),
+    )
+    with pytest.raises(ProjectionValidationError, match="contradictory explicit lifecycle inputs"):
+        project_metric_inventory(snapshot, current_state=current, lifecycle=lifecycle)
+
+    retired = LifecycleSnapshot(
+        source_id="fixture.lifecycle.v1",
+        source_sha256="c" * 64,
+        records=(ExplicitMetricLifecycle(metric_key=target, lifecycle="retired"),),
+    )
+    ready = SourceReadinessSnapshot(
+        source_id="fixture.readiness.v1",
+        source_sha256="d" * 64,
+        records=(ExplicitMetricSourceReadiness(metric_key=target, readiness="ready"),),
+    )
+    with pytest.raises(ProjectionValidationError, match="retired lifecycle cannot be source ready"):
+        project_metric_inventory(snapshot, lifecycle=retired, source_readiness=ready)
+
+    with pytest.raises(ProjectionValidationError, match="source readiness references unknown metric"):
+        project_metric_inventory(
+            snapshot,
+            source_readiness=SourceReadinessSnapshot(
+                source_id="fixture.readiness.v1",
+                source_sha256="e" * 64,
+                records=(ExplicitMetricSourceReadiness(metric_key="not_in_inventory", readiness="ready"),),
+            ),
+        )
+    with pytest.raises(ValueError, match="duplicate explicit source readiness"):
+        SourceReadinessSnapshot(
+            source_id="fixture.readiness.v1",
+            source_sha256="f" * 64,
+            records=(
+                ExplicitMetricSourceReadiness(metric_key=target, readiness="ready"),
+                ExplicitMetricSourceReadiness(metric_key=target, readiness="pending_source"),
+            ),
+        )
+
+
+def test_projection_exposes_typed_categories_and_dependencies() -> None:
+    projection = project_metric_inventory(_inventory())
+    with_category = [item for item in projection.metrics if item.categories]
+    with_dependency = [item for item in projection.metrics if item.dependencies]
+
+    assert len(with_category) == 44
+    assert len(with_dependency) == 56
+    assert all(
+        category.dimension_type == "category"
+        for item in with_category
+        for category in item.categories
+    )
+    assert all(item.provenance == "canonical_gold" for item in with_dependency)
+    identity = {entry.metric_key for entry in projection.metrics}
+    assert all(
+        dependency.target in identity
+        for item in with_dependency
+        for dependency in item.dependencies
+    )
+
+
+def test_projection_fingerprint_changes_for_readiness_drift() -> None:
+    snapshot = _inventory()
+    baseline = project_metric_inventory(snapshot)
+    readiness = SourceReadinessSnapshot(
+        source_id="fixture.readiness.v1",
+        source_sha256="1" * 64,
+        records=(ExplicitMetricSourceReadiness(metric_key=snapshot.canonical[0].metric_key, readiness="ready"),),
+    )
+
+    assert project_metric_inventory(snapshot, source_readiness=readiness).fingerprint != baseline.fingerprint
