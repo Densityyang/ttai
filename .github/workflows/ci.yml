@@ -3,7 +3,9 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
+      - feature/nl2sql-v3-production
 
 permissions:
   contents: read
