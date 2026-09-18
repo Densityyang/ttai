@@ -1,0 +1,1487 @@
+# COMPLAINT 业务域指标配置
+metrics:
+  # ============ 无维度指标（日粒度）============
+  - name: complaint_total_valid_bandwidth_count_day
+    display_name: 投诉有效带宽工单总数（日）
+    description: 投诉工单日度总数（无维度，带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+
+  - name: complaint_in_transit_count_day
+    display_name: 投诉在途工单数（日）
+    description: 投诉工单日度在途数量（无维度，竣工时间为空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 在途
+    time_grain: day
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: is_null
+
+  - name: complaint_archived_count_day
+    display_name: 投诉已归档工单数（日）
+    description: 投诉工单日度已归档数量（无维度，竣工时间非空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 已归档
+    time_grain: day
+    time_column: completion_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: not_null
+
+  # ============ 无维度指标（月粒度）============
+  - name: complaint_total_valid_bandwidth_count_month
+    display_name: 投诉有效带宽工单总数（月）
+    description: 投诉工单月度总数（无维度，带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+    time_grain: month
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+
+  - name: complaint_in_transit_count_month
+    display_name: 投诉在途工单数（月）
+    description: 投诉工单月度在途数量（无维度，竣工时间为空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 在途
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: is_null
+
+  - name: complaint_archived_count_month
+    display_name: 投诉已归档工单数（月）
+    description: 投诉工单月度已归档数量（无维度，竣工时间非空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 已归档
+    time_grain: month
+    time_column: completion_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: not_null
+
+  # ============ 及时工单数指标 - 区县维度 ============
+  - name: complaint_first_response_on_time_count_area_month
+    display_name: 投诉首响及时工单数（区县-月）
+    description: 投诉工单月累计首响及时数量（受理时间归月，仅带宽有效且已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: is_first_response_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_arrival_on_time_count_area_month
+    display_name: 投诉上门及时工单数（区县-月）
+    description: 投诉工单月累计上门及时数量（归档时间归月，仅带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: is_arrival_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_same_day_repair_on_time_count_area_month
+    display_name: 投诉当日修及时工单数（区县-月）
+    description: 投诉工单月累计当日修及时数量（受理时间归月，仅带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: is_same_day_repair_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  # ============ 辅助计算指标 - 投诉分母(归档) ============
+  - name: complaint_archived_calc_total_count_area_month
+    display_name: 投诉归档计算分母（区县-月）
+    description: 用于投诉上门和首响及时率计算的分母（归档时间归月，仅带宽有效，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, calc]
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_first_response_calc_total_count_area_month
+    display_name: 投诉首响计算分母（区县-月）
+    description: 用于投诉首响及时率计算的分母（受理时间归月，仅带宽有效，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, calc]
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_same_day_repair_calc_total_count_area_month
+    display_name: 投诉当日修计算分母（区县-月）
+    description: 用于投诉当日修及时率计算的分母（受理时间归月，仅带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, calc]
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+
+  - name: complaint_calc_total_count_team_day
+    display_name: 投诉计算分母（班组-日）
+    description: 用于投诉及时率计算的分母（班组维度，日粒度，仅带宽有效，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, calc]
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_calc_total_count_overall_day
+    display_name: 投诉计算分母（全局-日）
+    description: 用于投诉及时率计算的分母（全局维度，日粒度，仅带宽有效，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, calc]
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  # ============ 及时工单数指标 - 班组维度 ============
+  - name: complaint_first_response_on_time_count_team_day
+    display_name: 投诉首响及时工单数（班组-日）
+    description: 投诉工单首响及时数量（班组维度，日粒度，仅带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: is_first_response_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_arrival_on_time_count_team_day
+    display_name: 投诉上门及时工单数（班组-日）
+    description: 投诉工单上门及时数量（班组维度，日粒度，仅带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: is_arrival_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_same_day_repair_on_time_count_team_day
+    display_name: 投诉当日修及时工单数（班组-日）
+    description: 投诉工单当日修及时数量（班组维度，日粒度，仅带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: is_same_day_repair_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  # ============ 工单总数指标 - 区县维度 ============
+  - name: complaint_total_valid_bandwidth_count_area_day
+    display_name: 投诉有效带宽工单总数（区县-日）
+    description: 投诉工单日度总数（区县维度，带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+
+  - name: complaint_in_transit_count_area_day
+    display_name: 投诉在途工单数（区县-日）
+    description: 投诉工单日度在途数量（区县维度，竣工时间为空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 在途
+    time_grain: day
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: is_null
+
+  - name: complaint_archived_count_area_day
+    display_name: 投诉已归档工单数（区县-日）
+    description: 投诉工单日度已归档数量（区县维度，竣工时间非空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 已归档
+    time_grain: day
+    time_column: completion_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: not_null
+
+  # ============ 工单总数指标 - 班组维度 ============
+  - name: complaint_total_valid_bandwidth_count_team_day
+    display_name: 投诉有效带宽工单总数（班组-日）
+    description: 投诉工单日度总数（班组维度，带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+
+  - name: complaint_in_transit_count_team_day
+    display_name: 投诉在途工单数（班组-日）
+    description: 投诉工单日度在途数量（班组维度，竣工时间为空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 在途
+    time_grain: day
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: is_null
+
+  - name: complaint_archived_count_team_day
+    display_name: 投诉已归档工单数（班组-日）
+    description: 投诉工单日度已归档数量（班组维度，竣工时间非空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 已归档
+    time_grain: day
+    time_column: completion_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: not_null
+
+  # ============ 月度指标 - 区县维度 ============
+  - name: complaint_total_valid_bandwidth_count_area_month
+    display_name: 投诉有效带宽工单总数（区县-月）
+    description: 投诉工单月度总数（区县维度，带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+    time_grain: month
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+
+  - name: complaint_in_transit_count_area_month
+    display_name: 投诉在途工单数（区县-月）
+    description: 投诉工单月度在途数量（区县维度，竣工时间为空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 在途
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: is_null
+
+  - name: complaint_archived_count_area_month
+    display_name: 投诉已归档工单数（区县-月）
+    description: 投诉工单月度已归档数量（区县维度，竣工时间非空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 已归档
+    time_grain: month
+    time_column: completion_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: not_null
+
+  # ============ 月度指标 - 班组维度 ============
+  - name: complaint_total_valid_bandwidth_count_team_month
+    display_name: 投诉有效带宽工单总数（班组-月）
+    description: 投诉工单月度总数（班组维度，带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+    time_grain: month
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+
+  - name: complaint_in_transit_count_team_month
+    display_name: 投诉在途工单数（班组-月）
+    description: 投诉工单月度在途数量（班组维度，竣工时间为空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 在途
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: is_null
+
+  - name: complaint_archived_count_team_month
+    display_name: 投诉已归档工单数（班组-月）
+    description: 投诉工单月度已归档数量（班组维度，竣工时间非空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 已归档
+    time_grain: month
+    time_column: completion_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: not_null
+
+  # ============ KPI 指标 - 区县维度 ============
+  - name: complaint_first_response_rate_area_month
+    display_name: 投诉首响及时率（区县-月）
+    description: 投诉工单首响及时率（区县自然月累计，受理时间归月，已归档）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+      - kpi
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_first_response_on_time_count_area_month
+      total: complaint_first_response_calc_total_count_area_month
+
+  - name: complaint_arrival_rate_area_month
+    display_name: 投诉上门及时率（区县-月）
+    description: 投诉工单上门及时率（区县自然月累计，归档时间归月）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+      - kpi
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_arrival_on_time_count_area_month
+      total: complaint_archived_calc_total_count_area_month
+
+  - name: complaint_same_day_repair_rate_area_month
+    display_name: 投诉当日修及时率（区县-月）
+    description: 投诉工单当日修及时率（区县自然月累计，受理时间归月）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+      - kpi
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_same_day_repair_on_time_count_area_month
+      total: complaint_same_day_repair_calc_total_count_area_month
+
+  # ============ KPI 指标 - 班组维度 ============
+  - name: complaint_first_response_rate_team_day
+    display_name: 投诉首响及时率（班组-日）
+    description: 投诉工单首响及时率（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_first_response_on_time_count_team_day
+      total: complaint_calc_total_count_team_day
+
+  - name: complaint_arrival_rate_team_day
+    display_name: 投诉上门及时率（班组-日）
+    description: 投诉工单上门及时率（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_arrival_on_time_count_team_day
+      total: complaint_calc_total_count_team_day
+
+  - name: complaint_same_day_repair_rate_team_day
+    display_name: 投诉当日修及时率（班组-日）
+    description: 投诉工单当日修及时率（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - complaint
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_same_day_repair_on_time_count_team_day
+      total: complaint_calc_total_count_team_day
+
+  # ============ 全局总览 (Overall) ============
+  - name: complaint_total_count_overall_day
+    display_name: 投诉工单总数（全局-日）
+    description: 投诉工单日度总数（全局维度，带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    time_column: first_arrival_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+
+  - name: complaint_in_transit_count_overall_day
+    display_name: 投诉在途工单数（全局-日）
+    description: 投诉工单日度在途数量（全局维度，竣工时间为空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, 在途, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    time_column: acceptance_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: is_null
+
+  - name: complaint_archived_count_overall_day
+    display_name: 投诉已归档工单数（全局-日）
+    description: 投诉工单日度已归档数量（全局维度，竣工时间非空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, 已归档, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    time_column: completion_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: not_null
+
+
+  - name: complaint_first_response_on_time_count_overall_day
+    display_name: 投诉首响及时工单数（全局-日）
+    description: 投诉工单中首响及时数量（全局维度，日粒度，仅带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, 时效, overall]
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: is_first_response_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_arrival_on_time_count_overall_day
+    display_name: 投诉上门及时工单数（全局-日）
+    description: 投诉工单上门及时数量（全局维度，日粒度，仅带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, 时效, overall]
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: is_arrival_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_same_day_repair_on_time_count_overall_day
+    display_name: 投诉当日修及时工单数（全局-日）
+    description: 投诉工单当日修及时数量（全局维度，日粒度，仅带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, 时效, overall]
+    time_grain: day
+    time_column: first_arrival_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: is_same_day_repair_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  # ============ KPI 指标 - 全局维度 ============
+  - name: complaint_first_response_rate_overall_day
+    display_name: 投诉首响及时率（全局-日）
+    description: 投诉工单首响及时率（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, 时效, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_first_response_on_time_count_overall_day
+      total: complaint_calc_total_count_overall_day
+
+  - name: complaint_arrival_rate_overall_day
+    display_name: 投诉上门及时率（全局-日）
+    description: 投诉工单上门及时率（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, 时效, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_arrival_on_time_count_overall_day
+      total: complaint_calc_total_count_overall_day
+
+  - name: complaint_same_day_repair_rate_overall_day
+    display_name: 投诉当日修及时率（全局-日）
+    description: 投诉工单当日修及时率（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, 时效, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_same_day_repair_on_time_count_overall_day
+      total: complaint_calc_total_count_overall_day
+
+  - name: complaint_total_count_month_overall
+    display_name: 投诉工单总数（全局-月）
+    description: 投诉工单月度总数（全局维度，带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    time_column: first_arrival_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+
+  - name: complaint_in_transit_count_month_overall
+    display_name: 投诉在途工单数（全局-月）
+    description: 投诉工单月度在途数量（全局维度，竣工时间为空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, 在途, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    time_column: acceptance_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: is_null
+
+  - name: complaint_archived_count_month_overall
+    display_name: 投诉已归档工单数（全局-月）
+    description: 投诉工单月度已归档数量（全局维度，竣工时间非空、带宽有效）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, 已归档, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    time_column: completion_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: completion_time
+        operator: not_null
+
+  # ============ 日报专用：投诉处理及时率（区县-月） ============
+  - name: complaint_standard_processing_on_time_count_area_month
+    display_name: 投诉标准处理及时工单数（区县-月）
+    description: 已归档且带宽有效的投诉工单中，城市8小时、农村12小时内归档的数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, daily_report, 时效]
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: status
+        operator: eq
+        value: 已归档
+      - column: archive_time
+        operator: not_null
+      - column: is_standard_processing_on_time
+        operator: eq
+        value: true
+
+  - name: complaint_processing_total_count_area_month
+    display_name: 投诉处理计算分母（区县-月）
+    description: 已归档且带宽有效的投诉工单总数，按归档时间归月
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, daily_report, calc]
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: status
+        operator: eq
+        value: 已归档
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_city_same_day_processing_on_time_count_area_month
+    display_name: 城市投诉当日处理及时工单数（区县-月）
+    description: 城市已归档且带宽有效的投诉工单中，20点前当日归档或20点后24小时内归档的数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, daily_report, 时效, 城市]
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: status
+        operator: eq
+        value: 已归档
+      - column: area_attribute
+        operator: eq
+        value: 城市
+      - column: archive_time
+        operator: not_null
+      - column: is_same_day_repair_on_time
+        operator: eq
+        value: true
+
+  - name: complaint_city_processing_total_count_area_month
+    display_name: 城市投诉当日处理计算分母（区县-月）
+    description: 城市已归档且带宽有效的投诉工单总数，按归档时间归月
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, daily_report, calc, 城市]
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_fault_reporting_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: has_valid_bandwidth
+        operator: eq
+        value: true
+      - column: status
+        operator: eq
+        value: 已归档
+      - column: area_attribute
+        operator: eq
+        value: 城市
+      - column: archive_time
+        operator: not_null
+
+  - name: complaint_standard_processing_rate_area_month
+    display_name: 投诉标准处理及时率（区县-月）
+    description: 已归档投诉工单的标准处理及时率，按归档时间归月
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, daily_report, 时效, kpi]
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_standard_processing_on_time_count_area_month
+      total: complaint_processing_total_count_area_month
+
+  - name: complaint_city_same_day_processing_rate_area_month
+    display_name: 城市投诉当日处理及时率（区县-月）
+    description: 城市已归档投诉工单的当日处理及时率，按归档时间归月
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, daily_report, 时效, 城市, kpi]
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: complaint_city_same_day_processing_on_time_count_area_month
+      total: complaint_city_processing_total_count_area_month
+
+  - name: complaint_processing_timely_rate_area_month
+    display_name: 投诉处理及时率（区县-月）
+    description: 投诉标准处理及时率与城市当日处理及时率各占50%的日报指标
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, daily_report, 时效, kpi]
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {standard_rate} IS NOT NULL AND {city_same_day_rate} IS NOT NULL
+        THEN ROUND(({standard_rate} + {city_same_day_rate}) / 2, 2)
+        ELSE NULL
+      END
+    dependencies:
+      standard_rate: complaint_standard_processing_rate_area_month
+      city_same_day_rate: complaint_city_same_day_processing_rate_area_month

@@ -264,3 +264,19 @@ separately reviewed materializer change.  Those bindings and decisions must come
 from a later approved release step (P3+ for published reads, and the backend
 companion MRs for real bindings); until then every inventory metric stays
 non-active and every missing binding stays visible.
+
+## Authoritative binding (S0)
+
+The P1 metric inventory is no longer bound to the frozen fixtures alone.  The
+in-repo authoritative canonical source is `configs/semantic/gold/metrics/` (10
+`*.yaml`), copied verbatim from its producer
+`tt-api/src/apps/data_repository/gold/metadata/metrics`; the in-repo bound legacy
+source is `configs/semantic/semantic.md`.  `verify_authoritative_sources()` in
+`src/nl2sql/semantic/authoritative_sources.py` checks both against a hardcoded
+SHA-256 table before the inventory is built, so a missing, extra, or drifted bound
+file fails closed with that file named.  The bound copies are byte-identical to the
+frozen `tests/fixtures/v4_p1/authoritative/**` bytes and reproduce the locked
+inventory fingerprint
+`36d0d2d27d8a426a18f40018c163abe9525b636d3f2f6531328e38e2728c8b8a` and the locked
+Planner projection fingerprint
+`3c6a43c11fe8deb1218d79b4df7196082fe49ce027b8137a19d5e5858fcecd4d`.

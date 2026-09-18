@@ -1,0 +1,955 @@
+# SINGLE_FAULT 业务域指标配置
+metrics:
+  # ============ 无维度指标（日粒度）============
+  - name: single_fault_total_count_day
+    display_name: 单障工单总数（日）
+    description: 单障工单日度总数（无维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+
+  - name: single_fault_in_transit_count_day
+    display_name: 单障在途工单数（日）
+    description: 单障工单日度在途数量（无维度，竣工回单时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 在途
+    time_grain: day
+    time_column: work_order_arrival_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: single_fault_archived_count_day
+    display_name: 单障已归档工单数（日）
+    description: 单障工单日度已归档数量（无维度，竣工回单时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 已归档
+    time_grain: day
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 无维度指标（月粒度）============
+  - name: single_fault_total_count_month
+    display_name: 单障工单总数（月）
+    description: 单障工单月度总数（无维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+    time_grain: month
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+
+  - name: single_fault_in_transit_count_month
+    display_name: 单障在途工单数（月）
+    description: 单障工单月度在途数量（无维度，竣工回单时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 在途
+    time_grain: month
+    time_column: work_order_arrival_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: single_fault_archived_count_month
+    display_name: 单障已归档工单数（月）
+    description: 单障工单月度已归档数量（无维度，竣工回单时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 已归档
+    time_grain: month
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 及时工单数指标 - 区县维度 ============
+  - name: single_fault_first_response_on_time_count_area_day
+    display_name: 单障首响及时工单数（区县-日）
+    description: 单障工单首响及时数量（区县维度，日粒度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 时效
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_first_response_on_time
+        operator: eq
+        value: true
+      - column: completion_receipt_time
+        operator: not_null
+
+  - name: single_fault_archive_on_time_count_area_day
+    display_name: 单障归档及时工单数（区县-日）
+    description: 单障工单归档及时数量（区县维度，日粒度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 时效
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_archive_on_time
+        operator: eq
+        value: true
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 辅助计算指标 - 单障分母(归档) ============
+  - name: single_fault_calc_total_count_area_day
+    display_name: 单障计算分母（区县-日）
+    description: 用于单障及时率计算的分母（区县维度，日粒度，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, calc]
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  - name: single_fault_calc_total_count_team_day
+    display_name: 单障计算分母（班组-日）
+    description: 用于单障及时率计算的分母（班组维度，日粒度，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, calc]
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  - name: single_fault_calc_total_count_overall_day
+    display_name: 单障计算分母（全局-日）
+    description: 用于单障及时率计算的分母（全局维度，日粒度，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, calc]
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 及时工单数指标 - 班组维度 ============
+  - name: single_fault_first_response_on_time_count_team_day
+    display_name: 单障首响及时工单数（班组-日）
+    description: 单障工单首响及时数量（班组维度，日粒度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 时效
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_first_response_on_time
+        operator: eq
+        value: true
+      - column: completion_receipt_time
+        operator: not_null
+
+  - name: single_fault_archive_on_time_count_team_day
+    display_name: 单障归档及时工单数（班组-日）
+    description: 单障工单归档及时数量（班组维度，日粒度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 时效
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_archive_on_time
+        operator: eq
+        value: true
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 工单总数指标 - 区县维度 ============
+  - name: single_fault_total_count_area_day
+    display_name: 单障工单总数（区县-日）
+    description: 单障工单日度总数（区县维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+
+  - name: single_fault_in_transit_count_area_day
+    display_name: 单障在途工单数（区县-日）
+    description: 单障工单日度在途数量（区县维度，竣工回单时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 在途
+    time_grain: day
+    time_column: work_order_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: single_fault_archived_count_area_day
+    display_name: 单障已归档工单数（区县-日）
+    description: 单障工单日度已归档数量（区县维度，竣工回单时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 已归档
+    time_grain: day
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 工单总数指标 - 班组维度 ============
+  - name: single_fault_total_count_team_day
+    display_name: 单障工单总数（班组-日）
+    description: 单障工单日度总数（班组维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+
+  - name: single_fault_in_transit_count_team_day
+    display_name: 单障在途工单数（班组-日）
+    description: 单障工单日度在途数量（班组维度，竣工回单时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 在途
+    time_grain: day
+    time_column: work_order_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: single_fault_archived_count_team_day
+    display_name: 单障已归档工单数（班组-日）
+    description: 单障工单日度已归档数量（班组维度，竣工回单时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 已归档
+    time_grain: day
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 月度指标 - 区县维度 ============
+  - name: single_fault_total_count_area_month
+    display_name: 单障工单总数（区县-月）
+    description: 单障工单月度总数（区县维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+    time_grain: month
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+
+  - name: single_fault_in_transit_count_area_month
+    display_name: 单障在途工单数（区县-月）
+    description: 单障工单月度在途数量（区县维度，竣工回单时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 在途
+    time_grain: month
+    time_column: work_order_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: single_fault_archived_count_area_month
+    display_name: 单障已归档工单数（区县-月）
+    description: 单障工单月度已归档数量（区县维度，竣工回单时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 已归档
+    time_grain: month
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ 月度指标 - 班组维度 ============
+  - name: single_fault_total_count_team_month
+    display_name: 单障工单总数（班组-月）
+    description: 单障工单月度总数（班组维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+    time_grain: month
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+
+  - name: single_fault_in_transit_count_team_month
+    display_name: 单障在途工单数（班组-月）
+    description: 单障工单月度在途数量（班组维度，竣工回单时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 在途
+    time_grain: month
+    time_column: work_order_arrival_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: single_fault_archived_count_team_month
+    display_name: 单障已归档工单数（班组-月）
+    description: 单障工单月度已归档数量（班组维度，竣工回单时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 已归档
+    time_grain: month
+    time_column: completion_receipt_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ KPI 指标 - 区县维度 ============
+  - name: single_fault_first_response_rate_area_day
+    display_name: 单障首响及时率（区县-日）
+    description: 单障工单首响及时率（区县维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: single_fault_first_response_on_time_count_area_day
+      total: single_fault_calc_total_count_area_day
+
+  - name: single_fault_archive_rate_area_day
+    display_name: 单障归档及时率（区县-日）
+    description: 单障工单归档及时率（区县维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: single_fault_archive_on_time_count_area_day
+      total: single_fault_calc_total_count_area_day
+
+  # ============ KPI 指标 - 班组维度 ============
+  - name: single_fault_first_response_rate_team_day
+    display_name: 单障首响及时率（班组-日）
+    description: 单障工单首响及时率（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: single_fault_first_response_on_time_count_team_day
+      total: single_fault_calc_total_count_team_day
+
+  - name: single_fault_archive_rate_team_day
+    display_name: 单障归档及时率（班组-日）
+    description: 单障工单归档及时率（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - single_fault
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: single_fault_archive_on_time_count_team_day
+      total: single_fault_calc_total_count_team_day
+
+  # ============ 全局总览 (Overall) ============
+  - name: single_fault_total_count_overall_day
+    display_name: 单障工单总数（全局-日）
+    description: 单障工单日度总数（全局维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    time_column: order_acceptance_time
+    aggregation:
+      operation: count
+      column: id
+
+  - name: single_fault_in_transit_count_overall_day
+    display_name: 单障在途工单数（全局-日）
+    description: 单障工单日度在途数量（全局维度，竣工回单时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, 在途, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    time_column: work_order_arrival_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: single_fault_archived_count_overall_day
+    display_name: 单障已归档工单数（全局-日）
+    description: 单障工单日度已归档数量（全局维度，竣工回单时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, 已归档, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    time_column: completion_receipt_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null
+
+
+  - name: single_fault_first_response_on_time_count_overall_day
+    display_name: 单障首响及时工单数（全局-日）
+    description: 单障工单中首响及时数量（全局维度，日粒度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, 时效, overall]
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_first_response_on_time
+        operator: eq
+        value: true
+      - column: completion_receipt_time
+        operator: not_null
+
+  - name: single_fault_archive_on_time_count_overall_day
+    display_name: 单障归档及时工单数（全局-日）
+    description: 单障工单中归档及时数量（全局维度，日粒度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, 时效, overall]
+    time_grain: day
+    time_column: order_acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_archive_on_time
+        operator: eq
+        value: true
+      - column: completion_receipt_time
+        operator: not_null
+
+  # ============ KPI 指标 - 全局维度 ============
+  - name: single_fault_first_response_rate_overall_day
+    display_name: 单障首响及时率（全局-日）
+    description: 单障工单首响及时率（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, 时效, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: single_fault_first_response_on_time_count_overall_day
+      total: single_fault_calc_total_count_overall_day
+
+  - name: single_fault_archive_rate_overall_day
+    display_name: 单障归档及时率（全局-日）
+    description: 单障工单归档及时率（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, 时效, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: single_fault_archive_on_time_count_overall_day
+      total: single_fault_calc_total_count_overall_day
+
+  - name: single_fault_total_count_month_overall
+    display_name: 单障工单总数（全局-月）
+    description: 单障工单月度总数（全局维度）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    time_column: order_acceptance_time
+    aggregation:
+      operation: count
+      column: id
+
+  - name: single_fault_in_transit_count_month_overall
+    display_name: 单障在途工单数（全局-月）
+    description: 单障工单月度在途数量（全局维度，竣工回单时间为空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, 在途, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    time_column: work_order_arrival_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: is_null
+
+  - name: single_fault_archived_count_month_overall
+    display_name: 单障已归档工单数（全局-月）
+    description: 单障工单月度已归档数量（全局维度，竣工回单时间非空）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [single_fault, 已归档, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_single_faulty_order
+    time_column: completion_receipt_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: completion_receipt_time
+        operator: not_null

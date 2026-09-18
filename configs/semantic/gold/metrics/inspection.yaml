@@ -1,0 +1,338 @@
+# INSPECTION 业务域指标配置
+# 注意：inspection域的指标保留了双维度，因为机器质检业务需要同时按区县和团队维度进行统计
+metrics:
+  - name: machine_inspection_scene_valid_count_day
+    display_name: 机器质检场景有效数（日）
+    description: 机器质检场景日度有效数量（可用于指标统计）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: quality_dept
+    tags:
+      - inspection
+      - quality
+    time_grain: day
+    time_column: work_order_complete_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_machine_inspection_detail
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_valid_for_metrics
+        operator: eq
+        value: 1.0
+      - column: is_scene_valid
+        operator: eq
+        value: 1.0
+
+  - name: machine_inspection_recognized_count_day
+    display_name: 机器质检识别成功数（日）
+    description: 机器质检日度识别成功数量（可用于指标统计）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: quality_dept
+    tags:
+      - inspection
+      - quality
+    time_grain: day
+    time_column: work_order_complete_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_machine_inspection_detail
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_valid_for_metrics
+        operator: eq
+        value: 1.0
+      - column: is_recognized
+        operator: eq
+        value: 1.0
+
+  - name: machine_inspection_qualified_count_day
+    display_name: 机器质检合格数（日）
+    description: 机器质检日度合格数量（可用于指标统计）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: quality_dept
+    tags:
+      - inspection
+      - quality
+    time_grain: day
+    time_column: work_order_complete_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_machine_inspection_detail
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_valid_for_metrics
+        operator: eq
+        value: 1.0
+      - column: is_qualified
+        operator: eq
+        value: 1.0
+
+  - name: machine_inspection_recognition_rate_day
+    display_name: 机器质检识别率（日）
+    description: 机器质检日度识别率（识别成功数/场景有效数）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: quality_dept
+    tags:
+      - inspection
+      - quality
+    time_grain: day
+    rollup_strategy: null
+    dimensions:
+      - name: area_id
+        type: area
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: '%'
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST({recognized} AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      recognized: machine_inspection_recognized_count_day
+      total: machine_inspection_scene_valid_count_day
+
+  - name: machine_inspection_qualification_rate_day
+    display_name: 机器质检合格率（已识别-日）
+    description: 机器质检日度合格率（合格数/识别成功数）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: quality_dept
+    tags:
+      - inspection
+      - quality
+    time_grain: day
+    rollup_strategy: null
+    dimensions:
+      - name: area_id
+        type: area
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: '%'
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST({qualified} AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      qualified: machine_inspection_qualified_count_day
+      total: machine_inspection_recognized_count_day
+
+  - name: machine_inspection_qualified_rate_day
+    display_name: 机器质检合格率（日）
+    description: 机器质检日度合格率（识别率 * 0.3 + 合格率 * 0.7）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: quality_dept
+    tags:
+      - inspection
+      - quality
+      - kpi
+    time_grain: day
+    rollup_strategy: null
+    dimensions:
+      - name: area_id
+        type: area
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: '%'
+    expression: |
+      ROUND(({recognition} * 0.3 + {qualification} * 0.7), 2)
+    dependencies:
+      recognition: machine_inspection_recognition_rate_day
+      qualification: machine_inspection_qualification_rate_day
+
+  # 区县日报使用独立区县口径，不能将区县-班组百分比再次平均。
+  - name: machine_inspection_scene_valid_count_area_month
+    display_name: 机器质检场景有效数（区县-月）
+    description: 机器质检场景月累计有效数量（按工单完成时间归月）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: quality_dept
+    tags: [inspection, quality]
+    time_grain: month
+    time_column: work_order_complete_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_machine_inspection_detail
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_valid_for_metrics
+        operator: eq
+        value: 1.0
+      - column: is_scene_valid
+        operator: eq
+        value: 1.0
+
+  - name: machine_inspection_recognized_count_area_month
+    display_name: 机器质检识别成功数（区县-月）
+    description: 机器质检月累计识别成功数量（按工单完成时间归月）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: quality_dept
+    tags: [inspection, quality]
+    time_grain: month
+    time_column: work_order_complete_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_machine_inspection_detail
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_valid_for_metrics
+        operator: eq
+        value: 1.0
+      - column: is_recognized
+        operator: eq
+        value: 1.0
+
+  - name: machine_inspection_qualified_count_area_month
+    display_name: 机器质检合格数（区县-月）
+    description: 机器质检月累计合格数量（按工单完成时间归月）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: quality_dept
+    tags: [inspection, quality]
+    time_grain: month
+    time_column: work_order_complete_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_machine_inspection_detail
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_valid_for_metrics
+        operator: eq
+        value: 1.0
+      - column: is_qualified
+        operator: eq
+        value: 1.0
+
+  - name: machine_inspection_recognition_rate_area_month
+    display_name: 机器质检识别率（区县-月）
+    description: 机器质检月累计识别率（区县维度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: quality_dept
+    tags: [inspection, quality]
+    time_grain: month
+    rollup_strategy: null
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: '%'
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST({recognized} AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      recognized: machine_inspection_recognized_count_area_month
+      total: machine_inspection_scene_valid_count_area_month
+
+  - name: machine_inspection_qualification_rate_area_month
+    display_name: 机器质检合格率（已识别-区县月）
+    description: 机器质检月累计合格率（区县维度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: quality_dept
+    tags: [inspection, quality]
+    time_grain: month
+    rollup_strategy: null
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: '%'
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST({qualified} AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      qualified: machine_inspection_qualified_count_area_month
+      total: machine_inspection_recognized_count_area_month
+
+  - name: machine_inspection_qualified_rate_area_month
+    display_name: 机器质检合格率（区县-月）
+    description: 机器质检月累计合格率（识别率 * 0.3 + 合格率 * 0.7，区县维度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: quality_dept
+    tags: [inspection, quality, kpi]
+    time_grain: month
+    rollup_strategy: null
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: '%'
+    expression: |
+      ROUND(({recognition} * 0.3 + {qualification} * 0.7), 2)
+    dependencies:
+      recognition: machine_inspection_recognition_rate_area_month
+      qualification: machine_inspection_qualification_rate_area_month
