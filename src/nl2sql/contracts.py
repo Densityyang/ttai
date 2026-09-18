@@ -23,6 +23,8 @@ SourceDegradation = Literal[
     "metric_dimension_combination_unsupported", "metric_aggregate_sla_missing",
     "metric_freshness_evidence_invalid", "metric_freshness_authority_mismatch",
 ]
+# Final Agent-facing scope vocabulary owned by Backend/DB; tt-ai only consumes it.
+ScopeLevel = Literal["city_company", "area", "team", "employee"]
 
 
 class StrictContract(BaseModel):
@@ -45,6 +47,127 @@ class RequestContext(StrictContract):
     thread_id: UUID
     trace_id: str = Field(min_length=1, max_length=256)
     deadline_ms: int = Field(default=30_000, ge=1, le=120_000)
+
+
+class AuthorizationContext(StrictContract):
+    """Backend-owned effective authorization snapshot for one Agent request.
+
+    Every field is derived server-side from Backend/DB truth; tt-ai only
+    consumes the final Agent-facing vocabulary and never reinterprets a legacy
+    organization type.  authorization_revision is an opaque non-blank token.
+    An empty allowed_scope_ids means no effective scope at all
+    (deny-by-absence) and never widens access.  tt-ai consumes scope_level
+    verbatim and owes no hierarchy, ancestor, sibling or employee-scope
+    derivation -- Backend owns all of it.
+
+    policy_version and policy_checksum are provenance carried ONLY when Backend
+    supplies them: tt-ai asserts no Backend policy-versioning capability, and
+    their absence is not a failure and must never by itself cause a deny.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["1.0"] = "1.0"
+    authorization_revision: str = Field(min_length=1, max_length=256)
+    agent_enabled: bool
+    scope_level: ScopeLevel
+    allowed_scope_ids: tuple[str, ...] = ()
+    policy_version: str | None = Field(default=None, min_length=1, max_length=128)
+    policy_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("authorization_revision")
+    @classmethod
+    def validate_authorization_revision(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("authorization revision must be non-blank")
+        return value
+
+    @field_validator("allowed_scope_ids")
+    @classmethod
+    def validate_allowed_scope_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item.strip() for item in value):
+            raise ValueError("allowed scope identifiers must be non-empty")
+        if len(set(value)) != len(value):
+            raise ValueError("allowed scope identifiers must be unique")
+        return value
+
+    @property
+    def checksum(self) -> str:
+        return _contract_checksum(self)
+
+
+# The one and only deny reason: unavailable, malformed, stale and out-of-scope
+# authorization must not be distinguishable from each other.
+AUTHORIZATION_DENIED_REASON: Literal["authorization_denied"] = "authorization_denied"
+
+
+class AuthorizationDecision(StrictContract):
+    """Fail-closed authorization outcome taken against one opaque revision.
+
+    A deny never carries a revision or a cause-specific reason, so every deny
+    produces identical bytes: an unauthorized-but-existing resource and a
+    non-existent one are indistinguishable (no existence oracle).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    outcome: Literal["allow", "deny"]
+    reason: Literal["authorization_denied"] | None = None
+    authorization_revision: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+    )
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> AuthorizationDecision:
+        if self.outcome == "deny":
+            if self.reason is None:
+                raise ValueError("deny decision requires a reason")
+            if self.authorization_revision is not None:
+                raise ValueError("deny decision must not carry a revision")
+        elif self.reason is not None:
+            raise ValueError("allow decision cannot carry a reason")
+        elif self.authorization_revision is None:
+            raise ValueError("allow decision requires an authorization revision")
+        return self
+
+
+AUTHORIZATION_DENIED = AuthorizationDecision(
+    outcome="deny",
+    reason=AUTHORIZATION_DENIED_REASON,
+)
+
+
+def evaluate_authorization(
+    context: AuthorizationContext | None,
+    *,
+    expected_revision: str | None,
+    requested_scope_id: str | None = None,
+) -> AuthorizationDecision:
+    """Collapse every authorization failure into one indistinguishable deny.
+
+    context must be server-derived.  Any value that is not an
+    AuthorizationContext -- None, a malformed payload, or a lookalike object --
+    is treated as absent.  A missing or mismatched expected_revision covers
+    stale or revision-mismatched authorization.  An empty allowed_scope_ids or
+    a requested_scope_id outside the allowed set covers out-of-scope access.
+    All of them return the same AUTHORIZATION_DENIED object, so no caller can
+    observe a difference and the function never raises.
+    """
+
+    if not isinstance(context, AuthorizationContext) or not context.agent_enabled:
+        return AUTHORIZATION_DENIED
+    if not context.allowed_scope_ids:
+        return AUTHORIZATION_DENIED
+    if expected_revision is None or context.authorization_revision != expected_revision:
+        return AUTHORIZATION_DENIED
+    if requested_scope_id is not None and requested_scope_id not in context.allowed_scope_ids:
+        return AUTHORIZATION_DENIED
+    return AuthorizationDecision(
+        outcome="allow",
+        authorization_revision=context.authorization_revision,
+    )
 
 
 class PolicyDecision(StrictContract):

@@ -6,13 +6,61 @@ import hashlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from starlette.requests import Request
 
 from src.core.auth.types import AuthUser
 from src.core.settings import Settings, get_settings
+from src.nl2sql.contracts import (
+    AuthorizationContext,
+    AuthorizationDecision,
+    evaluate_authorization,
+)
+
+
+class BackendAuthorizationProvider(Protocol):
+    """Server-side source of the final Agent-facing authorization snapshot.
+
+    load returns the Backend-owned, already-resolved effective scope.  It must
+    not reinterpret a legacy organization type or derive roles; a None result
+    means the snapshot is UNAVAILABLE and is treated exactly like a deny.  This
+    is a contract only: no HTTP call, endpoint, or payload mapping is defined.
+    """
+
+    async def load(self, user: AuthUser) -> AuthorizationContext | None:
+        """Return the effective authorization for user, or None if unavailable."""
+        ...
+
+
+async def load_authorization(
+    provider: BackendAuthorizationProvider,
+    user: AuthUser,
+    *,
+    expected_revision: str | None,
+    requested_scope_id: str | None = None,
+) -> AuthorizationDecision:
+    """Resolve authorization fail-closed through a provider contract.
+
+    Any provider failure -- an exception, a None result, or a malformed
+    payload -- collapses to the same indistinguishable deny via
+    evaluate_authorization.  expected_revision is server-derived and is never
+    read from client input.
+    """
+
+    context: AuthorizationContext | None
+    try:
+        loaded = await provider.load(user)
+    except Exception:
+        context = None
+    else:
+        context = loaded if isinstance(loaded, AuthorizationContext) else None
+    return evaluate_authorization(
+        context,
+        expected_revision=expected_revision,
+        requested_scope_id=requested_scope_id,
+    )
 
 
 @dataclass(slots=True)
