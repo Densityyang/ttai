@@ -3,7 +3,9 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
+      - feature/nl2sql-v3-production
 
 permissions:
   contents: read
@@ -22,6 +24,25 @@ jobs:
           enable-cache: true
       - run: uv python install 3.13
       - run: uv sync --frozen --all-groups
+      - name: Whitespace gate (git diff --check)
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PR_BASE_SHA}" ]; then
+            RANGE="$(git merge-base "${PR_BASE_SHA}" HEAD)..HEAD"
+          elif [ -n "${PUSH_BEFORE_SHA}" ] && ! printf '%s' "${PUSH_BEFORE_SHA}" | grep -qE '^0+$'; then
+            RANGE="${PUSH_BEFORE_SHA}..HEAD"
+          else
+            RANGE="HEAD^..HEAD"
+          fi
+          # tests/fixtures/v4_p1/authoritative/ is a byte-identical, SHA-256-bound copy of an
+          # external producer's output (see src/nl2sql/semantic/authoritative_sources.py). Its
+          # legacy/semantic.md depends on semantically meaningful Markdown two-space hard line
+          # breaks, so it must not be reformatted: those trailing spaces are content, not a
+          # whitespace defect to fix.
+          git diff --check "${RANGE}" -- . ':(exclude)tests/fixtures/v4_p1/authoritative/**'
       - run: uv run ruff check src tests
       - run: uv run pyright
       - run: uv run pytest

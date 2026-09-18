@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Any, cast
 
@@ -13,6 +14,46 @@ def _load_yaml(relative_path: str) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise TypeError(f"expected mapping in {relative_path}")
     return cast(dict[str, Any], loaded)
+
+
+def _healthcheck_tokens(compose: dict[str, Any], service_name: str) -> list[str]:
+    """Tokenize a service healthcheck, stripping any CMD/CMD-SHELL prefix."""
+    healthcheck = compose["services"][service_name].get("healthcheck") or {}
+    command = healthcheck.get("test")
+    if command is None:
+        return []
+    parts = [str(part) for part in (command if isinstance(command, list) else [command])]
+    if parts and parts[0] in {"CMD", "CMD-SHELL"}:
+        parts = parts[1:]
+    if len(parts) == 1:
+        parts = shlex.split(parts[0])
+    return parts
+
+
+def _assert_pg_isready_targets_tcp(compose: dict[str, Any], service_name: str) -> None:
+    """Require a pg_isready probe to connect over TCP to 127.0.0.1.
+
+    The postgres entrypoint runs /docker-entrypoint-initdb.d scripts against a
+    temporary server with an empty listen_addresses, so a host-less pg_isready
+    reports healthy before the final TCP listener exists and services gated on
+    service_healthy connect too early.  Parsing the command into tokens keeps
+    this assertion independent of spacing and flag rendering.
+    """
+    tokens = _healthcheck_tokens(compose, service_name)
+    assert tokens[:1] == ["pg_isready"], f"{service_name} is not healthchecked by pg_isready"
+    hosts: list[str] = []
+    for index, token in enumerate(tokens):
+        if token in {"-h", "--host"}:
+            assert index + 1 < len(tokens), f"{service_name}: {token} needs a value"
+            hosts.append(tokens[index + 1])
+        elif token.startswith("--host="):
+            hosts.append(token.partition("=")[2])
+        elif token.startswith("-h") and len(token) > 2:
+            hosts.append(token[2:])
+    assert hosts == ["127.0.0.1"], (
+        f"{service_name} pg_isready must target 127.0.0.1 over TCP, "
+        f"not the Unix socket (got {hosts or 'no host'})"
+    )
 
 
 def test_base_compose_exposes_only_nginx_and_uses_readiness_healthchecks() -> None:
@@ -102,7 +143,7 @@ def test_dev_databases_are_healthy_isolated_and_use_distinct_named_volumes() -> 
     assert services["checkpoint-postgres"]["networks"] == {"control_net": None}
     assert services["business-postgres"]["networks"] == {"data_net": None}
     for service_name in ("control-postgres", "checkpoint-postgres", "business-postgres"):
-        assert "pg_isready" in " ".join(services[service_name]["healthcheck"]["test"])
+        _assert_pg_isready_targets_tcp(dev, service_name)
         assert "ports" not in services[service_name]
         assert "./initdb/roles.sh:/docker-entrypoint-initdb.d/010-roles.sh:ro" in services[
             service_name
@@ -131,6 +172,32 @@ def test_dev_databases_are_healthy_isolated_and_use_distinct_named_volumes() -> 
     }
     assert len(test_volume_names) == 3
     assert volume_names.isdisjoint(test_volume_names)
+
+
+def test_every_compose_pg_isready_healthcheck_targets_tcp_host() -> None:
+    expected_services = {
+        "docker/compose.dev.yml": {
+            "control-postgres",
+            "checkpoint-postgres",
+            "business-postgres",
+        },
+        "docker/compose.test.yml": {
+            "control-postgres",
+            "checkpoint-postgres",
+            "business-postgres",
+        },
+        "docker/compose.release.yml": {"control-postgres", "checkpoint-postgres"},
+    }
+    for compose_path, expected in expected_services.items():
+        compose = _load_yaml(compose_path)
+        probed = {
+            service_name
+            for service_name in compose["services"]
+            if _healthcheck_tokens(compose, service_name)[:1] == ["pg_isready"]
+        }
+        assert probed == expected, f"{compose_path}: {probed}"
+        for service_name in sorted(expected):
+            _assert_pg_isready_targets_tcp(compose, service_name)
 
 
 def test_benchmark_is_an_explicit_one_shot_compose_profile() -> None:
