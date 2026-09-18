@@ -114,6 +114,9 @@ def materialize_authoring_ir(
                 "owner": asset.owner,
                 "sensitivity": asset.sensitivity,
                 "status": asset.status,
+                **({"execution_contract": json.dumps(
+                    asset.payload["execution_contract"], sort_keys=True, separators=(",", ":")
+                )} if asset.payload.get("execution_contract") is not None else {}),
             },
         )
         for asset in assets

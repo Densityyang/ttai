@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date
+from datetime import date, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -14,6 +14,15 @@ ModelStage = Literal["classify", "retrieve", "plan", "generate_sql", "verify", "
 ModelDataClassification = Literal["public", "internal", "confidential", "restricted"]
 RouteName = Literal["fast", "standard", "deep"]
 PolicyLifecycle = Literal["bootstrap", "calibrated", "frozen"]
+SourceDegradation = Literal[
+    "aggregate_stale", "aggregate_unknown", "metric_permission_denied",
+    "metric_relation_unapproved", "metric_aggregate_coverage_unapproved",
+    "metric_aggregate_sensitivity_denied", "metric_column_unapproved",
+    "metric_column_type_mismatch", "metric_scan_rows_exceeded", "metric_time_index_required",
+    "metric_time_range_too_large", "metric_grain_or_dimension_unsupported",
+    "metric_dimension_combination_unsupported", "metric_aggregate_sla_missing",
+    "metric_freshness_evidence_invalid", "metric_freshness_authority_mismatch",
+]
 
 
 class StrictContract(BaseModel):
@@ -47,7 +56,7 @@ class PolicyDecision(StrictContract):
 
 
 class TimeRange(StrictContract):
-    """Explicit business time boundary; free-text dates never reach execution."""
+    """Inclusive business dates; compilers use [start midnight, end + 1 day)."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -165,8 +174,20 @@ class QueryPlan(StrictContract):
     time_range: TimeRange
     grain: Literal["hour", "day", "week", "month", "quarter", "year"]
     source_strategy: Literal["aggregate_first", "detail_required"]
+    # Ranking defaults to ten; other intents must leave this unset.
+    result_limit: int | None = Field(default=None, strict=True, ge=1, le=100)
     required_permissions: tuple[str, ...] = Field(default=(), max_length=32)
     unresolved_slots: tuple[str, ...] = Field(default=(), max_length=16)
+
+    @model_validator(mode="after")
+    def validate_result_limit(self) -> QueryPlan:
+        if self.intent != "ranking" and self.result_limit is not None:
+            raise ValueError("result_limit is only supported for ranking")
+        return self
+
+    @property
+    def ranking_limit(self) -> int:
+        return self.result_limit if self.result_limit is not None else 10
 
     @field_validator(
         "metric_keys",
@@ -360,6 +381,15 @@ class PlanStepReceipt(StrictContract):
     status: Literal["succeeded", "failed"]
     elapsed_ms: int = Field(ge=0)
     output_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    data_as_of: datetime | None = None
+    freshness_status: Literal["fresh", "stale", "unknown"] = "unknown"
+    source_kind: Literal["approved_aggregate", "approved_detail"] | None = None
+    source_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    selection_reason: Literal["fresh_approved_aggregate", "approved_detail_fallback", "approved_detail"] | None = None
+    source_degradation: tuple[SourceDegradation, ...] = ()
+    source_checkpoint: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    semantic_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     error_code: str | None = Field(default=None, min_length=1, max_length=128)
 
     @model_validator(mode="after")
@@ -507,11 +537,11 @@ class RouteBudgetRecord(StrictContract):
 
 
 class QueryCandidate(StrictContract):
-    sql: str
+    sql: str = Field(repr=False, exclude=True)
     fingerprint: str
     validation: tuple[str, ...] = ()
     cost: float | None = Field(default=None, ge=0)
-    score: float = Field(ge=0, le=1)
+    semantic_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class ExecutionReceipt(StrictContract):
@@ -527,6 +557,15 @@ class ExecutionReceipt(StrictContract):
     sql_fingerprint: str = ""
     policy_version: str = ""
     policy_outcome: Literal["allow", "deny"] = "deny"
+    rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    data_as_of: datetime | None = None
+    freshness_status: Literal["fresh", "stale", "unknown"] = "unknown"
+    source_kind: Literal["approved_aggregate", "approved_detail"] | None = None
+    source_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    selection_reason: Literal["fresh_approved_aggregate", "approved_detail_fallback", "approved_detail"] | None = None
+    source_degradation: tuple[SourceDegradation, ...] = ()
+    source_checkpoint: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    semantic_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class AnswerArtifact(StrictContract):

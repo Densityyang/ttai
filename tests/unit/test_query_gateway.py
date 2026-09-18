@@ -587,6 +587,7 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
             "trusted_template_registry.execute",
         },
         "src/nl2sql/orchestration/engine.py": {"plan_executor.execute"},
+        "src/nl2sql/orchestration/metric_query.py": {"self._gateway.execute"},
         "src/nl2sql/orchestration/execution.py": {
             "self._metric_runner.execute",
             "self._registry.execute",

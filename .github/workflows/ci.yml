@@ -91,8 +91,8 @@ jobs:
           enable-cache: true
       - run: uv python install 3.13
       - run: uv sync --frozen --all-groups
-      - name: Verify PostgreSQL roles, migrations, recovery, and HITL resume
-        run: uv run pytest -vv -s tests/integration/test_postgres_governance.py
+      - name: Verify PostgreSQL governance, QueryGateway, and metric execution
+        run: uv run pytest -vv -s tests/integration/test_postgres_governance.py tests/integration/test_query_gateway_postgres.py
 
   compose-contract:
     runs-on: ubuntu-latest
