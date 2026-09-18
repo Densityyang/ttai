@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, date, datetime
 from typing import Any, Literal, cast
 from uuid import UUID
@@ -58,6 +58,49 @@ SNAPSHOT_ID = UUID("22222222-2222-2222-2222-222222222222")
 REQUEST_ID = UUID("33333333-3333-3333-3333-333333333333")
 THREAD_ID = UUID("44444444-4444-4444-4444-444444444444")
 SQL_FINGERPRINT = "a" * 64
+
+_SYNTHETIC_PAYLOAD_KEY = "revenue"
+_SYNTHETIC_PAYLOAD_VALUE = 4242
+# Renderings that json.dumps(..., default=str) writes verbatim for non-JSON objects.
+# None can occur inside an ISO timestamp, UUID, hex checksum or plain counter.
+_SYNTHETIC_PAYLOAD_MARKERS = (
+    '"revenue": 4242',
+    '"revenue":4242',
+    '"revenue", 4242',
+    '"revenue",4242',
+    "'revenue': 4242",
+    "'revenue':4242",
+    "'revenue', 4242",
+    "'revenue',4242",
+    "revenue=4242",
+)
+
+
+def _assert_business_payload_absent(persisted: object, *, path: str = "$") -> None:
+    """Fail when a persisted structure carries the raw synthetic business payload.
+
+    The payload counts as persisted only as a mapping whose "revenue" entry is
+    4242. JSON text is decoded and walked structurally; strings that render the
+    payload as a Python repr (dataclass/kwargs, tuple/list, single-quoted dict)
+    are matched against payload-shaped markers. Opaque metadata (timestamps,
+    UUIDs, hashes, counters) satisfies neither and cannot reintroduce the flake.
+    """
+    if isinstance(persisted, Mapping):
+        if persisted.get(_SYNTHETIC_PAYLOAD_KEY) == _SYNTHETIC_PAYLOAD_VALUE:
+            raise AssertionError(f"raw business payload persisted at {path}")
+        for key, value in persisted.items():
+            _assert_business_payload_absent(value, path=f"{path}.{key}")
+    elif isinstance(persisted, (list, tuple)):
+        for index, value in enumerate(persisted):
+            _assert_business_payload_absent(value, path=f"{path}[{index}]")
+    elif isinstance(persisted, str):
+        if any(marker in persisted for marker in _SYNTHETIC_PAYLOAD_MARKERS):
+            raise AssertionError(f"raw business payload persisted at {path}")
+        try:
+            decoded = json.loads(persisted)
+        except json.JSONDecodeError:
+            return
+        _assert_business_payload_absent(decoded, path=path)
 
 
 def _identity(*, permissions: frozenset[str] = frozenset({"metrics:read"})) -> RequestIdentity:
@@ -480,7 +523,7 @@ async def test_plan_executor_charges_before_execution_and_checkpoints_only_recei
     assert ledger.model_calls == 0
     checkpoint = result.record.model_dump_json()
     assert "SELECT synthetic_revenue" not in checkpoint
-    assert "4242" not in checkpoint
+    _assert_business_payload_absent(checkpoint)
 
 
 @pytest.mark.asyncio
@@ -646,6 +689,44 @@ async def test_plan_executor_propagates_request_cancellation() -> None:
         await task
 
 
+def test_business_payload_absence_check_is_structural_not_substring() -> None:
+    false_positive = {
+        "trace_events": [
+            {
+                "name": "received",
+                "timestamp": "2026-09-18T07:08:32.424208+00:00",
+                "checkpoint_id": "9f8e7d6c-5b4a-3210-9876-543210fedcba",
+                "checksum": "4242" * 16,
+                "sequence": 424208,
+            }
+        ],
+        "budget_record": {"sql_candidates": 1, "sql_executions": 1},
+    }
+    _assert_business_payload_absent(false_positive)
+    _assert_business_payload_absent(json.dumps(false_positive, sort_keys=True, default=str))
+
+    # Structural and JSON-encoded persistence of the raw payload.
+    structural_leaks = (
+        {"revenue": 4242},
+        {"outputs": {"revenue": 4242}},
+        {"a": {"b": {"c": {"revenue": 4242}}}},
+        {"items": [{"revenue": 4242}]},
+        [{"revenue": 4242}],
+        json.dumps({"outputs": {"revenue": 4242}}),
+    )
+    # Non-JSON renderings that json.dumps(..., default=str) writes verbatim.
+    rendered_leaks = (
+        "FetchMetricResult(revenue=4242)",
+        str(("revenue", 4242)),
+        "{'revenue': 4242}",
+    )
+    for leak in structural_leaks + rendered_leaks:
+        with pytest.raises(AssertionError, match="raw business payload persisted at"):
+            _assert_business_payload_absent(leak)
+        with pytest.raises(AssertionError, match="raw business payload persisted at"):
+            _assert_business_payload_absent(json.dumps(leak, sort_keys=True))
+
+
 @pytest.mark.asyncio
 async def test_engine_uses_zero_model_fast_path_for_a_validated_typed_plan() -> None:
     context = _context()
@@ -697,10 +778,10 @@ async def test_engine_uses_zero_model_fast_path_for_a_validated_typed_plan() -> 
     )
     assert "GroundedAnswerPending" in result["degradation_flags"]
     execution_checkpoint = json.dumps(result["execution_record"], sort_keys=True)
-    assert "4242" not in execution_checkpoint
+    _assert_business_payload_absent(execution_checkpoint)
     serialized_checkpoint = json.dumps(checkpoint_values, default=str, sort_keys=True)
     assert "SELECT synthetic_revenue" not in serialized_checkpoint
-    assert "4242" not in serialized_checkpoint
+    _assert_business_payload_absent(serialized_checkpoint)
     assert [event["name"] for event in result["trace_events"]] == [
         "received",
         "context_compiled",
