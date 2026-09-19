@@ -16,9 +16,9 @@ from src.nl2sql.contracts import (
     evaluate_authorization,
 )
 
-# Configurable keys carrying the trusted authorization context and its revision.
+# The single configurable key carrying the trusted authorization context; the
+# context itself carries its authorization revision, so no second copy exists.
 AUTHORIZATION_CONFIG_KEY = "authorization_context"
-AUTHORIZATION_REVISION_CONFIG_KEY = "authorization_revision"
 
 
 def internal_thread_id(context: RequestContext) -> str:
@@ -32,9 +32,9 @@ def runtime_config(context: RequestContext) -> dict[str, object]:
     """Build the config propagated to supervisor graphs and their tools.
 
     The pre-existing keys and their exact values are unchanged.  The
-    authorization context and its revision are added only when the request
-    actually carries one, so an authorization-free request produces the exact
-    same mapping as before this slice.
+    authorization context (which carries its own revision) is added only when
+    the request actually carries one, so an authorization-free request produces
+    the exact same mapping as before this slice.
     """
 
     identity = context.identity
@@ -56,7 +56,6 @@ def runtime_config(context: RequestContext) -> dict[str, object]:
     authorization = context.authorization
     if authorization is not None:
         configurable[AUTHORIZATION_CONFIG_KEY] = authorization.model_dump(mode="json")
-        configurable[AUTHORIZATION_REVISION_CONFIG_KEY] = authorization.authorization_revision
     return {"configurable": configurable}
 
 
@@ -110,13 +109,15 @@ def evaluate_config_authorization(
 ) -> AuthorizationDecision | None:
     """The single fail-closed enforcement seam for a runtime configurable.
 
-    Returns None ONLY when authorization is neither required nor present, so a
-    request that carries no authorization follows today's code path unchanged.
-    Every other case -- required-but-absent, malformed, revision-mismatched,
-    agent-disabled, empty or out-of-scope -- is delegated verbatim to
-    evaluate_authorization, which yields the one canonical public denial.  No
-    second deny shape is produced and the cause is never placed on a
-    user-visible surface.
+    Returns None ONLY when authorization is not required AND no valid context is
+    carried -- absent, wrong-typed or malformed, all of which the accessor
+    collapses to absent -- so an authorization-free request follows today's
+    code path unchanged.  Otherwise it delegates verbatim to
+    evaluate_authorization: required-but-absent yields the canonical denial,
+    and a valid-but-unusable supplied context (revision-mismatched,
+    agent-disabled, empty or out-of-scope) yields that SAME canonical denial
+    even when authorization_required is False.  No second deny shape is
+    produced and the cause is never placed on a user-visible surface.
     """
 
     context = authorization_context_from_config(configurable)

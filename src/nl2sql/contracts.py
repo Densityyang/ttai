@@ -47,10 +47,13 @@ class RequestContext(StrictContract):
     thread_id: UUID
     trace_id: str = Field(min_length=1, max_length=256)
     deadline_ms: int = Field(default=30_000, ge=1, le=120_000)
-    # Optional on purpose: a request that carries no authorization keeps the
-    # pre-existing runtime-configurable path unchanged.  Fail-closed
-    # enforcement applies only where authorization is actually REQUIRED
-    # downstream.
+    # Optional carrier; absence must keep the pre-existing runtime-configurable
+    # path unchanged.  A supplied, parseable context is ALWAYS evaluated: a
+    # present-but-unusable one (stale revision, disabled, empty or out-of-scope)
+    # denies regardless of any requirement flag.  Only when the carrier is
+    # absent -- or malformed, which the accessor collapses to absent -- does the
+    # requirement flag choose between a fail-closed deny (required) and the
+    # existing path (not required).
     authorization: AuthorizationContext | None = None
 
 

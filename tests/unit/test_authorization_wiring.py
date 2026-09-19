@@ -23,7 +23,6 @@ from src.nl2sql.contracts import (
 )
 from src.nl2sql.ownership import (
     AUTHORIZATION_CONFIG_KEY,
-    AUTHORIZATION_REVISION_CONFIG_KEY,
     authorization_context_from_config,
     bind_execution_receipt_authorization,
     evaluate_config_authorization,
@@ -98,12 +97,13 @@ class _ExplodingMapping(Mapping[str, object]):
 # --- propagation -----------------------------------------------------------
 
 
-def test_runtime_config_carries_the_context_and_revision_when_present() -> None:
+def test_runtime_config_carries_the_context_when_present() -> None:
     configurable = _configurable(_authorization("rev-7"))
-    assert configurable[AUTHORIZATION_REVISION_CONFIG_KEY] == "rev-7"
     assert configurable[AUTHORIZATION_CONFIG_KEY] == _authorization("rev-7").model_dump(
         mode="json"
     )
+    # The context carries its own revision; no second, drift-prone copy exists.
+    assert "authorization_revision" not in configurable
 
 
 def test_runtime_config_omits_authorization_keys_when_absent() -> None:
@@ -232,6 +232,59 @@ def test_required_but_absent_authorization_denies_canonically() -> None:
     assert decision == AUTHORIZATION_DENIED
     assert decision is not None
     assert decision.model_dump_json() == _CANONICAL_DENY
+
+
+def test_present_stale_context_denies_even_when_authorization_is_not_required() -> None:
+    # The requirement flag does NOT gate a supplied-but-unusable context.
+    decision = evaluate_config_authorization(
+        _configurable(_authorization("rev-2")),
+        authorization_required=False,
+        expected_revision="rev-1",
+    )
+    assert decision == AUTHORIZATION_DENIED
+    assert decision is not None
+    assert decision.model_dump_json() == _CANONICAL_DENY
+
+
+def test_present_disabled_context_denies_even_when_authorization_is_not_required() -> None:
+    decision = evaluate_config_authorization(
+        _configurable(_authorization(agent_enabled=False)),
+        authorization_required=False,
+        expected_revision="rev-1",
+    )
+    assert decision == AUTHORIZATION_DENIED
+    assert decision is not None
+
+
+def test_present_but_malformed_context_is_absent_when_not_required() -> None:
+    # Malformed collapses to absent, so the requirement flag DOES govern it.
+    assert (
+        evaluate_config_authorization(
+            {AUTHORIZATION_CONFIG_KEY: "malformed"},
+            authorization_required=False,
+            expected_revision="rev-1",
+        )
+        is None
+    )
+    assert (
+        evaluate_config_authorization(
+            {},
+            authorization_required=False,
+            expected_revision="rev-1",
+        )
+        is None
+    )
+
+
+def test_required_with_a_valid_matching_context_allows() -> None:
+    decision = evaluate_config_authorization(
+        _configurable(_authorization("rev-1")),
+        authorization_required=True,
+        expected_revision="rev-1",
+    )
+    assert decision is not None
+    assert decision.outcome == "allow"
+    assert decision.authorization_revision == "rev-1"
 
 
 def test_absent_authorization_leaves_the_existing_path_unchanged() -> None:
