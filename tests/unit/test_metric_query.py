@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -9,12 +11,25 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from src.nl2sql.contracts import BoundFilter, FetchMetricStep, TimeRange
+from src.nl2sql.contracts import (
+    AUTHORIZATION_DENIED,
+    AuthorizationContext,
+    AuthorizationDecision,
+    BoundFilter,
+    FetchMetricStep,
+    TimeRange,
+    evaluate_authorization,
+)
 from src.nl2sql.infra.governance.query_gateway import QueryGateway, QueryReceipt
 from src.nl2sql.orchestration.budget import RouteBudgetLedger
 from src.nl2sql.orchestration.candidates import rowset_sha256
 from src.nl2sql.orchestration.execution import PlanStepError, PreparedMetricStep
-from src.nl2sql.orchestration.metric_query import GatewayMetricStepRunner, metric_plan_executor
+from src.nl2sql.orchestration.metric_query import (
+    CompiledMetricQuery,
+    EligibilityPolicy,
+    GatewayMetricStepRunner,
+    metric_plan_executor,
+)
 from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
 from src.nl2sql.semantic.metric_contract import (
     MetricCatalog,
@@ -22,8 +37,19 @@ from src.nl2sql.semantic.metric_contract import (
     metric_catalog_ir,
 )
 from src.nl2sql.semantic.registry import SemanticReleaseState
-from src.nl2sql.semantic.schema_snapshot import SchemaSnapshotState
-from tests.metric_fixtures import MetricAuthority, ratio_contract, seed_contract
+from src.nl2sql.semantic.schema_snapshot import (
+    ColumnSnapshot,
+    OrganizationCoverageBinding,
+    SchemaSnapshotState,
+    validate_organization_coverage,
+)
+from tests.metric_fixtures import (
+    RELEASE_ID,
+    SNAPSHOT_ID,
+    MetricAuthority,
+    ratio_contract,
+    seed_contract,
+)
 
 
 def test_catalog_addition_requires_no_python_and_preserves_channels() -> None:
@@ -297,3 +323,417 @@ async def test_integer_filter_and_deployment_extra_eligibility() -> None:
     assert query.params["filter_0"] == 2
     assert '"is_valid_for_metrics" IS TRUE' in query.sql
     assert '"completion_time" IS NULL' in query.sql
+
+# ---------------------------------------------------------------------------
+# Slice 2B: dormant typed organization-scope + RelationCoverage enforcement
+# ---------------------------------------------------------------------------
+
+
+def _auth(
+    level: str,
+    ids: tuple[str, ...],
+    *,
+    revision: str = "rev-1",
+    enabled: bool = True,
+) -> AuthorizationContext:
+    return AuthorizationContext(
+        authorization_revision=revision,
+        agent_enabled=enabled,
+        scope_level=level,
+        allowed_scope_ids=ids,
+    )
+
+
+def _org_filter(dimension: str, value: Any, operator: str = "eq") -> BoundFilter:
+    return BoundFilter.model_validate(
+        dict(field_ref=dimension, operator=operator, value=value, source="entity_alias")
+    )
+
+
+def _with_employee(authority: MetricAuthority) -> None:
+    assert authority.snapshot is not None
+    relation = authority.snapshot.candidate.relations[0]
+    authority.change_snapshot_relation(
+        columns=(
+            *relation.columns,
+            ColumnSnapshot("employee_id", "text", True, len(relation.columns) + 1),
+        ),
+        organization_coverage=(
+            *relation.organization_coverage,
+            OrganizationCoverageBinding("employee", "employee_id", "text"),
+        ),
+    )
+    authority.binding = authority.binding.model_copy(
+        update={
+            "allowed_columns": (*authority.binding.allowed_columns, "employee_id"),
+        }
+    )
+
+
+def _area_team_authority() -> MetricAuthority:
+    return MetricAuthority(
+        seed_contract(supported_dimensions=("city_company", "area", "team"))
+    )
+
+
+@pytest.mark.asyncio
+async def test_multi_level_coverage_on_one_relation() -> None:
+    # A. One relation exposes city_company AND area AND team AND employee at once.
+    authority = MetricAuthority(
+        seed_contract(
+            supported_dimensions=("city_company", "area", "team", "employee")
+        )
+    )
+    _with_employee(authority)
+    assert authority.snapshot is not None
+    relation = authority.snapshot.candidate.relations[0]
+    assert {binding.scope_level for binding in relation.organization_coverage} == {
+        "city_company",
+        "area",
+        "team",
+        "employee",
+    }
+    assert validate_organization_coverage(relation) == ()
+    query = await authority.compiler(
+        authorization=_auth("city_company", ("cc-1",))
+    ).compile(authority.plan(intent="comparison", dimensions=("employee",)), authority.context)
+    assert '"employee_id"' in query.sql
+
+
+@pytest.mark.asyncio
+async def test_city_company_requires_explicit_coverage_without_a_fake_id() -> None:
+    # B. city_company is an explicit root scope: no fabricated id predicate, and
+    # missing explicit coverage fails closed.
+    authority = MetricAuthority()
+    query = await authority.compiler(
+        authorization=_auth("city_company", ("cc-1",))
+    ).compile(authority.plan(), authority.context)
+    assert query.authorization_scope_level == "city_company"
+    assert query.authorization_revision == "rev-1"
+    assert not any(name.startswith("auth_scope_") for name in query.params)
+    assert "company_id" not in query.sql and " IN (" not in query.sql
+
+    authority.change_snapshot_relation(
+        organization_coverage=(
+            OrganizationCoverageBinding("area", "area_id", "text"),
+            OrganizationCoverageBinding("team", "team_id", "integer"),
+        )
+    )
+    with pytest.raises(PlanStepError, match="coverage_unapproved"):
+        await authority.compiler(authorization=_auth("city_company", ("cc-1",))).compile(
+            authority.plan(), authority.context
+        )
+
+
+@pytest.mark.asyncio
+async def test_area_authorization_grouping_by_team_is_a_physical_row_fact() -> None:
+    # C. area auth + team grouping: area_id IN authorized areas while grouping
+    # team_id, with NO derived area->team membership.
+    authority = _area_team_authority()
+    query = await authority.compiler(
+        authorization=_auth("area", ("area-1",))
+    ).compile(
+        authority.plan(intent="comparison", dimensions=("team",)), authority.context
+    )
+    assert '"area_id" IN (:auth_scope_0)' in query.sql
+    assert '"team_id"' in query.sql and "GROUP BY" in query.sql
+    assert query.params["auth_scope_0"] == "area-1"
+    assert "JOIN" not in query.sql
+    assert query.sql.count("FROM") == 1
+
+
+@pytest.mark.asyncio
+async def test_team_authorization_grouping_by_employee_is_a_physical_row_fact() -> None:
+    # D. team auth + employee grouping requires approved team AND employee
+    # coverage and derives NO team->employee hierarchy.
+    authority = MetricAuthority(
+        seed_contract(supported_dimensions=("city_company", "area", "team", "employee"))
+    )
+    _with_employee(authority)
+    query = await authority.compiler(
+        authorization=_auth("team", ("7",))
+    ).compile(
+        authority.plan(intent="comparison", dimensions=("employee",)), authority.context
+    )
+    assert '"team_id" IN (:auth_scope_0)' in query.sql
+    assert '"employee_id"' in query.sql and "GROUP BY" in query.sql
+    # Integer-backed coverage converts the opaque string id strictly.
+    assert query.params["auth_scope_0"] == 7
+    assert "JOIN" not in query.sql
+
+
+@pytest.mark.asyncio
+async def test_narrower_user_filter_keeps_the_system_predicate() -> None:
+    # E. area auth + a narrower team filter: BOTH predicates are present, and no
+    # child id list is required from Backend.
+    authority = _area_team_authority()
+    query = await authority.compiler(
+        authorization=_auth("area", ("area-1",))
+    ).compile(
+        authority.plan(filters=(_org_filter("team", 9),)), authority.context
+    )
+    assert '"area_id" IN (:auth_scope_0)' in query.sql
+    assert '"team_id" = :filter_0' in query.sql
+    assert query.params["auth_scope_0"] == "area-1" and query.params["filter_0"] == 9
+
+
+@pytest.mark.asyncio
+async def test_same_level_out_of_scope_filter_is_a_canonical_deny() -> None:
+    # F. area auth A1 + requested area A2 denies before any SQL is produced.
+    authority = _area_team_authority()
+    with pytest.raises(PlanStepError, match="authorization_denied"):
+        await authority.compiler(
+            authorization=_auth("area", ("area-1",))
+        ).compile(
+            authority.plan(filters=(_org_filter("area", "area-2"),)), authority.context
+        )
+
+
+@pytest.mark.asyncio
+async def test_cross_level_id_collision_does_not_authorize() -> None:
+    # G. An id authorized as area must never satisfy a team-level authorization;
+    # a colliding team id does not rescue an uncovered area scope.
+    assert (
+        evaluate_authorization(
+            _auth("area", ("12",)),
+            expected_revision=None,
+            requested_scope_level="team",
+            requested_scope_id="12",
+        ).outcome
+        == "deny"
+    )
+    authority = _area_team_authority()
+    authority.change_snapshot_relation(
+        organization_coverage=(
+            OrganizationCoverageBinding("city_company"),
+            OrganizationCoverageBinding("team", "team_id", "integer"),
+        )
+    )
+    with pytest.raises(PlanStepError, match="coverage_unapproved"):
+        await authority.compiler(authorization=_auth("area", ("12",))).compile(
+            authority.plan(filters=(_org_filter("team", 12),)), authority.context
+        )
+
+
+@pytest.mark.asyncio
+async def test_broader_query_than_the_authorization_level_is_denied() -> None:
+    # H. team auth may not request an area (or city_company) organizational view.
+    authority = _area_team_authority()
+    with pytest.raises(PlanStepError, match="scope_denied"):
+        await authority.compiler(authorization=_auth("team", ("team-1",))).compile(
+            authority.plan(intent="comparison", dimensions=("area",)), authority.context
+        )
+
+
+@pytest.mark.asyncio
+async def test_employee_requires_explicit_metric_and_relation_coverage() -> None:
+    # I. employee support without approved employee coverage fails closed; team
+    # ids never imply employee access.
+    authority = MetricAuthority(
+        seed_contract(supported_dimensions=("city_company", "area", "team", "employee"))
+    )
+    with pytest.raises(PlanStepError, match="coverage_unapproved"):
+        await authority.compiler(authorization=_auth("team", ("team-1",))).compile(
+            authority.plan(intent="comparison", dimensions=("employee",)), authority.context
+        )
+
+
+@pytest.mark.asyncio
+async def test_removing_a_user_filter_never_removes_the_system_predicate() -> None:
+    # J. The system predicate is independent of the QueryPlan.
+    authority = _area_team_authority()
+    compiler = authority.compiler(authorization=_auth("area", ("area-1",)))
+    without_filter = await compiler.compile(authority.plan(), authority.context)
+    with_filter = await compiler.compile(
+        authority.plan(filters=(_org_filter("area", "area-1"),)), authority.context
+    )
+    assert '"area_id" IN (:auth_scope_0)' in without_filter.sql
+    assert '"area_id" IN (:auth_scope_0)' in with_filter.sql
+
+
+@pytest.mark.asyncio
+async def test_compiler_admission_denies_disabled_and_empty_scope() -> None:
+    authority = MetricAuthority()
+    with pytest.raises(PlanStepError, match="authorization_denied"):
+        await authority.compiler(
+            authorization=_auth("area", ("area-1",), enabled=False)
+        ).compile(authority.plan(), authority.context)
+    with pytest.raises(PlanStepError, match="authorization_denied"):
+        await authority.compiler(authorization=_auth("area", ())).compile(
+            authority.plan(), authority.context
+        )
+
+
+@pytest.mark.asyncio
+async def test_compiler_without_injected_authorization_is_unchanged() -> None:
+    # T. The dormant pre-existing behavior is preserved when no context is injected.
+    authority = MetricAuthority(ratio_contract())
+    query = await authority.compiler().compile(authority.plan(), authority.context)
+    assert query.authorization_revision is None
+    assert query.authorization_scope_level is None
+    assert not any(name.startswith("auth_scope_") for name in query.params)
+    assert " IN (" not in query.sql
+    grouping = await authority.compiler().compile(
+        authority.plan(intent="comparison", dimensions=("area",)), authority.context
+    )
+    assert '"area_id"' in grouping.sql and " IN (" not in grouping.sql
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ids",
+    [("007",), ("+7",), (" 7",), ("7.0",), ("1e1",), ("9223372036854775808",)],
+)
+async def test_malformed_integer_authorization_ids_fail_closed(ids: tuple[str, ...]) -> None:
+    authority = _area_team_authority()
+    with pytest.raises(PlanStepError, match="coverage_invalid"):
+        await authority.compiler(authorization=_auth("team", ids)).compile(
+            authority.plan(), authority.context
+        )
+
+@pytest.mark.asyncio
+async def test_recompilation_detects_an_authorization_change() -> None:
+    authority = _area_team_authority()
+    compiler = authority.compiler(authorization=_auth("area", ("area-1",)))
+    gateway = QueryGateway(async_sessionmaker(), schema="ai_views")
+    runner = GatewayMetricStepRunner(compiler, gateway)
+    plan = authority.plan()
+    prepared = await runner.prepare(
+        step=FetchMetricStep(step_id="fetch", metric_keys=plan.metric_keys),
+        query_plan=plan,
+        context=authority.context,
+    )
+    # A rotated opaque revision must invalidate the prepared authority before the
+    # gateway is reached; the revision and scope level bind the replay identity.
+    compiler._authorization = _auth("area", ("area-1",), revision="rev-2")
+    gateway.execute = AsyncMock()
+    with pytest.raises(PlanStepError, match="prepared_query_changed"):
+        await runner.execute(prepared, timeout_ms=1000)
+    gateway.execute.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_no_authorization_city_company_dimension_still_compiles() -> None:
+    # B. NO authorization + a city_company dimension compiles exactly as before,
+    # even when the relation declares no coverage: city_company remains the
+    # default total scope and no coverage is enforced.
+    authority = MetricAuthority()
+    authority.change_snapshot_relation(organization_coverage=())
+    query = await authority.compiler().compile(
+        authority.plan(dimensions=("city_company",)), authority.context
+    )
+    assert query.authorization_revision is None and query.authorization_scope_level is None
+    assert "company_id" not in query.sql and " IN (" not in query.sql
+
+
+@pytest.mark.asyncio
+async def test_authorized_city_company_without_declared_coverage_denies() -> None:
+    # D. AUTHORIZATION injected + city_company with NO declared city_company
+    # coverage is a non-degradable deny: city_company is an explicit scope, never
+    # 'authorization disabled'.
+    authority = MetricAuthority()
+    authority.change_snapshot_relation(
+        organization_coverage=(
+            OrganizationCoverageBinding("area", "area_id", "text"),
+        )
+    )
+    with pytest.raises(PlanStepError, match="coverage_unapproved"):
+        await authority.compiler(authorization=_auth("city_company", ("cc-1",))).compile(
+            authority.plan(), authority.context
+        )
+
+@pytest.mark.asyncio
+async def test_authorized_malformed_coverage_is_non_degradable() -> None:
+    # Authorized-path coverage ENFORCEMENT is intact: a coverage declaration that
+    # disagrees with the physical column family fails closed and cannot degrade.
+    authority = MetricAuthority()
+    authority.change_snapshot_relation(
+        organization_coverage=(
+            # area_id is text, so declaring it integer is malformed.
+            OrganizationCoverageBinding("area", "area_id", "integer"),
+        )
+    )
+    with pytest.raises(PlanStepError, match="coverage_invalid"):
+        await authority.compiler(authorization=_auth("area", ("area-1",))).compile(
+            authority.plan(), authority.context
+        )
+
+@pytest.mark.asyncio
+async def test_no_authorization_signature_matches_the_pre_2b_payload() -> None:
+    # FIX 1: pin the no-auth semantic_signature to the KNOWN pre-2B value.  The
+    # hashed payload carried EXACTLY the pre-2B keys; no authorization key may be
+    # present on the no-auth path.  This is what makes the constructor comment's
+    # byte-identity claim a tested invariant rather than an assertion.
+    authority = MetricAuthority()
+    assert authority.snapshot is not None and authority.release is not None
+    plan = authority.plan()
+    query = await authority.compiler().compile(plan, authority.context)
+    expected_payload = {
+        "plan": plan.model_dump(mode="json", exclude={"source_strategy"}),
+        "metric": authority.metric.model_dump(mode="json"),
+        "policy": EligibilityPolicy(
+            policy_id=authority.metric.eligibility_policy_id
+        ).model_dump(mode="json"),
+        "release": RELEASE_ID,
+        "snapshot": SNAPSHOT_ID,
+        "checksum": authority.snapshot.checksum,
+        "checkpoint": None,
+    }
+    assert sorted(expected_payload) == [
+        "checkpoint",
+        "checksum",
+        "metric",
+        "plan",
+        "policy",
+        "release",
+        "snapshot",
+    ]
+    assert "authorization_revision" not in expected_payload
+    assert "authorization_scope_level" not in expected_payload
+    expected = hashlib.sha256(
+        json.dumps(expected_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert query.semantic_signature == expected
+    # Literal pre-2B value pin (the fixture is deterministic).
+    assert query.semantic_signature == (
+        "e753d3dcfcc0c0a039d1d28d2f87b75d804b94c91ddc43be3f0b91f65b0d1b0b"
+    )
+
+
+@pytest.mark.asyncio
+async def test_authorized_compile_receipt_never_takes_the_context_revision() -> None:
+    # FIX 2: R12 as a TESTED invariant.  The compiled authority carries the
+    # context revision for replay binding, but an ExecutionReceipt only ever gets
+    # a revision through bind_execution_receipt_authorization on a real ALLOW --
+    # never by copying the context.
+    from src.nl2sql.ownership import bind_execution_receipt_authorization
+
+    authority = _area_team_authority()
+    gateway = QueryGateway(async_sessionmaker(), schema="ai_views")
+    runner = GatewayMetricStepRunner(
+        authority.compiler(authorization=_auth("area", ("area-1",))), gateway
+    )
+    plan = authority.plan()
+    prepared = await runner.prepare(
+        step=FetchMetricStep(step_id="fetch", metric_keys=plan.metric_keys),
+        query_plan=plan,
+        context=authority.context,
+    )
+    query = prepared.payload
+    assert isinstance(query, CompiledMetricQuery)
+    assert query.authorization_revision == "rev-1"
+    gateway.execute = AsyncMock(return_value=QueryReceipt(
+        accepted=True, sql=query.sql, sql_fingerprint=prepared.sql_fingerprint,
+        rows=[{"value": 1}], row_count=1, policy_outcome="allow", max_rows=200,
+    ))
+    result = await runner.execute(prepared, timeout_ms=1000)
+    assert result.receipt is not None
+    assert result.receipt.authorization_revision is None
+    assert "rev-1" not in result.receipt.model_dump_json()
+    # No decision => the ORIGINAL receipt object, still unstamped.
+    assert bind_execution_receipt_authorization(result.receipt, None) is result.receipt
+    # Only an explicit ALLOW decision stamps a revision.
+    allowed = AuthorizationDecision(outcome="allow", authorization_revision="rev-1")
+    bound = bind_execution_receipt_authorization(result.receipt, allowed)
+    assert bound.authorization_revision == "rev-1"
+    assert result.receipt.authorization_revision is None
+    with pytest.raises(ValueError, match="deny decision"):
+        bind_execution_receipt_authorization(result.receipt, AUTHORIZATION_DENIED)

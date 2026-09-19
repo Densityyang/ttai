@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from src.nl2sql.contracts import FetchMetricStep
+from src.nl2sql.contracts import AuthorizationContext, FetchMetricStep
 from src.nl2sql.infra.governance.query_gateway import QueryGateway, QueryReceipt
 from src.nl2sql.orchestration.execution import PlanStepError
 from src.nl2sql.orchestration.metric_query import (
@@ -17,7 +17,7 @@ from src.nl2sql.orchestration.metric_query import (
     aggregate_definition_checksum,
 )
 from src.nl2sql.semantic.metric_contract import Predicate
-from src.nl2sql.semantic.schema_snapshot import IndexSnapshot
+from src.nl2sql.semantic.schema_snapshot import IndexSnapshot, OrganizationCoverageBinding
 from tests.metric_fixtures import (
     NOW,
     AggregateAuthority,
@@ -341,3 +341,98 @@ async def test_invalid_first_aggregate_does_not_hide_later_eligible_source() -> 
         authority.freshness[binding.deployment_source_id] = original.model_copy(update={"source_id": binding.deployment_source_id})
     result = await authority.compiler(bindings=(authority.binding, second, first)).compile(authority.plan(), authority.context)
     assert result.source_id == "b.second"
+
+def _area_authorization() -> AuthorizationContext:
+    return AuthorizationContext(
+        authorization_revision="rev-area-1",
+        agent_enabled=True,
+        scope_level="area",
+        allowed_scope_ids=("area-1",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_degradable_organization_failure_and_still_degradable_aggregate_coverage() -> None:
+    authority = AggregateAuthority()
+    assert authority.snapshot is not None
+    authority.aggregate_binding = authority.aggregate_binding.model_copy(
+        update={"allow_detail_fallback": True}
+    )
+    detail, aggregate = authority.snapshot.candidate.relations
+
+    # L. metric_aggregate_coverage_unapproved keeps its permitted, fully
+    # revalidated detail fallback, even under an injected authorization context.
+    degraded = replace(aggregate, aggregate_coverage=())
+    authority.snapshot = replace(
+        authority.snapshot,
+        candidate=replace(authority.snapshot.candidate, relations=(detail, degraded)),
+    )
+    query = await authority.compiler(authorization=_area_authorization()).compile(
+        authority.plan(), authority.context
+    )
+    assert query.source_kind == "approved_detail"
+    assert query.degradation == ("metric_aggregate_coverage_unapproved",)
+
+    # K. An ORGANIZATION coverage failure is non-degradable: it terminates source
+    # selection and may NOT select the approved detail fallback.
+    uncovered = replace(
+        aggregate,
+        organization_coverage=(OrganizationCoverageBinding("city_company"),),
+    )
+    authority.snapshot = replace(
+        authority.snapshot,
+        candidate=replace(authority.snapshot.candidate, relations=(detail, uncovered)),
+    )
+    with pytest.raises(PlanStepError, match="coverage_unapproved"):
+        await authority.compiler(authorization=_area_authorization()).compile(
+            authority.plan(), authority.context
+        )
+
+def _authority_without_team_coverage() -> AggregateAuthority:
+    """Aggregate relation covers city_company+area but NOT team; detail covers team."""
+    authority = AggregateAuthority(
+        seed_contract(supported_dimensions=("city_company", "area", "team"))
+    )
+    assert authority.snapshot is not None
+    authority.aggregate_binding = authority.aggregate_binding.model_copy(
+        update={"allow_detail_fallback": True}
+    )
+    detail, aggregate = authority.snapshot.candidate.relations
+    without_team = replace(
+        aggregate,
+        organization_coverage=(
+            OrganizationCoverageBinding("city_company"),
+            OrganizationCoverageBinding("area", "area_id", "text"),
+        ),
+    )
+    authority.snapshot = replace(
+        authority.snapshot,
+        candidate=replace(authority.snapshot.candidate, relations=(detail, without_team)),
+    )
+    return authority
+
+
+@pytest.mark.asyncio
+async def test_no_authorization_uncovered_dimension_keeps_degradable_fallback() -> None:
+    # A. NO authorization: a metric-supported dimension the relation coverage
+    # lacks keeps the pre-existing DEGRADABLE grain error, and the detail
+    # fallback is still reachable.
+    authority = _authority_without_team_coverage()
+    query = await authority.compiler().compile(
+        authority.plan(intent="comparison", dimensions=("team",)), authority.context
+    )
+    assert query.source_kind == "approved_detail"
+    assert query.degradation == ("metric_grain_or_dimension_unsupported",)
+    assert query.authorization_revision is None
+
+
+@pytest.mark.asyncio
+async def test_authorized_uncovered_dimension_is_non_degradable() -> None:
+    # C. AUTHORIZATION injected: the SAME uncovered dimension is a NON-DEGRADABLE
+    # coverage failure with NO detail fallback.  A and C together prove the two
+    # paths are genuinely distinct.
+    authority = _authority_without_team_coverage()
+    with pytest.raises(PlanStepError, match="coverage_unapproved"):
+        await authority.compiler(authorization=_area_authorization()).compile(
+            authority.plan(intent="comparison", dimensions=("team",)), authority.context
+        )

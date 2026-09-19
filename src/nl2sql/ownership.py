@@ -1,10 +1,24 @@
-"""Identity-bound thread namespacing used by all stateful v2 endpoints."""
+"""Identity-bound thread namespacing and the runtime configurable payload."""
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from urllib.parse import quote
 
-from src.nl2sql.contracts import RequestContext
+from src.nl2sql.contracts import (
+    AuthorizationContext,
+    AuthorizationDecision,
+    ExecutionReceipt,
+    RequestContext,
+    ScopeLevel,
+    evaluate_authorization,
+)
+
+# The single authoritative runtime key carrying the trusted authorization
+# context; request_context never duplicates it, so no drift-prone second copy
+# exists.  The context itself carries its authorization revision.
+AUTHORIZATION_CONFIG_KEY = "authorization_context"
 
 
 def internal_thread_id(context: RequestContext) -> str:
@@ -15,16 +29,130 @@ def internal_thread_id(context: RequestContext) -> str:
 
 
 def runtime_config(context: RequestContext) -> dict[str, object]:
-    """Build the config propagated to supervisor graphs and their tools."""
+    """Build the config propagated to supervisor graphs and their tools.
+
+    The pre-existing keys and their exact values are unchanged.  request_context
+    keeps exactly its pre-existing responsibility -- identity, deployment scope,
+    thread, trace and deadline -- and NEVER carries the authorization field,
+    whether it is absent or present, so both payloads have the same shape and
+    the authorization-free payload stays byte-identical to the pre-slice one.
+    The optional AuthorizationContext is projected exactly once, under
+    AUTHORIZATION_CONFIG_KEY, the single authoritative runtime location.
+    """
 
     identity = context.identity
-    return {
-        "configurable": {
-            "thread_id": internal_thread_id(context),
-            "request_identity": identity.model_dump(mode="json"),
-            "request_context": context.model_dump(mode="json"),
-            "auth_user_id": identity.user_id,
-            "auth_user_roles": sorted(identity.roles),
-            "auth_user_permissions": sorted(identity.permissions),
-        }
+    request_payload = context.model_dump(mode="json")
+    # Always drop the top-level authorization key: the one authoritative copy
+    # lives under AUTHORIZATION_CONFIG_KEY below.  exclude_none is unusable
+    # here: it is recursive and would also strip identity's pre-existing
+    # "auth_epoch": null.
+    request_payload.pop("authorization", None)
+    configurable: dict[str, object] = {
+        "thread_id": internal_thread_id(context),
+        "request_identity": identity.model_dump(mode="json"),
+        "request_context": request_payload,
+        "auth_user_id": identity.user_id,
+        "auth_user_roles": sorted(identity.roles),
+        "auth_user_permissions": sorted(identity.permissions),
     }
+    authorization = context.authorization
+    if authorization is not None:
+        configurable[AUTHORIZATION_CONFIG_KEY] = authorization.model_dump(mode="json")
+    return {"configurable": configurable}
+
+
+def authorization_context_from_config(
+    configurable: Mapping[str, object],
+) -> AuthorizationContext | None:
+    """Read a trusted AuthorizationContext back out of a configurable mapping.
+
+    PURE and total: an absent carrier, a wrong-typed carrier, a Mapping that
+    raises during lookup, or a malformed payload all collapse to None and this
+    function never raises.  A malformed context is therefore treated EXACTLY
+    like an absent one, reusing the slice-1 fail-closed discipline rather than
+    inventing a second error path.
+    """
+
+    try:
+        # The lookup itself sits inside the fail-closed boundary: an outer
+        # Mapping that raises during lookup must collapse to None exactly like an
+        # absent carrier, so the PURE/total claim holds across the whole Mapping
+        # boundary.  The normal dict path is unchanged.
+        raw = configurable.get(AUTHORIZATION_CONFIG_KEY)
+        if isinstance(raw, AuthorizationContext):
+            return raw
+        if not isinstance(raw, Mapping):
+            return None
+        # Revalidate through the JSON path: the carrier is a JSON projection, and
+        # AuthorizationContext is strict, so a JSON array must still bind to the
+        # strict tuple field exactly as it did when originally produced.
+        return AuthorizationContext.model_validate_json(json.dumps(dict(raw)))
+    except Exception:
+        return None
+
+
+def evaluate_config_authorization(
+    configurable: Mapping[str, object],
+    *,
+    authorization_required: bool,
+    expected_revision: str | None,
+    requested_scope_level: ScopeLevel | None = None,
+    requested_scope_id: str | None = None,
+) -> AuthorizationDecision | None:
+    """The single fail-closed enforcement seam for a runtime configurable.
+
+    Returns None ONLY when authorization is not required AND no valid context is
+    carried -- absent, wrong-typed or malformed, all of which the accessor
+    collapses to absent -- so an authorization-free request follows today's
+    code path unchanged.  Otherwise it delegates verbatim to
+    evaluate_authorization: required-but-absent yields the canonical denial,
+    and a valid-but-unusable supplied context (revision-mismatched,
+    agent-disabled, empty or out-of-scope) yields that SAME canonical denial
+    even when authorization_required is False.  No second deny shape is
+    produced and the cause is never placed on a user-visible surface.
+    """
+
+    context = authorization_context_from_config(configurable)
+    if context is None and not authorization_required:
+        return None
+    return evaluate_authorization(
+        context,
+        expected_revision=expected_revision,
+        requested_scope_level=requested_scope_level,
+        requested_scope_id=requested_scope_id,
+    )
+
+
+def bind_execution_receipt_authorization(
+    receipt: ExecutionReceipt,
+    decision: AuthorizationDecision | None,
+) -> ExecutionReceipt:
+    """Bind the revision PROVEN by an authorization ALLOW onto a receipt.
+
+    FROZEN meaning of ExecutionReceipt.authorization_revision: the execution was
+    bound to an authorization decision that ALLOWED, and the stamped revision is
+    that decision's revision.  It never means "a parseable context was present".
+
+    * decision is None -- no decision was taken -- returns the ORIGINAL receipt
+      object unchanged, so existing paths stay byte-identical.
+    * decision.outcome == "allow" stamps decision.authorization_revision, which
+      the AuthorizationDecision contract already requires to be present.
+    * decision.outcome == "deny" is caller misuse and RAISES: a deny proves
+      nothing, so passing one to a provenance binder must never silently return
+      an unstamped receipt and hide the mistake.
+
+    This binder reads no AuthorizationContext and no configurable mapping.  The
+    call site that produces a real decision belongs to the later end-to-end
+    authority lifecycle, not to an ad-hoc gate.
+    """
+
+    if decision is None:
+        return receipt
+    if decision.outcome == "deny":
+        raise ValueError(
+            "cannot bind a deny decision to an execution receipt: "
+            "authorization_revision may only be stamped from an allow decision"
+        )
+    return receipt.model_copy(
+        update={"authorization_revision": decision.authorization_revision}
+    )

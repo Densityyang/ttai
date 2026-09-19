@@ -61,7 +61,11 @@ class MetricContract(FrozenContract):
     business_time_column: Identifier
     timezone: Literal["Asia/Shanghai"] = "Asia/Shanghai"
     supported_grains: tuple[Literal["day", "month"], ...] = ("day", "month")
-    supported_dimensions: tuple[Literal["city_company", "area", "team"], ...] = ("city_company",)
+    # A metric is employee-capable ONLY when it explicitly declares employee
+    # here; it is never inferred from team ids or from a broader scope.
+    supported_dimensions: tuple[
+        Literal["city_company", "area", "team", "employee"], ...
+    ] = ("city_company",)
     predicates: tuple[Predicate, ...] = ()
     filters: tuple[FilterField, ...] = ()
     required_permissions: tuple[str, ...] = Field(min_length=1)

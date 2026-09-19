@@ -12,7 +12,6 @@ from src.nl2sql.orchestration.metric_query import (
     AggregateContract,
     EligibilityPolicy,
     MetricQueryCompiler,
-    OrganizationDimensionBinding,
     RelationBinding,
     SourceFreshnessRecord,
     aggregate_definition_checksum,
@@ -29,6 +28,7 @@ from src.nl2sql.semantic.registry import SemanticRelease, SemanticReleaseState
 from src.nl2sql.semantic.schema_snapshot import (
     ColumnSnapshot,
     IndexSnapshot,
+    OrganizationCoverageBinding,
     RelationSnapshot,
     SchemaSnapshot,
     SchemaSnapshotCandidate,
@@ -81,6 +81,11 @@ class MetricAuthority:
             partition_key=None, parent_relation_id=None, estimated_rows=12, total_bytes=8192,
             sensitivity="internal", sensitive_columns=(), aggregate_coverage=(),
             freshness_sla_seconds=None,
+            organization_coverage=(
+                OrganizationCoverageBinding("city_company"),
+                OrganizationCoverageBinding("area", "area_id", "text"),
+                OrganizationCoverageBinding("team", "team_id", "integer"),
+            ),
         )
         candidate = SchemaSnapshotCandidate("generated-fixture", ("ai_views",), (relation,), "a" * 64, "b" * 64)
         self.snapshot: SchemaSnapshot | None = SchemaSnapshot(
@@ -103,11 +108,6 @@ class MetricAuthority:
             schema_name="ai_views", relation_name="complaint_orders",
             allowed_columns=tuple(types), required_permissions=("metrics:read",), approved=True,
             timestamp_kind="timestamptz" if timestamptz else "timestamp",
-            organization_dimensions=(
-                OrganizationDimensionBinding(dimension="city_company"),
-                OrganizationDimensionBinding(dimension="area", field="area_id", value_type="text"),
-                OrganizationDimensionBinding(dimension="team", field="team_id", value_type="integer"),
-            ),
         )
         self.identity = RequestIdentity(request_id=UUID(RELEASE_ID), user_id="synthetic-reader",
                                         permissions=frozenset({"metrics:read", "nl2sql:invoke"}))
@@ -183,7 +183,6 @@ class AggregateAuthority(MetricAuthority):
             source_ref=self.binding.source_ref, source_id="approved_daily_facts", relation_asset_id=aggregate_asset,
             schema_name="ai_views", relation_name="approved_daily_facts", allowed_columns=tuple(types),
             required_permissions=self.binding.required_permissions, approved=True, timestamp_kind="timestamptz",
-            organization_dimensions=self.binding.organization_dimensions,
             aggregate=AggregateContract(metric_key=self.metric.metric_key, formula_version=self.metric.formula_version,
                                         operation=self.metric.operation, columns=mapping, unique_daily_facts=True,
                                         metric_contract_sha256=aggregate_definition_checksum(self.metric),
