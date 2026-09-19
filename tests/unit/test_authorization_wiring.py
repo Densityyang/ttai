@@ -2,8 +2,10 @@
 
 Injected/test composition only: the configurable mapping is built through
 runtime_config, read back through the pure accessor, and evaluated with the
-slice-1 evaluate_authorization rule.  No Backend, no network, no Docker, and
-no existing test or fixture is touched.
+slice-1 evaluate_authorization rule.  The execution-receipt binder is driven by
+an explicit AuthorizationDecision, never by the configurable mapping, so the
+receipt revision is PROVEN by an ALLOW rather than read off config.  No Backend,
+no network, no Docker, and no existing test or fixture is touched.
 """
 
 from __future__ import annotations
@@ -27,7 +29,6 @@ from src.nl2sql.ownership import (
     bind_execution_receipt_authorization,
     evaluate_config_authorization,
     runtime_config,
-    runtime_configurable,
 )
 
 THREAD_ID = UUID("11111111-1111-1111-1111-111111111111")
@@ -98,12 +99,14 @@ class _ExplodingMapping(Mapping[str, object]):
 
 
 def test_runtime_config_carries_the_context_when_present() -> None:
+    # F. AUTHORIZATION_CONFIG_KEY is the one authoritative runtime location.
     configurable = _configurable(_authorization("rev-7"))
     assert configurable[AUTHORIZATION_CONFIG_KEY] == _authorization("rev-7").model_dump(
         mode="json"
     )
     # The context carries its own revision; no second, drift-prone copy exists.
     assert "authorization_revision" not in configurable
+    assert authorization_context_from_config(configurable) == _authorization("rev-7")
 
 
 def test_runtime_config_omits_authorization_keys_when_absent() -> None:
@@ -118,10 +121,24 @@ def test_runtime_config_omits_authorization_keys_when_absent() -> None:
     }
 
 
+def test_request_context_never_carries_an_authorization_key() -> None:
+    # E. The field is projected out ALWAYS -- when authorization is absent AND
+    # when it is present -- so request_context keeps exactly its pre-existing
+    # responsibility and the two payloads are identical in shape and content.
+    absent = cast(dict[str, object], _configurable()["request_context"])
+    present_configurable = _configurable(_authorization("rev-5"))
+    present = cast(dict[str, object], present_configurable["request_context"])
+    assert "authorization" not in absent
+    assert "authorization" not in present
+    assert present == absent
+    # The context is nonetheless carried, exactly once, under the authority key.
+    assert AUTHORIZATION_CONFIG_KEY in present_configurable
+
+
 def test_absent_authorization_request_context_dump_is_pre_slice_identical() -> None:
-    # Structural pin: the pre-existing request_context payload must not gain an
-    # "authorization" key on the authorization-free path, and the nested
-    # pre-existing "auth_epoch": null must survive (exclude_none would strip it).
+    # H. Structural pin: the pre-existing request_context payload must not gain an
+    # "authorization" key, and the nested pre-existing "auth_epoch": null must
+    # survive (exclude_none would strip it).
     configurable = _configurable()
     payload = cast(dict[str, object], configurable["request_context"])
     assert "authorization" not in payload
@@ -134,13 +151,6 @@ def test_absent_authorization_request_context_dump_is_pre_slice_identical() -> N
     }
     identity = cast(dict[str, object], payload["identity"])
     assert identity["auth_epoch"] is None
-
-
-def test_present_authorization_request_context_dump_carries_and_round_trips() -> None:
-    configurable = _configurable(_authorization("rev-5"))
-    payload = cast(dict[str, object], configurable["request_context"])
-    assert "authorization" in payload
-    assert payload["authorization"] == _authorization("rev-5").model_dump(mode="json")
 
 
 # --- accessor --------------------------------------------------------------
@@ -183,6 +193,12 @@ def test_accessor_returns_none_for_absent_and_malformed_without_raising(
 ) -> None:
     assert authorization_context_from_config({}) is None
     assert authorization_context_from_config({AUTHORIZATION_CONFIG_KEY: malformed}) is None
+
+
+def test_exploding_outer_mapping_is_converted_to_none() -> None:
+    # G. The lookup itself is inside the fail-closed boundary, so an outer
+    # Mapping that raises during lookup is total and never escapes.
+    assert authorization_context_from_config(_ExplodingMapping()) is None
 
 
 # --- enforcement seam ------------------------------------------------------
@@ -331,30 +347,51 @@ def test_every_enforcement_failure_uses_the_one_canonical_deny_shape() -> None:
 # --- execution receipt binding ---------------------------------------------
 
 
-def test_revision_reaches_the_execution_receipt() -> None:
-    receipt = _receipt()
-    bound = bind_execution_receipt_authorization(
-        receipt,
+def test_allow_decision_binds_its_revision_to_the_receipt() -> None:
+    # A. An ALLOW decision -- derived from a real evaluation rather than read off
+    # config -- stamps its revision onto a NEW receipt; the original is untouched.
+    decision = evaluate_config_authorization(
         _configurable(_authorization("rev-9")),
+        authorization_required=True,
+        expected_revision=None,
+        requested_scope_level="area",
+        requested_scope_id="area-1",
     )
+    assert decision is not None and decision.outcome == "allow"
+    receipt = _receipt()
+    bound = bind_execution_receipt_authorization(receipt, decision)
     assert bound.authorization_revision == "rev-9"
     assert receipt.authorization_revision is None
     assert bound is not receipt
 
 
-def test_receipt_is_unchanged_when_no_authorization_is_carried() -> None:
+def test_none_decision_returns_the_same_receipt_object() -> None:
+    # B. No decision was taken: the ORIGINAL receipt object is returned unchanged.
     receipt = _receipt()
-    assert bind_execution_receipt_authorization(receipt, {}) is receipt
+    assert bind_execution_receipt_authorization(receipt, None) is receipt
     assert receipt.authorization_revision is None
 
 
-def test_receipt_binding_uses_the_active_runtime_config() -> None:
-    from langchain_core.runnables.config import var_child_runnable_config
+def test_deny_decision_cannot_produce_an_authorization_stamped_receipt() -> None:
+    # C. A deny proves nothing and must not pass silently: the binder raises.
+    receipt = _receipt()
+    with pytest.raises(ValueError, match="deny decision"):
+        bind_execution_receipt_authorization(receipt, AUTHORIZATION_DENIED)
+    assert receipt.authorization_revision is None
 
-    config = runtime_config(_context(_authorization("rev-11")))
-    token = var_child_runnable_config.set(config)
-    try:
-        bound = bind_execution_receipt_authorization(_receipt(), runtime_configurable())
-    finally:
-        var_child_runnable_config.reset(token)
-    assert bound.authorization_revision == "rev-11"
+
+def test_disabled_context_in_config_cannot_by_itself_stamp_a_receipt() -> None:
+    # D. A valid but agent_enabled=False context is really present in the
+    # authoritative carrier, yet presence alone proves nothing: the seam denies it
+    # and the decision-driven binder has no ALLOW to stamp.
+    configurable = _configurable(_authorization(agent_enabled=False))
+    assert AUTHORIZATION_CONFIG_KEY in configurable
+    decision = evaluate_config_authorization(
+        configurable,
+        authorization_required=False,
+        expected_revision=None,
+    )
+    assert decision == AUTHORIZATION_DENIED
+    receipt = _receipt()
+    assert bind_execution_receipt_authorization(receipt, None) is receipt
+    assert receipt.authorization_revision is None

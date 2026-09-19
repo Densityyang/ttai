@@ -28,10 +28,6 @@ from src.nl2sql.orchestration.execution import (
     PreparedMetricStep,
 )
 from src.nl2sql.orchestration.planning import PlanValidator
-from src.nl2sql.ownership import (
-    bind_execution_receipt_authorization,
-    runtime_configurable,
-)
 from src.nl2sql.semantic.metric_contract import (
     ContractId,
     FrozenContract,
@@ -626,9 +622,11 @@ class GatewayMetricStepRunner:
             data_as_of=current.freshness.data_as_of if current.freshness else None,
         )
         receipt = type(result.execution_receipt).model_validate(payload)
-        # Bind the request's authorization revision onto the execution receipt
-        # surface when one is carried; absent authorization leaves it unchanged.
-        receipt = bind_execution_receipt_authorization(receipt, runtime_configurable())
+        # Authorization provenance binding is intentionally absent from this SQL
+        # step in slice 2A: the enforcement seam is not yet part of the execution
+        # path, so no real decision exists to bind.  An ad-hoc evaluation here
+        # would manufacture a late gate; the real call site belongs to the later
+        # end-to-end authority lifecycle.
         output: dict[str, JsonValue] = {
             "rows": rows,
             "no_data": not rows or (query.operation == "ratio"

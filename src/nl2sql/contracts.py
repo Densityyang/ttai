@@ -747,6 +747,9 @@ class ExecutionReceipt(StrictContract):
     sql_fingerprint: str = ""
     policy_version: str = ""
     policy_outcome: Literal["allow", "deny"] = "deny"
+    # Frozen meaning: this execution was bound to an authorization decision that
+    # ALLOWED under this revision.  It is NOT evidence that some parseable
+    # context was merely present, and a deny must never stamp it.
     authorization_revision: str | None = Field(
         default=None,
         min_length=1,
