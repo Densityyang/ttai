@@ -26,13 +26,31 @@ from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.semantic.registry import SemanticReleaseCandidate, SemanticReleaseError
 
 SCHEMA_SNAPSHOT_PARSER_VERSION = "postgres-catalog-v1"
+# Format version of the serialized candidate payload.  The legacy v1 payload has
+# no organization coverage; v2 carries RelationSnapshot.organization_coverage.
+# Bumping this version does NOT invalidate legacy snapshots: a payload with no
+# "format_version" marker is read under the immutable v1 rules, never upgraded.
+SCHEMA_SNAPSHOT_FORMAT_VERSION = "postgres-catalog-payload-v2"
+LEGACY_SCHEMA_SNAPSHOT_FORMAT_VERSION = "postgres-catalog-payload-v1"
+SCHEMA_SNAPSHOT_FORMAT_VERSIONS = frozenset(
+    {SCHEMA_SNAPSHOT_FORMAT_VERSION, LEGACY_SCHEMA_SNAPSHOT_FORMAT_VERSION}
+)
+# Final Agent-facing scope vocabulary owned by Backend/DB; tt-ai only consumes it.
+ORGANIZATION_SCOPE_LEVELS = ("city_company", "area", "team", "employee")
+ORGANIZATION_VALUE_TYPES = ("text", "integer")
+_TEXT_COLUMN_TYPES = frozenset({"text", "character varying", "varchar"})
+_INTEGER_COLUMN_TYPES = frozenset(
+    {"smallint", "int2", "integer", "int4", "bigint", "int8"}
+)
 DEFAULT_MAX_RELATIONS = 64
 ABSOLUTE_MAX_RELATIONS = 256
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+_ORGANIZATION_COVERAGE_FIELDS = {"field", "scope_level", "value_type"}
 _POLICY_FIELDS = {
     "aggregate_coverage",
     "freshness_sla_seconds",
+    "organization_coverage",
     "sensitive_columns",
     "sensitivity",
 }
@@ -76,11 +94,29 @@ class IndexSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class OrganizationCoverageBinding:
+    """One physical route by which authorized scope narrows a relation's rows.
+
+    scope_level is the Backend-owned Agent-facing vocabulary.  city_company is
+    the explicit deployment/root scope and carries NO physical column;
+    area/team/employee require the physical stable-ID column and its declared
+    PostgreSQL column family.  This is release/semantic metadata over DB-owned
+    physical facts: it never encodes hierarchy, ancestors, descendants,
+    siblings, parent ids or Backend user/role material.
+    """
+
+    scope_level: str
+    field: str | None = None
+    value_type: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RelationPolicy:
     sensitivity: str = "unclassified"
     sensitive_columns: tuple[str, ...] = ()
     aggregate_coverage: tuple[str, ...] = ()
     freshness_sla_seconds: int | None = None
+    organization_coverage: tuple[OrganizationCoverageBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +137,7 @@ class RelationSnapshot:
     sensitive_columns: tuple[str, ...]
     aggregate_coverage: tuple[str, ...]
     freshness_sla_seconds: int | None
+    organization_coverage: tuple[OrganizationCoverageBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +203,7 @@ class SchemaSnapshotCandidate:
     checksum: str
     schema_checksum: str
     parser_version: str = SCHEMA_SNAPSHOT_PARSER_VERSION
+    format_version: str = SCHEMA_SNAPSHOT_FORMAT_VERSION
 
     def to_payload(self) -> dict[str, Any]:
         return _candidate_payload(self)
@@ -556,6 +594,9 @@ def build_schema_snapshot_candidate(
                 sensitive_columns=tuple(sorted(set(policy.sensitive_columns))),
                 aggregate_coverage=tuple(sorted(set(policy.aggregate_coverage))),
                 freshness_sla_seconds=policy.freshness_sla_seconds,
+                organization_coverage=_normalize_organization_coverage(
+                    policy.organization_coverage
+                ),
             )
         )
 
@@ -628,8 +669,122 @@ def load_relation_policies(path: Path) -> dict[str, RelationPolicy]:
                 field="aggregate_coverage",
             ),
             freshness_sla_seconds=freshness,
+            organization_coverage=_policy_organization_coverage(
+                raw_policy.get("organization_coverage"),
+                relation_id=relation_id,
+            ),
         )
     return policies
+
+
+@dataclass(frozen=True, slots=True)
+class OrganizationCoverageProblem:
+    """One fail-closed defect in a relation's declared organization coverage."""
+
+    code: str
+    message: str
+    path: str = ""
+
+
+def validate_organization_coverage(
+    relation: RelationSnapshot,
+) -> tuple[OrganizationCoverageProblem, ...]:
+    """Validate declared RelationCoverage; every defect is fail-closed.
+
+    The rules are structural and local to one relation: unique scope levels,
+    unique physical fields, city_company without a physical id, area/team/
+    employee with both field and value_type, the field must exist, and the
+    declared value type must match the actual PostgreSQL column family.  No
+    hierarchy membership, ancestor, sibling or Backend user/role material can be
+    expressed here by construction.
+    """
+
+    problems: list[OrganizationCoverageProblem] = []
+    column_types = {column.name: column.data_type.lower() for column in relation.columns}
+    seen_levels: set[str] = set()
+    seen_fields: set[str] = set()
+    for binding in relation.organization_coverage:
+        path = f"organization_coverage.{binding.scope_level}"
+        if binding.scope_level not in ORGANIZATION_SCOPE_LEVELS:
+            problems.append(
+                OrganizationCoverageProblem(
+                    "relation_organization_coverage_level_invalid",
+                    f"organization coverage scope level is not supported: {binding.scope_level}",
+                    path,
+                )
+            )
+            continue
+        if binding.scope_level in seen_levels:
+            problems.append(
+                OrganizationCoverageProblem(
+                    "relation_organization_coverage_duplicate_level",
+                    f"organization coverage repeats scope level: {binding.scope_level}",
+                    path,
+                )
+            )
+            continue
+        seen_levels.add(binding.scope_level)
+        if binding.scope_level == "city_company":
+            if binding.field is not None or binding.value_type is not None:
+                problems.append(
+                    OrganizationCoverageProblem(
+                        "relation_organization_coverage_city_field",
+                        "city_company coverage is a total scope without a physical ID column",
+                        path,
+                    )
+                )
+            continue
+        if binding.field is None or binding.value_type is None:
+            problems.append(
+                OrganizationCoverageProblem(
+                    "relation_organization_coverage_incomplete",
+                    f"{binding.scope_level} coverage requires a field and value_type",
+                    path,
+                )
+            )
+            continue
+        if binding.value_type not in ORGANIZATION_VALUE_TYPES:
+            problems.append(
+                OrganizationCoverageProblem(
+                    "relation_organization_coverage_incomplete",
+                    f"{binding.scope_level} coverage value_type is not supported: "
+                    f"{binding.value_type}",
+                    path,
+                )
+            )
+            continue
+        if binding.field in seen_fields:
+            problems.append(
+                OrganizationCoverageProblem(
+                    "relation_organization_coverage_duplicate_field",
+                    f"organization coverage reuses physical field: {binding.field}",
+                    path,
+                )
+            )
+            continue
+        seen_fields.add(binding.field)
+        if binding.field not in column_types:
+            problems.append(
+                OrganizationCoverageProblem(
+                    "relation_organization_coverage_field_missing",
+                    f"organization coverage field does not exist: {binding.field}",
+                    f"{path}.field",
+                )
+            )
+            continue
+        expected_types = (
+            _TEXT_COLUMN_TYPES if binding.value_type == "text" else _INTEGER_COLUMN_TYPES
+        )
+        if column_types[binding.field] not in expected_types:
+            problems.append(
+                OrganizationCoverageProblem(
+                    "relation_organization_coverage_type_mismatch",
+                    f"organization coverage value type {binding.value_type} does not match "
+                    f"column type {column_types[binding.field]}: {binding.field}",
+                    f"{path}.value_type",
+                )
+            )
+    return tuple(problems)
 
 
 def validate_schema_snapshot(
@@ -744,6 +899,16 @@ def validate_schema_snapshot(
                     path=f"sensitive_columns.{column}",
                 )
             )
+        for problem in validate_organization_coverage(relation):
+            issues.append(
+                SchemaSnapshotIssue(
+                    code=problem.code,
+                    severity=SnapshotIssueSeverity.ERROR,
+                    message=problem.message,
+                    relation_id=relation.relation_id,
+                    path=problem.path,
+                )
+            )
 
     if previous is not None:
         issues.extend(_schema_drift_issues(previous, candidate))
@@ -800,13 +965,15 @@ def _schema_drift_issues(
             )
         )
 
+    previous_by_id = {relation.relation_id: relation for relation in previous.relations}
+    candidate_by_id = {relation.relation_id: relation for relation in candidate.relations}
     previous_relations = {
-        relation.relation_id: _relation_structure_payload(relation)
-        for relation in previous.relations
+        relation_id: _relation_structure_payload(relation)
+        for relation_id, relation in previous_by_id.items()
     }
     candidate_relations = {
-        relation.relation_id: _relation_structure_payload(relation)
-        for relation in candidate.relations
+        relation_id: _relation_structure_payload(relation)
+        for relation_id, relation in candidate_by_id.items()
     }
     for relation_id in sorted(previous_relations.keys() - candidate_relations.keys()):
         issues.append(
@@ -834,6 +1001,43 @@ def _schema_drift_issues(
                     severity=SnapshotIssueSeverity.ERROR,
                     message="approved relation structure changed",
                     relation_id=relation_id,
+                )
+            )
+        before = previous_by_id[relation_id]
+        after = candidate_by_id[relation_id]
+        # Database structure and governance policy are DISTINCT audit concepts.
+        # A metadata-only change must surface as explicit policy drift and must
+        # never masquerade as relation_structure_changed.  A change that becomes
+        # MORE restrictive still requires explicit review: direction does not
+        # bypass governance.
+        if before.sensitivity != after.sensitivity:
+            issues.append(
+                SchemaSnapshotIssue(
+                    code="relation_sensitivity_changed",
+                    severity=SnapshotIssueSeverity.ERROR,
+                    message="approved relation sensitivity changed and requires explicit approval",
+                    relation_id=relation_id,
+                    path="sensitivity",
+                )
+            )
+        if before.sensitive_columns != after.sensitive_columns:
+            issues.append(
+                SchemaSnapshotIssue(
+                    code="relation_sensitive_columns_changed",
+                    severity=SnapshotIssueSeverity.ERROR,
+                    message="approved relation sensitive columns changed and require explicit approval",
+                    relation_id=relation_id,
+                    path="sensitive_columns",
+                )
+            )
+        if before.organization_coverage != after.organization_coverage:
+            issues.append(
+                SchemaSnapshotIssue(
+                    code="relation_organization_coverage_changed",
+                    severity=SnapshotIssueSeverity.ERROR,
+                    message="approved relation organization coverage changed and requires explicit approval",
+                    relation_id=relation_id,
+                    path="organization_coverage",
                 )
             )
     return issues
@@ -1049,8 +1253,19 @@ def schema_snapshot_candidate_from_payload(
     *,
     checksum: str,
 ) -> SchemaSnapshotCandidate:
+    # A payload with no format_version marker is a legacy v1 payload and is read
+    # under its ORIGINAL rules: no organization coverage, and the payload is
+    # never upgraded to the new shape.  An unknown marker is unsupported.
+    raw_format_version = payload.get("format_version")
+    format_version = (
+        LEGACY_SCHEMA_SNAPSHOT_FORMAT_VERSION
+        if raw_format_version is None
+        else str(raw_format_version)
+    )
+    if format_version not in SCHEMA_SNAPSHOT_FORMAT_VERSIONS:
+        raise SchemaSnapshotError("persisted schema snapshot format version is unsupported")
     relations = tuple(
-        _relation_from_payload(relation)
+        _relation_from_payload(relation, format_version=format_version)
         for relation in payload.get("relations", ())
         if isinstance(relation, Mapping)
     )
@@ -1061,6 +1276,7 @@ def schema_snapshot_candidate_from_payload(
         checksum=checksum,
         schema_checksum=str(payload.get("schema_checksum") or ""),
         parser_version=str(payload.get("parser_version") or ""),
+        format_version=format_version,
     )
     canonical_payload = candidate.to_payload()
     if dict(payload) != canonical_payload:
@@ -1214,17 +1430,35 @@ def _snapshot_from_row(row: Mapping[str, Any]) -> SchemaSnapshot:
 
 
 def _candidate_payload(candidate: SchemaSnapshotCandidate) -> dict[str, Any]:
-    return {
+    include_organization_coverage = (
+        candidate.format_version != LEGACY_SCHEMA_SNAPSHOT_FORMAT_VERSION
+    )
+    payload: dict[str, Any] = {
         "approved_schemas": list(candidate.approved_schemas),
         "parser_version": candidate.parser_version,
-        "relations": [_relation_payload(relation) for relation in candidate.relations],
+        "relations": [
+            _relation_payload(
+                relation,
+                include_organization_coverage=include_organization_coverage,
+            )
+            for relation in candidate.relations
+        ],
         "schema_checksum": candidate.schema_checksum,
         "source_identifier": candidate.source_identifier,
     }
+    # The legacy payload omits the format marker; the new payload carries it so a
+    # legacy snapshot is never silently reinterpreted under the new shape.
+    if include_organization_coverage:
+        payload["format_version"] = candidate.format_version
+    return payload
 
 
-def _relation_payload(relation: RelationSnapshot) -> dict[str, Any]:
-    return {
+def _relation_payload(
+    relation: RelationSnapshot,
+    *,
+    include_organization_coverage: bool,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "aggregate_coverage": list(relation.aggregate_coverage),
         "columns": [asdict(column) for column in relation.columns],
         "estimated_rows": relation.estimated_rows,
@@ -1259,6 +1493,16 @@ def _relation_payload(relation: RelationSnapshot) -> dict[str, Any]:
         "sensitivity": relation.sensitivity,
         "total_bytes": relation.total_bytes,
     }
+    if include_organization_coverage:
+        payload["organization_coverage"] = [
+            {
+                "field": binding.field,
+                "scope_level": binding.scope_level,
+                "value_type": binding.value_type,
+            }
+            for binding in relation.organization_coverage
+        ]
+    return payload
 
 
 def _relation_structure_payload(relation: RelationSnapshot) -> dict[str, Any]:
@@ -1274,7 +1518,26 @@ def _relation_structure_payload(relation: RelationSnapshot) -> dict[str, Any]:
     }
 
 
-def _relation_from_payload(payload: Mapping[str, Any]) -> RelationSnapshot:
+def _relation_from_payload(
+    payload: Mapping[str, Any],
+    *,
+    format_version: str,
+) -> RelationSnapshot:
+    organization_coverage: tuple[OrganizationCoverageBinding, ...] = ()
+    if format_version != LEGACY_SCHEMA_SNAPSHOT_FORMAT_VERSION:
+        organization_coverage = tuple(
+            OrganizationCoverageBinding(
+                scope_level=str(entry.get("scope_level") or ""),
+                field=(str(entry["field"]) if entry.get("field") is not None else None),
+                value_type=(
+                    str(entry["value_type"])
+                    if entry.get("value_type") is not None
+                    else None
+                ),
+            )
+            for entry in payload.get("organization_coverage", ())
+            if isinstance(entry, Mapping)
+        )
     return RelationSnapshot(
         relation_id=str(payload["relation_id"]),
         schema_name=str(payload["schema_name"]),
@@ -1331,6 +1594,7 @@ def _relation_from_payload(payload: Mapping[str, Any]) -> RelationSnapshot:
             if payload.get("freshness_sla_seconds") is not None
             else None
         ),
+        organization_coverage=organization_coverage,
     )
 
 
@@ -1399,6 +1663,74 @@ def _text_value(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return str(value)
+
+
+def _normalize_organization_coverage(
+    coverage: Sequence[OrganizationCoverageBinding],
+) -> tuple[OrganizationCoverageBinding, ...]:
+    """Canonical, deterministic ordering for the serialized coverage tuple."""
+
+    def sort_key(binding: OrganizationCoverageBinding) -> tuple[int, str, str, str]:
+        try:
+            rank = ORGANIZATION_SCOPE_LEVELS.index(binding.scope_level)
+        except ValueError:
+            rank = len(ORGANIZATION_SCOPE_LEVELS)
+        return (rank, binding.scope_level, binding.field or "", binding.value_type or "")
+
+    return tuple(sorted(coverage, key=sort_key))
+
+
+def _policy_organization_coverage(
+    value: Any,
+    *,
+    relation_id: str,
+) -> tuple[OrganizationCoverageBinding, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise SchemaSnapshotError(
+            f"schema snapshot policy organization_coverage must be an array: {relation_id}"
+        )
+    bindings: list[OrganizationCoverageBinding] = []
+    for entry in value:
+        if not isinstance(entry, Mapping):
+            raise SchemaSnapshotError(
+                f"schema snapshot policy organization_coverage entries must be objects: "
+                f"{relation_id}"
+            )
+        unknown_fields = sorted(set(entry) - _ORGANIZATION_COVERAGE_FIELDS)
+        if unknown_fields:
+            raise SchemaSnapshotError(
+                f"unknown organization coverage field for {relation_id}: {unknown_fields[0]}"
+            )
+        scope_level = entry.get("scope_level")
+        if not isinstance(scope_level, str) or not scope_level.strip():
+            raise SchemaSnapshotError(
+                f"schema snapshot policy organization_coverage scope_level must be a "
+                f"non-empty string: {relation_id}"
+            )
+        field = entry.get("field")
+        if field is not None and (not isinstance(field, str) or not field.strip()):
+            raise SchemaSnapshotError(
+                f"schema snapshot policy organization_coverage field must be a string: "
+                f"{relation_id}"
+            )
+        value_type = entry.get("value_type")
+        if value_type is not None and (
+            not isinstance(value_type, str) or not value_type.strip()
+        ):
+            raise SchemaSnapshotError(
+                f"schema snapshot policy organization_coverage value_type must be a string: "
+                f"{relation_id}"
+            )
+        bindings.append(
+            OrganizationCoverageBinding(
+                scope_level=scope_level.strip(),
+                field=field.strip() if isinstance(field, str) else None,
+                value_type=value_type.strip() if isinstance(value_type, str) else None,
+            )
+        )
+    return tuple(bindings)
 
 
 def _policy_string_tuple(
@@ -1506,11 +1838,16 @@ def main() -> None:
 __all__ = [
     "ABSOLUTE_MAX_RELATIONS",
     "DEFAULT_MAX_RELATIONS",
+    "LEGACY_SCHEMA_SNAPSHOT_FORMAT_VERSION",
+    "ORGANIZATION_SCOPE_LEVELS",
+    "SCHEMA_SNAPSHOT_FORMAT_VERSION",
     "SCHEMA_SNAPSHOT_PARSER_VERSION",
     "ColumnSnapshot",
     "ControlSchemaSnapshotStore",
     "ForeignKeySnapshot",
     "IndexSnapshot",
+    "OrganizationCoverageBinding",
+    "OrganizationCoverageProblem",
     "PostgresSchemaSnapshotCollector",
     "RelationPolicy",
     "RelationSnapshot",
@@ -1527,6 +1864,7 @@ __all__ = [
     "load_relation_policies",
     "run_snapshotter",
     "schema_snapshot_candidate_from_payload",
+    "validate_organization_coverage",
     "validate_schema_snapshot",
 ]
 

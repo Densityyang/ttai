@@ -48,12 +48,14 @@ class RequestContext(StrictContract):
     trace_id: str = Field(min_length=1, max_length=256)
     deadline_ms: int = Field(default=30_000, ge=1, le=120_000)
     # Optional carrier; absence must keep the pre-existing runtime-configurable
-    # path unchanged.  A supplied, parseable context is ALWAYS evaluated: a
+    # path unchanged.  When evaluated through the authorization enforcement
+    # seam, a supplied, parseable context is always evaluated: a
     # present-but-unusable one (stale revision, disabled, empty or out-of-scope)
     # denies regardless of any requirement flag.  Only when the carrier is
     # absent -- or malformed, which the accessor collapses to absent -- does the
     # requirement flag choose between a fail-closed deny (required) and the
-    # existing path (not required).
+    # existing path (not required).  No active runtime enforcement is claimed
+    # here: production does not yet populate this carrier.
     authorization: AuthorizationContext | None = None
 
 

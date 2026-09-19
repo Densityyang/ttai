@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
@@ -18,7 +19,14 @@ from zoneinfo import ZoneInfo
 
 from pydantic import Field, JsonValue, model_validator
 
-from src.nl2sql.contracts import ContextBundle, FetchMetricStep, QueryPlan, RequestIdentity
+from src.nl2sql.contracts import (
+    AuthorizationContext,
+    ContextBundle,
+    FetchMetricStep,
+    QueryPlan,
+    RequestIdentity,
+    evaluate_authorization,
+)
 from src.nl2sql.infra.governance.query_gateway import QueryGateway
 from src.nl2sql.orchestration.candidates import rowset_sha256
 from src.nl2sql.orchestration.execution import (
@@ -36,7 +44,12 @@ from src.nl2sql.semantic.metric_contract import (
     Predicate,
 )
 from src.nl2sql.semantic.registry import SemanticRelease, SemanticReleaseState
-from src.nl2sql.semantic.schema_snapshot import SchemaSnapshot, SchemaSnapshotState
+from src.nl2sql.semantic.schema_snapshot import (
+    OrganizationCoverageBinding,
+    SchemaSnapshot,
+    SchemaSnapshotState,
+    validate_organization_coverage,
+)
 
 _SOURCE_REJECTIONS = frozenset({
     "metric_permission_denied", "metric_relation_unapproved", "metric_aggregate_coverage_unapproved",
@@ -54,21 +67,15 @@ class EligibilityPolicy(FrozenContract):
     predicates: tuple[Predicate, ...] = ()
 
 
-class OrganizationDimensionBinding(FrozenContract):
-    """Deployment maps semantic organization scopes to stable ID columns only."""
-
-    dimension: Literal["city_company", "area", "team"]
-    field: Identifier | None = None
-    value_type: Literal["text", "integer"] | None = None
-
-    @model_validator(mode="after")
-    def validate_binding(self) -> OrganizationDimensionBinding:
-        if self.dimension == "city_company":
-            if self.field is not None or self.value_type is not None:
-                raise ValueError("city company is a total scope without an ID column")
-        elif self.field is None or self.value_type is None:
-            raise ValueError("area/team require a typed stable ID column")
-        return self
+# Query-granularity order ONLY: a narrower caller may not request a broader
+# organizational view.  It never authorizes ids and never establishes
+# membership -- membership is enforced exclusively by the authorization row
+# predicate built from the relation's approved organization coverage.
+_SCOPE_ORDER = {"city_company": 0, "area": 1, "team": 2, "employee": 3}
+_ORGANIZATION_SCOPE_NAMES = frozenset(_SCOPE_ORDER)
+# Canonical strict integer syntax: optional minus, no plus sign, no leading
+# zeros, no whitespace, no float/exponent form.  Never float, never fuzzy.
+_AUTHORIZATION_INTEGER_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)$")
 
 
 class AggregateColumns(FrozenContract):
@@ -152,17 +159,11 @@ class RelationBinding(FrozenContract):
     allow_detail_required: bool = True
     max_estimated_rows: int = Field(default=1_000_000, ge=1)
     bootstrap_scan_max_rows: int | None = Field(default=None, ge=1)
-    organization_dimensions: tuple[OrganizationDimensionBinding, ...] = (
-        OrganizationDimensionBinding(dimension="city_company"),
-    )
-
-    @model_validator(mode="after")
-    def unique_dimensions(self) -> RelationBinding:
-        names = [item.dimension for item in self.organization_dimensions]
-        fields = [item.field for item in self.organization_dimensions if item.field is not None]
-        if len(set(names)) != len(names) or len(set(fields)) != len(fields):
-            raise ValueError("duplicate organization dimension binding")
-        return self
+    # NOTE: physical organization scope -> column truth lives ONLY on the
+    # versioned SchemaSnapshot relation policy (RelationSnapshot.
+    # organization_coverage).  The compiler DERIVES its organization bindings
+    # from that snapshot and proves they are the approved projection, so there is
+    # no second, writable, silently-divergent source of physical org truth here.
 
     @property
     def relation_id(self) -> str:
@@ -183,13 +184,18 @@ class CompiledMetricQuery:
     query_plan: QueryPlan = field(repr=False)
     context: ContextBundle = field(repr=False)
     operation: Literal["count", "ratio"] = "count"
-    dimension: OrganizationDimensionBinding | None = None
+    dimension: OrganizationCoverageBinding | None = None
     source_kind: Literal["approved_aggregate", "approved_detail"] = "approved_detail"
     source_id: str = ""
     selection_reason: str = "approved_detail"
     degradation: tuple[str, ...] = ()
     freshness: SourceFreshnessRecord | None = None
     semantic_signature: str = ""
+    # Deterministic replay identity of the injected trusted authorization.  Only
+    # the opaque revision and the effective scope level are bound; the allowed
+    # scope id collection is NEVER copied into a public receipt or log.
+    authorization_revision: str | None = None
+    authorization_scope_level: str | None = None
 
 
 class MetricQueryCompiler:
@@ -203,7 +209,30 @@ class MetricQueryCompiler:
         identity: RequestIdentity,
         read_freshness: Callable[[str], Awaitable[SourceFreshnessRecord | None]] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        # Dormant/test seam: an INJECTED trusted Backend authorization context.
+        # Production never supplies one in this slice -- the engine path is not
+        # activated and v2.py never populates RequestContext.authorization -- so
+        # production fail-closed admission remains a later integration slice
+        # gated on real Backend evidence.
+        #
+        # Without a context the compiler preserves the pre-slice-2B non-authorized
+        # decision behavior, and this is enforced by code and regression tests:
+        # no authorization predicate is added, organization coverage is NOT
+        # enforced, city_company stays available as the default total scope, an
+        # uncovered-but-metric-supported scope keeps the DEGRADABLE
+        # metric_grain_or_dimension_unsupported (so the detail fallback stays
+        # reachable), and the compiled signature omits the authorization keys so
+        # its hash is byte-identical for the same inputs.  The one representational
+        # change is that physical organization bindings are read from the snapshot
+        # RelationSnapshot.organization_coverage -- the retired
+        # RelationBinding.organization_dimensions field no longer exists -- so a
+        # deployment whose coverage differs from the old binding would bind
+        # differently; there is no longer any second source to disagree with it.
+        authorization: AuthorizationContext | None = None,
     ) -> None:
+        if authorization is not None and not isinstance(authorization, AuthorizationContext):
+            raise ValueError("compiler authorization must be an AuthorizationContext")
+        self._authorization = authorization
         self._read_active = read_active
         self._read_snapshot = read_snapshot
         bindings = tuple(RelationBinding.model_validate_json(item.model_dump_json()) for item in bindings)
@@ -221,6 +250,15 @@ class MetricQueryCompiler:
     async def compile(self, plan: QueryPlan, context: ContextBundle) -> CompiledMetricQuery:
         plan = QueryPlan.model_validate_json(plan.model_dump_json())
         context = ContextBundle.model_validate_json(context.model_dump_json())
+        # FIRST, the frozen admission semantics: a disabled agent, an empty
+        # effective scope, or a malformed/unusable injected context denies
+        # canonically before any source is considered.  This is NON-DEGRADABLE:
+        # authorization_denied is not in _SOURCE_REJECTIONS, so it can never be
+        # laundered into a detail fallback.
+        if self._authorization is not None:
+            decision = evaluate_authorization(self._authorization, expected_revision=None)
+            if decision.outcome != "allow":
+                raise PlanStepError("authorization_denied")
         validation = PlanValidator().validate_query_plan(
             plan=plan, context=context, identity=self._identity,
         )
@@ -288,17 +326,38 @@ class MetricQueryCompiler:
         if len(relation_docs) != 1 or len(relations) != 1:
             raise PlanStepError("metric_relation_unapproved")
         relation = relations[0]
+        coverage = relation.organization_coverage
+        authorization = self._authorization
+        # Organization-coverage ENFORCEMENT is authorized-path-only: with no
+        # injected context the compiler must keep its pre-slice-2B behavior and
+        # never fail closed on coverage it was not previously consulting.  When a
+        # context IS injected, the versioned snapshot relation policy is the
+        # SINGLE source of physical organization scope -> column truth and a
+        # malformed declaration is NON-DEGRADABLE.
+        if authorization is not None and validate_organization_coverage(relation):
+            raise PlanStepError("metric_organization_coverage_invalid")
         if binding.aggregate is not None and relation.sensitivity not in {"public", "internal"}:
             raise PlanStepError("metric_aggregate_sensitivity_denied")
         if binding.aggregate is not None and metric.metric_key not in relation.aggregate_coverage:
             raise PlanStepError("metric_aggregate_coverage_unapproved")
         columns = {column.name: column.data_type.lower() for column in relation.columns}
+        authorized_coverage = (
+            _authorization_coverage(coverage, authorization.scope_level)
+            if authorization is not None
+            else None
+        )
         aggregate = binding.aggregate
         business_time_column = aggregate.columns.time if aggregate else metric.business_time_column
         predicates = (Predicate(field="is_valid_for_metrics", operator="is_true"),
                       *policy.predicates, *metric.predicates)
         formula_predicates = (*predicates, *metric.formula_predicates)
-        dimension, filter_dimensions = _organization_scope(plan, metric, binding)
+        dimension, filter_dimensions = _organization_scope(
+            plan, metric, coverage, authorization_required=authorization is not None,
+        )
+        if authorization is not None and authorized_coverage is not None:
+            _validate_authorized_organization_request(
+                dimension, filter_dimensions, authorization,
+            )
         used = {business_time_column, *(item.field for item in formula_predicates),
                 *(item.field for item in metric.filters)}
         if aggregate:
@@ -306,6 +365,14 @@ class MetricQueryCompiler:
         used.update(item.field for item in filter_dimensions.values() if item.field is not None)
         if dimension is not None and dimension.field is not None:
             used.add(dimension.field)
+        if authorized_coverage is not None and authorized_coverage.field is not None:
+            used.add(authorized_coverage.field)
+            field = authorized_coverage.field
+            # Authorization field/type mismatch is NON-DEGRADABLE; it must not
+            # borrow the degradable metric_column_unapproved path.
+            if (field not in set(binding.allowed_columns) or field not in columns
+                    or field in set(relation.sensitive_columns)):
+                raise PlanStepError("metric_organization_coverage_invalid")
         if (not used <= set(binding.allowed_columns) or not used <= columns.keys()
                 or used & set(relation.sensitive_columns)):
             raise PlanStepError("metric_column_unapproved")
@@ -357,9 +424,33 @@ class MetricQueryCompiler:
         params: dict[str, Any] = {"start_at": start, "end_at": end}
         business_time = _quote(business_time_column)
         where = [f"{business_time} >= :start_at", f"{business_time} < :end_at"]
+        # SYSTEM-AUTHORED authorization predicate, independent of QueryPlan and
+        # of user filters.  It is built ONLY from the trusted context ids and the
+        # relation's approved coverage, and ids are always bound parameters.
+        if (authorization is not None and authorized_coverage is not None
+                and authorized_coverage.field is not None):
+            assert authorized_coverage.value_type is not None
+            authorization_ids = _authorization_scope_values(
+                authorization.allowed_scope_ids,
+                authorized_coverage.value_type,
+                columns[authorized_coverage.field],
+            )
+            authorization_keys = [
+                f"auth_scope_{position}" for position in range(len(authorization_ids))
+            ]
+            where.append(
+                f"{_quote(authorized_coverage.field)} IN "
+                f"({', '.join(':' + key for key in authorization_keys)})"
+            )
+            params.update(zip(authorization_keys, authorization_ids, strict=True))
         if aggregate:
             assert freshness is not None
-            scope = dimension.dimension if dimension else next(iter(filter_dimensions), "city_company")
+            scope = (
+                dimension.scope_level
+                if dimension is not None
+                else next(iter(filter_dimensions), None)
+                or (authorization.scope_level if authorization is not None else "city_company")
+            )
             for key, column, value in (
                 ("metric", aggregate.columns.metric_key, metric.metric_key),
                 ("formula", aggregate.columns.formula_version, metric.formula_version),
@@ -400,6 +491,17 @@ class MetricQueryCompiler:
                 raise PlanStepError("metric_filter_list_invalid")
             for value in values:
                 _validate_filter_value(value, value_type, columns[field_name])
+            if (organization is not None and authorization is not None
+                    and organization.scope_level == authorization.scope_level):
+                # Same-level user filter: typed membership against the trusted
+                # authorized set.  ONE unauthorized value in an IN list denies the
+                # whole request; the authorized subset is never silently returned.
+                authorized_values = _authorization_scope_values(
+                    authorization.allowed_scope_ids, value_type, columns[field_name],
+                )
+                for value in values:
+                    if value not in authorized_values:
+                        raise PlanStepError("authorization_denied")
             if item.operator == "in":
                 if len(set(values)) != len(values):
                     raise PlanStepError("metric_filter_list_invalid")
@@ -453,16 +555,30 @@ class MetricQueryCompiler:
                    f"FROM ({sql}) AS metric_counts")
         sql += order
         signature_plan = plan.model_dump(mode="json", exclude={"source_strategy"})
-        signature = hashlib.sha256(json.dumps({
+        signature_payload: dict[str, Any] = {
             "plan": signature_plan, "metric": metric.model_dump(mode="json"),
             "policy": policy.model_dump(mode="json"), "release": release.release_id,
             "snapshot": snapshot.snapshot_id, "checksum": snapshot.checksum,
             "checkpoint": freshness.checkpoint if freshness else None,
-        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        }
+        if authorization is not None:
+            # Deterministic replay identity for the injected trusted authority.
+            # A changed authorization revision or effective scope level MUST
+            # change the compiled authority; the allowed id collection is never
+            # part of the public identity.  With NO injected authority these keys
+            # are absent, so the no-auth signature stays byte-identical to
+            # pre-slice-2B.
+            signature_payload["authorization_revision"] = authorization.authorization_revision
+            signature_payload["authorization_scope_level"] = authorization.scope_level
+        signature = hashlib.sha256(json.dumps(
+            signature_payload, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
         return CompiledMetricQuery(
             sql, params, release.release_id, snapshot.snapshot_id, snapshot.checksum, plan, context,
             metric.operation, dimension, "approved_aggregate" if aggregate else "approved_detail",
             binding.deployment_source_id, reason, degradation, freshness, signature,
+            authorization.authorization_revision if authorization is not None else None,
+            authorization.scope_level if authorization is not None else None,
         )
 
     async def _select_source(
@@ -576,6 +692,8 @@ class GatewayMetricStepRunner:
                     or current.source_kind != query.source_kind
                     or current.selection_reason != query.selection_reason
                     or current.degradation != query.degradation
+                    or current.authorization_revision != query.authorization_revision
+                    or current.authorization_scope_level != query.authorization_scope_level
                     or self._gateway.prepare(current.sql).fingerprint != prepared.sql_fingerprint):
                 raise PlanStepError("metric_prepared_query_changed")
             result = await self._gateway.execute(current.sql, current.params)
@@ -669,11 +787,45 @@ def _predicate_sql(predicate: Predicate) -> str:
 
 
 def _organization_scope(
-    plan: QueryPlan, metric: MetricContract, binding: RelationBinding,
-) -> tuple[OrganizationDimensionBinding | None, dict[str, OrganizationDimensionBinding]]:
-    bindings = {item.dimension: item for item in binding.organization_dimensions}
-    if any(item not in metric.supported_dimensions or item not in bindings for item in plan.dimensions):
-        raise PlanStepError("metric_grain_or_dimension_unsupported")
+    plan: QueryPlan,
+    metric: MetricContract,
+    coverage: tuple[OrganizationCoverageBinding, ...],
+    *,
+    authorization_required: bool,
+) -> tuple[OrganizationCoverageBinding | None, dict[str, OrganizationCoverageBinding]]:
+    """Resolve requested organization dimensions/filters against relation coverage.
+
+    When a trusted context was injected (authorization_required), the snapshot
+    relation policy is the authority and a requested scope the metric supports but
+    the relation does not cover is a NON-DEGRADABLE coverage failure.
+
+    With NO injected context the compiler keeps the pre-slice-2B decision
+    behavior: city_company is always available as the retired RelationBinding
+    default total scope, and a supported-but-uncovered scope keeps the
+    pre-existing DEGRADABLE metric_grain_or_dimension_unsupported so its detail
+    fallback stays reachable.
+    """
+
+    bindings = {item.scope_level: item for item in coverage}
+    if not authorization_required:
+        # No coverage enforcement on this path, so ignore a structurally
+        # unusable non-city binding rather than tripping a downstream assertion;
+        # it is treated exactly like "scope not covered" below.  city_company is
+        # always restored as the default total scope.
+        bindings = {
+            level: binding
+            for level, binding in bindings.items()
+            if level == "city_company"
+            or (binding.field is not None and binding.value_type is not None)
+        }
+        bindings.setdefault("city_company", OrganizationCoverageBinding("city_company"))
+    for item in plan.dimensions:
+        if item not in metric.supported_dimensions:
+            raise PlanStepError("metric_grain_or_dimension_unsupported")
+        if item not in bindings:
+            if authorization_required:
+                raise PlanStepError("metric_organization_coverage_unapproved")
+            raise PlanStepError("metric_grain_or_dimension_unsupported")
     if len(plan.dimensions) > 1:
         raise PlanStepError("metric_dimension_combination_unsupported")
     dimension_name = next(iter(plan.dimensions), None)
@@ -683,12 +835,16 @@ def _organization_scope(
     if not grouped and any(item != "city_company" for item in plan.dimensions):
         raise PlanStepError("metric_dimension_combination_unsupported")
     dimension = bindings[dimension_name] if grouped and dimension_name is not None else None
-    organization_filters = {}
+    organization_filters: dict[str, OrganizationCoverageBinding] = {}
     for item in plan.filters:
-        if item.field_ref in {"city_company", "area", "team"}:
-            if (item.source != "entity_alias"
-                    or item.field_ref == "city_company" or item.field_ref not in bindings
-                    or item.field_ref not in metric.supported_dimensions):
+        if item.field_ref in _ORGANIZATION_SCOPE_NAMES:
+            if item.source != "entity_alias" or item.field_ref == "city_company":
+                raise PlanStepError("metric_filter_unsupported")
+            if item.field_ref not in metric.supported_dimensions:
+                raise PlanStepError("metric_filter_unsupported")
+            if item.field_ref not in bindings:
+                if authorization_required:
+                    raise PlanStepError("metric_organization_coverage_unapproved")
                 raise PlanStepError("metric_filter_unsupported")
             organization_filters[item.field_ref] = bindings[item.field_ref]
     scopes = set(plan.dimensions) | set(organization_filters)
@@ -696,9 +852,87 @@ def _organization_scope(
         raise PlanStepError("metric_dimension_combination_unsupported")
     # Ordinary YAML filters cannot provide a second route to physical org IDs.
     org_fields = {item.field for item in bindings.values() if item.field is not None}
-    if any(item.field in org_fields | {"city_company", "area", "team"} for item in metric.filters):
+    if any(item.field in org_fields | set(_ORGANIZATION_SCOPE_NAMES) for item in metric.filters):
         raise PlanStepError("metric_filter_unsupported")
     return dimension, organization_filters
+
+
+def _authorization_coverage(
+    coverage: tuple[OrganizationCoverageBinding, ...],
+    scope_level: str,
+) -> OrganizationCoverageBinding:
+    """Select the approved coverage entry for the caller's effective scope.
+
+    No matching coverage for the context scope level is fail-closed and
+    NON-DEGRADABLE: the relation cannot be safely constrained for this caller.
+    city_company is an explicit deployment/root authorization scope -- NOT
+    authorization-disabled and NOT default unrestricted access -- so it too must
+    be explicitly declared.
+    """
+
+    for binding in coverage:
+        if binding.scope_level == scope_level:
+            return binding
+    raise PlanStepError("metric_organization_coverage_unapproved")
+
+
+def _validate_authorized_organization_request(
+    dimension: OrganizationCoverageBinding | None,
+    filter_dimensions: dict[str, OrganizationCoverageBinding],
+    authorization: AuthorizationContext,
+) -> None:
+    """Enforce the query-granularity rule only.
+
+    The caller's scope level establishes NO id authorization and NO membership:
+    it only prevents a narrower caller from requesting a broader organizational
+    view.  Same-level id membership and the narrowing behavior of child filters
+    are handled where the physical predicates are built.
+    """
+
+    context_rank = _SCOPE_ORDER[authorization.scope_level]
+    requested_levels: list[str] = []
+    if dimension is not None:
+        requested_levels.append(dimension.scope_level)
+    requested_levels.extend(binding.scope_level for binding in filter_dimensions.values())
+    for requested_level in requested_levels:
+        if _SCOPE_ORDER[requested_level] < context_rank:
+            raise PlanStepError("metric_organization_scope_denied")
+
+
+def _authorization_scope_values(
+    allowed_scope_ids: tuple[str, ...],
+    value_type: str,
+    column_type: str | None,
+) -> tuple[Any, ...]:
+    """Convert the frozen opaque string ids to the physical column family.
+
+    Text columns bind the ids as text.  Integer-backed columns use a
+    deterministic, STRICT canonical conversion; malformed, non-canonical or
+    out-of-range values fail closed.  Floating point is never used and ids are
+    never fuzzy-normalized.
+    """
+
+    if value_type == "text":
+        return tuple(allowed_scope_ids)
+    if column_type is None:
+        raise PlanStepError("metric_organization_coverage_invalid")
+    return tuple(_strict_integer_scope_id(item, column_type) for item in allowed_scope_ids)
+
+
+def _strict_integer_scope_id(value: str, column_type: str) -> int:
+    if not isinstance(value, str) or not _AUTHORIZATION_INTEGER_RE.fullmatch(value):
+        raise PlanStepError("metric_organization_coverage_invalid")
+    number = int(value)
+    bits = (
+        16
+        if column_type in {"smallint", "int2"}
+        else 32
+        if column_type in {"integer", "int4"}
+        else 64
+    )
+    if not -(2 ** (bits - 1)) <= number < 2 ** (bits - 1):
+        raise PlanStepError("metric_organization_coverage_invalid")
+    return number
 
 
 def _validate_column_type(value_type: str, column_type: str) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -18,6 +19,8 @@ from src.nl2sql.semantic.registry import (
     SemanticReleaseError,
 )
 from src.nl2sql.semantic.schema_snapshot import (
+    LEGACY_SCHEMA_SNAPSHOT_FORMAT_VERSION,
+    OrganizationCoverageBinding,
     PostgresSchemaSnapshotCollector,
     RelationPolicy,
     SchemaRequirement,
@@ -25,10 +28,12 @@ from src.nl2sql.semantic.schema_snapshot import (
     SchemaSnapshotCandidate,
     SchemaSnapshotError,
     SchemaSnapshotState,
+    SnapshotIssueSeverity,
     bind_schema_snapshot,
     build_schema_snapshot_candidate,
     load_relation_policies,
     schema_snapshot_candidate_from_payload,
+    validate_organization_coverage,
     validate_schema_snapshot,
 )
 
@@ -586,3 +591,206 @@ def test_snapshot_checksum_integrity_is_rechecked_before_validation() -> None:
 
     with pytest.raises(SchemaSnapshotError, match="candidate checksum mismatch"):
         validate_schema_snapshot(candidate)
+
+# ---------------------------------------------------------------------------
+# Slice 2B: organization coverage, explicit policy drift and format versioning
+# ---------------------------------------------------------------------------
+
+_AREA_ON_USER_ID = (
+    OrganizationCoverageBinding("city_company"),
+    OrganizationCoverageBinding("area", "user_id", "integer"),
+)
+_AREA_ON_ID = (
+    OrganizationCoverageBinding("city_company"),
+    OrganizationCoverageBinding("area", "id", "integer"),
+)
+
+
+def _policy_with(
+    *,
+    sensitivity: str = "restricted",
+    sensitive_columns: tuple[str, ...] = ("user_id",),
+    coverage: tuple[OrganizationCoverageBinding, ...] = (),
+) -> dict[str, RelationPolicy]:
+    policies = _policies()
+    policies["public.complaints"] = RelationPolicy(
+        sensitivity=sensitivity,
+        sensitive_columns=sensitive_columns,
+        aggregate_coverage=("metric.complaint_count",),
+        freshness_sla_seconds=3_600,
+        organization_coverage=coverage,
+    )
+    return policies
+
+
+def test_new_format_checksum_covers_organization_coverage() -> None:
+    # Q. A policy-only coverage change must change the FULL candidate checksum...
+    first = _candidate(policies=_policy_with(coverage=_AREA_ON_USER_ID))
+    second = _candidate(policies=_policy_with(coverage=_AREA_ON_ID))
+    assert first.format_version != LEGACY_SCHEMA_SNAPSHOT_FORMAT_VERSION
+    assert first.checksum != second.checksum
+    # ...while the DB-structure checksum is deliberately unchanged: DB structural
+    # drift and governance-policy drift are DISTINCT audit concepts.
+    assert first.schema_checksum == second.schema_checksum
+    assert first.to_payload()["relations"][0]["organization_coverage"] == [
+        {"field": None, "scope_level": "city_company", "value_type": None},
+        {"field": "user_id", "scope_level": "area", "value_type": "integer"},
+    ]
+
+
+def test_organization_coverage_change_is_explicit_policy_drift() -> None:
+    # M + P. The change surfaces with a POLICY-SPECIFIC code and never masquerades
+    # as relation_structure_changed.
+    baseline = _candidate(policies=_policy_with(coverage=_AREA_ON_USER_ID))
+    current = _candidate(policies=_policy_with(coverage=_AREA_ON_ID))
+    report = validate_schema_snapshot(current, previous=baseline)
+    codes = {issue.code for issue in report.issues}
+    assert "relation_organization_coverage_changed" in codes
+    assert "relation_structure_changed" not in codes
+    assert all(
+        issue.severity is SnapshotIssueSeverity.ERROR
+        for issue in report.issues
+        if issue.code == "relation_organization_coverage_changed"
+    )
+
+
+def test_sensitivity_and_sensitive_column_changes_are_explicit_policy_drift() -> None:
+    # N + O + P. A MORE restrictive change still requires explicit review.
+    baseline = _candidate(policies=_policy_with(sensitivity="internal"))
+    stricter = _candidate(policies=_policy_with(sensitivity="restricted"))
+    sensitivity_report = validate_schema_snapshot(stricter, previous=baseline)
+    sensitivity_codes = {issue.code for issue in sensitivity_report.issues}
+    assert "relation_sensitivity_changed" in sensitivity_codes
+    assert "relation_structure_changed" not in sensitivity_codes
+
+    columns_report = validate_schema_snapshot(
+        _candidate(policies=_policy_with(sensitive_columns=("id",))),
+        previous=baseline,
+    )
+    columns_codes = {issue.code for issue in columns_report.issues}
+    assert "relation_sensitive_columns_changed" in columns_codes
+    assert "relation_structure_changed" not in columns_codes
+
+
+def test_legacy_snapshot_payload_is_readable_under_original_checksum() -> None:
+    # R. A pre-coverage payload must still deserialize and validate its ORIGINAL
+    # checksum: absence of the new key maps only to legacy "no coverage".
+    modern = _candidate(policies=_policy_with(coverage=_AREA_ON_USER_ID))
+    legacy_payload = json.loads(json.dumps(modern.to_payload()))
+    assert "format_version" in legacy_payload
+    legacy_payload.pop("format_version")
+    for relation in legacy_payload["relations"]:
+        relation.pop("organization_coverage")
+    legacy_checksum = hashlib.sha256(
+        json.dumps(
+            legacy_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+
+    restored = schema_snapshot_candidate_from_payload(legacy_payload, checksum=legacy_checksum)
+
+    assert restored.format_version == LEGACY_SCHEMA_SNAPSHOT_FORMAT_VERSION
+    assert restored.checksum == legacy_checksum
+    assert restored.schema_checksum == modern.schema_checksum
+    assert all(relation.organization_coverage == () for relation in restored.relations)
+    # A legacy marker combined with the new payload key is NOT canonical and is
+    # rejected rather than silently reinterpreted.
+    tampered = json.loads(json.dumps(legacy_payload))
+    tampered["relations"][0]["organization_coverage"] = []
+    with pytest.raises(SchemaSnapshotError, match="not canonical"):
+        schema_snapshot_candidate_from_payload(tampered, checksum=legacy_checksum)
+
+
+def test_validate_organization_coverage_rejects_malformed_declarations() -> None:
+    # S. Missing column, wrong type, duplicate level, duplicate physical field,
+    # city_company with a physical id, and incomplete non-city coverage.
+    relation = _candidate(policies={}).relations[0]
+
+    def codes(coverage: tuple[OrganizationCoverageBinding, ...]) -> set[str]:
+        return {
+            problem.code
+            for problem in validate_organization_coverage(
+                replace(relation, organization_coverage=coverage)
+            )
+        }
+
+    assert codes((OrganizationCoverageBinding("area", "area_id", "text"),)) == {
+        "relation_organization_coverage_field_missing"
+    }
+    assert codes((OrganizationCoverageBinding("area", "user_id", "text"),)) == {
+        "relation_organization_coverage_type_mismatch"
+    }
+    assert codes(
+        (
+            OrganizationCoverageBinding("area", "id", "integer"),
+            OrganizationCoverageBinding("area", "user_id", "integer"),
+        )
+    ) == {"relation_organization_coverage_duplicate_level"}
+    assert codes(
+        (
+            OrganizationCoverageBinding("area", "id", "integer"),
+            OrganizationCoverageBinding("team", "id", "integer"),
+        )
+    ) == {"relation_organization_coverage_duplicate_field"}
+    assert codes((OrganizationCoverageBinding("city_company", "id", "integer"),)) == {
+        "relation_organization_coverage_city_field"
+    }
+    assert codes((OrganizationCoverageBinding("employee"),)) == {
+        "relation_organization_coverage_incomplete"
+    }
+
+
+def test_malformed_declared_coverage_is_an_error_issue() -> None:
+    malformed = _candidate(
+        policies=_policy_with(
+            coverage=(OrganizationCoverageBinding("area", "missing_column", "integer"),)
+        )
+    )
+    report = validate_schema_snapshot(malformed)
+    assert not report.ok
+    issue = next(
+        issue
+        for issue in report.issues
+        if issue.code == "relation_organization_coverage_field_missing"
+    )
+    assert issue.severity is SnapshotIssueSeverity.ERROR
+    assert issue.relation_id == "public.complaints"
+
+
+def test_organization_coverage_policy_file_round_trips(tmp_path: Path) -> None:
+    policy_path = tmp_path / "schema-policy.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "public.complaints": {
+                    "sensitivity": "restricted",
+                    "sensitive_columns": ["user_id"],
+                    "organization_coverage": [
+                        {"scope_level": "city_company"},
+                        {"scope_level": "area", "field": "user_id", "value_type": "integer"},
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    policies = load_relation_policies(policy_path)
+    assert policies["public.complaints"].organization_coverage == (
+        OrganizationCoverageBinding("city_company"),
+        OrganizationCoverageBinding("area", "user_id", "integer"),
+    )
+
+    policy_path.write_text(
+        json.dumps(
+            {
+                "public.complaints": {
+                    "organization_coverage": [
+                        {"scope_level": "area", "field": "user_id", "value_type": "text", "extra": 1}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SchemaSnapshotError, match="unknown organization coverage field"):
+        load_relation_policies(policy_path)
