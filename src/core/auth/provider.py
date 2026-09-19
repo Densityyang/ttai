@@ -16,6 +16,7 @@ from src.core.settings import Settings, get_settings
 from src.nl2sql.contracts import (
     AuthorizationContext,
     AuthorizationDecision,
+    ScopeLevel,
     evaluate_authorization,
 )
 
@@ -39,6 +40,7 @@ async def load_authorization(
     user: AuthUser,
     *,
     expected_revision: str | None,
+    requested_scope_level: ScopeLevel | None = None,
     requested_scope_id: str | None = None,
 ) -> AuthorizationDecision:
     """Resolve authorization fail-closed through a provider contract.
@@ -59,6 +61,7 @@ async def load_authorization(
     return evaluate_authorization(
         context,
         expected_revision=expected_revision,
+        requested_scope_level=requested_scope_level,
         requested_scope_id=requested_scope_id,
     )
 

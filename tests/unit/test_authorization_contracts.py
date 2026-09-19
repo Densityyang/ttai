@@ -21,7 +21,6 @@ from src.nl2sql.contracts import (
     evaluate_authorization,
 )
 
-POLICY_CHECKSUM = "a" * 64
 USER = AuthUser(
     user_id="u-1",
     telephone=None,
@@ -36,8 +35,6 @@ def _context(**overrides: object) -> AuthorizationContext:
         "agent_enabled": True,
         "scope_level": "area",
         "allowed_scope_ids": ("area-1", "area-2"),
-        "policy_version": "authz-policy-1",
-        "policy_checksum": POLICY_CHECKSUM,
     }
     values.update(overrides)
     return AuthorizationContext(**values)
@@ -69,8 +66,6 @@ class _LookalikeContext:
     agent_enabled = True
     scope_level = "area"
     allowed_scope_ids = ("area-1",)
-    policy_version = "authz-policy-1"
-    policy_checksum = POLICY_CHECKSUM
 
 
 # --- a. strictness ---------------------------------------------------------
@@ -92,11 +87,27 @@ def test_context_rejects_list_scope_ids() -> None:
         _context(allowed_scope_ids=["area-1"])
 
 
-def test_context_rejects_blank_or_duplicate_scope_ids() -> None:
+def test_context_rejects_blank_scope_ids() -> None:
     with pytest.raises(ValidationError):
         _context(allowed_scope_ids=("area-1", " "))
+
+
+def test_context_rejects_duplicate_scope_ids_within_one_level() -> None:
+    # Duplicates inside one AuthorizationContext are the SAME opaque id repeated
+    # within the single declared scope_level, so they are rejected.
     with pytest.raises(ValidationError):
-        _context(allowed_scope_ids=("area-1", "area-1"))
+        _context(allowed_scope_ids=("shared-id", "shared-id"))
+
+
+def test_context_makes_no_global_cross_level_uniqueness_claim() -> None:
+    # A context never combines multiple levels, so the contract asserts nothing
+    # about the same raw string existing at a DIFFERENT scope_level; two
+    # separate contexts at different levels may each carry the same id.
+    area = _context(scope_level="area", allowed_scope_ids=("12",))
+    team = _context(scope_level="team", allowed_scope_ids=("12",))
+    assert area.allowed_scope_ids == ("12",)
+    assert team.allowed_scope_ids == ("12",)
+    assert area.scope_level != team.scope_level
 
 
 # --- b. closed ScopeLevel vocabulary --------------------------------------
@@ -122,8 +133,6 @@ def test_authorization_revision_is_required() -> None:
             agent_enabled=True,
             scope_level="area",
             allowed_scope_ids=("area-1",),
-            policy_version="authz-policy-1",
-            policy_checksum=POLICY_CHECKSUM,
         )
 
 
@@ -133,41 +142,19 @@ def test_authorization_revision_rejects_blank(revision: str) -> None:
         _context(authorization_revision=revision)
 
 
-# --- c2. Backend policy provenance is optional -----------------------------
-
-
-def test_context_without_policy_provenance_is_valid() -> None:
-    context = AuthorizationContext(
-        authorization_revision="rev-1",
-        agent_enabled=True,
-        scope_level="area",
-        allowed_scope_ids=("area-1",),
-    )
-    assert context.policy_version is None
-    assert context.policy_checksum is None
-
-
-def test_context_without_policy_provenance_still_allows() -> None:
-    context = AuthorizationContext(
-        authorization_revision="rev-1",
-        agent_enabled=True,
-        scope_level="area",
-        allowed_scope_ids=("area-1",),
-    )
-    decision = evaluate_authorization(
-        context,
-        expected_revision="rev-1",
-        requested_scope_id="area-1",
-    )
-    assert decision.outcome == "allow"
-    assert decision.authorization_revision == "rev-1"
-
-
-def test_supplied_but_malformed_policy_provenance_is_rejected() -> None:
-    with pytest.raises(ValidationError):
-        _context(policy_checksum="not-a-checksum")
-    with pytest.raises(ValidationError):
-        _context(policy_version="")
+def test_context_schema_has_no_invented_backend_policy_fields() -> None:
+    # Guards the removal against silent regression: no Backend/DB evidence
+    # establishes a policy-versioning capability, so these must not reappear.
+    fields = set(AuthorizationContext.model_fields)
+    assert "policy_version" not in fields
+    assert "policy_checksum" not in fields
+    assert fields == {
+        "schema_version",
+        "authorization_revision",
+        "agent_enabled",
+        "scope_level",
+        "allowed_scope_ids",
+    }
 
 
 # --- d. empty scope is valid but denies -----------------------------------
@@ -178,6 +165,51 @@ def test_empty_allowed_scope_ids_is_valid_but_denies() -> None:
     assert context.allowed_scope_ids == ()
     decision = evaluate_authorization(context, expected_revision="rev-1")
     assert decision.outcome == "deny"
+    assert decision == AUTHORIZATION_DENIED
+
+
+# --- d2. typed scope membership -------------------------------------------
+
+
+def test_typed_membership_allows_matching_level_and_id() -> None:
+    context = _context(scope_level="area", allowed_scope_ids=("12",))
+    decision = evaluate_authorization(
+        context,
+        expected_revision="rev-1",
+        requested_scope_level="area",
+        requested_scope_id="12",
+    )
+    assert decision.outcome == "allow"
+
+
+def test_cross_level_id_collision_is_denied() -> None:
+    # area context allows id "12"; asking for TEAM id "12" must NOT satisfy raw
+    # string membership, because ids are not assumed globally unique.
+    context = _context(scope_level="area", allowed_scope_ids=("12",))
+    decision = evaluate_authorization(
+        context,
+        expected_revision="rev-1",
+        requested_scope_level="team",
+        requested_scope_id="12",
+    )
+    assert decision == AUTHORIZATION_DENIED
+
+
+def test_requested_id_without_a_level_is_denied() -> None:
+    decision = evaluate_authorization(
+        _context(),
+        expected_revision="rev-1",
+        requested_scope_id="area-1",
+    )
+    assert decision == AUTHORIZATION_DENIED
+
+
+def test_requested_level_without_an_id_is_denied() -> None:
+    decision = evaluate_authorization(
+        _context(),
+        expected_revision="rev-1",
+        requested_scope_level="area",
+    )
     assert decision == AUTHORIZATION_DENIED
 
 
@@ -200,7 +232,16 @@ async def test_malformed_provider_payload_denies() -> None:
     assert decision == AUTHORIZATION_DENIED
 
 
-def test_stale_revision_denies() -> None:
+def test_resumed_request_allows_on_a_matching_bound_revision() -> None:
+    decision = evaluate_authorization(
+        _context(authorization_revision="rev-1"),
+        expected_revision="rev-1",
+    )
+    assert decision.outcome == "allow"
+    assert decision.authorization_revision == "rev-1"
+
+
+def test_stale_resumed_request_denies_on_a_mismatched_bound_revision() -> None:
     decision = evaluate_authorization(
         _context(authorization_revision="rev-1"),
         expected_revision="rev-2",
@@ -208,9 +249,23 @@ def test_stale_revision_denies() -> None:
     assert decision == AUTHORIZATION_DENIED
 
 
-def test_missing_expected_revision_denies() -> None:
+def test_initial_request_allows_without_a_bound_revision() -> None:
+    # First request: no revision has been bound yet, so the fresh context's own
+    # authorization_revision is authoritative and absence is not a denial.
+    decision = evaluate_authorization(
+        _context(),
+        expected_revision=None,
+        requested_scope_level="area",
+        requested_scope_id="area-1",
+    )
+    assert decision.outcome == "allow"
+    assert decision.authorization_revision == "rev-1"
+
+
+def test_initial_request_allows_without_a_requested_scope_id() -> None:
     decision = evaluate_authorization(_context(), expected_revision=None)
-    assert decision == AUTHORIZATION_DENIED
+    assert decision.outcome == "allow"
+    assert decision.authorization_revision == "rev-1"
 
 
 def test_disabled_agent_denies() -> None:
@@ -222,6 +277,7 @@ def test_in_scope_allows_against_the_matching_revision() -> None:
     decision = evaluate_authorization(
         _context(),
         expected_revision="rev-1",
+        requested_scope_level="area",
         requested_scope_id="area-1",
     )
     assert decision.outcome == "allow"
@@ -239,6 +295,7 @@ async def test_forged_client_authorization_is_ignored() -> None:
         _StubProvider(forged),
         USER,
         expected_revision="rev-1",
+        requested_scope_level="area",
         requested_scope_id="area-9",
     )
     assert decision == AUTHORIZATION_DENIED
@@ -249,6 +306,7 @@ async def test_unavailable_and_out_of_scope_are_byte_identical() -> None:
     out_of_scope = evaluate_authorization(
         _context(allowed_scope_ids=("area-1",)),
         expected_revision="rev-1",
+        requested_scope_level="area",
         requested_scope_id="area-2",
     )
     assert unavailable.model_dump_json() == out_of_scope.model_dump_json()
@@ -270,16 +328,37 @@ def test_malformed_context_denies_without_raising(malformed: object) -> None:
     assert decision.reason == AUTHORIZATION_DENIED_REASON
 
 
-def test_malformed_deny_is_byte_identical_to_unavailable_and_out_of_scope() -> None:
-    malformed = evaluate_authorization({"a": 1}, expected_revision="rev-1")
-    unavailable = evaluate_authorization(None, expected_revision="rev-1")
-    out_of_scope = evaluate_authorization(
-        _context(allowed_scope_ids=("area-1",)),
-        expected_revision="rev-1",
-        requested_scope_id="area-2",
-    )
-    assert malformed.model_dump_json() == unavailable.model_dump_json()
-    assert malformed.model_dump_json() == out_of_scope.model_dump_json()
+async def test_every_public_deny_serializes_byte_identically() -> None:
+    denies = [
+        await load_authorization(_StubProvider(None), USER, expected_revision="rev-1"),
+        await load_authorization(_RaisingProvider(), USER, expected_revision="rev-1"),
+        await load_authorization(
+            _StubProvider({"authorization_revision": "rev-1"}),
+            USER,
+            expected_revision="rev-1",
+        ),
+        evaluate_authorization(None, expected_revision="rev-1"),
+        evaluate_authorization({"a": 1}, expected_revision="rev-1"),
+        evaluate_authorization(_context(agent_enabled=False), expected_revision="rev-1"),
+        evaluate_authorization(_context(allowed_scope_ids=()), expected_revision="rev-1"),
+        evaluate_authorization(
+            _context(authorization_revision="rev-1"),
+            expected_revision="rev-2",
+        ),
+        evaluate_authorization(
+            _context(allowed_scope_ids=("area-1",)),
+            expected_revision="rev-1",
+            requested_scope_level="area",
+            requested_scope_id="area-2",
+        ),
+        evaluate_authorization(_context(), expected_revision="rev-1", requested_scope_id="area-1"),
+        evaluate_authorization(_context(), expected_revision="rev-1", requested_scope_level="area"),
+    ]
+    payloads = {decision.model_dump_json() for decision in denies}
+    assert payloads == {
+        '{"outcome":"deny","reason":"authorization_denied","authorization_revision":null}'
+    }
+    assert all(decision == AUTHORIZATION_DENIED for decision in denies)
 
 
 def test_decision_rejects_partial_deny_or_allow() -> None:

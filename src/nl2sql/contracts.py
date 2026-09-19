@@ -55,14 +55,19 @@ class AuthorizationContext(StrictContract):
     Every field is derived server-side from Backend/DB truth; tt-ai only
     consumes the final Agent-facing vocabulary and never reinterprets a legacy
     organization type.  authorization_revision is an opaque non-blank token.
-    An empty allowed_scope_ids means no effective scope at all
-    (deny-by-absence) and never widens access.  tt-ai consumes scope_level
-    verbatim and owes no hierarchy, ancestor, sibling or employee-scope
-    derivation -- Backend owns all of it.
 
-    policy_version and policy_checksum are provenance carried ONLY when Backend
-    supplies them: tt-ai asserts no Backend policy-versioning capability, and
-    their absence is not a failure and must never by itself cause a deny.
+    scope_level is consumed verbatim: tt-ai owes no hierarchy, ancestor,
+    sibling or employee-scope derivation, and no user-to-role resolution --
+    Backend owns all of it.
+
+    allowed_scope_ids is trusted Backend effective-authorization material for
+    exactly ONE declared scope_level.  Membership is tested against exactly the
+    IDs supplied: nothing is expanded and nothing is inferred (no area-to-teams,
+    no team-to-employees, no siblings, no ancestors, no legacy org_type
+    mapping).  The IDs are opaque strings, so the same raw string may also
+    legitimately exist at a DIFFERENT scope_level; this contract makes no claim
+    of global cross-level uniqueness.  An empty tuple means no effective scope
+    at all (deny-by-absence) and never widens access.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -72,8 +77,6 @@ class AuthorizationContext(StrictContract):
     agent_enabled: bool
     scope_level: ScopeLevel
     allowed_scope_ids: tuple[str, ...] = ()
-    policy_version: str | None = Field(default=None, min_length=1, max_length=128)
-    policy_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("authorization_revision")
     @classmethod
@@ -85,10 +88,17 @@ class AuthorizationContext(StrictContract):
     @field_validator("allowed_scope_ids")
     @classmethod
     def validate_allowed_scope_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Require unique, non-blank IDs within this single declared scope.
+
+        Uniqueness is required WITHIN one declared scope_level.  No claim is
+        made that the same raw string cannot also exist at a different
+        scope_level; a context never combines multiple levels.
+        """
+
         if any(not item.strip() for item in value):
             raise ValueError("allowed scope identifiers must be non-empty")
         if len(set(value)) != len(value):
-            raise ValueError("allowed scope identifiers must be unique")
+            raise ValueError("allowed scope identifiers must be unique within a scope")
         return value
 
     @property
@@ -96,17 +106,22 @@ class AuthorizationContext(StrictContract):
         return _contract_checksum(self)
 
 
-# The one and only deny reason: unavailable, malformed, stale and out-of-scope
-# authorization must not be distinguishable from each other.
+# The one and only PUBLIC deny reason.  Internal audit and metrics MAY record a
+# precise cause (provider-unavailable, malformed-backend-response,
+# agent-disabled, stale-revision, scope-denied); the user-visible decision must
+# not distinguish them.
 AUTHORIZATION_DENIED_REASON: Literal["authorization_denied"] = "authorization_denied"
 
 
 class AuthorizationDecision(StrictContract):
     """Fail-closed authorization outcome taken against one opaque revision.
 
-    A deny never carries a revision or a cause-specific reason, so every deny
-    produces identical bytes: an unauthorized-but-existing resource and a
-    non-existent one are indistinguishable (no existence oracle).
+    A deny never carries a revision and its reason is pinned to the single
+    canonical literal, so every PUBLIC deny serializes identically: an
+    unauthorized-but-existing resource and a non-existent one are
+    indistinguishable to the caller (no existence oracle).  Internal audit and
+    metrics MAY distinguish causes; that detail does not belong in this
+    user-visible field.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -143,27 +158,63 @@ def evaluate_authorization(
     context: AuthorizationContext | None,
     *,
     expected_revision: str | None,
+    requested_scope_level: ScopeLevel | None = None,
     requested_scope_id: str | None = None,
 ) -> AuthorizationDecision:
-    """Collapse every authorization failure into one indistinguishable deny.
+    """Decide one request against the trusted Backend authorization snapshot.
 
     context must be server-derived.  Any value that is not an
     AuthorizationContext -- None, a malformed payload, or a lookalike object --
-    is treated as absent.  A missing or mismatched expected_revision covers
-    stale or revision-mismatched authorization.  An empty allowed_scope_ids or
-    a requested_scope_id outside the allowed set covers out-of-scope access.
-    All of them return the same AUTHORIZATION_DENIED object, so no caller can
-    observe a difference and the function never raises.
+    is treated as absent.  The function never raises.
+
+    Two revision cases are distinct:
+
+    * INITIAL REQUEST -- expected_revision is None because no revision has been
+      bound yet.  Absence of a prior revision is not a denial: the fresh
+      context's authorization_revision is authoritative, so evaluate
+      agent_enabled, non-empty allowed_scope_ids and requested-id membership
+      normally and allow if they pass.  The returned revision is then
+      propagated into plan, receipt and checkpoint artifacts.
+    * RESUME / CONTINUATION / HITL REVALIDATION -- a previously bound revision
+      IS supplied as expected_revision.  The freshly fetched
+      context.authorization_revision must equal it; a mismatch fails closed so
+      revocation is honoured.
+
+    Callers must NOT pass expected_revision=context.authorization_revision to
+    satisfy the resumed case: that is tautological and destroys revocation and
+    revalidation semantics.  On an initial request pass None explicitly.
+
+    Scope membership is TYPED.  A requested_scope_id is evaluated only when the
+    matching requested_scope_level is supplied and equals context.scope_level;
+    supplying exactly one of the two is a deny.  Raw ids are opaque and are not
+    assumed globally unique across levels, so an id alone can never prove
+    membership: asking for TEAM id "12" must not match an area context whose
+    allowed ids happen to contain "12".  This primitive infers no ancestors,
+    descendants, siblings, area-to-team or team-to-employee relation and no
+    legacy org_type mapping.  A higher- or lower-level business query is
+    authorised later through the trusted Backend effective scope plus
+    RelationCoverage and typed relation binding -- never by guessing here.
+
+    Every failure -- absent, malformed, agent-disabled, empty scope,
+    stale-revision, an unpaired or cross-level scope request, or a requested id
+    outside the trusted set -- returns the same canonical AUTHORIZATION_DENIED,
+    so the PUBLIC decision is indistinguishable to the caller.  Internal audit
+    and metrics MAY record the precise cause.
     """
 
     if not isinstance(context, AuthorizationContext) or not context.agent_enabled:
         return AUTHORIZATION_DENIED
     if not context.allowed_scope_ids:
         return AUTHORIZATION_DENIED
-    if expected_revision is None or context.authorization_revision != expected_revision:
+    if expected_revision is not None and context.authorization_revision != expected_revision:
         return AUTHORIZATION_DENIED
-    if requested_scope_id is not None and requested_scope_id not in context.allowed_scope_ids:
+    if (requested_scope_level is None) != (requested_scope_id is None):
         return AUTHORIZATION_DENIED
+    if requested_scope_level is not None and requested_scope_id is not None:
+        if requested_scope_level != context.scope_level:
+            return AUTHORIZATION_DENIED
+        if requested_scope_id not in context.allowed_scope_ids:
+            return AUTHORIZATION_DENIED
     return AuthorizationDecision(
         outcome="allow",
         authorization_revision=context.authorization_revision,
