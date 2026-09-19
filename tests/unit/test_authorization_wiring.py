@@ -5,7 +5,8 @@ runtime_config, read back through the pure accessor, and evaluated with the
 slice-1 evaluate_authorization rule.  The execution-receipt binder is driven by
 an explicit AuthorizationDecision, never by the configurable mapping, so the
 receipt revision is PROVEN by an ALLOW rather than read off config.  No Backend,
-no network, no Docker, and no existing test or fixture is touched.
+no network, no Docker; no other test module and no shared fixture is modified
+(tests/metric_fixtures.py is untouched).
 """
 
 from __future__ import annotations
@@ -382,8 +383,8 @@ def test_deny_decision_cannot_produce_an_authorization_stamped_receipt() -> None
 
 def test_disabled_context_in_config_cannot_by_itself_stamp_a_receipt() -> None:
     # D. A valid but agent_enabled=False context is really present in the
-    # authoritative carrier, yet presence alone proves nothing: the seam denies it
-    # and the decision-driven binder has no ALLOW to stamp.
+    # authoritative carrier, yet presence alone proves nothing: the seam denies
+    # it, and the binder REJECTS that actual deny instead of stamping a receipt.
     configurable = _configurable(_authorization(agent_enabled=False))
     assert AUTHORIZATION_CONFIG_KEY in configurable
     decision = evaluate_config_authorization(
@@ -393,5 +394,6 @@ def test_disabled_context_in_config_cannot_by_itself_stamp_a_receipt() -> None:
     )
     assert decision == AUTHORIZATION_DENIED
     receipt = _receipt()
-    assert bind_execution_receipt_authorization(receipt, None) is receipt
+    with pytest.raises(ValueError, match="deny decision"):
+        bind_execution_receipt_authorization(receipt, decision)
     assert receipt.authorization_revision is None
