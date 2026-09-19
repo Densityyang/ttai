@@ -28,6 +28,10 @@ from src.nl2sql.orchestration.execution import (
     PreparedMetricStep,
 )
 from src.nl2sql.orchestration.planning import PlanValidator
+from src.nl2sql.ownership import (
+    bind_execution_receipt_authorization,
+    runtime_configurable,
+)
 from src.nl2sql.semantic.metric_contract import (
     ContractId,
     FrozenContract,
@@ -622,6 +626,9 @@ class GatewayMetricStepRunner:
             data_as_of=current.freshness.data_as_of if current.freshness else None,
         )
         receipt = type(result.execution_receipt).model_validate(payload)
+        # Bind the request's authorization revision onto the execution receipt
+        # surface when one is carried; absent authorization leaves it unchanged.
+        receipt = bind_execution_receipt_authorization(receipt, runtime_configurable())
         output: dict[str, JsonValue] = {
             "rows": rows,
             "no_data": not rows or (query.operation == "ratio"

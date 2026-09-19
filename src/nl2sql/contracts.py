@@ -47,14 +47,22 @@ class RequestContext(StrictContract):
     thread_id: UUID
     trace_id: str = Field(min_length=1, max_length=256)
     deadline_ms: int = Field(default=30_000, ge=1, le=120_000)
+    # Optional on purpose: a request that carries no authorization keeps the
+    # pre-existing runtime-configurable path unchanged.  Fail-closed
+    # enforcement applies only where authorization is actually REQUIRED
+    # downstream.
+    authorization: AuthorizationContext | None = None
 
 
 class AuthorizationContext(StrictContract):
     """Backend-owned effective authorization snapshot for one Agent request.
 
-    Every field is derived server-side from Backend/DB truth; tt-ai only
-    consumes the final Agent-facing vocabulary and never reinterprets a legacy
-    organization type.  authorization_revision is an opaque non-blank token.
+    The business fields -- authorization_revision, agent_enabled, scope_level
+    and allowed_scope_ids -- are derived server-side from Backend/DB truth;
+    tt-ai only consumes the final Agent-facing vocabulary and never
+    reinterprets a legacy organization type.  authorization_revision is an
+    opaque non-blank token.  schema_version is NOT Backend/DB-derived: it is
+    tt-ai contract metadata that versions this Agent-boundary shape itself.
 
     scope_level is consumed verbatim: tt-ai owes no hierarchy, ancestor,
     sibling or employee-scope derivation, and no user-to-role resolution --
@@ -104,6 +112,11 @@ class AuthorizationContext(StrictContract):
     @property
     def checksum(self) -> str:
         return _contract_checksum(self)
+
+
+# RequestContext is declared before AuthorizationContext, so its forward
+# reference is bound here, once AuthorizationContext exists in this namespace.
+RequestContext.model_rebuild()
 
 
 # The one and only PUBLIC deny reason.  Internal audit and metrics MAY record a
@@ -731,6 +744,11 @@ class ExecutionReceipt(StrictContract):
     sql_fingerprint: str = ""
     policy_version: str = ""
     policy_outcome: Literal["allow", "deny"] = "deny"
+    authorization_revision: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+    )
     rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     data_as_of: datetime | None = None
     freshness_status: Literal["fresh", "stale", "unknown"] = "unknown"
