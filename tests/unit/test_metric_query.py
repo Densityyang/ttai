@@ -701,41 +701,57 @@ async def test_no_authorization_signature_matches_the_pre_2b_payload() -> None:
 
 
 @pytest.mark.asyncio
-async def test_authorized_compile_receipt_never_takes_the_context_revision() -> None:
-    # FIX 2: R12 as a TESTED invariant.  The compiled authority carries the
-    # context revision for replay binding, but an ExecutionReceipt only ever gets
-    # a revision through bind_execution_receipt_authorization on a real ALLOW --
-    # never by copying the context.
+async def test_authorized_receipt_is_stamped_from_the_allow_decision() -> None:
+    # S1c A5 (this test DELIBERATELY replaces the slice-2A pin that asserted the
+    # receipt stayed unstamped).  The compiled authority still carries the
+    # context revision for replay binding, but the ExecutionReceipt now gets its
+    # provenance from the EXISTING binder on a real explicit ALLOW -- never by
+    # copying the context field.  The unauthorized execution stays unstamped, so
+    # the two are distinguishable.
     from src.nl2sql.ownership import bind_execution_receipt_authorization
 
     authority = _area_team_authority()
-    gateway = QueryGateway(async_sessionmaker(), schema="ai_views")
-    runner = GatewayMetricStepRunner(
-        authority.compiler(authorization=_auth("area", ("area-1",))), gateway
+
+    async def _run(compiler) -> tuple[CompiledMetricQuery, object]:
+        gateway = QueryGateway(async_sessionmaker(), schema="ai_views")
+        runner = GatewayMetricStepRunner(compiler, gateway)
+        plan = authority.plan()
+        prepared = await runner.prepare(
+            step=FetchMetricStep(step_id="fetch", metric_keys=plan.metric_keys),
+            query_plan=plan,
+            context=authority.context,
+        )
+        query = prepared.payload
+        assert isinstance(query, CompiledMetricQuery)
+        gateway.execute = AsyncMock(return_value=QueryReceipt(
+            accepted=True, sql=query.sql, sql_fingerprint=prepared.sql_fingerprint,
+            rows=[{"value": 1}], row_count=1, policy_outcome="allow", max_rows=200,
+        ))
+        result = await runner.execute(prepared, timeout_ms=1000)
+        return query, result.receipt
+
+    authorized_query, authorized_receipt = await _run(
+        authority.compiler(authorization=_auth("area", ("area-1",)))
     )
-    plan = authority.plan()
-    prepared = await runner.prepare(
-        step=FetchMetricStep(step_id="fetch", metric_keys=plan.metric_keys),
-        query_plan=plan,
-        context=authority.context,
+    assert authorized_query.authorization_revision == "rev-1"
+    assert authorized_receipt.authorization_revision == "rev-1"
+    assert "rev-1" in authorized_receipt.model_dump_json()
+
+    # No injected authorization => no ALLOW decision => NO provenance stamped.
+    plain_query, plain_receipt = await _run(authority.compiler())
+    assert plain_query.authorization_revision is None
+    assert plain_receipt.authorization_revision is None
+    assert "rev-1" not in plain_receipt.model_dump_json()
+    assert (
+        authorized_receipt.authorization_revision
+        != plain_receipt.authorization_revision
     )
-    query = prepared.payload
-    assert isinstance(query, CompiledMetricQuery)
-    assert query.authorization_revision == "rev-1"
-    gateway.execute = AsyncMock(return_value=QueryReceipt(
-        accepted=True, sql=query.sql, sql_fingerprint=prepared.sql_fingerprint,
-        rows=[{"value": 1}], row_count=1, policy_outcome="allow", max_rows=200,
-    ))
-    result = await runner.execute(prepared, timeout_ms=1000)
-    assert result.receipt is not None
-    assert result.receipt.authorization_revision is None
-    assert "rev-1" not in result.receipt.model_dump_json()
-    # No decision => the ORIGINAL receipt object, still unstamped.
-    assert bind_execution_receipt_authorization(result.receipt, None) is result.receipt
-    # Only an explicit ALLOW decision stamps a revision.
+
+    # The binder is the single seam: no decision is a no-op, a deny raises.
+    assert bind_execution_receipt_authorization(plain_receipt, None) is plain_receipt
     allowed = AuthorizationDecision(outcome="allow", authorization_revision="rev-1")
-    bound = bind_execution_receipt_authorization(result.receipt, allowed)
+    bound = bind_execution_receipt_authorization(plain_receipt, allowed)
     assert bound.authorization_revision == "rev-1"
-    assert result.receipt.authorization_revision is None
+    assert plain_receipt.authorization_revision is None
     with pytest.raises(ValueError, match="deny decision"):
-        bind_execution_receipt_authorization(result.receipt, AUTHORIZATION_DENIED)
+        bind_execution_receipt_authorization(plain_receipt, AUTHORIZATION_DENIED)

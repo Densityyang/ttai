@@ -7,6 +7,7 @@ x-product-api: &product-api
     TT_API_BASE_URL: ${TT_API_BASE_URL:?TT_API_BASE_URL must be set for product}
     CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS must be set for product}
     CODEACT_MODE: disabled
+    TYPED_RUNTIME_ACTIVATION: disabled
     ENABLE_DYNAMIC_CALC: "false"
     DATABASE_URL_FILE: /run/secrets/business_ro_database_url
     CONTROL_DATABASE_URL_FILE: /run/secrets/control_app_database_url

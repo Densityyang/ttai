@@ -92,6 +92,22 @@ class Settings(BaseSettings):
         default="nl2sql:stream",
         description="stream ????????",
     )
+    # Deployment-level typed-runtime activation.  "disabled" (the default) keeps
+    # the EXISTING v2 product path and leaves the typed runtime DORMANT.  The
+    # ONLY enabling value is "trusted_backend_authorization", which requires the
+    # trusted Backend Agent AuthorizationContext carrier to be configured.  There
+    # is deliberately no generic boolean "security off" switch and no
+    # per-request bypass: the decision is taken once, deployment-wide, when the
+    # engine is built.
+    typed_runtime_activation: Literal[
+        "disabled", "trusted_backend_authorization"
+    ] = Field(
+        default="disabled",
+        description=(
+            "Deployment-level typed-runtime activation; the only enabling value "
+            "is trusted_backend_authorization."
+        ),
+    )
     api_port: int = Field(default=9001, description="API ????")
     service_mode: Literal["infra-dev", "product"] = Field(default="infra-dev")
     model_required: bool = Field(default=False)
@@ -176,6 +192,12 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
+
+    @property
+    def typed_runtime_enabled(self) -> bool:
+        """True only for a deployment that enabled the trusted typed path."""
+
+        return self.typed_runtime_activation == "trusted_backend_authorization"
 
 
 @lru_cache

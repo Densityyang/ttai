@@ -193,14 +193,18 @@ def evaluate_authorization(
       agent_enabled, non-empty allowed_scope_ids and requested-id membership
       normally and allow if they pass.  The returned revision is then
       propagated into plan, receipt and checkpoint artifacts.
-    * RESUME / CONTINUATION / HITL REVALIDATION -- a previously bound revision
-      IS supplied as expected_revision.  The freshly fetched
-      context.authorization_revision must equal it; a mismatch fails closed so
-      revocation is honoured.
+    * RESUME / CONTINUATION / HITL -- a previously bound revision IS supplied
+      as expected_revision for RUN-BOUND CONSISTENCY.  Authorization is resolved
+      once at run start and BOUND to that run; the supplied context must be the
+      SAME snapshot originally bound to the run.  A mismatch is a run-binding
+      failure.  This is NOT a fresh Backend fetch and must NEVER trigger a
+      revocation or a live revalidation of an in-flight run.
 
-    Callers must NOT pass expected_revision=context.authorization_revision to
-    satisfy the resumed case: that is tautological and destroys revocation and
-    revalidation semantics.  On an initial request pass None explicitly.
+    Callers resolve authorization once at run start and BIND that snapshot to the
+    run; expected_revision is then the run-bound revision restored from run state
+    (None only when no revision was bound).  Passing the context's own revision
+    merely to manufacture a fresh check is tautological and is not a substitute
+    for run binding.
 
     Scope membership is TYPED.  A requested_scope_id is evaluated only when the
     matching requested_scope_level is supplied and equals context.scope_level;
