@@ -13,6 +13,7 @@ from langchain_openai import OpenAIEmbeddings
 from src.core.settings import ROOT_DIR, get_settings
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.infra.store.semantic_rag import parse_semantic_markdown
+from src.nl2sql.observability.content_policy import contains_technical_secret
 from src.nl2sql.semantic.registry import (
     ControlSemanticReleasePublisher,
     SemanticDocument,
@@ -51,6 +52,13 @@ async def attach_embeddings(
     documents: list[SemanticDocument],
 ) -> tuple[list[SemanticDocument], dict[str, object]]:
     """Build candidate embeddings without making the indexer unavailable on provider failure."""
+    # Embedding egress: refuse to send technical secrets to the embedding
+    # provider.  A detected secret degrades the release instead of leaking.
+    if contains_technical_secret([document.content for document in documents]):
+        return documents, {
+            "embedding_status": "degraded",
+            "embedding_error": "EmbeddingEgressSecretDetected",
+        }
     config = get_agent_config()
     embedder = OpenAIEmbeddings(
         api_key=config.embedding_api_key,

@@ -100,3 +100,37 @@ def test_trace_schema_redacts_sensitive_attributes_and_covers_all_stages() -> No
     assert all(event.attributes["prompt_hash"] == "a" * 64 for event in trace.events)
     assert all(event.attributes["prompt_version"] == "prompt-v1" for event in trace.events)
     assert TraceEvent.model_validate(trace.events[0]).trace_id == "trace-1"
+
+def test_trace_envelope_scrubs_technical_secrets_value_level() -> None:
+    trace = TraceEnvelope(trace_id="trace-1")
+
+    event = trace.record(
+        "answer",
+        "observed",
+        note="password = 'hunter2'",
+        nested={"credential": "postgresql://svc:hunter2@db/app"},
+    )
+
+    assert event.attributes["note"] == "[REDACTED]"
+    assert "hunter2" not in event.attributes["nested"]["credential"]
+    assert event.attributes["nested"]["credential"].startswith("[REDACTED]")
+
+
+@pytest.mark.asyncio
+async def test_control_audit_scrubs_technical_secrets_before_persisting() -> None:
+    connection = _Connection()
+    store = ControlAuditStore(connection)
+    event = TraceEvent(
+        trace_id="trace-1",
+        stage="answer",
+        name="observed",
+        attributes={"note": "password = 'hunter2'", "answer": "revenue 100"},
+    )
+
+    await store.append(event)
+
+    audit_payload = connection.calls[0][1][5]
+    outbox_payload = connection.calls[1][1][4]
+    assert "hunter2" not in audit_payload
+    assert "hunter2" not in outbox_payload
+    assert "revenue 100" in audit_payload

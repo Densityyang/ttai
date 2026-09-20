@@ -858,6 +858,13 @@ class ModelRequest(StrictContract):
     data_classification: ModelDataClassification
     prompt_version: str = Field(min_length=1, max_length=128)
     plan_reason: str | None = Field(default=None, max_length=1024)
+    # Optional run-bound authorization snapshot identity carried for provenance.
+    # It is NOT re-evaluated here and is never authoritative on the model path.
+    authorization_revision: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+    )
 
 
 class ModelFailure(StrictContract):
@@ -891,6 +898,14 @@ class ModelReceipt(StrictContract):
     )
     content: str = ""
     estimated_cost: float = Field(default=0, ge=0)
+    # P2-S2 egress evidence: the exact policy version/checksum that authorised
+    # the resolved target, the outcome actually taken, any secret categories the
+    # gate matched, and a stable digest of the request payload it evaluated.
+    model_input_policy_version: str = Field(min_length=1, max_length=128)
+    model_input_policy_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    egress_outcome: Literal["allow", "deny"] = "allow"
+    matched_categories: tuple[str, ...] = Field(default=(), max_length=16)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("usage")
     @classmethod
@@ -898,6 +913,39 @@ class ModelReceipt(StrictContract):
         if any(not key or amount < 0 for key, amount in value.items()):
             raise ValueError("model usage keys must be non-empty and values non-negative")
         return value
+
+
+class ModelInputDecision(StrictContract):
+    """One resolved model target's pre-egress ModelInputPolicy outcome.
+
+    The decision is TARGET-SCOPED: the same request evaluates independently for
+    the primary and for the fallback, and a permitted primary never implies a
+    permitted fallback.  A deny carries matched secret categories but never a
+    raw value; an allow never carries a category.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    outcome: Literal["allow", "deny"]
+    reason: str | None = Field(default=None, min_length=1, max_length=128)
+    policy_version: str = Field(min_length=1, max_length=128)
+    policy_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    policy_state: PolicyLifecycle
+    target_provider: str = Field(min_length=1, max_length=128)
+    target_model: str = Field(min_length=1, max_length=256)
+    matched_categories: tuple[str, ...] = Field(default=(), max_length=16)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> ModelInputDecision:
+        if self.outcome == "deny":
+            if self.reason is None:
+                raise ValueError("deny model input decision requires a reason")
+        elif self.reason is not None:
+            raise ValueError("allow model input decision cannot carry a reason")
+        elif self.matched_categories:
+            raise ValueError("allow model input decision cannot match categories")
+        return self
 
 
 def _contract_checksum(contract: BaseModel) -> str:
