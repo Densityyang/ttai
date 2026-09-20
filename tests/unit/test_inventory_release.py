@@ -360,7 +360,7 @@ def test_old_contract_bridge_walks_through_pending_and_active_contracts() -> Non
 
     active = bridge_metric_contract(
         active_content,
-        relations={"complaint_orders": RELATION},
+        relations={active_contract.source_ref: RELATION},
         inventory=snapshot,
         relation_columns=RELATION_COLUMNS,
     )

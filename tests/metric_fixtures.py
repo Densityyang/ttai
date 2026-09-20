@@ -91,7 +91,10 @@ class MetricAuthority:
         self.snapshot: SchemaSnapshot | None = SchemaSnapshot(
             SNAPSHOT_ID, SchemaSnapshotState.VALIDATED, candidate, {"ok": True}, NOW, NOW,
         )
-        ir = metric_catalog_ir(MetricCatalog(metrics=(self.metric,)), relations={"complaint_orders": RELATION})
+        # Synthetic fixture: the physical relation name is EXPLICITLY
+        # overridden to complaint_orders while source_ref follows the published
+        # metric vocabulary (V1: source_ref == AIViewsConfig.views[].name).
+        ir = metric_catalog_ir(MetricCatalog(metrics=(self.metric,)), relations={self.metric.source_ref: RELATION})
         report = validate_authoring_ir(ir, relation_columns={RELATION: types})
         assert report.ok, report.to_dict()
         release_candidate = materialize_authoring_ir(ir, report)
@@ -104,7 +107,7 @@ class MetricAuthority:
             schema_snapshot_checksum=candidate.checksum,
         )
         self.binding = RelationBinding(
-            source_ref="complaint_orders", relation_asset_id=relation_asset.asset_id,
+            source_ref=self.metric.source_ref, relation_asset_id=relation_asset.asset_id,
             schema_name="ai_views", relation_name="complaint_orders",
             allowed_columns=tuple(types), required_permissions=("metrics:read",), approved=True,
             timestamp_kind="timestamptz" if timestamptz else "timestamp",

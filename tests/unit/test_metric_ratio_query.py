@@ -63,7 +63,7 @@ def test_ratio_seed_and_authoring_preserve_target_and_pending_governance() -> No
         ("is_first_response_on_time", "is_true"),
     ]
     active = ratio_contract()
-    ir = metric_catalog_ir(MetricCatalog(metrics=(active,)), relations={"complaint_orders": "ai_views.complaint_orders"})
+    ir = metric_catalog_ir(MetricCatalog(metrics=(active,)), relations={active.source_ref: "ai_views.complaint_orders"})
     assert "is_first_response_on_time" in ir.metrics[0].source_columns
     assert ir.metrics[0].execution_contract == active.model_dump(mode="json")
     other = ratio_contract(metric_key="complaint_other_ratio", formula_version="complaint_other_ratio.v1")

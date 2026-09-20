@@ -144,12 +144,28 @@ class SourceFreshnessRecord(FrozenContract):
 
 
 class RelationBinding(FrozenContract):
+    """Typed execution object binding an executable metric to one relation.
+
+    V1 construction source: (1) the published legacy AI-view deployment
+    (``configs/semantic/ai_views.yaml``), (2) the active SemanticRelease and
+    (3) the release-bound validated SchemaSnapshot.  ``approved`` is retained as
+    ``Literal[True]`` for contract compatibility, but its V1 meaning is
+    "constructed from a Backend-published deployment relation" -- NOT "a human
+    approved this inside Agent".  There is no approval attestation, approval
+    record, approval lookup or approval workflow here; Backend/data publication
+    is the authority boundary (O3).
+    """
+
     source_ref: ContractId
     relation_asset_id: str = Field(min_length=1)
     schema_name: Identifier
     relation_name: Identifier
     allowed_columns: tuple[Identifier, ...] = Field(min_length=1)
-    required_permissions: tuple[str, ...] = Field(min_length=1)
+    # V1 has NO extra relation-level permission layer.  The metric-level
+    # Backend-provided entry permission (MetricContract.required_permissions)
+    # stays authoritative; this field defaults to an EMPTY tuple and must never
+    # duplicate ``nl2sql:invoke`` into a second binding-level permission gate.
+    required_permissions: tuple[str, ...] = ()
     approved: Literal[True]
     timestamp_kind: Literal["timestamp", "timestamptz"]
     max_days: int = Field(default=366, ge=1, le=3660)
