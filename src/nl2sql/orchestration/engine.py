@@ -43,6 +43,7 @@ from src.nl2sql.orchestration.budget import (
     should_stop,
 )
 from src.nl2sql.orchestration.execution import PlanExecutor
+from src.nl2sql.orchestration.grounding import ground_execution_answer
 from src.nl2sql.orchestration.planning import (
     ContextResolver,
     PlanCompiler,
@@ -780,6 +781,11 @@ def create_v2_engine(
             ),
         )
         record = result.record
+        # S1d: the executor's request-local outputs map is the ONLY grounding
+        # material (records carry only receipts).  It is captured here and used
+        # in this node only; it must never enter engine state, a checkpoint or a
+        # message.  Only the rendered answer text below may persist.
+        outputs = result.outputs
         trace.record(
             "sql",
             "typed_plan_executed",
@@ -798,21 +804,28 @@ def create_v2_engine(
             "budget_record": route_budget.checkpoint_record().model_dump(mode="json"),
         }
         if record.status == "succeeded":
-            answer = "Typed execution completed. Grounded answer rendering is pending."
+            # Deterministic grounded renderer, request-local.  No model call,
+            # no confidence and no ungrounded unit are ever emitted.
+            grounded = ground_execution_answer(
+                query_plan=query_plan,
+                execution_plan=execution_plan,
+                record=record,
+                outputs=outputs,
+            )
             trace.record(
                 "answer",
                 "typed_execution_completed",
-                answer_hash=fingerprint(answer),
+                answer_hash=fingerprint(grounded.answer_text),
                 execution_plan_checksum=record.execution_plan_checksum,
                 route=route,
                 model_calls=route_budget.model_calls,
             )
             response.update(
                 {
-                    "messages": [AIMessage(content=answer)],
+                    "messages": [AIMessage(content=grounded.answer_text)],
                     "degradation_flags": _degradation_flags(
                         state,
-                        "GroundedAnswerPending",
+                        *grounded.artifact.degradation_flags,
                     ),
                 }
             )

@@ -23,6 +23,10 @@ SourceDegradation = Literal[
     "metric_dimension_combination_unsupported", "metric_aggregate_sla_missing",
     "metric_freshness_evidence_invalid", "metric_freshness_authority_mismatch",
 ]
+# Deterministic evidence/verification indication band.  No producer exists for
+# the typed execution path yet, so every carrier defaults to absent rather than
+# fabricating a band.
+ConfidenceBand = Literal["low", "medium", "high"]
 # Final Agent-facing scope vocabulary owned by Backend/DB; tt-ai only consumes it.
 ScopeLevel = Literal["city_company", "area", "team", "employee"]
 
@@ -772,10 +776,58 @@ class ExecutionReceipt(StrictContract):
     semantic_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
+class AnswerFact(StrictContract):
+    """One grounded value projected from request-local execution evidence.
+
+    Only fields proven by a successful step receipt or the request-local step
+    output are populated.  Descriptive fields (unit, time range, dimension,
+    quality, freshness explanation, confidence) default to absent: no scope,
+    unit, time, dimension, category, quality or provenance plumbing is added in
+    this slice, and nothing may be fabricated to satisfy the schema.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    fact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    step_id: PlanStepId
+    metric_key: str = Field(min_length=1, max_length=256)
+    status: Literal["grounded", "unavailable"] = "grounded"
+    value: JsonValue = None
+    rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    output_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    semantic_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    data_as_of: datetime | None = None
+    freshness_status: Literal["fresh", "stale", "unknown"] = "unknown"
+    source_kind: Literal["approved_aggregate", "approved_detail"] | None = None
+    selection_reason: Literal[
+        "fresh_approved_aggregate", "approved_detail_fallback", "approved_detail"
+    ] | None = None
+    source_degradation: tuple[SourceDegradation, ...] = ()
+    # Descriptive fields: evidence absent -> absent, never synthesised.
+    unit: str | None = None
+    time_range: TimeRange | None = None
+    dimension: str | None = None
+    quality: str | None = None
+    freshness_explanation: str | None = None
+    confidence_band: ConfidenceBand | None = None
+
+    @model_validator(mode="after")
+    def validate_unavailable_carries_no_value(self) -> AnswerFact:
+        if self.status == "unavailable" and self.value is not None:
+            raise ValueError("unavailable answer fact cannot carry a value")
+        return self
+
+
 class AnswerArtifact(StrictContract):
+    """Request-local grounded projection; only its rendered text is persisted."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    facts: tuple[AnswerFact, ...] = ()
     blocks: list[dict[str, Any]] = Field(default_factory=list)
     data_reference: str | None = None
-    confidence: float = Field(ge=0, le=1)
+    confidence_band: ConfidenceBand | None = None
     citations: tuple[str, ...] = ()
     degradation_flags: tuple[str, ...] = ()
 
