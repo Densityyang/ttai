@@ -35,6 +35,27 @@ class BackendAuthorizationProvider(Protocol):
         ...
 
 
+async def resolve_authorization_context(
+    provider: BackendAuthorizationProvider | None,
+    user: AuthUser,
+) -> AuthorizationContext | None:
+    """Resolve the trusted Backend authorization context, fail-closed to None.
+
+    An absent provider, a None result, any provider exception, and a
+    malformed/lookalike payload all collapse to the same None.  A real
+    AuthorizationContext is returned VERBATIM: no scope inference, no role
+    inference, and no authorization_revision synthesis happen here.
+    """
+
+    if provider is None:
+        return None
+    try:
+        loaded = await provider.load(user)
+    except Exception:
+        return None
+    return loaded if isinstance(loaded, AuthorizationContext) else None
+
+
 async def load_authorization(
     provider: BackendAuthorizationProvider,
     user: AuthUser,
@@ -51,13 +72,7 @@ async def load_authorization(
     read from client input.
     """
 
-    context: AuthorizationContext | None
-    try:
-        loaded = await provider.load(user)
-    except Exception:
-        context = None
-    else:
-        context = loaded if isinstance(loaded, AuthorizationContext) else None
+    context = await resolve_authorization_context(provider, user)
     return evaluate_authorization(
         context,
         expected_revision=expected_revision,

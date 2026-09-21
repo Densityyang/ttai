@@ -13,6 +13,10 @@ from langgraph.types import Command
 from pydantic import Field, model_validator
 
 from src.core.auth.dependencies import require_nl2sql_permission
+from src.core.auth.provider import (
+    BackendAuthorizationProvider,
+    resolve_authorization_context,
+)
 from src.core.auth.types import AuthUser
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import ErrorEnvelope, RequestContext, RequestIdentity, StrictContract
@@ -132,6 +136,54 @@ def _request_context(request: Request, auth_user: AuthUser, thread_id: UUID) -> 
     )
 
 
+def _authorization_provider_from_request(
+    request: Request,
+) -> BackendAuthorizationProvider | None:
+    """Return the app-scoped Backend authorization provider, or None.
+
+    Total/fail-closed: an absent container, an absent or non-callable accessor,
+    an accessor returning None, and an accessor that RAISES all collapse to the
+    same None, so the trusted boundary has ONE unavailable-source behavior.  A
+    provider-like object is returned and resolve_authorization_context decides
+    whether load() yields a valid AuthorizationContext.
+    """
+
+    container = getattr(request.app.state, "container", None)
+    accessor = getattr(container, "get_backend_authorization_provider", None)
+    if not callable(accessor):
+        return None
+    try:
+        provider = accessor()
+    except Exception:
+        return None
+    return cast(BackendAuthorizationProvider | None, provider)
+
+
+async def _new_run_request_context(
+    request: Request,
+    auth_user: AuthUser,
+    thread_id: UUID,
+) -> RequestContext:
+    """Build a NEW-run RequestContext, resolving trusted authorization ONCE.
+
+    Only the routes that create a new graph run use this.  Existing-run and read
+    routes keep the pure base _request_context, so thread/history/action/
+    feedback never trigger a fresh Backend authorization fetch; the engine stays
+    the sole in-run authority read and restores the bound snapshot.
+    """
+
+    identity = _request_identity(request, auth_user)
+    authorization = await resolve_authorization_context(
+        _authorization_provider_from_request(request), auth_user
+    )
+    return RequestContext(
+        identity=identity,
+        thread_id=thread_id,
+        trace_id=request.headers.get("x-trace-id") or str(identity.request_id),
+        authorization=authorization,
+    )
+
+
 def _runtime_config(context: RequestContext) -> RunnableConfig:
     config = cast(RunnableConfig, runtime_config(context))
     agent_config = get_agent_config()
@@ -220,7 +272,7 @@ def register_v2_routes(app: FastAPI) -> None:
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> QueryResponse:
         thread_id = body.thread_id or uuid4()
-        context = _request_context(request, auth_user, thread_id)
+        context = await _new_run_request_context(request, auth_user, thread_id)
         config = _runtime_config(context)
         result = await (await _engine_from_request(request)).ainvoke(
             {"messages": [message.model_dump() for message in body.messages]}, config
@@ -234,7 +286,7 @@ def register_v2_routes(app: FastAPI) -> None:
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> StreamingResponse:
         thread_id = body.thread_id or uuid4()
-        context = _request_context(request, auth_user, thread_id)
+        context = await _new_run_request_context(request, auth_user, thread_id)
         config = _runtime_config(context)
         return StreamingResponse(
             _stream_query(
