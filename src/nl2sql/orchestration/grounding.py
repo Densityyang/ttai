@@ -13,6 +13,11 @@ and never one fact per raw row.  A per-row rule is deliberately NOT used:
 output rows are schemaless and carry no stable per-row identity that could be
 grounded, so a row-derived fact id would not be reproducible.
 
+Internal dependency fetches are excluded: a fetch step that declares a trusted
+calculation input role supplies one governed calculation input, not a requested
+answer.  Only the bound calculation's own receipt grounds the canonical metric,
+so the requested value has exactly ONE authority and exactly one fact.
+
 Confidence (open choice a): confidence_band is always absent.  No deterministic
 producer for a band exists anywhere in src, and the planning specification bans
 model-authored or fabricated confidence, so the honest value is None rather
@@ -105,6 +110,10 @@ def build_answer_facts(
         if receipt.status != "succeeded" or receipt.kind != "fetch_metric":
             continue
         step = steps_by_id.get(receipt.step_id)
+        if isinstance(step, FetchMetricStep) and step.calculation_input_role is not None:
+            # An internal dependency fetch feeds one trusted calculation input
+            # role; it is never a grounded answer fact for the requested metric.
+            continue
         metric_keys = (
             step.metric_keys
             if isinstance(step, FetchMetricStep)
@@ -121,6 +130,21 @@ def build_answer_facts(
                     value=value,
                 )
             )
+    for receipt in record.step_receipts:
+        if receipt.status != "succeeded" or receipt.kind != "trusted_calculation":
+            continue
+        metric_key = receipt.output_metric_key
+        if not metric_key:
+            continue
+        status, value = _project_output(outputs.get(receipt.step_id), metric_key=metric_key)
+        facts.append(
+            _answer_fact(
+                receipt=receipt,
+                metric_key=metric_key,
+                status=status,
+                value=value,
+            )
+        )
     return tuple(facts)
 
 

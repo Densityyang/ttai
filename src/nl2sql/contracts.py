@@ -432,6 +432,19 @@ class FetchMetricStep(StrictContract):
     step_id: PlanStepId
     metric_keys: tuple[str, ...] = Field(min_length=1, max_length=16)
     depends_on: tuple[PlanStepId, ...] = Field(default=(), max_length=16)
+    # Compiler-produced, trusted-binding-derived provenance marking this step as
+    # an INTERNAL dependency fetch feeding one trusted calculation input role.
+    # It never fetches the requested output metric and is never model-authored.
+    # All three fields are present together or absent together.
+    calculation_input_role: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+    )
+    calculation_binding_checksum: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    calculation_output_metric_key: str | None = Field(
+        default=None, min_length=1, max_length=256
+    )
 
     @field_validator("metric_keys", "depends_on")
     @classmethod
@@ -439,6 +452,20 @@ class FetchMetricStep(StrictContract):
         if len(set(value)) != len(value):
             raise ValueError("fetch metric values must be unique")
         return value
+
+    @model_validator(mode="after")
+    def validate_dependency_fetch_provenance(self) -> FetchMetricStep:
+        provenance = (
+            self.calculation_input_role,
+            self.calculation_binding_checksum,
+            self.calculation_output_metric_key,
+        )
+        declared = sum(1 for item in provenance if item is not None)
+        if declared not in (0, len(provenance)):
+            raise ValueError("dependency fetch provenance must be all-or-none")
+        if declared and len(self.metric_keys) != 1:
+            raise ValueError("dependency fetch must project exactly one metric key")
+        return self
 
 
 class TrustedCalculationStep(StrictContract):
@@ -449,6 +476,11 @@ class TrustedCalculationStep(StrictContract):
     template_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
     input_refs: dict[PlanInputName, PlanInputRef] = Field(min_length=1, max_length=32)
     depends_on: tuple[PlanStepId, ...] = Field(min_length=1, max_length=16)
+    # Compiler-produced, trusted-binding-derived provenance.  Never model-authored.
+    template_version: str | None = Field(default=None, min_length=1, max_length=64)
+    template_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    binding_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    output_metric_key: str | None = Field(default=None, min_length=1, max_length=256)
 
     @field_validator("depends_on")
     @classmethod
@@ -459,6 +491,28 @@ class TrustedCalculationStep(StrictContract):
         if len(set(value)) != len(value):
             raise ValueError("calculation dependencies must be unique")
         return value
+
+    @model_validator(mode="after")
+    def validate_binding_provenance(self) -> TrustedCalculationStep:
+        """Canonical binding provenance is all-or-none.
+
+        All absent is the legacy/unbound representation.  All present is a
+        canonical trusted-binding calculation whose ONLY authority is the
+        resolved ApprovedCalculationCatalog binding, never the template
+        allowlist.  A partial set could be confused with either, so it is
+        rejected at contract construction.
+        """
+
+        provenance = (
+            self.template_version,
+            self.template_checksum,
+            self.binding_checksum,
+            self.output_metric_key,
+        )
+        declared = sum(1 for item in provenance if item is not None)
+        if declared not in (0, len(provenance)):
+            raise ValueError("calculation binding provenance must be all-or-none")
+        return self
 
 
 class VerifyStep(StrictContract):
@@ -590,6 +644,11 @@ class PlanStepReceipt(StrictContract):
     source_degradation: tuple[SourceDegradation, ...] = ()
     source_checkpoint: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
     semantic_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    # Calculation provenance (secret-free; no raw SQL, rowsets or values).
+    template_id: str | None = Field(default=None, min_length=1, max_length=128)
+    template_version: str | None = Field(default=None, min_length=1, max_length=64)
+    binding_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    output_metric_key: str | None = Field(default=None, min_length=1, max_length=256)
     error_code: str | None = Field(default=None, min_length=1, max_length=128)
 
     @model_validator(mode="after")

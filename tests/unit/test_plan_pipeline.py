@@ -667,6 +667,71 @@ async def test_trusted_calculation_step_uses_only_the_approved_registry() -> Non
     assert result.outputs["calculate_ratio"] == {"ratio": 2.0}
 
 
+def test_canonical_provenance_cannot_be_authorized_by_a_template_allowlist() -> None:
+    # Canonical metric authority is the resolved trusted binding only.  A step
+    # carrying canonical provenance is DENIED when no catalog is available --
+    # never downgraded to "approval" and never authorized by approved_template_ids.
+    context = _context()
+    plan = _query_plan()
+    fetch = FetchMetricStep(step_id="fetch_metrics", metric_keys=plan.metric_keys)
+    calculate = TrustedCalculationStep(
+        step_id="calculate_metric",
+        template_id="ratio",
+        template_version="1.0",
+        template_checksum="a" * 64,
+        binding_checksum="b" * 64,
+        output_metric_key="metric.revenue_ratio",
+        input_refs={
+            "numerator": "fetch_metrics.numerator",
+            "denominator": "fetch_metrics.denominator",
+        },
+        depends_on=(fetch.step_id,),
+    )
+    verify = VerifyStep(
+        step_id="verify_result",
+        input_refs=(calculate.step_id,),
+        invariant_ids=("typed_result_present",),
+        depends_on=(calculate.step_id,),
+    )
+    execution_plan = ExecutionPlan(
+        query_plan_sha256=plan.checksum,
+        semantic_release_id=context.semantic_release_id,
+        schema_snapshot_id=context.schema_snapshot_id,
+        policy_version="plan-compiler.test.v1",
+        steps=(fetch, calculate, verify),
+    )
+    for validator in (
+        PlanValidator(),
+        PlanValidator(approved_template_ids=frozenset({"ratio"})),
+    ):
+        record = validator.validate_execution_plan(
+            execution_plan=execution_plan,
+            query_plan=plan,
+            context=context,
+            route_budget=RouteBudgetLedger(route="fast").limits,
+        )
+        assert record.outcome == "deny"
+        assert [issue.code for issue in record.issues] == [
+            "trusted_calculation_binding_authority_missing"
+        ]
+
+
+def test_partial_calculation_provenance_is_rejected_at_construction() -> None:
+    base: dict[str, object] = {
+        "step_id": "calculate_metric",
+        "template_id": "ratio",
+        "input_refs": {"numerator": "fetch_metrics.numerator"},
+        "depends_on": ("fetch_metrics",),
+    }
+    for partial in (
+        {"binding_checksum": "b" * 64},
+        {"output_metric_key": "metric.revenue_ratio"},
+        {"template_version": "1.0", "binding_checksum": "b" * 64},
+    ):
+        with pytest.raises(ValidationError):
+            TrustedCalculationStep(**{**base, **partial})
+
+
 @pytest.mark.asyncio
 async def test_plan_executor_propagates_request_cancellation() -> None:
     context = _context()
