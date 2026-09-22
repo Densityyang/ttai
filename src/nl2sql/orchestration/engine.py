@@ -764,6 +764,11 @@ def create_v2_engine(
             execution_validation.outcome != "allow"
             or execution_validation.query_plan_sha256 != query_plan.checksum
             or execution_validation.context_checksum != context.checksum
+            or execution_validation.execution_plan_sha256 != execution_plan.checksum
+            or execution_validation.policy_version
+            != resolved_plan_validator.policy_version
+            or execution_validation.policy_checksum
+            != resolved_plan_validator.policy_checksum
         ):
             stop_reason = route_budget.halt("execution_plan_validation_missing")
             return {
@@ -779,6 +784,9 @@ def create_v2_engine(
             query_plan=query_plan,
             context=context,
             execution_plan=execution_plan,
+            validation=execution_validation,
+            expected_policy_version=resolved_plan_validator.policy_version,
+            expected_policy_checksum=resolved_plan_validator.policy_checksum,
             budget=route_budget,
             deadline_ms=_remaining_route_deadline_ms(
                 state,

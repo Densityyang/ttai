@@ -369,11 +369,16 @@ async def _slice2_execute(
     validation = validator.validate_query_plan(plan=plan, context=authority.context, identity=authority.identity)
     execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
     budget = RouteBudgetLedger(route="standard")
-    assert validator.validate_execution_plan(
+    execution_validation = validator.validate_execution_plan(
         execution_plan=execution, query_plan=plan, context=authority.context, route_budget=budget.limits,
-    ).outcome == "allow"
+    )
+    assert execution_validation.outcome == "allow"
     result = await metric_plan_executor(authority.compiler(), gateway).execute(
-        query_plan=plan, context=authority.context, execution_plan=execution, budget=budget, deadline_ms=10000,
+        query_plan=plan, context=authority.context, execution_plan=execution,
+        validation=execution_validation,
+        expected_policy_version=validator.policy_version,
+        expected_policy_checksum=validator.policy_checksum,
+        budget=budget, deadline_ms=10000,
     )
     assert budget.sql_executions == 1
     return result
@@ -465,8 +470,15 @@ async def test_pr07a_ratio_real_gateway_period_attribution_and_no_widening(
         plan = authority.plan(intent="trend", grain=grain, time_range=TimeRange(start=start, end=end))
         validation = PlanValidator().validate_query_plan(plan=plan, context=authority.context, identity=authority.identity)
         execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
+        execution_validation = PlanValidator().validate_execution_plan(
+            execution_plan=execution, query_plan=plan, context=authority.context,
+            route_budget=RouteBudgetLedger(route="standard").limits,
+        )
         result = await metric_plan_executor(authority.compiler(), gateway).execute(
             query_plan=plan, context=authority.context, execution_plan=execution,
+            validation=execution_validation,
+            expected_policy_version=PlanValidator().policy_version,
+            expected_policy_checksum=PlanValidator().policy_checksum,
             budget=RouteBudgetLedger(route="standard"), deadline_ms=10000,
         )
         assert result.record.status == "succeeded", result.record
@@ -688,13 +700,17 @@ async def test_pr07a_metric_executor_real_gateway_contract(
         )
         execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
         budget = RouteBudgetLedger(route="standard")
-        assert validator.validate_execution_plan(
+        execution_validation = validator.validate_execution_plan(
             execution_plan=execution, query_plan=plan, context=authority.context,
             route_budget=budget.limits,
-        ).outcome == "allow"
+        )
+        assert execution_validation.outcome == "allow"
         result = await metric_plan_executor(authority.compiler(), gateway).execute(
             query_plan=plan, context=authority.context, execution_plan=execution,
-            budget=budget, deadline_ms=10000,
+            validation=execution_validation,
+        expected_policy_version=validator.policy_version,
+        expected_policy_checksum=validator.policy_checksum,
+        budget=budget, deadline_ms=10000,
         )
         assert result.record.status == "succeeded", result.record
         value = result.outputs["fetch_metrics"]
@@ -748,8 +764,15 @@ async def test_pr07a_synthetic_aggregate_detail_hash_parity(
                                                               identity=authority.identity)
             execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
             budget = RouteBudgetLedger(route="standard")
+            execution_validation = PlanValidator().validate_execution_plan(
+                execution_plan=execution, query_plan=plan, context=authority.context,
+                route_budget=budget.limits,
+            )
             result = await metric_plan_executor(authority.compiler(), gateway).execute(
                 query_plan=plan, context=authority.context, execution_plan=execution,
+                validation=execution_validation,
+                expected_policy_version=PlanValidator().policy_version,
+                expected_policy_checksum=PlanValidator().policy_checksum,
                 budget=budget, deadline_ms=10_000,
             )
             assert result.record.status == "succeeded", result.record

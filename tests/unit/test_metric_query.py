@@ -242,10 +242,17 @@ async def test_executor_factory_preserves_receipt_and_hides_ephemeral_values() -
     validated = validator.validate_query_plan(plan=plan, context=authority.context, identity=authority.identity)
     execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validated)
     budget = RouteBudgetLedger(route="standard")
-    assert validator.validate_execution_plan(execution_plan=execution, query_plan=plan,
-                                             context=authority.context, route_budget=budget.limits).outcome == "allow"
+    execution_validation = validator.validate_execution_plan(
+        execution_plan=execution, query_plan=plan,
+        context=authority.context, route_budget=budget.limits,
+    )
+    assert execution_validation.outcome == "allow"
     result = await metric_plan_executor(authority.compiler(), gateway).execute(
-        query_plan=plan, context=authority.context, execution_plan=execution, budget=budget, deadline_ms=10000,
+        query_plan=plan, context=authority.context, execution_plan=execution,
+        validation=execution_validation,
+        expected_policy_version=validator.policy_version,
+        expected_policy_checksum=validator.policy_checksum,
+        budget=budget, deadline_ms=10000,
     )
     assert result.record.status == "succeeded"
     receipt = result.record.step_receipts[0]

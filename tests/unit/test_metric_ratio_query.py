@@ -404,8 +404,16 @@ async def test_ratio_checkpoint_isolation_and_authority_reread() -> None:
     ))
     validation = PlanValidator().validate_query_plan(plan=plan, context=authority.context, identity=authority.identity)
     execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
+    execution_validation = PlanValidator().validate_execution_plan(
+        execution_plan=execution, query_plan=plan,
+        context=authority.context,
+        route_budget=RouteBudgetLedger(route="standard").limits,
+    )
     result = await metric_plan_executor(authority.compiler(), gateway).execute(
         query_plan=plan, context=authority.context, execution_plan=execution,
+        validation=execution_validation,
+        expected_policy_version=PlanValidator().policy_version,
+        expected_policy_checksum=PlanValidator().policy_checksum,
         budget=RouteBudgetLedger(route="standard"), deadline_ms=10000,
     )
     assert result.record.status == "succeeded"

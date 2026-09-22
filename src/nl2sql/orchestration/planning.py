@@ -8,6 +8,7 @@ import re
 from typing import Protocol
 
 from src.nl2sql.contracts import (
+    AdHocCalculationStep,
     ContextBundle,
     ExecutionPlan,
     FetchMetricStep,
@@ -25,6 +26,12 @@ from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationBinding,
     ApprovedCalculationCatalog,
     declares_canonical_binding,
+)
+from src.nl2sql.semantic.calculation_contract import (
+    CalculationExecutionBinding,
+    CalculationSpec,
+    derived_output_id,
+    referenced_input_roles,
 )
 
 PLAN_VALIDATION_POLICY_VERSION = "plan-validation.bootstrap.v1"
@@ -91,12 +98,21 @@ class PlanValidator:
         # Already-resolved trusted bindings; None keeps the bounded legacy
         # approved-template-id behaviour and never invents authority.
         self._calculation_catalog = calculation_catalog
+        policy_payload_fields: dict[str, object] = {
+            "policy_version": policy_version,
+            "approved_template_ids": sorted(approved_template_ids),
+            "approved_invariant_ids": sorted(approved_invariant_ids),
+        }
+        if calculation_catalog is not None:
+            # Two validators with different authoritative canonical calculation
+            # catalogs must not share a policy identity.  When no catalog is
+            # configured the legacy payload is kept byte-for-byte identical, so
+            # no empty-catalog authority marker is invented.
+            policy_payload_fields["calculation_catalog_checksum"] = (
+                calculation_catalog.checksum
+            )
         policy_payload = json.dumps(
-            {
-                "policy_version": policy_version,
-                "approved_template_ids": sorted(approved_template_ids),
-                "approved_invariant_ids": sorted(approved_invariant_ids),
-            },
+            policy_payload_fields,
             separators=(",", ":"),
             sort_keys=True,
         )
@@ -273,20 +289,51 @@ class PlanValidator:
                 )
             )
 
+        ad_hoc_steps = [
+            step
+            for step in execution_plan.steps
+            if isinstance(step, AdHocCalculationStep)
+        ]
+        canonical_provenance_present = any(
+            isinstance(step, TrustedCalculationStep)
+            and declares_canonical_binding(step)
+            for step in execution_plan.steps
+        ) or any(
+            isinstance(step, FetchMetricStep)
+            and step.calculation_input_role is not None
+            for step in execution_plan.steps
+        )
+        if ad_hoc_steps and canonical_provenance_present:
+            deny.append(
+                _issue(
+                    "ad_hoc_calculation_canonical_conflict",
+                    "execution_plan.steps",
+                    "A plan may not mix canonical and AD_HOC calculation provenance.",
+                )
+            )
+        for code in _ad_hoc_v1_closure_failures(execution_plan):
+            deny.append(
+                _issue(
+                    code,
+                    "execution_plan.steps",
+                    "The plan does not match the exact V1 AD_HOC carrier shape.",
+                )
+            )
+        for code in _ad_hoc_closure_failures(execution_plan.steps):
+            deny.append(
+                _issue(
+                    code,
+                    "execution_plan.steps",
+                    "An AD_HOC dependency fetch is not closed over exactly one owner.",
+                )
+            )
+
         if self._calculation_catalog is None:
             # Calculation provenance is trusted-binding authority evidence.  A
             # plan carrying ANY canonical provenance -- a canonical calculation
             # or a dependency fetch -- is a hard DENY without a catalog, and a
             # template-id allowlist can never stand in for it.
-            if any(
-                isinstance(step, TrustedCalculationStep)
-                and declares_canonical_binding(step)
-                for step in execution_plan.steps
-            ) or any(
-                isinstance(step, FetchMetricStep)
-                and step.calculation_input_role is not None
-                for step in execution_plan.steps
-            ):
+            if canonical_provenance_present:
                 deny.append(
                     _issue(
                         "trusted_calculation_binding_authority_missing",
@@ -351,6 +398,31 @@ class PlanValidator:
                             "The requested calculation template is not approved for this plan.",
                         )
                     )
+            elif isinstance(step, AdHocCalculationStep):
+                for code in _ad_hoc_step_failures(
+                    step, execution_plan.steps, context, query_plan
+                ):
+                    deny.append(
+                        _issue(
+                            code,
+                            f"execution_plan.steps.{step.step_id}",
+                            "The AD_HOC calculation step is not structurally valid.",
+                        )
+                    )
+                if self._calculation_catalog is not None:
+                    for item in step.calculation_spec.inputs:
+                        if item.metric_key and (
+                            self._calculation_catalog.binding_for(item.metric_key)
+                            is not None
+                        ):
+                            deny.append(
+                                _issue(
+                                    "ad_hoc_calculation_input_catalog_bound",
+                                    f"execution_plan.steps.{step.step_id}",
+                                    "An AD_HOC input may not be a catalog-bound "
+                                    "approved calculation.",
+                                )
+                            )
             elif isinstance(step, VerifyStep):
                 unknown = set(step.invariant_ids) - self.approved_invariant_ids
                 if unknown:
@@ -370,6 +442,7 @@ class PlanValidator:
             outcome=outcome,
             query_plan_sha256=query_plan.checksum,
             context_checksum=context.checksum,
+            execution_plan_sha256=execution_plan.checksum,
             issues=issues,
         )
 
@@ -444,6 +517,138 @@ class PlanCompiler:
             steps=steps,
         )
 
+    def compile_ad_hoc(
+        self,
+        *,
+        plan: QueryPlan,
+        context: ContextBundle,
+        validation: PlanValidationRecord,
+        calculation_spec: CalculationSpec,
+        execution_binding: CalculationExecutionBinding,
+    ) -> ExecutionPlan:
+        """Compile one PRE-RESOLVED explicit AD_HOC calculation (noncanonical).
+
+        Separate entry point: normal compile() behavior is unchanged and AD_HOC
+        is never inferred from the mere presence of arithmetic.
+        """
+
+        plan = QueryPlan.model_validate_json(plan.model_dump_json())
+        context = ContextBundle.model_validate_json(context.model_dump_json())
+        validation = PlanValidationRecord.model_validate_json(
+            validation.model_dump_json()
+        )
+        spec = CalculationSpec.model_validate_json(calculation_spec.model_dump_json())
+        binding = CalculationExecutionBinding.model_validate_json(
+            execution_binding.model_dump_json()
+        )
+        if validation.outcome != "allow":
+            raise PlanValidationError(validation)
+        if validation.query_plan_sha256 != plan.checksum:
+            raise PlanCompilationError("query_plan_validation_hash_mismatch")
+        if validation.context_checksum != context.checksum:
+            raise PlanCompilationError("context_validation_hash_mismatch")
+        if plan.intent != "metric":
+            raise PlanCompilationError("ad_hoc_calculation_intent_unsupported")
+        if plan.unresolved_slots or context.unresolved_slots:
+            raise PlanCompilationError("ad_hoc_calculation_unresolved_slots")
+        if binding.calculation_id != spec.calculation_id:
+            raise PlanCompilationError("ad_hoc_calculation_binding_identity_mismatch")
+        if binding.spec_checksum != spec.checksum:
+            raise PlanCompilationError("ad_hoc_calculation_binding_spec_mismatch")
+        if binding.binding_failures(spec):
+            raise PlanCompilationError("ad_hoc_calculation_binding_invalid")
+        if {item.role for item in spec.inputs} != set(
+            referenced_input_roles(spec.expression)
+        ):
+            raise PlanCompilationError("ad_hoc_calculation_input_unused")
+        resolved: dict[str, str] = {}
+        for item in spec.inputs:
+            if item.metric_key is None:
+                raise PlanCompilationError("ad_hoc_calculation_input_unresolved")
+            if item.provenance == "ad_hoc_metric":
+                raise PlanCompilationError(
+                    "ad_hoc_calculation_nested_input_unsupported"
+                )
+            resolved[item.role] = item.metric_key
+        if len(set(resolved.values())) != len(resolved):
+            raise PlanCompilationError("ad_hoc_calculation_input_duplicate")
+        if set(resolved.values()) != set(plan.metric_keys):
+            raise PlanCompilationError("ad_hoc_calculation_source_plan_mismatch")
+        if set(resolved.values()) - set(context.asset_ids):
+            raise PlanCompilationError("ad_hoc_calculation_context_missing")
+        catalog = self._calculation_catalog
+        if catalog is not None and any(
+            catalog.binding_for(key) is not None for key in resolved.values()
+        ):
+            raise PlanCompilationError("ad_hoc_calculation_input_catalog_bound")
+        steps = _compile_ad_hoc_calculation(
+            spec=spec, binding=binding, resolved=resolved
+        )
+        return ExecutionPlan(
+            query_plan_sha256=plan.checksum,
+            semantic_release_id=context.semantic_release_id,
+            schema_snapshot_id=context.schema_snapshot_id,
+            policy_version=self.policy_version,
+            steps=steps,
+        )
+
+
+def _ad_hoc_fetch_step_id(role: str) -> str:
+    """Deterministic PlanStepId for one AD_HOC calculation input role."""
+
+    normalized = role.lower()
+    if not _DEPENDENCY_ROLE.fullmatch(normalized):
+        raise PlanCompilationError("ad_hoc_calculation_role_unsupported")
+    return f"fetch_{normalized}"
+
+
+def _compile_ad_hoc_calculation(
+    *,
+    spec: CalculationSpec,
+    binding: CalculationExecutionBinding,
+    resolved: dict[str, str],
+) -> tuple[PlanStep, ...]:
+    """Emit the deterministic NONCANONICAL AD_HOC dependency DAG.
+
+    Each declared input role becomes exactly one dependency fetch carrying the
+    AD_HOC provenance triple; the calculation consumes only the projected scalar
+    ("<fetch>.value") of those fetches.  No canonical provenance is emitted.
+    """
+
+    if len(spec.inputs) + 2 > 16:
+        raise PlanCompilationError("ad_hoc_calculation_plan_shape_unsupported")
+    output_id = derived_output_id(spec, binding)
+    fetch_ids = {item.role: _ad_hoc_fetch_step_id(item.role) for item in spec.inputs}
+    if len(set(fetch_ids.values())) != len(fetch_ids):
+        raise PlanCompilationError("ad_hoc_calculation_role_unsupported")
+    fetches = tuple(
+        FetchMetricStep(
+            step_id=fetch_ids[item.role],
+            metric_keys=(resolved[item.role],),
+            ad_hoc_input_role=item.role,
+            ad_hoc_spec_checksum=spec.checksum,
+            ad_hoc_derived_output_id=output_id,
+        )
+        for item in spec.inputs
+    )
+    calculation = AdHocCalculationStep(
+        step_id="calculate_adhoc",
+        calculation_spec=spec,
+        execution_binding=binding,
+        input_refs={
+            item.role: f"{fetch_ids[item.role]}.value" for item in spec.inputs
+        },
+        depends_on=tuple(fetch_ids[item.role] for item in spec.inputs),
+        derived_output_id=output_id,
+    )
+    verify = VerifyStep(
+        step_id="verify_result",
+        input_refs=(calculation.step_id,),
+        invariant_ids=("typed_result_present",),
+        depends_on=(calculation.step_id,),
+    )
+    return (*fetches, calculation, verify)
+
 
 def _dependency_fetch_step_id(role: str) -> str:
     """Deterministic PlanStepId for one trusted binding input role."""
@@ -505,6 +710,136 @@ def _compile_bound_calculation(
         depends_on=(calculation.step_id,),
     )
     return (*fetch_steps, calculation, verify)
+
+
+def _ad_hoc_v1_closure_failures(execution_plan: ExecutionPlan) -> tuple[str, ...]:
+    """Prove the EXACT V1 AD_HOC carrier shape WITHOUT trusting compiler provenance.
+
+    A plan containing an AdHocCalculationStep must be exactly:
+    N AD_HOC dependency fetches + 1 AdHocCalculationStep + 1 VerifyStep, where N is
+    the number of declared calculation input roles.  Every fetch must carry full
+    AD_HOC provenance and map to exactly one role; the calculation must depend on
+    exactly those fetches; the single verify must observe only the calculation.
+    """
+
+    steps = execution_plan.steps
+    ad_hoc_steps = [s for s in steps if isinstance(s, AdHocCalculationStep)]
+    if not ad_hoc_steps:
+        return ()
+    failures: list[str] = []
+    if len(ad_hoc_steps) != 1:
+        failures.append("ad_hoc_calculation_output_duplicate")
+    calculation = ad_hoc_steps[0]
+    if any(isinstance(s, TrustedCalculationStep) for s in steps):
+        failures.append("ad_hoc_calculation_trusted_step_forbidden")
+    fetch_steps = [s for s in steps if isinstance(s, FetchMetricStep)]
+    verify_steps = [s for s in steps if isinstance(s, VerifyStep)]
+    if not verify_steps:
+        failures.append("ad_hoc_calculation_verify_missing")
+    elif len(verify_steps) > 1:
+        failures.append("ad_hoc_calculation_verify_duplicate")
+    permitted = {s.step_id for s in fetch_steps}
+    permitted.add(calculation.step_id)
+    permitted.update(s.step_id for s in verify_steps)
+    if len(permitted) != len(steps):
+        failures.append("ad_hoc_calculation_plan_shape_unsupported")
+    roles = {item.role for item in calculation.calculation_spec.inputs}
+    role_counts: dict[str, int] = {}
+    for fetch in fetch_steps:
+        role = fetch.ad_hoc_input_role
+        if (
+            role is None
+            or fetch.ad_hoc_spec_checksum is None
+            or fetch.ad_hoc_derived_output_id is None
+        ):
+            failures.append("ad_hoc_calculation_dependency_provenance_missing")
+            continue
+        role_counts[role] = role_counts.get(role, 0) + 1
+    if any(count != 1 for count in role_counts.values()):
+        failures.append("ad_hoc_calculation_dependency_role_duplicate")
+    if set(role_counts) != roles or len(fetch_steps) != len(roles):
+        failures.append("ad_hoc_calculation_dependency_count_mismatch")
+    if set(calculation.depends_on) != {f.step_id for f in fetch_steps}:
+        failures.append("ad_hoc_calculation_dependency_set_mismatch")
+    if verify_steps:
+        verify = verify_steps[0]
+        if (
+            verify.depends_on != (calculation.step_id,)
+            or verify.input_refs != (calculation.step_id,)
+            or verify.invariant_ids != ("typed_result_present",)
+        ):
+            failures.append("ad_hoc_calculation_verify_mismatch")
+    return tuple(dict.fromkeys(failures))
+
+
+def _ad_hoc_closure_failures(steps: tuple[PlanStep, ...]) -> tuple[str, ...]:
+    failures: list[str] = []
+    ad_hoc_steps = [s for s in steps if isinstance(s, AdHocCalculationStep)]
+    for step in steps:
+        if not isinstance(step, FetchMetricStep) or step.ad_hoc_input_role is None:
+            continue
+        consumers = [c for c in ad_hoc_steps if step.step_id in c.depends_on]
+        if not consumers:
+            failures.append("ad_hoc_calculation_dependency_rogue")
+            continue
+        if len(consumers) > 1:
+            failures.append("ad_hoc_calculation_dependency_duplicate_consumer")
+            continue
+        consumer = consumers[0]
+        if consumer.input_refs.get(step.ad_hoc_input_role) != f"{step.step_id}.value":
+            failures.append("ad_hoc_calculation_input_ref_mismatch")
+        if step.ad_hoc_spec_checksum != consumer.calculation_spec.checksum:
+            failures.append("ad_hoc_calculation_dependency_spec_mismatch")
+        if step.ad_hoc_derived_output_id != consumer.derived_output_id:
+            failures.append("ad_hoc_calculation_dependency_output_mismatch")
+    return tuple(dict.fromkeys(failures))
+
+
+def _ad_hoc_step_failures(
+    step: AdHocCalculationStep,
+    steps: tuple[PlanStep, ...],
+    context: ContextBundle,
+    query_plan: QueryPlan,
+) -> tuple[str, ...]:
+    failures: list[str] = []
+    spec = step.calculation_spec
+    # Source-identity closure: the spec's resolved input metrics must be exactly
+    # the governed QueryPlan source metric set.  No hidden input, no extra plan
+    # metric, no unresolved or duplicate identity.
+    metrics = [item.metric_key for item in spec.inputs]
+    if any(metric is None for metric in metrics):
+        failures.append("ad_hoc_calculation_input_unresolved")
+    if any(item.provenance == "ad_hoc_metric" for item in spec.inputs):
+        failures.append("ad_hoc_calculation_nested_input_unsupported")
+    resolved = [metric for metric in metrics if metric is not None]
+    if len(set(resolved)) != len(resolved):
+        failures.append("ad_hoc_calculation_input_duplicate")
+    if set(resolved) != set(query_plan.metric_keys):
+        failures.append("ad_hoc_calculation_source_plan_mismatch")
+    fetches_by_role: dict[str, list[FetchMetricStep]] = {}
+    for candidate in steps:
+        if (
+            isinstance(candidate, FetchMetricStep)
+            and candidate.ad_hoc_input_role is not None
+            and candidate.step_id in step.depends_on
+        ):
+            fetches_by_role.setdefault(candidate.ad_hoc_input_role, []).append(candidate)
+    declared_roles = {item.role for item in spec.inputs}
+    if set(fetches_by_role) != declared_roles:
+        failures.append("ad_hoc_calculation_dependency_role_missing")
+    for role, matches in fetches_by_role.items():
+        if len(matches) > 1:
+            failures.append("ad_hoc_calculation_dependency_duplicate_consumer")
+            continue
+        fetch = matches[0]
+        expected_metric = next(
+            (item.metric_key for item in spec.inputs if item.role == role), None
+        )
+        if expected_metric is None or fetch.metric_keys != (expected_metric,):
+            failures.append("ad_hoc_calculation_dependency_metric_mismatch")
+        elif expected_metric not in context.asset_ids:
+            failures.append("ad_hoc_calculation_context_missing")
+    return tuple(dict.fromkeys(failures))
 
 
 def _issue(code: str, path: str, safe_message: str) -> PlanValidationIssue:

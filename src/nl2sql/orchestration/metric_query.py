@@ -736,6 +736,15 @@ class GatewayMetricStepRunner:
 
     async def prepare(self, *, step: FetchMetricStep, query_plan: QueryPlan,
                       context: ContextBundle) -> PreparedMetricStep:
+        if step.ad_hoc_input_role is not None:
+            ad_hoc_plan = self._adhoc_dependency_plan(
+                step=step, query_plan=query_plan, context=context
+            )
+            query = await self._compiler.compile(ad_hoc_plan, context)
+            prepared = self._gateway.prepare(query.sql)
+            return PreparedMetricStep(
+                prepared.fingerprint, 0, query, dependency_fetch=True
+            )
         if step.calculation_input_role is None:
             if step.metric_keys != query_plan.metric_keys:
                 raise PlanStepError("metric_step_mismatch")
@@ -799,6 +808,37 @@ class GatewayMetricStepRunner:
         # Only the requested metric identity changes: domain, filters, time
         # range, grain, source strategy and permission requirements stay exactly
         # as the validated plan declared them, and compile() re-validates.
+        return query_plan.model_copy(update={"metric_keys": step.metric_keys})
+
+    def _adhoc_dependency_plan(
+        self,
+        *,
+        step: FetchMetricStep,
+        query_plan: QueryPlan,
+        context: ContextBundle,
+    ) -> QueryPlan:
+        """Derive the ephemeral child plan fetching ONE AD_HOC input.
+
+        No catalog is consulted.  The input metric must be resolved in this
+        request's context and must not itself be catalog-bound: V1 refuses a
+        nested approved calculation, and it never direct-fetches a computed
+        metric as a substitute for its governed compute path.  Domain, filters,
+        time range, grain, source strategy and permissions stay exactly as the
+        validated plan declared them, and compile() re-validates.
+        """
+
+        if len(step.metric_keys) != 1:
+            raise PlanStepError("metric_adhoc_dependency_shape_invalid")
+        if step.ad_hoc_derived_output_id is None:
+            raise PlanStepError("metric_adhoc_dependency_output_missing")
+        if query_plan.intent != "metric":
+            raise PlanStepError("metric_adhoc_dependency_intent_unsupported")
+        metric_key = step.metric_keys[0]
+        if metric_key not in context.asset_ids:
+            raise PlanStepError("metric_adhoc_dependency_metric_unresolved")
+        catalog = self._calculation_catalog
+        if catalog is not None and catalog.binding_for(metric_key) is not None:
+            raise PlanStepError("metric_adhoc_dependency_catalog_bound")
         return query_plan.model_copy(update={"metric_keys": step.metric_keys})
 
     async def execute(self, prepared: PreparedMetricStep, *, timeout_ms: int) -> MetricStepResult:

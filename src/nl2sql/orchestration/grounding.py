@@ -40,6 +40,7 @@ from typing import Any, cast
 from pydantic import JsonValue
 
 from src.nl2sql.contracts import (
+    AdHocCalculationStep,
     AnswerArtifact,
     AnswerFact,
     ExecutionPlan,
@@ -47,6 +48,7 @@ from src.nl2sql.contracts import (
     PlanExecutionRecord,
     PlanStepReceipt,
     QueryPlan,
+    TrustedCalculationStep,
 )
 
 __all__ = [
@@ -104,23 +106,35 @@ def build_answer_facts(
 ) -> tuple[AnswerFact, ...]:
     """Project successful fetch-metric step outputs into typed grounded facts."""
 
+    if record.status != "succeeded":
+        # A failed execution must never ground business facts, even if it
+        # contains a succeeded receipt.
+        return ()
+    if record.execution_plan_checksum != execution_plan.checksum:
+        # A record from another execution plan must never ground facts against
+        # the supplied plan.
+        return ()
     steps_by_id = {step.step_id: step for step in execution_plan.steps}
     facts: list[AnswerFact] = []
     for receipt in record.step_receipts:
         if receipt.status != "succeeded" or receipt.kind != "fetch_metric":
             continue
+        # RE-BIND to the real plan step: a missing or non-fetch step grounds
+        # nothing, and never falls back to query_plan.metric_keys.
         step = steps_by_id.get(receipt.step_id)
-        if isinstance(step, FetchMetricStep) and step.calculation_input_role is not None:
-            # An internal dependency fetch feeds one trusted calculation input
-            # role; it is never a grounded answer fact for the requested metric.
+        if not isinstance(step, FetchMetricStep):
             continue
-        metric_keys = (
-            step.metric_keys
-            if isinstance(step, FetchMetricStep)
-            else query_plan.metric_keys
-        )
+        if receipt.step_id not in record.output_step_ids:
+            continue
+        if (
+            step.calculation_input_role is not None
+            or step.ad_hoc_input_role is not None
+        ):
+            # An internal dependency fetch feeds one calculation input role; it
+            # is never a grounded answer fact for the requested metric.
+            continue
         output = outputs.get(receipt.step_id)
-        for metric_key in metric_keys:
+        for metric_key in step.metric_keys:
             status, value = _project_output(output, metric_key=metric_key)
             facts.append(
                 _answer_fact(
@@ -133,14 +147,63 @@ def build_answer_facts(
     for receipt in record.step_receipts:
         if receipt.status != "succeeded" or receipt.kind != "trusted_calculation":
             continue
-        metric_key = receipt.output_metric_key
+        # RE-BIND to the real executed step and require its canonical provenance
+        # to agree with the receipt; receipt metadata alone is never authority.
+        step = steps_by_id.get(receipt.step_id)
+        if not isinstance(step, TrustedCalculationStep):
+            continue
+        if receipt.step_id not in record.output_step_ids:
+            continue
+        metric_key = step.output_metric_key
         if not metric_key:
+            continue
+        if (
+            receipt.output_metric_key != step.output_metric_key
+            or receipt.template_id != step.template_id
+            or receipt.template_version != step.template_version
+            or receipt.binding_checksum != step.binding_checksum
+        ):
             continue
         status, value = _project_output(outputs.get(receipt.step_id), metric_key=metric_key)
         facts.append(
             _answer_fact(
                 receipt=receipt,
                 metric_key=metric_key,
+                status=status,
+                value=value,
+            )
+        )
+    for receipt in record.step_receipts:
+        if receipt.status != "succeeded" or receipt.kind != "ad_hoc_calculation":
+            continue
+        # RE-BIND the receipt to the real plan step: an orphan, non-AD_HOC or
+        # mismatched receipt must never ground a derived fact.
+        step = steps_by_id.get(receipt.step_id)
+        if not isinstance(step, AdHocCalculationStep):
+            continue
+        if receipt.step_id not in record.output_step_ids:
+            continue
+        derived_output_id = receipt.derived_output_id
+        if (
+            derived_output_id is None
+            or derived_output_id != step.derived_output_id
+            or receipt.calculation_spec_checksum != step.calculation_spec.checksum
+            or receipt.execution_binding_checksum
+            != step.execution_binding.checksum
+            or receipt.calculation_scope != "ad_hoc_noncanonical"
+        ):
+            continue
+        if receipt.step_id not in outputs:
+            # Presence is key-based: a missing output key is not the same as a
+            # present JSON null, which remains a real (no_data) result here.
+            continue
+        status, value = _project_output(
+            outputs[receipt.step_id], metric_key=derived_output_id
+        )
+        facts.append(
+            _adhoc_answer_fact(
+                receipt=receipt,
+                derived_output_id=derived_output_id,
                 status=status,
                 value=value,
             )
@@ -180,14 +243,25 @@ def render_grounded_answer(
         return f"No grounded value was produced for {metric_keys}."
     lines: list[str] = []
     for fact in facts:
+        label = _fact_label(fact)
         if fact.status == "unavailable":
-            lines.append(f"{fact.metric_key}: no data returned")
+            lines.append(f"{label}: no data returned")
         elif _is_scalar(fact.value):
-            lines.append(f"{fact.metric_key}: {_stable_json(fact.value)}")
+            lines.append(f"{label}: {_stable_json(fact.value)}")
         else:
             reference = fact.output_digest or fact.fact_id
-            lines.append(f"{fact.metric_key}: grounded value recorded (digest {reference})")
+            lines.append(f"{label}: grounded value recorded (digest {reference})")
     return "\n".join(lines)
+
+
+def _fact_label(fact: AnswerFact) -> str:
+    """A canonical metric name, or an explicit derived/noncanonical label."""
+
+    if fact.metric_key is not None:
+        return fact.metric_key
+    if fact.derived_output_id is not None:
+        return f"Derived result ({fact.derived_output_id})"
+    return fact.step_id
 
 
 def _answer_fact(
@@ -218,6 +292,57 @@ def _answer_fact(
         selection_reason=receipt.selection_reason,
         source_degradation=receipt.source_degradation,
     )
+
+
+def _adhoc_answer_fact(
+    *,
+    receipt: PlanStepReceipt,
+    derived_output_id: str,
+    status: str,
+    value: JsonValue,
+) -> AnswerFact:
+    return AnswerFact(
+        fact_id=_derived_fact_id(
+            step_id=receipt.step_id,
+            derived_output_id=derived_output_id,
+            status=status,
+            value=value,
+        ),
+        step_id=receipt.step_id,
+        derived_output_id=derived_output_id,
+        calculation_scope="ad_hoc_noncanonical",
+        status=cast("Any", status),
+        value=value,
+        rowset_sha256=receipt.rowset_sha256,
+        output_digest=receipt.output_digest,
+        source_id=receipt.source_id,
+        semantic_signature=receipt.semantic_signature,
+        data_as_of=receipt.data_as_of,
+        freshness_status=receipt.freshness_status,
+        source_kind=receipt.source_kind,
+        selection_reason=receipt.selection_reason,
+        source_degradation=receipt.source_degradation,
+    )
+
+
+def _derived_fact_id(
+    *, step_id: str, derived_output_id: str, status: str, value: JsonValue
+) -> str:
+    """Deterministic NONCANONICAL fact identity (separate from _fact_id)."""
+
+    payload = json.dumps(
+        {
+            "step_id": step_id,
+            "derived_output_id": derived_output_id,
+            "status": status,
+            "value": value,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _project_output(output: JsonValue, *, metric_key: str) -> tuple[str, JsonValue]:
