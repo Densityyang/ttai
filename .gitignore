@@ -90,4 +90,5 @@ _build_slide2.py
 # Tool workspaces and shell artifacts (never product deliverables)
 .opencode/
 .mobilework-workspace
+.mobilework-sessions.json
 %SystemDrive%/

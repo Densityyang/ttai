@@ -576,8 +576,10 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
         },
         "src/nl2sql/infra/store/ai_views.py": {"conn.execute"},
         "src/nl2sql/observability/control_audit.py": {
+            # Reviewed control-plane writer: the pool hands out the single
+            # connection that carries both audit INSERTs in one transaction.
             "pool.fetchval",
-            "self._connection.execute",
+            "connection.execute",
         },
         # Reviewed Mode3 orchestration call: the service resolves governed
         # scalar evidence and invokes the pure Calculation Runtime; it is not a

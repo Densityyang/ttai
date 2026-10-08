@@ -9,6 +9,18 @@ attacked with adversarial extra fields on the REAL contract shape; the stock
 app is used for route/permission gates; conflict output is searched for
 winner-like semantics in the SERIALIZED body.
 
+DECLARED MOCK BOUNDARY - read this before trusting a green run.  The
+database-execution boundary is MOCKED in this module, so it is NOT a
+real-execution acceptance: the engine is composed around the REAL
+MetricQueryCompiler and PlanExecutor, but the QueryGateway is built over an
+AsyncMock session and its execute is replaced by an AsyncMock returning a fixed
+QueryReceipt (see the engine helper below).  Consequently no SQL ever reaches
+PostgreSQL here, and no dialect, parameter-binding, row-shape or database
+permission defect can be caught by this module.  What it does prove is the
+orchestration, accounting and gating behaviour AROUND that boundary.  The REAL
+execution path is covered by tests/integration (test_query_gateway_postgres.py,
+test_postgres_governance.py) and by the live lane, not here.
+
 No production file is modified by this module.
 """
 

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from contextlib import AbstractAsyncContextManager
+from typing import Any, Protocol
 from uuid import uuid4
 
 from src.core.database import DatabasePurpose, validate_application_database_url
@@ -18,8 +19,24 @@ from src.nl2sql.observability.content_policy import scrub_value
 from src.nl2sql.observability.trace import TraceEvent, fingerprint
 
 
-class AuditConnection(Protocol):
+class AuditExecutor(Protocol):
+    """One control-plane connection; both audit INSERTs run on it."""
+
     async def execute(self, query: str, *args: object) -> object: ...
+
+    def transaction(self) -> AbstractAsyncContextManager[None]: ...
+
+
+class AuditConnection(Protocol):
+    """Connection source held by the store.
+
+    Production passes the asyncpg pool built by ``ControlAuditStore.open``.  The
+    pool is dynamically typed, so ``append`` binds the acquired object to an
+    ``AuditExecutor``: asyncpg offers no ``Pool.transaction()``, hence the one
+    connection acquired here must carry both INSERTs of one transaction.
+    """
+
+    def acquire(self) -> Any: ...
 
 
 class ControlAuditUnavailable(RuntimeError):
@@ -85,29 +102,34 @@ class ControlAuditStore:
         payload = scrub_value(event.model_dump(mode="json"))
         attributes = payload["attributes"]
         try:
-            await self._connection.execute(
-                """
-                INSERT INTO audit_events (event_id, trace_id, stage, event_name, occurred_at, attributes)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                """,
-                event_id,
-                event.trace_id,
-                event.stage,
-                event.name,
-                event.at,
-                json.dumps(attributes, ensure_ascii=False, default=str),
-            )
-            await self._connection.execute(
-                """
-                INSERT INTO audit_outbox (outbox_id, trace_id, event_id, topic, payload)
-                VALUES ($1, $2, $3, $4, $5::jsonb)
-                """,
-                str(uuid4()),
-                event.trace_id,
-                event_id,
-                "nl2sql.trace",
-                json.dumps(payload, ensure_ascii=False, default=str),
-            )
+            # One acquired connection and one transaction: the audit event and
+            # its outbox record are either both durable or both absent.
+            async with self._connection.acquire() as acquired:
+                connection: AuditExecutor = acquired
+                async with connection.transaction():
+                    await connection.execute(
+                        """
+                        INSERT INTO audit_events (event_id, trace_id, stage, event_name, occurred_at, attributes)
+                        VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                        """,
+                        event_id,
+                        event.trace_id,
+                        event.stage,
+                        event.name,
+                        event.at,
+                        json.dumps(attributes, ensure_ascii=False, default=str),
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO audit_outbox (outbox_id, trace_id, event_id, topic, payload)
+                        VALUES ($1, $2, $3, $4, $5::jsonb)
+                        """,
+                        str(uuid4()),
+                        event.trace_id,
+                        event_id,
+                        "nl2sql.trace",
+                        json.dumps(payload, ensure_ascii=False, default=str),
+                    )
         except Exception as exc:
             raise ControlAuditUnavailable("control audit/outbox write failed") from exc
 

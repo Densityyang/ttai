@@ -41,6 +41,7 @@ from src.nl2sql.local_real.deployment import (
     LocalRealRelationProbe,
     missing_required_columns,
 )
+from src.nl2sql.observability.content_policy import scrub_text
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,10 @@ logger = logging.getLogger(__name__)
 # hold a session open or scan an unbounded relation.
 PROBE_STATEMENT_TIMEOUT_MS = 5_000
 PROBE_LOCK_TIMEOUT_MS = 2_000
+
+# Diagnostic budget for a failed probe: long enough to separate a statement
+# timeout from a lock timeout, short enough that no payload can ride along.
+_PROBE_FAILURE_REASON_MAX_CHARS = 200
 
 # Business time column of the frozen case (canonical time_column: report_time).
 FROZEN_CASE_BUSINESS_TIME_COLUMN = "report_time"
@@ -88,6 +93,37 @@ class SourceWatermarkResult:
     data_as_of: datetime | None
     resolved: bool
     observed_at: datetime | None = None
+
+
+def _probe_failure_detail(exc: BaseException) -> str:
+    """Bounded, credential-scrubbed detail for a failed probe.
+
+    Never the raw ``str(exc)``: SQLAlchemy appends the statement text and
+    the bound parameters AFTER the driver message, so only the driver message
+    line survives, and that line is then passed through the shared observability
+    scrubbing policy and length-capped.  The driver class plus its SQLSTATE is
+    what lets an operator tell a statement timeout from a lock timeout, a
+    connection failure or a privilege error.  Diagnostics must never mask the
+    failure they describe, so any internal error degrades to the class name.
+    """
+
+    try:
+        origin = getattr(exc, "orig", exc)
+        parts = [type(exc).__name__]
+        if origin is not exc:
+            parts.append(type(origin).__name__)
+        sqlstate = getattr(origin, "sqlstate", None) or getattr(origin, "pgcode", None)
+        if isinstance(sqlstate, str) and sqlstate:
+            parts.append(f"sqlstate={sqlstate}")
+        lines = str(origin).splitlines()
+        # Defensive: the statement text never shares the driver message line.
+        message = (lines[0] if lines else "").split("[SQL:", 1)[0]
+        message = scrub_text(" ".join(message.split()))
+        if len(message) > _PROBE_FAILURE_REASON_MAX_CHARS:
+            message = message[:_PROBE_FAILURE_REASON_MAX_CHARS] + "..."
+        return f"{' '.join(parts)}: {message}" if message else " ".join(parts)
+    except Exception:
+        return type(exc).__name__
 
 
 def _require_allowed_relation(relation_id: str) -> str:
@@ -193,7 +229,7 @@ async def probe_relation(
                 else await _relation_columns(session, FALLBACK_PHYSICAL_RELATION)
             )
     except Exception as exc:
-        logger.error("local-real relation probe failed: %s", type(exc).__name__)
+        logger.error("local-real relation probe failed: %s", _probe_failure_detail(exc))
         return LocalRealRelationProbe(status=RELATION_STATUS_NOT_PROBED)
     if view_columns is not None:
         missing = missing_required_columns(view_columns)
@@ -255,7 +291,7 @@ async def resolve_latest_authoritative_date(
         async with bounded_read_only_session(session_factory) as session:
             row = (await session.execute(statement)).mappings().one_or_none()
     except Exception as exc:
-        logger.error("local-real latest-date probe failed: %s", type(exc).__name__)
+        logger.error("local-real latest-date probe failed: %s", _probe_failure_detail(exc))
         return LatestDateResult(latest_date=None, denominator_rows=0, resolved=False)
     if row is None or row["latest_date"] is None:
         return LatestDateResult(latest_date=None, denominator_rows=0, resolved=False)
@@ -304,7 +340,7 @@ async def resolve_recent_authoritative_dates(
         async with bounded_read_only_session(session_factory) as session:
             rows = (await session.execute(statement, {"limit": limit})).mappings().all()
     except Exception as exc:
-        logger.error("local-real recent-date probe failed: %s", type(exc).__name__)
+        logger.error("local-real recent-date probe failed: %s", _probe_failure_detail(exc))
         return RecentDateResult(dates=(), resolved=False)
     dates = tuple(str(row["business_date"]) for row in rows if row["business_date"])
     return RecentDateResult(dates=dates, resolved=bool(dates))
@@ -332,7 +368,7 @@ async def resolve_source_watermark(
         async with bounded_read_only_session(session_factory) as session:
             row = (await session.execute(statement)).mappings().one_or_none()
     except Exception as exc:
-        logger.error("local-real source watermark probe failed: %s", type(exc).__name__)
+        logger.error("local-real source watermark probe failed: %s", _probe_failure_detail(exc))
         return SourceWatermarkResult(data_as_of=None, resolved=False)
     watermark = row["source_watermark"] if row is not None else None
     if not isinstance(watermark, datetime):

@@ -88,7 +88,10 @@ class LocalRealGovernedMetricInputFetcher:
             )
 
         if execution_context.date_mode == "exact_date":
-            assert execution_context.exact_date is not None
+            if execution_context.exact_date is None:
+                raise GovernedMetricInputResolutionError(
+                    "local_real_governed_exact_date_missing"
+                )
             time_clause = execution_context.exact_date.isoformat()
         else:
             time_clause = "latest_authoritative"

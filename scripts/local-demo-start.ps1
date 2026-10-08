@@ -6,8 +6,12 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 New-Item -ItemType Directory -Force -Path (Join-Path $root 'logs') | Out-Null
+# PID files live in var\ and are consumed by scripts\local-demo-stop.ps1.
+$pidDir = Join-Path $root 'var'
+New-Item -ItemType Directory -Force -Path $pidDir | Out-Null
 
 $py = Join-Path $root '.venv\Scripts\python.exe'
+$tunnelPort = if ($env:TUNNEL_LOCAL_PORT) { [int]$env:TUNNEL_LOCAL_PORT } else { 15432 }
 
 # Ambient proxy vars (a bracketed NO_PROXY entry) crash httpx URL parsing.
 foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy','NO_PROXY','no_proxy') {
@@ -16,14 +20,26 @@ foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy'
 
 if (-not $NoTunnel) {
   $listening = $false
-  try { $listening = [bool](Get-NetTCPConnection -LocalPort 15432 -State Listen -ErrorAction Stop) } catch { $listening = $false }
+  try { $listening = [bool](Get-NetTCPConnection -LocalPort $tunnelPort -State Listen -ErrorAction Stop) } catch { $listening = $false }
   if (-not $listening) {
     $t = Start-Process -FilePath $py -ArgumentList 'scripts\local_tunnel.py' -WorkingDirectory $root -RedirectStandardOutput (Join-Path $root 'logs\tunnel.out.log') -RedirectStandardError (Join-Path $root 'logs\tunnel.err.log') -WindowStyle Hidden -PassThru
+    Set-Content -Path (Join-Path $pidDir 'tunnel.pid') -Value $t.Id -Encoding ascii
     Write-Host "[tunnel] started pid=$($t.Id)"
-    Start-Sleep -Seconds 4
   } else {
-    Write-Host "[tunnel] already listening on 15432"
+    Write-Host "[tunnel] already listening on $tunnelPort"
   }
+
+  # A bound local listener is not proof the forward works, so probe the port for real.
+  $tunnelUp = $false
+  foreach ($i in 1..10) {
+    try { if (Test-NetConnection -ComputerName 127.0.0.1 -Port $tunnelPort -InformationLevel Quiet -WarningAction SilentlyContinue) { $tunnelUp = $true; break } } catch {}
+    Start-Sleep -Seconds 2
+  }
+  if (-not $tunnelUp) {
+    Write-Host "[tunnel] ERROR: 127.0.0.1:$tunnelPort is not connectable (check logs\tunnel.err.log)" -ForegroundColor Red
+    exit 1
+  }
+  Write-Host "[tunnel] local port $tunnelPort connectable"
 }
 
 # ---- V4 API (root project) ----
@@ -62,16 +78,23 @@ $env:V2_ROUTE_DEADLINE_FAST_MS = '120000'
 $env:V2_ROUTE_DEADLINE_STANDARD_MS = '120000'
 $env:V2_ROUTE_DEADLINE_DEEP_MS = '120000'
 $ai = Start-Process -FilePath $py -ArgumentList 'main.py','prod' -WorkingDirectory $root -RedirectStandardOutput (Join-Path $root 'logs\tt-ai.out.log') -RedirectStandardError (Join-Path $root 'logs\tt-ai.err.log') -WindowStyle Hidden -PassThru
+Set-Content -Path (Join-Path $pidDir 'tt-ai.pid') -Value $ai.Id -Encoding ascii
 Write-Host "[tt-ai] started pid=$($ai.Id)"
 
 # ---- TT Admin API ----
 $env:ENV = 'prod'
 $apiDir = Join-Path $root 'tt-intelligent-main\tt-api'
 $api = Start-Process -FilePath $py -ArgumentList 'main.py','run' -WorkingDirectory $apiDir -RedirectStandardOutput (Join-Path $root 'logs\tt-api.out.log') -RedirectStandardError (Join-Path $root 'logs\tt-api.err.log') -WindowStyle Hidden -PassThru
+Set-Content -Path (Join-Path $pidDir 'tt-api.pid') -Value $api.Id -Encoding ascii
 Write-Host "[tt-api] started pid=$($api.Id)"
 
+$ready = $false
 foreach ($i in 1..30) {
   Start-Sleep -Seconds 3
-  try { $r = Invoke-WebRequest -Uri 'http://127.0.0.1:9001/readyz' -UseBasicParsing -TimeoutSec 5; if ($r.StatusCode -eq 200) { Write-Host '[tt-ai] READY'; break } } catch {}
+  try { $r = Invoke-WebRequest -Uri 'http://127.0.0.1:9001/readyz' -UseBasicParsing -TimeoutSec 5; if ($r.StatusCode -eq 200) { Write-Host '[tt-ai] READY'; $ready = $true; break } } catch {}
+}
+if (-not $ready) {
+  Write-Host '[tt-ai] ERROR: /readyz not ready after 90s (see logs\tt-ai.err.log)' -ForegroundColor Red
+  exit 1
 }
 Write-Host 'start-local-demo done'

@@ -15,10 +15,32 @@ fingerprint/checksum.
 
 from __future__ import annotations
 
+import logging
 import os
 from urllib.parse import unquote, urlsplit
 
 from src.core.secrets import SecretProvider
+
+logger = logging.getLogger(__name__)
+
+# A settings-resolution failure is one CONDITION, not an event per egress, so it
+# is reported once per process instead of on every scrub call.
+_settings_failure_reported = False
+
+
+def _report_settings_failure(source: str, exc: BaseException) -> None:
+    """Surface a settings-read failure once, without ever logging a value."""
+
+    global _settings_failure_reported
+    if _settings_failure_reported:
+        return
+    _settings_failure_reported = True
+    logger.warning(
+        "observability secret source could not read %s (%s); only the "
+        "environment and *_FILE channels apply to this process",
+        source,
+        type(exc).__name__,
+    )
 
 # The bounded set of configured credential values this deployment may hold.
 _API_KEY_ENV_NAMES = (
@@ -86,16 +108,17 @@ def _settings_secret_values() -> tuple[str, ...]:
             settings.checkpoint_database_url,
         ):
             values.extend(_dsn_passwords(dsn or ""))
-    except Exception:
+    except Exception as exc:
         # Settings may legitimately be unavailable or invalid outside a real
-        # deployment; the env/*_FILE channel above still applies.
-        pass
+        # deployment; the env/*_FILE channel above still applies.  The failure
+        # is still surfaced once so an operator is not left guessing.
+        _report_settings_failure("src.core.settings", exc)
     try:
         from src.nl2sql.config.settings import get_agent_config
 
         values.append(get_agent_config().embedding_api_key.get_secret_value() or "")
-    except Exception:
-        pass
+    except Exception as exc:
+        _report_settings_failure("src.nl2sql.config.settings", exc)
     return tuple(values)
 
 

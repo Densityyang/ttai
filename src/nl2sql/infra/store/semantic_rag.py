@@ -19,6 +19,11 @@ from pydantic import SecretStr
 
 from src.core.settings import ROOT_DIR
 from src.nl2sql.config.settings import AgentConfig, get_agent_config
+from src.nl2sql.infra.store.index_integrity import (
+    checksum_manifest_matches,
+    verify_checksum_manifest,
+    write_checksum_manifest,
+)
 
 
 def _import_faiss_class() -> type[Any]:
@@ -140,6 +145,9 @@ class SemanticRetriever:
             self.vectorstore = self._load_local_vectorstore()
 
     def _load_local_vectorstore(self) -> Any:
+        # Fail closed: never deserialize the pickle docstore unless every file
+        # still matches the SHA-256 manifest written by sync().
+        verify_checksum_manifest(self.faiss_index_path)
         faiss_cls = _import_faiss_class()
         return faiss_cls.load_local(
             folder_path=str(self.faiss_index_path),
@@ -203,11 +211,15 @@ class SemanticRetriever:
         new_manifest = self._build_manifest(docs=docs, source_hash=source_hash)
         old_manifest = self._read_manifest()
 
+        # Skipping the rebuild requires a verified on-disk index: a directory
+        # whose files no longer match the checksum manifest is rebuilt instead
+        # of being trusted.
         if (
             not force
             and old_manifest == new_manifest
             and self._index_file.exists()
             and self._docstore_file.exists()
+            and checksum_manifest_matches(self.faiss_index_path)
         ):
             return SemanticSyncResult(
                 changed=False,
@@ -222,6 +234,9 @@ class SemanticRetriever:
             json.dumps(new_manifest, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        # Cover every file in the directory (manifest.json included) so the
+        # load path can reject a tampered pickle docstore.
+        write_checksum_manifest(self.faiss_index_path)
         self.vectorstore = self._load_local_vectorstore()
 
         return SemanticSyncResult(

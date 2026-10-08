@@ -26,6 +26,7 @@ import paramiko
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "secrets" / "ssh" / "tunnel.json"
 LOG_PATH = ROOT / "logs" / "tunnel.log"
+RECONNECT_DELAY_SECONDS = 5
 
 logging.basicConfig(
     level=logging.INFO,
@@ -135,12 +136,16 @@ def serve_once(cfg: dict) -> None:
 
 def main() -> int:
     cfg = load_config()
+    reconnects = 0
     while True:
         try:
             serve_once(cfg)
         except Exception as exc:
             log.error("tunnel error: %s", exc)
-        time.sleep(5)
+        # No retry ceiling: the demo tunnel must survive indefinitely.
+        reconnects += 1
+        log.info("reconnect #%d in %ss", reconnects, RECONNECT_DELAY_SECONDS)
+        time.sleep(RECONNECT_DELAY_SECONDS)
 
 
 if __name__ == "__main__":

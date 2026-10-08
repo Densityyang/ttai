@@ -32,6 +32,12 @@ SecretCategory = Literal[
     "private_key",
     "credential_dsn",
     "credential_assignment",
+    "cloud_access_key",
+    "vcs_access_token",
+    "messaging_token",
+    "jwt",
+    "langfuse_key",
+    "nesting_depth_exceeded",
 ]
 
 CONFIGURED_SECRET: SecretCategory = "configured_secret"
@@ -40,6 +46,14 @@ BASIC_AUTH: SecretCategory = "basic_auth"
 PRIVATE_KEY: SecretCategory = "private_key"
 CREDENTIAL_DSN: SecretCategory = "credential_dsn"
 CREDENTIAL_ASSIGNMENT: SecretCategory = "credential_assignment"
+CLOUD_ACCESS_KEY: SecretCategory = "cloud_access_key"
+VCS_ACCESS_TOKEN: SecretCategory = "vcs_access_token"
+MESSAGING_TOKEN: SecretCategory = "messaging_token"
+JWT: SecretCategory = "jwt"
+LANGFUSE_KEY: SecretCategory = "langfuse_key"
+# Not a credential shape: a structure too deep to walk, reported instead of
+# silently passing unverified content through.
+NESTING_DEPTH_EXCEEDED: SecretCategory = "nesting_depth_exceeded"
 
 # Layer 2: secret SHAPES.  Each entry is intentionally anchored to a technical
 # credential form; none of them attempts to classify business data.
@@ -65,7 +79,43 @@ _SHAPE_PATTERNS: tuple[tuple[SecretCategory, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
+    (
+        # AWS access key IDs: the AKIA/ASIA prefix plus 16 upper-case
+        # base32-ish characters.  Ordinary prose cannot produce that shape.
+        CLOUD_ACCESS_KEY,
+        re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    ),
+    (
+        # GitHub personal/oauth/user/server/refresh tokens.
+        VCS_ACCESS_TOKEN,
+        re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
+    ),
+    (
+        # Slack bot/app/user/refresh/workflow tokens.
+        MESSAGING_TOKEN,
+        re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+    ),
+    (
+        # A JWT is three dot-separated base64url segments.  The per-segment
+        # minimum length plus the "eyJ" header prefix keeps ordinary long
+        # base64 blobs out of the shape.
+        JWT,
+        re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    ),
+    (
+        # Langfuse public/secret API keys: "pk-lf-"/"sk-lf-" plus a UUID.
+        LANGFUSE_KEY,
+        re.compile(
+            r"\b(?:pk|sk)-lf-[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}"
+            r"-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}\b"
+        ),
+    ),
 )
+
+# A value nested deeper than this is not walked further: unbounded recursion on
+# attacker-shaped input would exhaust the interpreter stack.  The cap is far
+# above any legitimate observability payload.
+_MAX_NESTING_DEPTH = 64
 
 # Basic auth is VALIDATED, not length-guessed: a candidate token must be
 # syntactically valid Base64 that decodes to "user:password".  This catches an
@@ -101,6 +151,7 @@ def scan_value(
         "$",
         _usable_secret_values(_resolved_secret_values(secret_values)),
         findings,
+        0,
     )
     return tuple(findings)
 
@@ -131,39 +182,48 @@ def scrub_value(
 
     Ordinary business content -- including PII-shaped business fields -- is
     preserved; only configured values and the recognised technical-secret shapes
-    are replaced.  Both mapping values AND mapping keys are scrubbed.
+    are replaced.  Both mapping values AND mapping keys are scrubbed.  A subtree
+    nested deeper than _MAX_NESTING_DEPTH is replaced wholesale instead of being
+    recursed into.
     """
 
     secrets = _usable_secret_values(_resolved_secret_values(secret_values))
+    return _scrub_value(value, secrets, replacement, 0)
+
+
+def _scrub_value(
+    value: Any,
+    secrets: tuple[str, ...],
+    replacement: str,
+    depth: int,
+) -> Any:
+    if depth > _MAX_NESTING_DEPTH:
+        # Fail closed: content too deep to inspect is never emitted as-is.
+        return replacement
     if isinstance(value, str):
         return _scrub_text(value, secrets, replacement)
     if isinstance(value, BaseModel):
-        return scrub_value(
-            value.model_dump(mode="json"), secret_values=secrets, replacement=replacement
+        return _scrub_value(
+            value.model_dump(mode="json"), secrets, replacement, depth + 1
         )
     if isinstance(value, Mapping):
         # Mapping KEYS are scrubbed too: a secret used as a key is still a
         # technical secret that must not leave the boundary.
         return {
-            _scrub_mapping_key(key, secrets, replacement): scrub_value(
-                item, secret_values=secrets, replacement=replacement
+            _scrub_mapping_key(key, secrets, replacement): _scrub_value(
+                item, secrets, replacement, depth + 1
             )
             for key, item in value.items()
         }
     if isinstance(value, tuple):
         return tuple(
-            scrub_value(item, secret_values=secrets, replacement=replacement)
-            for item in value
+            _scrub_value(item, secrets, replacement, depth + 1) for item in value
         )
     if isinstance(value, list):
-        return [
-            scrub_value(item, secret_values=secrets, replacement=replacement)
-            for item in value
-        ]
+        return [_scrub_value(item, secrets, replacement, depth + 1) for item in value]
     if isinstance(value, (set, frozenset)):
         return type(value)(
-            scrub_value(item, secret_values=secrets, replacement=replacement)
-            for item in value
+            _scrub_value(item, secrets, replacement, depth + 1) for item in value
         )
     return value
 
@@ -219,13 +279,18 @@ def _walk(
     path: str,
     secrets: tuple[str, ...],
     findings: list[SecretFinding],
+    depth: int,
 ) -> None:
+    if depth > _MAX_NESTING_DEPTH:
+        # Too deep to verify: report it instead of walking on unverified.
+        findings.append(SecretFinding(category=NESTING_DEPTH_EXCEEDED, path=path))
+        return
     if isinstance(value, str):
         for category in _match_categories(value, secrets):
             findings.append(SecretFinding(category=category, path=path))
         return
     if isinstance(value, BaseModel):
-        _walk(value.model_dump(mode="json"), path, secrets, findings)
+        _walk(value.model_dump(mode="json"), path, secrets, findings, depth + 1)
         return
     if isinstance(value, Mapping):
         for key, item in value.items():
@@ -238,11 +303,11 @@ def _walk(
             )
             for category in key_categories:
                 findings.append(SecretFinding(category=category, path=child_path))
-            _walk(item, child_path, secrets, findings)
+            _walk(item, child_path, secrets, findings, depth + 1)
         return
     if isinstance(value, (list, tuple, set, frozenset)):
         for index, item in enumerate(value):
-            _walk(item, path + "[" + str(index) + "]", secrets, findings)
+            _walk(item, path + "[" + str(index) + "]", secrets, findings, depth + 1)
         return
 
 

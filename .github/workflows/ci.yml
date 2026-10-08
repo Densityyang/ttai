@@ -6,6 +6,10 @@ on:
     branches:
       - main
       - feature/nl2sql-v3-production
+      # Bounded agent branches are pushed directly (no PR) during the
+      # owner-gated workflow, so the exact-commit gate must run on push too.
+      # Without this an agent branch has NO CI at all.
+      - 'agent/**'
 
 permissions:
   contents: read

@@ -6,10 +6,9 @@ only through a validated typed plan after routing and budget selection.
 
 from __future__ import annotations
 
-import logging
-
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Mapping
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -24,8 +23,6 @@ from langgraph.graph.message import add_messages
 from langgraph.types import interrupt
 
 from src.nl2sql.config.settings import get_agent_config
-
-logger = logging.getLogger(__name__)
 from src.nl2sql.contracts import (
     AnswerArtifact,
     AuthorizationContext,
@@ -106,6 +103,8 @@ from src.nl2sql.supervisor.schemas import (
     ProvenanceTimeRangeBlock,
     TextBlock,
 )
+
+logger = logging.getLogger(__name__)
 
 _TRACE_SINK_TIMEOUT_SECONDS = 0.25
 _INVALID_REQUEST_ELAPSED_MS = 120_000

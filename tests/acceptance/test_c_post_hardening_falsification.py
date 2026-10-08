@@ -24,31 +24,51 @@ def test_probe_build_authority_gate_is_not_vacuous() -> None:
     assert (query.effective_mode != "BUILD") is True
 
 
-def test_probe_sse_root_gate_is_not_vacuous() -> None:
-    """The strict-root predicate must reject each falsification shape."""
+async def test_probe_sse_root_gate_is_not_vacuous() -> None:
+    """The REAL production root gate must reject each falsification shape.
 
-    def finalizes(event: dict[str, Any]) -> bool:
-        if event.get("event") != "on_chain_end":
-            return False
-        if event.get("name") != "nl2sql_v2_explicit":
-            return False
-        parents = event.get("parent_ids")
-        if not isinstance(parents, (list, tuple)) or parents:
-            return False
-        return isinstance(event.get("data", {}).get("output"), dict)
+    The strict-root predicate is inline in the production SSE generator
+    (src.nl2sql.api.stream_blocks), so it is not importable on its own.  Rather
+    than re-implement it here - a local copy could silently drift from
+    production and let this probe pass vacuously - the probe feeds each
+    falsification shape through the REAL generator and asserts that no product
+    block is projected.
+    """
+
+    from src.nl2sql.api import stream_blocks
+
+    class _Supervisor:
+        def __init__(self, events: list[dict[str, Any]]) -> None:
+            self._events = events
+
+        async def astream_events(self, *_args: object, **_kwargs: object) -> Any:
+            for event in self._events:
+                yield event
+
+    async def _block_frames(event: dict[str, Any]) -> list[str]:
+        frames: list[str] = []
+        async for chunk in stream_blocks(_Supervisor([event]), [], {}, "root-gate"):
+            frames.append(chunk)
+        return [frame for frame in frames if "event: block" in frame]
 
     good = {
         "event": "on_chain_end",
         "name": "nl2sql_v2_explicit",
         "parent_ids": [],
-        "data": {"output": {"messages": []}},
+        # An explicit block payload, so the probe depends only on the root gate
+        # and not on how an empty result would be defaulted.
+        "data": {"output": {"response_blocks": [{"type": "text", "text": "root"}]}},
     }
-    assert finalizes(good) is True
-    assert finalizes({**good, "name": None}) is False
-    assert finalizes({**good, "name": "child"}) is False
-    assert finalizes({**good, "parent_ids": ["p"]}) is False
-    assert finalizes({**good, "event": "on_chain_start"}) is False
-    assert finalizes({**good, "data": {}}) is False
+    # The genuine root completion is projected as exactly one product block.
+    assert len(await _block_frames(good)) == 1
+    for sabotaged in (
+        {**good, "name": None},
+        {**good, "name": "child"},
+        {**good, "parent_ids": ["p"]},
+        {**good, "event": "on_chain_start"},
+        {**good, "data": {}},
+    ):
+        assert await _block_frames(sabotaged) == [], sabotaged
 
 
 def test_probe_publication_current_monotonicity_is_not_vacuous() -> None:

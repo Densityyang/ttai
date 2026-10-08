@@ -5,13 +5,17 @@ the gitignored tt-api env file, so no credential is ever written into this
 script or into Git. Writes the tokens to .demo_tokens.json (gitignored) and
 prints only the profile endpoint status.
 
-Usage:  .venv\Scripts\python.exe scripts\mint_demo_token.py [telephone]
+Usage:  .venv\Scripts\python.exe scripts\mint_demo_token.py <telephone>
+
+The telephone is REQUIRED: pass it as the first argument, or set the
+TTAI_DEMO_TELEPHONE environment variable. No default is baked in on purpose.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -25,8 +29,13 @@ ROOT = Path(__file__).resolve().parents[1]
 ADMIN_DSN_FILE = ROOT / "secrets" / "database" / "business_admin_database_url"
 TT_API_ENV = ROOT / "tt-intelligent-main" / "tt-api" / ".env.prod"
 TOKENS_OUT = ROOT / ".demo_tokens.json"
-DEFAULT_TELEPHONE = "13668164299"
+TELEPHONE_ENV = "TTAI_DEMO_TELEPHONE"
 TT_API_BASE = "http://127.0.0.1:9000"
+
+USAGE = (
+    "usage: .venv\\Scripts\\python.exe scripts\\mint_demo_token.py <telephone>\n"
+    f"   or: set {TELEPHONE_ENV}=<telephone> before running the script\n"
+)
 
 _DSN = re.compile(
     r"postgresql\+asyncpg://(?P<user>[^:]+):(?P<pwd>[^@]+)@"
@@ -99,8 +108,17 @@ def _verify(token: str) -> None:
         print("profile -> ERROR", type(exc).__name__, str(exc)[:160])
 
 
+def _resolve_telephone() -> str:
+    telephone = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(TELEPHONE_ENV, "")
+    telephone = telephone.strip()
+    if not telephone:
+        print(USAGE, file=sys.stderr)
+        raise SystemExit(2)
+    return telephone
+
+
 def main() -> int:
-    telephone = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TELEPHONE
+    telephone = _resolve_telephone()
     payload = asyncio.run(_mint(telephone))
     TOKENS_OUT.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"minted demo session for {payload['name']} (id={payload['user_id']}, active={payload['is_active']})")

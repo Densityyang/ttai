@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -59,6 +60,8 @@ from src.nl2sql.semantic.schema_snapshot import (
     SchemaSnapshotState,
     validate_organization_coverage,
 )
+
+logger = logging.getLogger(__name__)
 
 _SOURCE_REJECTIONS = frozenset({
     "metric_permission_denied", "metric_relation_unapproved", "metric_aggregate_coverage_unapproved",
@@ -728,6 +731,12 @@ class MetricQueryCompiler:
             if not source.allow_detail_fallback:
                 blocked.append(code)
         if blocked:
+            # The exception keeps its single-code contract, but the FULL blocked
+            # set is what a batch-deployment operator needs: every code after
+            # the first is otherwise lost.
+            logger.warning(
+                "metric aggregate source selection blocked; failure_codes=%s", blocked
+            )
             raise PlanStepError(blocked[0])
         for source in sources:
             if source.aggregate is not None:
@@ -746,6 +755,12 @@ class MetricQueryCompiler:
                     raise
                 rejected.append(exc.code)
         if rejected:
+            # Same contract: one code on the exception, the complete rejected
+            # set in the log.
+            logger.warning(
+                "metric source selection rejected every candidate; failure_codes=%s",
+                rejected,
+            )
             raise PlanStepError(rejected[0])
         raise PlanStepError("metric_source_or_policy_missing")
 
