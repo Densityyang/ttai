@@ -594,6 +594,12 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
         # reads and writes installs/Stars/withdrawal acks through the shared
         # runtime engine, never through a business query session.
         "src/nl2sql/artifacts/library_control_store.py": {"connection.execute"},
+        # Reviewed definition writer: the control-PG definition store reads and
+        # writes the stable identity, the exact immutable versions and the
+        # per-version lifecycle through the shared runtime engine, never through
+        # a business query session.  Every statement is a fixed text(...) with
+        # bound parameters; none is assembled from request data.
+        "src/nl2sql/artifacts/definition_control_store.py": {"connection.execute"},
         # Reviewed Mode3 orchestration call: the service resolves governed
         # scalar evidence and invokes the pure Calculation Runtime; it is not a
         # database session or QueryGateway bypass.

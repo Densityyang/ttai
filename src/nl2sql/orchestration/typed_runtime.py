@@ -114,7 +114,11 @@ from src.nl2sql.orchestration.decision_contract import SlotBinding
 from src.nl2sql.orchestration.deterministic_query_plan import (
     DeterministicQueryPlanProvider,
 )
-from src.nl2sql.orchestration.execution import PlanExecutor
+from src.nl2sql.orchestration.execution import (
+    AdHocCalculationRunner,
+    PlanExecutor,
+    RuntimeCalculationRunner,
+)
 from src.nl2sql.orchestration.metric_query import (
     EligibilityPolicy,
     MetricQueryCompiler,
@@ -122,6 +126,7 @@ from src.nl2sql.orchestration.metric_query import (
     SourceFreshnessRecord,
     metric_plan_executor,
 )
+from src.nl2sql.orchestration.mode_contract import Capability
 from src.nl2sql.semantic.context_compiler import (
     ContextCompiler,
     SemanticContextResolver,
@@ -578,6 +583,22 @@ def _build_binding(
         raise TypedDeploymentError("relation_binding_invalid", source_ref) from exc
 
 
+def ad_hoc_calculation_runner_for_capabilities(
+    capabilities: frozenset[Capability] | frozenset[str],
+) -> AdHocCalculationRunner | None:
+    """EXPLICIT, fail-closed AD_HOC runner gate.
+
+    The shared typed evaluator is injected ONLY when the CURRENT run's
+    capability set grants ``run_scoped_derivation`` (frozen A1: QUERY,
+    ANALYZE and BUILD all carry it; a capability-less/unknown run does not).
+    There is no fallback: an absent capability means an AD_HOC calculation
+    step fails closed with ad_hoc_calculation_unavailable.
+    """
+
+    if "run_scoped_derivation" in capabilities:
+        return RuntimeCalculationRunner()
+    return None
+
 async def build_request_typed_runtime(
     *,
     views: AIViewsConfig,
@@ -593,6 +614,7 @@ async def build_request_typed_runtime(
     source_freshness: SourceFreshnessRecord | None = None,
     bootstrap_scan_max_rows: int | None = None,
     expected_revision: str | None = None,
+    capabilities: frozenset[Capability] | frozenset[str] = frozenset(),
 ) -> RequestTypedRuntime | TypedRuntimeUnavailable:
     """Compose ONE request-scoped typed component set, or fail closed.
 
@@ -725,7 +747,16 @@ async def build_request_typed_runtime(
         context_resolver=context_resolver,
         query_plan_provider=query_plan_provider,
         metric_query_compiler=compiler,
-        plan_executor=metric_plan_executor(compiler, gateway),
+        # The run's capability set decides AD_HOC injection EXPLICITLY.  Absent
+        # the run_scoped_derivation capability the runner stays None and the
+        # executor fails closed with ad_hoc_calculation_unavailable.
+        plan_executor=metric_plan_executor(
+            compiler,
+            gateway,
+            ad_hoc_calculation_runner=ad_hoc_calculation_runner_for_capabilities(
+                capabilities
+            ),
+        ),
         gateway=gateway,
         identity=identity,
         authorization=authorization,
@@ -806,6 +837,7 @@ __all__ = [
     "TypedRequestScopeError",
     "TypedRuntimeUnavailable",
     "build_eligibility_policies",
+    "ad_hoc_calculation_runner_for_capabilities",
     "build_relation_binding",
     "build_relation_bindings",
     "build_request_typed_runtime",

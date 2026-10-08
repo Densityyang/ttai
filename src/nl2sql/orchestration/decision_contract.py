@@ -3,9 +3,12 @@
 TYPED_CLARIFICATION_DECISION_RESUME_CONTRACT_V1.
 
 This module defines strict, frozen typed objects for resumable governed
-decisions plus ONE pure projection from an existing clarify validation record.
-It is CONTRACT + PURE PROJECTION ONLY: it performs no I/O, mutates no engine
-graph, and wires nothing into LangGraph, /actions, checkpoints or execution.
+decisions plus the pure producers that create them: a clarification request
+from an existing clarify validation record, and business-confirmation /
+risk-policy requests from a validated plan+context and explicit policy
+identity.  It is CONTRACT + PURE PRODUCER ONLY: it performs no I/O, mutates no
+engine graph, and wires nothing into LangGraph, /actions, checkpoints or
+execution.
 
 INVARIANTS
 ----------
@@ -35,6 +38,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Annotated, Final, Literal, TypeVar
@@ -658,9 +662,10 @@ def clarification_request(
 ) -> HITLRequest:
     """Pure projection: a clarify validation record -> typed HITLRequest.
 
-    No I/O, no authority, no producer for business/risk kinds.  Fails closed
-    when the validation is not a clarify, when the bound hashes do not match the
-    supplied plan/context, or when no unresolved slot actually exists.
+    No I/O and no authority.  Fails closed when the validation is not a clarify,
+    when the bound hashes do not match the supplied plan/context, or when no
+    unresolved slot actually exists.  business_confirmation_request and
+    risk_policy_decision_request are the sibling producers for the other kinds.
     """
 
     if validation.outcome != "clarify":
@@ -698,6 +703,117 @@ def clarification_request(
         policy_checksum=validation.policy_checksum,
         issue_codes=issue_codes,
         unresolved_slots=slots,
+    )
+
+
+def _confirmation_request(
+    *,
+    decision_kind: Literal["business_confirmation", "risk_policy_decision"],
+    plan: QueryPlan,
+    context: ContextBundle,
+    policy_version: str,
+    policy_checksum: str,
+    issue_codes: tuple[str, ...],
+    version: int = 1,
+    safe_summary: str | None = None,
+) -> HITLRequest:
+    """Shared fail-closed HITLRequest constructor for the two material kinds.
+
+    Reuses HITLRequest's own kind/action/forbidden-field validation instead of
+    introducing a second decision interface.
+    """
+
+    normalized_codes = tuple(dict.fromkeys(code.strip() for code in issue_codes))
+    if not normalized_codes or any(not code for code in normalized_codes):
+        raise DecisionContractError(
+            "material decision request requires at least one non-blank issue code"
+        )
+    if re.fullmatch(r"^[0-9a-f]{64}$", policy_checksum) is None:
+        raise DecisionContractError(
+            "material decision request policy checksum is invalid"
+        )
+    identity = {
+        "decision_kind": decision_kind,
+        "version": version,
+        "plan_sha256": plan.checksum,
+        "context_checksum": context.checksum,
+        "policy_version": policy_version,
+        "policy_checksum": policy_checksum,
+        "issue_codes": list(normalized_codes),
+    }
+    prefix = "business-" if decision_kind == "business_confirmation" else "risk-"
+    return HITLRequest(
+        request_id=prefix + _checksum(identity)[:32],
+        decision_kind=decision_kind,
+        version=version,
+        allowed_actions=_REQUEST_ACTIONS[decision_kind],
+        plan_sha256=plan.checksum,
+        context_checksum=context.checksum,
+        policy_version=policy_version,
+        policy_checksum=policy_checksum,
+        issue_codes=normalized_codes,
+        unresolved_slots=(),
+        safe_summary=safe_summary,
+    )
+
+
+def business_confirmation_request(
+    *,
+    plan: QueryPlan,
+    context: ContextBundle,
+    policy_version: str,
+    policy_checksum: str,
+    issue_codes: tuple[str, ...],
+    version: int = 1,
+    safe_summary: str | None = None,
+) -> HITLRequest:
+    """Pure producer: a material business-plan confirmation -> HITLRequest.
+
+    This is the missing producer for decision_kind="business_confirmation".
+    It is reason-oriented: the caller must supply at least one bounded issue
+    code.  It carries no unresolved slots, no authority, no mode and no
+    canonical/definition confirmation; it never replaces a definition
+    confirmation and never grants canonical authority.
+    """
+
+    return _confirmation_request(
+        decision_kind="business_confirmation",
+        plan=plan,
+        context=context,
+        policy_version=policy_version,
+        policy_checksum=policy_checksum,
+        issue_codes=issue_codes,
+        version=version,
+        safe_summary=safe_summary,
+    )
+
+
+def risk_policy_decision_request(
+    *,
+    plan: QueryPlan,
+    context: ContextBundle,
+    policy_version: str,
+    policy_checksum: str,
+    issue_codes: tuple[str, ...],
+    version: int = 1,
+    safe_summary: str | None = None,
+) -> HITLRequest:
+    """Pure producer: a material risk/sensitivity decision -> HITLRequest.
+
+    This is the missing producer for decision_kind="risk_policy_decision".  It
+    only offers confirm/reject/cancel and never a resolution payload, so it can
+    never smuggle a data/org/relation authorization through a risk acceptance.
+    """
+
+    return _confirmation_request(
+        decision_kind="risk_policy_decision",
+        plan=plan,
+        context=context,
+        policy_version=policy_version,
+        policy_checksum=policy_checksum,
+        issue_codes=issue_codes,
+        version=version,
+        safe_summary=safe_summary,
     )
 
 
@@ -742,9 +858,11 @@ __all__ = [
     "SlotBinding",
     "SlotName",
     "SlotValue",
+    "business_confirmation_request",
     "clarification_request",
     "resume_token",
     "revalidate_decision",
+    "risk_policy_decision_request",
     "revalidate_request",
     "revalidate_resume_token",
 ]

@@ -16,6 +16,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from src.nl2sql.artifacts.definition_control_store import ControlDefinitionStore
+    from src.nl2sql.artifacts.definition_store import InMemoryDefinitionStore
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
     from src.nl2sql.artifacts.library_control_store import ControlLibraryRepository
     from src.nl2sql.artifacts.publication import PublicationCatalogue
@@ -25,3 +27,4 @@ if TYPE_CHECKING:
 
     CataloguePort = PublicationCatalogue | ControlPublicationCatalogue
     LibraryPort = InMemoryLibraryRepository | ControlLibraryRepository
+    DefinitionStorePort = InMemoryDefinitionStore | ControlDefinitionStore

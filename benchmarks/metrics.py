@@ -1,7 +1,7 @@
-"""评测指标计算 -- Phase 5 Benchmark 体系。
+"""评测指标计算 -- Phase 5 / P9A Benchmark 体系。
 
 支持的指标：
-- Execution Accuracy (EX): SQL 执行结果与金标一致
+- Execution Accuracy (EX): 产出值与独立 oracle 一致（分母只含可裁决 case）
 - Test-Suite Accuracy: 多组测试输入下执行结果与金标一致
 - Dynamic Metric Success@K: CodeAct 计算结果在 K 次尝试内正确
 - Value Error (MAPE/SMAPE): 数值结果与金标的偏差
@@ -11,12 +11,33 @@
 - P95 Latency: 95% 分位耗时
 - Safety Interception Rate: 危险操作拦截率
 
+P9A 关键修正（统计分母）：
+- 缺 oracle 的 case 记 UNKNOWN，既不判对也不判错，且不进入 PASS 判定；
+- 分母是"可裁决 case 数"，不是 len(results)；
+- 执行成功但值错 = FAIL（真正比较值，绝不用 None/None 判等冒充正确）。
+
 并发安全：所有函数为纯函数。
 """
 
 import math
 from dataclasses import dataclass, field
 from typing import Any
+
+from benchmarks.assertions import (
+    CaseObservation,
+    CaseVerdict,
+    adjudicate,
+)
+from benchmarks.assertions import (
+    normalize_value as _normalize_value,
+)
+from benchmarks.assertions import (
+    to_numeric as _to_numeric,
+)
+from benchmarks.assertions import (
+    values_match as _values_match,
+)
+from benchmarks.registry import OUTCOME_TAXONOMY
 
 
 @dataclass
@@ -53,6 +74,68 @@ class CaseResult:
     answer_receipt: dict[str, Any] = field(default_factory=dict)
     provider_cost: float = 0.0
 
+    # ── P9A 统一评测维度 ────────────────────────────────────────────────────
+    expected_outcome: str = ""
+    observed_outcome: str = ""
+    adjudicated: bool = False
+    passed: bool | None = None
+    assertion_failures: list[str] = field(default_factory=list)
+    oracle_state: str = ""
+    oracle_available_override: bool | None = None
+    mode: str = "QUERY"
+    observed_mode: str = ""
+    capability: str = "fetch"
+    risk: str = "low"
+    tags: list[str] = field(default_factory=list)
+    expected_value_sha256: str | None = None
+    output_value_sha256: str | None = None
+    reference_sql_fingerprint: str | None = None
+    receipt_required: bool = False
+    receipt_present: bool = False
+    answer_type: str = ""
+    policy_outcome: str = ""
+    execution_accepted: bool = False
+    execution_row_count: int = 0
+    candidate_score: float | None = None
+    confirmed_plan_checksum: str | None = None
+    observed_plan_checksum: str | None = None
+    expected_row_count: int | None = None
+    observed_terminal: str = ""
+
+    def to_observation(self) -> CaseObservation:
+        return CaseObservation(
+            case_id=self.case_id,
+            expected_outcome=self.expected_outcome,
+            expected_mode=self.expected_mode,
+            tags=tuple(self.tags),
+            mode=self.mode,
+            observed_mode=self.observed_mode,
+            oracle_state=self.oracle_state,
+            oracle_available_override=self.oracle_available_override,
+            tolerance=self.tolerance,
+            gold_value=self.gold_value,
+            output_value=self.output_value,
+            output_value_sha256=self.output_value_sha256,
+            expected_value_sha256=self.expected_value_sha256,
+            reference_sql_fingerprint=self.reference_sql_fingerprint,
+            execution_success=self.execution_success,
+            execution_error=self.execution_error,
+            was_intercepted=self.was_intercepted,
+            should_reject=self.should_reject,
+            is_adversarial=self.is_adversarial,
+            receipt_required=self.receipt_required,
+            receipt_present=self.receipt_present,
+            answer_type=self.answer_type,
+            policy_outcome=self.policy_outcome,
+            execution_accepted=self.execution_accepted,
+            execution_row_count=self.execution_row_count,
+            candidate_score=self.candidate_score,
+            confirmed_plan_checksum=self.confirmed_plan_checksum,
+            observed_plan_checksum=self.observed_plan_checksum,
+            expected_row_count=self.expected_row_count,
+            observed_terminal=self.observed_terminal,
+        )
+
 
 @dataclass
 class BenchmarkReport:
@@ -79,10 +162,35 @@ class BenchmarkReport:
     manifest: dict[str, Any] = field(default_factory=dict)
     total_provider_cost: float = 0.0
 
+    # ── P9A 分母与切片 ─────────────────────────────────────────────────────
+    evidence_kind: str = "harness"
+    # How many cases actually carried a structured typed receipt.  A run with
+    # zero receipts proves nothing about accuracy, even when the oracle is
+    # adjudicable: every such case is PROVENANCE_FAILURE, not a measured miss.
+    receipts_present: int = 0
+    # False when no case had an adjudicable oracle OR no case produced a typed
+    # receipt: the 0.0 above is then "not established", never a measured 0%.
+    accuracy_established: bool = False
+    denominators: dict[str, Any] = field(default_factory=dict)
+    outcome_counts: dict[str, int] = field(default_factory=dict)
+    oracle_state_counts: dict[str, int] = field(default_factory=dict)
+    assertion_failure_counts: dict[str, int] = field(default_factory=dict)
+    mode_accuracy: dict[str, float] = field(default_factory=dict)
+    capability_accuracy: dict[str, float] = field(default_factory=dict)
+    risk_accuracy: dict[str, float] = field(default_factory=dict)
+    mode_slices: dict[str, dict[str, Any]] = field(default_factory=dict)
+    capability_slices: dict[str, dict[str, Any]] = field(default_factory=dict)
+    risk_slices: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def for_mode(self, mode: str) -> dict[str, Any]:
+        """One report can be sliced into three modes without a second run."""
+        return self.mode_slices.get(mode, {})
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "total_cases": self.total_cases,
+            "evidence_kind": self.evidence_kind,
             "execution_accuracy": round(self.execution_accuracy, 4),
             "dynamic_metric_success_at_1": round(self.dynamic_metric_success_at_1, 4),
             "mape": round(self.mean_absolute_percentage_error, 4),
@@ -96,28 +204,69 @@ class BenchmarkReport:
             "domain_accuracy": {k: round(v, 4) for k, v in self.domain_accuracy.items()},
             "manifest": self.manifest,
             "total_provider_cost": round(self.total_provider_cost, 6),
+            "receipts_present": self.receipts_present,
+            "accuracy_established": self.accuracy_established,
+            "denominators": self.denominators,
+            "outcome_counts": self.outcome_counts,
+            "oracle_state_counts": self.oracle_state_counts,
+            "assertion_failure_counts": self.assertion_failure_counts,
+            "mode_accuracy": {k: round(v, 4) for k, v in self.mode_accuracy.items()},
+            "capability_accuracy": {k: round(v, 4) for k, v in self.capability_accuracy.items()},
+            "risk_accuracy": {k: round(v, 4) for k, v in self.risk_accuracy.items()},
+            "mode_slices": self.mode_slices,
+            "capability_slices": self.capability_slices,
+            "risk_slices": self.risk_slices,
         }
 
 
+def verdict_for(result: CaseResult) -> CaseVerdict:
+    return adjudicate(result.to_observation())
+
+
+def adjudicate_case_result(result: CaseResult) -> CaseResult:
+    """Fill the adjudication fields of a result from its raw evidence."""
+    verdict = verdict_for(result)
+    result.expected_outcome = verdict.expected_outcome
+    result.observed_outcome = verdict.observed_outcome
+    result.adjudicated = verdict.adjudicated
+    result.passed = verdict.passed
+    result.assertion_failures = list(verdict.failures)
+    result.oracle_state = verdict.oracle_state
+    return result
+
+
+def adjudicated_results(results: list[CaseResult]) -> list[tuple[CaseResult, CaseVerdict]]:
+    return [(result, verdict_for(result)) for result in results]
+
+
 def compute_execution_accuracy(results: list[CaseResult]) -> float:
-    """Execution Accuracy: 执行结果与金标一致的比率。"""
+    """Execution Accuracy: 可裁决 case 中产出值与独立 oracle 一致的比率。
+
+    分母只包含"有独立 oracle 且可裁决"的 case。缺 oracle、只有 reference SQL
+    而无具体值、以及未运行的 case 记 UNKNOWN，不进入分子也不进入分母。
+    """
     if not results:
         return 0.0
-    correct = sum(1 for r in results if _values_match(r.output_value, r.gold_value, r.tolerance))
-    return correct / len(results)
+    verdicts = [verdict_for(result) for result in results]
+    adjudicated = [verdict for verdict in verdicts if verdict.adjudicated]
+    if not adjudicated:
+        return 0.0
+    correct = sum(1 for verdict in adjudicated if verdict.passed)
+    return correct / len(adjudicated)
 
 
 def compute_dynamic_metric_success(results: list[CaseResult], k: int = 1) -> float:
     """Dynamic Metric Success@K: CodeAct 结果在 K 次内正确的比率。
 
-    当前实现仅支持 K=1（单次执行成功即算通过）。
+    当前实现仅支持 K=1（单次执行成功且值可裁决即算通过）。
     """
     dynamic_cases = [r for r in results if r.expected_mode == "sql_plus_code"]
     if not dynamic_cases:
         return 0.0
     success = sum(
-        1 for r in dynamic_cases
-        if r.execution_success and _values_match(r.output_value, r.gold_value, r.tolerance)
+        1
+        for result in dynamic_cases
+        if (verdict := verdict_for(result)).adjudicated and verdict.passed
     )
     return success / len(dynamic_cases)
 
@@ -210,9 +359,117 @@ def compute_domain_accuracy(results: list[CaseResult]) -> dict[str, float]:
     }
 
 
-def generate_report(run_id: str, results: list[CaseResult]) -> BenchmarkReport:
-    """生成完整评测报告。"""
+# ── P9A 切片与分母 ──────────────────────────────────────────────────────────
+
+
+def compute_denominators(results: list[CaseResult]) -> dict[str, Any]:
+    """可解释的分母：总数、可裁决、UNKNOWN 及其原因。"""
+    verdicts = [verdict_for(result) for result in results]
+    adjudicated = [v for v in verdicts if v.adjudicated]
+    unknown = [v for v in verdicts if not v.adjudicated]
+    return {
+        "total_cases": len(results),
+        "adjudicated_cases": len(adjudicated),
+        "unknown_cases": len(unknown),
+        "unknown_missing_oracle": sum(1 for v in unknown if v.oracle_state == "MISSING"),
+        "unknown_reference_only": sum(1 for v in unknown if v.oracle_state == "REFERENCE_ONLY"),
+        "correct": sum(1 for v in adjudicated if v.passed),
+        "incorrect": sum(1 for v in adjudicated if not v.passed),
+    }
+
+
+def compute_outcome_counts(results: list[CaseResult]) -> dict[str, int]:
+    counts: dict[str, int] = {outcome: 0 for outcome in OUTCOME_TAXONOMY}
+    for result in results:
+        outcome = verdict_for(result).observed_outcome
+        counts[outcome] = counts.get(outcome, 0) + 1
+    return {outcome: count for outcome, count in counts.items() if count}
+
+
+def compute_oracle_state_counts(results: list[CaseResult]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        state = verdict_for(result).oracle_state
+        counts[state] = counts.get(state, 0) + 1
+    return counts
+
+
+def compute_assertion_failure_counts(results: list[CaseResult]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        for failure in result.assertion_failures:
+            counts[failure] = counts.get(failure, 0) + 1
+    return counts
+
+
+def _slice_metrics(results: list[CaseResult]) -> dict[str, Any]:
+    verdicts = [verdict_for(result) for result in results]
+    adjudicated = [v for v in verdicts if v.adjudicated]
+    correct = sum(1 for v in adjudicated if v.passed)
+    return {
+        "total_cases": len(results),
+        "adjudicated_cases": len(adjudicated),
+        "unknown_cases": len(verdicts) - len(adjudicated),
+        "correct": correct,
+        "execution_accuracy": round(correct / len(adjudicated), 4) if adjudicated else 0.0,
+        "outcome_counts": _count_outcomes(verdicts),
+    }
+
+
+def _count_outcomes(verdicts: list[CaseVerdict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for verdict in verdicts:
+        counts[verdict.observed_outcome] = counts.get(verdict.observed_outcome, 0) + 1
+    return counts
+
+
+def _group_slices(
+    results: list[CaseResult],
+    key: Any,
+) -> dict[str, dict[str, Any]]:
+    groups: dict[str, list[CaseResult]] = {}
+    for result in results:
+        groups.setdefault(str(key(result)), []).append(result)
+    return {name: _slice_metrics(cases) for name, cases in sorted(groups.items())}
+
+
+def compute_mode_slices(results: list[CaseResult]) -> dict[str, dict[str, Any]]:
+    return _group_slices(results, lambda r: r.mode)
+
+
+def compute_capability_slices(results: list[CaseResult]) -> dict[str, dict[str, Any]]:
+    return _group_slices(results, lambda r: r.capability)
+
+
+def compute_risk_slices(results: list[CaseResult]) -> dict[str, dict[str, Any]]:
+    return _group_slices(results, lambda r: r.risk)
+
+
+def _slice_accuracy(slices: dict[str, dict[str, Any]]) -> dict[str, float]:
+    return {name: float(data["execution_accuracy"]) for name, data in slices.items()}
+
+
+def generate_report(
+    run_id: str,
+    results: list[CaseResult],
+    *,
+    evidence_kind: str = "harness",
+) -> BenchmarkReport:
+    """生成完整评测报告。
+
+    evidence_kind 默认为 "harness"：桩实现/fake provider 的结果只证明评测
+    框架本身，不能冒充真实准确率。
+    """
+    for result in results:
+        adjudicate_case_result(result)
+
     sql_fail, code_fail = compute_failure_rates(results)
+    denominators = compute_denominators(results)
+    receipts_present = sum(1 for result in results if result.receipt_present)
+    denominators["receipts_present"] = receipts_present
+    mode_slices = compute_mode_slices(results)
+    capability_slices = compute_capability_slices(results)
+    risk_slices = compute_risk_slices(results)
 
     report = BenchmarkReport(
         run_id=run_id,
@@ -230,6 +487,19 @@ def generate_report(run_id: str, results: list[CaseResult]) -> BenchmarkReport:
         layer_accuracy=compute_layer_accuracy(results),
         domain_accuracy=compute_domain_accuracy(results),
         total_provider_cost=sum(result.provider_cost for result in results),
+        evidence_kind=evidence_kind,
+        receipts_present=receipts_present,
+        accuracy_established=denominators["adjudicated_cases"] > 0 and receipts_present > 0,
+        denominators=denominators,
+        outcome_counts=compute_outcome_counts(results),
+        oracle_state_counts=compute_oracle_state_counts(results),
+        assertion_failure_counts=compute_assertion_failure_counts(results),
+        mode_accuracy=_slice_accuracy(mode_slices),
+        capability_accuracy=_slice_accuracy(capability_slices),
+        risk_accuracy=_slice_accuracy(risk_slices),
+        mode_slices=mode_slices,
+        capability_slices=capability_slices,
+        risk_slices=risk_slices,
     )
     return report
 
@@ -276,38 +546,32 @@ def statistical_significance(
     }
 
 
-# ── 内部辅助 ──────────────────────────────────────────────────────────────────
-
-
-def _values_match(output: Any, gold: Any, tolerance: float = 0.0) -> bool:
-    """判断输出值与金标是否匹配。"""
-    if output is None or gold is None:
-        return output is None and gold is None
-
-    out_num = _to_numeric(output)
-    gold_num = _to_numeric(gold)
-
-    if out_num is not None and gold_num is not None:
-        if tolerance > 0:
-            return abs(out_num - gold_num) <= tolerance
-        return out_num == gold_num
-
-    # 字符串比较（标准化后）
-    return _normalize_value(str(output)) == _normalize_value(str(gold))
-
-
-def _to_numeric(value: Any) -> float | None:
-    """尝试转换为数值。"""
-    if isinstance(value, (int, float)):
-        return float(value) if not math.isnan(value) and not math.isinf(value) else None
-    if isinstance(value, str):
-        try:
-            return float(value.replace(",", "").strip())
-        except ValueError:
-            return None
-    return None
-
-
-def _normalize_value(text: str) -> str:
-    """标准化值用于比较。"""
-    return text.strip().lower().replace(" ", "").replace("\n", "")
+__all__ = [
+    "BenchmarkReport",
+    "CaseResult",
+    "_normalize_value",
+    "_to_numeric",
+    "_values_match",
+    "adjudicate_case_result",
+    "adjudicated_results",
+    "compute_assertion_failure_counts",
+    "compute_capability_slices",
+    "compute_denominators",
+    "compute_domain_accuracy",
+    "compute_dynamic_metric_success",
+    "compute_execution_accuracy",
+    "compute_failure_rates",
+    "compute_layer_accuracy",
+    "compute_mape",
+    "compute_mode_slices",
+    "compute_oracle_state_counts",
+    "compute_outcome_counts",
+    "compute_p95_latency",
+    "compute_repair_success_rate",
+    "compute_risk_slices",
+    "compute_safety_interception_rate",
+    "compute_smape",
+    "generate_report",
+    "statistical_significance",
+    "verdict_for",
+]

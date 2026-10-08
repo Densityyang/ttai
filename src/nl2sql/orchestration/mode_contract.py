@@ -53,8 +53,13 @@ RequestedMode = Literal["auto", "QUERY", "ANALYZE", "BUILD"]
 DEFAULT_MODE_FOR_AUTO: Final[ProductMode] = "ANALYZE"
 
 _MODE_CAPABILITIES: Final[dict[str, tuple[str, ...]]] = {
-    # QUERY / Mode1: zero-model authoritative retrieval.
-    "QUERY": ("deterministic_retrieval",),
+    # QUERY / Mode1: authoritative retrieval.  The frozen A1 product rule makes
+    # QUERY also carry canonical computation and TEMPORARY noncanonical AD_HOC
+    # computation, so the run-scoped derivation capability belongs here too.
+    # QUERY still confers NO model participation: a run-scoped derivation is
+    # deterministic and runs through the SAME governed plan/validation/executor
+    # path, so this widens the CONTRACT without widening any permission.
+    "QUERY": ("deterministic_retrieval", "run_scoped_derivation"),
     # ANALYZE / Mode2: model participation + run-scoped noncanonical derivation.
     "ANALYZE": ("deterministic_retrieval", "model_analysis", "run_scoped_derivation"),
     # BUILD / Mode3: semantic authoring/mutation capability.

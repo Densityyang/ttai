@@ -83,10 +83,13 @@ def test_no_mode_confers_a_forbidden_capability() -> None:
         granted = set(caps)
         assert granted & mc.FORBIDDEN_CAPABILITIES == set(), mode
         assert granted <= set(get_args(mc.Capability)), mode
-    # QUERY strictly grants retrieval only - no model participation
-    assert registry["QUERY"] == ("deterministic_retrieval",)
+    # QUERY grants retrieval plus the frozen A1 set (canonical computation and
+    # temporary noncanonical AD_HOC computation).  It still grants NO model
+    # participation and NO semantic authoring, so widening the contract does not
+    # widen any permission.
+    assert registry["QUERY"] == ("deterministic_retrieval", "run_scoped_derivation")
     assert "model_analysis" not in registry["QUERY"]
-    assert "run_scoped_derivation" not in registry["QUERY"]
+    assert "semantic_authoring" not in registry["QUERY"]
     # semantic authoring is BUILD-only
     assert "semantic_authoring" in registry["BUILD"]
     assert "semantic_authoring" not in registry["ANALYZE"]

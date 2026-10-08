@@ -476,6 +476,20 @@ class PlanCompiler:
         self.policy_version = policy_version
         self._calculation_catalog = calculation_catalog
 
+    @property
+    def calculation_catalog(self) -> ApprovedCalculationCatalog | None:
+        """The catalog this compiler was built with, read-only.
+
+        A caller that must run the SAME authority check before compiling (for
+        example the AD_HOC request resolver, which has to reject an input that is
+        catalog-bound) would otherwise have to be handed the catalog separately
+        and could silently be handed a DIFFERENT one.  Exposing the compiler's
+        own catalog makes that impossible; the reference is returned as-is and
+        there is deliberately no setter.
+        """
+
+        return self._calculation_catalog
+
     def compile(
         self,
         *,

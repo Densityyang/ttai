@@ -37,6 +37,7 @@ from src.nl2sql.orchestration.approved_compute import (
 )
 from src.nl2sql.orchestration.candidates import rowset_sha256
 from src.nl2sql.orchestration.execution import (
+    AdHocCalculationRunner,
     MetricStepResult,
     PlanExecutor,
     PlanStepError,
@@ -1066,6 +1067,7 @@ def metric_plan_executor(
     *,
     trusted_calculation_runner: TrustedCalculationRunner | None = None,
     calculation_catalog: ApprovedCalculationCatalog | None = None,
+    ad_hoc_calculation_runner: AdHocCalculationRunner | None = None,
 ) -> PlanExecutor:
     """Explicit request-scoped wiring; default AppContainer remains fail closed.
 
@@ -1074,6 +1076,11 @@ def metric_plan_executor(
     here does not make any unbound production metric executable.  The same holds
     for calculation_catalog: without it no dependency fetch is ever admitted, so
     the AppContainer default remains fail closed.
+
+    ad_hoc_calculation_runner DEFAULTS TO NONE.  A run-scoped AD_HOC
+    calculation therefore fails closed with ad_hoc_calculation_unavailable
+    unless a caller that has already proven the run's run_scoped_derivation
+    capability explicitly injects the shared evaluator.
     """
 
     return PlanExecutor(
@@ -1085,6 +1092,7 @@ def metric_plan_executor(
             if trusted_calculation_runner is not None
             else RegistryTrustedCalculationRunner()
         ),
+        ad_hoc_calculation_runner=ad_hoc_calculation_runner,
     )
 
 

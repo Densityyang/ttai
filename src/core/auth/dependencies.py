@@ -42,6 +42,20 @@ _THREAD_INVOKE_ROUTES = (
         "POST",
         re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/versions/[0-9]+/execute$"),
     ),
+    # The per-run audit records of ONE exact version.  Both the collection and
+    # the single-record reader are listed EXPLICITLY: an unmapped route fails
+    # closed with 403 AUTH_PERMISSION_POLICY_MISSING rather than silently
+    # inheriting a permission, so a new reader must be authorized by name here.
+    (
+        "GET",
+        re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/versions/[0-9]+/runs$"),
+    ),
+    (
+        "GET",
+        re.compile(
+            rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/versions/[0-9]+/runs/[^/]+$"
+        ),
+    ),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/install$")),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/uninstall$")),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/star$")),
