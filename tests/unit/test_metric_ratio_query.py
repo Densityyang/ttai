@@ -18,8 +18,6 @@ from src.nl2sql.orchestration.candidates import rowset_sha256
 from src.nl2sql.orchestration.execution import PlanStepError
 from src.nl2sql.orchestration.metric_query import (
     GatewayMetricStepRunner,
-    OrganizationDimensionBinding,
-    RelationBinding,
     metric_plan_executor,
 )
 from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
@@ -27,6 +25,10 @@ from src.nl2sql.semantic.metric_contract import (
     MetricCatalog,
     load_metric_catalog,
     metric_catalog_ir,
+)
+from src.nl2sql.semantic.schema_snapshot import (
+    OrganizationCoverageBinding,
+    validate_organization_coverage,
 )
 from tests.metric_fixtures import MetricAuthority, ratio_contract, seed_contract
 
@@ -98,23 +100,45 @@ def test_ratio_fields_cannot_be_omitted_or_generalized(field: str, value: Any) -
         seed_contract(ratio=metric.ratio)
 
 
-@pytest.mark.parametrize("payload", [
-    {"dimension": "unknown"}, {"dimension": "area"},
-    {"dimension": "team", "field": "team_id"},
-    {"dimension": "area", "field": "x;SELECT", "value_type": "text"},
-    {"dimension": "city_company", "field": "area_id", "value_type": "text"},
+@pytest.mark.parametrize("coverage", [
+    (OrganizationCoverageBinding("area"),),
+    (OrganizationCoverageBinding("team", "team_id"),),
+    (OrganizationCoverageBinding("area", "area_id", "decimal"),),
+    (OrganizationCoverageBinding("unknown", "area_id", "text"),),
+    (OrganizationCoverageBinding("area", "x;SELECT", "text"),),
+    (OrganizationCoverageBinding("area", "missing_column", "text"),),
+    (OrganizationCoverageBinding("area", "team_id", "text"),),
+    (OrganizationCoverageBinding("city_company", "area_id", "text"),),
 ])
-def test_invalid_deployment_dimensions(payload: dict[str, Any]) -> None:
-    with pytest.raises(ValidationError):
-        OrganizationDimensionBinding.model_validate(payload)
+def test_invalid_declared_organization_coverage_is_rejected(
+    coverage: tuple[OrganizationCoverageBinding, ...],
+) -> None:
+    authority = MetricAuthority()
+    assert authority.snapshot is not None
+    relation = authority.snapshot.candidate.relations[0]
+    assert validate_organization_coverage(
+        replace(relation, organization_coverage=coverage)
+    )
 
 
-def test_duplicate_deployment_dimension_rejected() -> None:
-    binding = MetricAuthority().binding
-    payload = binding.model_dump(mode="json")
-    payload["organization_dimensions"] *= 2
-    with pytest.raises(ValidationError, match="duplicate"):
-        RelationBinding.model_validate(payload)
+def test_duplicate_level_or_physical_field_coverage_is_rejected() -> None:
+    authority = MetricAuthority()
+    assert authority.snapshot is not None
+    relation = authority.snapshot.candidate.relations[0]
+    duplicate_level = (
+        OrganizationCoverageBinding("area", "area_id", "text"),
+        OrganizationCoverageBinding("area", "team_id", "integer"),
+    )
+    duplicate_field = (
+        OrganizationCoverageBinding("area", "area_id", "text"),
+        OrganizationCoverageBinding("team", "area_id", "integer"),
+    )
+    assert validate_organization_coverage(
+        replace(relation, organization_coverage=duplicate_level)
+    )
+    assert validate_organization_coverage(
+        replace(relation, organization_coverage=duplicate_field)
+    )
 
 
 @pytest.mark.parametrize("limit", [0, 101, True, "5", 1.5, float("inf")])
@@ -221,7 +245,11 @@ async def test_dimension_and_filter_snapshot_policy(case: str) -> None:
     authority = MetricAuthority(metric)
     assert authority.snapshot is not None
     if case == "missing_binding":
-        authority.binding = authority.binding.model_copy(update={"organization_dimensions": ()})
+        # No authorization is injected here, so this guards the PRE-2B no-auth
+        # path: an uncovered requested scope must keep the DEGRADABLE
+        # grain_or_dimension error (and its detail fallback), exactly as the old
+        # empty organization_dimensions produced.
+        authority.change_snapshot_relation(organization_coverage=())
     elif case == "allowed":
         authority.binding = authority.binding.model_copy(update={
             "allowed_columns": tuple(c for c in authority.binding.allowed_columns if c != "area_id"),
@@ -236,6 +264,9 @@ async def test_dimension_and_filter_snapshot_policy(case: str) -> None:
         ))
     assert authority.release is not None
     authority.release = replace(authority.release, schema_snapshot_checksum=authority.snapshot.checksum)
+    # This test injects NO authorization, so every expectation is the pre-2B
+    # no-auth behavior: uncovered scope => degradable grain error; missing or
+    # wrong-typed physical column => the pre-existing column errors.
     expected_error = {
         "missing_binding": "grain_or_dimension", "allowed": "column_unapproved",
         "missing_column": "column_unapproved", "sensitive": "column_unapproved",
