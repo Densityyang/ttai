@@ -1449,9 +1449,9 @@ async def test_f_mode2_is_analyze_and_fetches_before_any_model() -> None:
             assert forbidden not in payload, forbidden
 
 
-# ========================================================================== 
+# ==========================================================================
 # Falsification probes: prove the new re-acceptance gates are not vacuous.
-# ========================================================================== 
+# ==========================================================================
 
 
 def test_probe_ph1_narrow_typing_is_not_vacuous() -> None:

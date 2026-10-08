@@ -562,9 +562,9 @@ async def test_public_output_separates_source_facts_from_interpretation() -> Non
     assert provenance["model"] == "acceptance-model"
 
 
-# ========================================================================== 
+# ==========================================================================
 # 5. Mode3 shared runtime + generic resolver contract.
-# ========================================================================== 
+# ==========================================================================
 
 
 def _actual_to_target_spec() -> CalculationSpec:

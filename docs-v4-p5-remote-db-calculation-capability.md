@@ -863,5 +863,3 @@ remote roles" is more actionable than framing it as new hardening work.
 - Raw probe scripts and JSON (outside both repositories): `C:\Users\Density\.dsh\p5\`
   (`probe_A*.py` / `probe_A*_out.json`, `probe_b_*.py` / `out_meta.json` / `out_agg.json` / `out_cov.json`).
 - No file in either repository was modified by this audit; the only repository artifact is this document.
-
-

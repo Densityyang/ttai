@@ -142,4 +142,3 @@ def test_probe_definition_block_sabotage_is_detectable() -> None:
     )
     assert "status" in set(collapsed.model_fields)
     assert "status" not in set(DefinitionBlock.model_fields)
-

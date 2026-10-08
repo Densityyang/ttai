@@ -133,4 +133,3 @@ def test_probe_block_manifest_gate_is_not_vacuous() -> None:
 
 def _noop(*_: object, **__: object) -> Any:
     return None
-
