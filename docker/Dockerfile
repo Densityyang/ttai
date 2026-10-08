@@ -38,7 +38,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends postgresql-client \
+    && apt-get install --yes --no-install-recommends \
+        postgresql-client \
+        libssl3t64 \
+        openssl \
+        openssl-provider-legacy \
+    && apt-get install --yes --only-upgrade --no-install-recommends \
+        gzip \
+        libpcre2-8-0 \
+        libsqlite3-0 \
+    && python -m pip install --no-cache-dir --upgrade "setuptools>=78.1.1" \
+    && python -m pip uninstall --yes pip \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system app \
     && useradd --system --gid app --create-home app

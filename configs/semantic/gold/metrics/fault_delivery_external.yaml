@@ -1,0 +1,122 @@
+# 外部故障交付分析系统已计算的月度百分比，禁止在本系统内再次汇总。
+metrics:
+  - name: fault_delivery_compliance_rate_month
+    display_name: 故障交付达标率（月）
+    description: 外部导入的故障交付达标率月度权威值
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [fault_delivery, external]
+    time_grain: month
+    rollup_strategy: null
+    dimensions: &fault_delivery_dimensions
+      - {name: area_id, type: area}
+      - {name: team_id, type: team}
+      - {name: employee_id, type: employee}
+      - {name: category_code, type: category, required: true}
+    value_type: percent
+    unit: '%'
+
+  - name: timely_first_response_rate_month
+    display_name: 及时首响占比（月）
+    description: 外部导入的及时首响占比月度权威值
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [fault_delivery, external]
+    time_grain: month
+    rollup_strategy: null
+    dimensions: *fault_delivery_dimensions
+    value_type: percent
+    unit: '%'
+
+  - name: recording_quality_pass_rate_month
+    display_name: 录音质检合格占比（月）
+    description: 外部导入的录音质检合格占比月度权威值
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [fault_delivery, external]
+    time_grain: month
+    rollup_strategy: null
+    dimensions: *fault_delivery_dimensions
+    value_type: percent
+    unit: '%'
+
+  - name: timely_reschedule_rate_month
+    display_name: 及时改约占比（月）
+    description: 外部导入的及时改约占比月度权威值
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [fault_delivery, external]
+    time_grain: month
+    rollup_strategy: null
+    dimensions: *fault_delivery_dimensions
+    value_type: percent
+    unit: '%'
+
+  - name: timely_arrival_rate_month
+    display_name: 及时上门占比（月）
+    description: 外部导入的及时上门占比月度权威值
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [fault_delivery, external]
+    time_grain: month
+    rollup_strategy: null
+    dimensions: *fault_delivery_dimensions
+    value_type: percent
+    unit: '%'
+
+  - name: onsite_speed_test_rate_month
+    display_name: 现场测速占比（月）
+    description: 外部导入的现场测速占比月度权威值
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [fault_delivery, external]
+    time_grain: month
+    rollup_strategy: null
+    dimensions: *fault_delivery_dimensions
+    value_type: percent
+    unit: '%'
+
+  - name: normal_archive_rate_month
+    display_name: 正常归档占比（月）
+    description: 外部导入的正常归档占比月度权威值
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [fault_delivery, external]
+    time_grain: month
+    rollup_strategy: null
+    dimensions: *fault_delivery_dimensions
+    value_type: percent
+    unit: '%'
+
+  - name: review_invitation_rate_month
+    display_name: 引评占比（月）
+    description: 外部导入的引评占比月度权威值
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [fault_delivery, external]
+    time_grain: month
+    rollup_strategy: null
+    dimensions: *fault_delivery_dimensions
+    value_type: percent
+    unit: '%'
+
+  - name: authentic_customer_signature_rate_month
+    display_name: 客户真实签字占比（月）
+    description: 外部导入的客户真实签字占比月度权威值
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [fault_delivery, external]
+    time_grain: month
+    rollup_strategy: null
+    dimensions: *fault_delivery_dimensions
+    value_type: percent
+    unit: '%'

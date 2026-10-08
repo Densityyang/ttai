@@ -6,13 +6,79 @@ import hashlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from starlette.requests import Request
 
-from src.core.auth.types import AuthUser
+from src.core.auth.types import AuthUser, OrganizationIdentity
 from src.core.settings import Settings, get_settings
+from src.nl2sql.contracts import (
+    AuthorizationContext,
+    AuthorizationDecision,
+    ScopeLevel,
+    evaluate_authorization,
+)
+
+
+class BackendAuthorizationProvider(Protocol):
+    """Server-side source of the final Agent-facing authorization snapshot.
+
+    load returns the Backend-owned, already-resolved effective scope.  It must
+    not reinterpret a legacy organization type or derive roles; a None result
+    means the snapshot is UNAVAILABLE and is treated exactly like a deny.  This
+    is a contract only: no HTTP call, endpoint, or payload mapping is defined.
+    """
+
+    async def load(self, user: AuthUser) -> AuthorizationContext | None:
+        """Return the effective authorization for user, or None if unavailable."""
+        ...
+
+
+async def resolve_authorization_context(
+    provider: BackendAuthorizationProvider | None,
+    user: AuthUser,
+) -> AuthorizationContext | None:
+    """Resolve the trusted Backend authorization context, fail-closed to None.
+
+    An absent provider, a None result, any provider exception, and a
+    malformed/lookalike payload all collapse to the same None.  A real
+    AuthorizationContext is returned VERBATIM: no scope inference, no role
+    inference, and no authorization_revision synthesis happen here.
+    """
+
+    if provider is None:
+        return None
+    try:
+        loaded = await provider.load(user)
+    except Exception:
+        return None
+    return loaded if isinstance(loaded, AuthorizationContext) else None
+
+
+async def load_authorization(
+    provider: BackendAuthorizationProvider,
+    user: AuthUser,
+    *,
+    expected_revision: str | None,
+    requested_scope_level: ScopeLevel | None = None,
+    requested_scope_id: str | None = None,
+) -> AuthorizationDecision:
+    """Resolve authorization fail-closed through a provider contract.
+
+    Any provider failure -- an exception, a None result, or a malformed
+    payload -- collapses to the same indistinguishable deny via
+    evaluate_authorization.  expected_revision is server-derived and is never
+    read from client input.
+    """
+
+    context = await resolve_authorization_context(provider, user)
+    return evaluate_authorization(
+        context,
+        expected_revision=expected_revision,
+        requested_scope_level=requested_scope_level,
+        requested_scope_id=requested_scope_id,
+    )
 
 
 @dataclass(slots=True)
@@ -148,6 +214,9 @@ class TTApiAuthProvider:
             telephone=telephone,
             roles=roles,
             permissions=permissions,
+            # CONTEXT ONLY.  Mapped once at the provider boundary and never used
+            # to derive scope, permission or authorization revision.
+            organization=self._extract_organization(raw_data),
         )
 
     @staticmethod
@@ -185,6 +254,54 @@ class TTApiAuthProvider:
         if user_id is None:
             raise AuthUpstreamUnavailableError("鉴权上游缺少用户标识")
         return user_id
+
+    @classmethod
+    def _extract_optional_id(cls, raw_data: dict[str, Any], *keys: str) -> str | None:
+        """Normalize an opaque organization id to a non-empty string."""
+
+        value = cls._pick_first(raw_data, list(keys))
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, str)):
+            text = str(value).strip()
+            return text or None
+        return None
+
+    @classmethod
+    def _extract_optional_text(cls, raw_data: dict[str, Any], *keys: str) -> str | None:
+        value = cls._pick_first(raw_data, list(keys))
+        if isinstance(value, str):
+            text = value.strip()
+            return text or None
+        return None
+
+    def _extract_organization(self, raw_data: dict[str, Any]) -> OrganizationIdentity:
+        """Map the profile organization block; unknown/malformed values drop.
+
+        Organization identity is CONTEXT, so a malformed org block must never
+        fail the request - unlike the four legacy fields, which stay fail-closed.
+
+        The upstream free-text position (an employee job title) is deliberately
+        NOT aliased to position_name.
+        """
+
+        return OrganizationIdentity(
+            company_id=self._extract_optional_id(raw_data, "company_id", "companyId"),
+            department_id=self._extract_optional_id(
+                raw_data, "department_id", "departmentId", "dept_id"
+            ),
+            team_id=self._extract_optional_id(raw_data, "team_id", "teamId"),
+            employee_id=self._extract_optional_id(raw_data, "employee_id", "employeeId"),
+            position_id=self._extract_optional_id(raw_data, "position_id", "positionId"),
+            company_name=self._extract_optional_text(raw_data, "company_name", "companyName"),
+            department_name=self._extract_optional_text(
+                raw_data, "department_name", "departmentName", "dept_name"
+            ),
+            team_name=self._extract_optional_text(raw_data, "team_name", "teamName"),
+            position_name=self._extract_optional_text(
+                raw_data, "position_name", "positionName"
+            ),
+        )
 
     def _extract_telephone(self, raw_data: dict[str, Any]) -> str | None:
         telephone_raw = self._pick_first(raw_data, ["telephone", "phone", "mobile"])

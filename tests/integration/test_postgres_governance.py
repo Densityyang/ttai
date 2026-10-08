@@ -90,6 +90,8 @@ def _wait_for_postgres(container: str, owner: str, database: str) -> None:
             "exec",
             container,
             "pg_isready",
+            "--host",
+            "127.0.0.1",
             "--username",
             owner,
             "--dbname",

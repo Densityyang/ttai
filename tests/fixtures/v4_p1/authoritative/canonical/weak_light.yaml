@@ -1,0 +1,525 @@
+# WEAK_LIGHT 业务域指标配置
+metrics:
+  - name: home_broadband_weak_light_count_day
+    display_name: 全量弱光数（日）
+    description: 家宽运维系统弱光 ONU 统计报表中，昨日业务类型为家宽且光功率不达标类型为弱光/重度弱光的 ONU 数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - home_broadband
+      - onu
+    time_grain: day
+    time_column: collection_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 户
+    source_table: silver_weak_light_onu_statistics
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: service_type
+        operator: eq
+        value: 家宽
+      - column: light_power_noncompliance_type
+        operator: in
+        value: [弱光, 重度弱光]
+
+  - name: home_broadband_severe_weak_light_count_day
+    display_name: 重度弱光数（日）
+    description: 家宽运维系统弱光 ONU 统计报表中，昨日业务类型为家宽且光功率不达标类型为重度弱光的 ONU 数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - severe_weak_light
+      - home_broadband
+      - onu
+    time_grain: day
+    time_column: collection_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 户
+    source_table: silver_weak_light_onu_statistics
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: service_type
+        operator: eq
+        value: 家宽
+      - column: light_power_noncompliance_type
+        operator: eq
+        value: 重度弱光
+
+  - name: enterprise_broadband_weak_light_count_day
+    display_name: 企宽弱光数（日）
+    description: 感知系统弱光 ONU 统计报表中，昨日业务类型为企宽的 ONU 弱光数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - enterprise_broadband
+      - onu
+    time_grain: day
+    time_column: collection_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 户
+    source_table: silver_weak_light_onu_statistics
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: service_type
+        operator: eq
+        value: 企宽
+      - column: light_power_noncompliance_type
+        operator: in
+        value: [弱光, 重度弱光]
+
+  - name: home_broadband_weak_light_rate_day
+    display_name: 当月光功率不达标占比（日）
+    description: 全量弱光数 / 家宽客户数，按弱光 ONU 统计报表昨日快照计算
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - home_broadband
+      - kpi
+    time_grain: day
+    rollup_strategy: null
+    dimensions: []
+    value_type: percent
+    unit: '%'
+    expression: |
+      ROUND((CAST({weak_light} AS DECIMAL) / {customer_count}) * 100, 2)
+    dependencies:
+      weak_light: home_broadband_weak_light_count_day
+      customer_count: home_broadband_customer_count
+
+  - name: home_broadband_severe_weak_light_rate_day
+    display_name: 当月重度弱光占比（日）
+    description: 重度弱光数 / 全量弱光数，按弱光 ONU 统计报表昨日快照计算
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - severe_weak_light
+      - kpi
+    time_grain: day
+    rollup_strategy: null
+    dimensions: []
+    value_type: percent
+    unit: '%'
+    expression: |
+      ROUND((CAST({severe_weak_light} AS DECIMAL) / {weak_light}) * 100, 2)
+    dependencies:
+      severe_weak_light: home_broadband_severe_weak_light_count_day
+      weak_light: home_broadband_weak_light_count_day
+
+  - name: enterprise_broadband_weak_light_rate_day
+    display_name: 企宽弱光占比（日）
+    description: 企宽弱光数 / 家宽客户数，按感知系统弱光 ONU 统计报表昨日快照计算，分母沿用家宽客户数口径
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - enterprise_broadband
+      - kpi
+    time_grain: day
+    rollup_strategy: null
+    dimensions: []
+    value_type: percent
+    unit: '%'
+    expression: |
+      ROUND((CAST({enterprise_weak_light} AS DECIMAL) / {customer_count}) * 100, 2)
+    dependencies:
+      enterprise_weak_light: enterprise_broadband_weak_light_count_day
+      customer_count: home_broadband_customer_count
+
+  - name: home_broadband_customer_count_area_day
+    display_name: 家宽客户数（区县-日）
+    description: 家宽客户数区县日快照，来源于 Consumer 模块维护的家宽客户数快照表
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - consumer
+      - home_broadband
+      - customer_count
+      - area
+    time_grain: day
+    time_column: stat_date
+    rollup_strategy: last
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: integer
+    unit: 户
+    source_table: consumer_home_broadband_customer_count_snapshot
+    aggregation:
+      operation: sum
+      column: customer_count
+    filters:
+      - column: dimension_type
+        operator: eq
+        value: area
+
+  - name: home_broadband_weak_light_count_area_day
+    display_name: 全量弱光数（区县-日）
+    description: 家宽运维系统弱光 ONU 统计报表中，昨日按区县统计的家宽弱光/重度弱光 ONU 数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - home_broadband
+      - onu
+      - area
+    time_grain: day
+    time_column: collection_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 户
+    source_table: silver_weak_light_onu_statistics
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: service_type
+        operator: eq
+        value: 家宽
+      - column: light_power_noncompliance_type
+        operator: in
+        value: [弱光, 重度弱光]
+
+  - name: home_broadband_severe_weak_light_count_area_day
+    display_name: 重度弱光数（区县-日）
+    description: 家宽运维系统弱光 ONU 统计报表中，昨日按区县统计的家宽重度弱光 ONU 数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - severe_weak_light
+      - home_broadband
+      - onu
+      - area
+    time_grain: day
+    time_column: collection_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 户
+    source_table: silver_weak_light_onu_statistics
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: service_type
+        operator: eq
+        value: 家宽
+      - column: light_power_noncompliance_type
+        operator: eq
+        value: 重度弱光
+
+  - name: enterprise_broadband_weak_light_count_area_day
+    display_name: 企宽弱光数（区县-日）
+    description: 感知系统弱光 ONU 统计报表中，昨日按区县统计的业务类型为企宽的 ONU 弱光数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - enterprise_broadband
+      - onu
+      - area
+    time_grain: day
+    time_column: collection_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 户
+    source_table: silver_weak_light_onu_statistics
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: service_type
+        operator: eq
+        value: 企宽
+      - column: light_power_noncompliance_type
+        operator: in
+        value: [弱光, 重度弱光]
+
+  - name: home_broadband_weak_light_rate_area_day
+    display_name: 当月光功率不达标占比（区县-日）
+    description: 区县全量弱光数 / 区县家宽客户数，按弱光 ONU 统计报表昨日快照计算
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - home_broadband
+      - kpi
+      - area
+    time_grain: day
+    rollup_strategy: null
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: '%'
+    expression: |
+      ROUND((CAST({weak_light} AS DECIMAL) / {customer_count}) * 100, 2)
+    dependencies:
+      weak_light: home_broadband_weak_light_count_area_day
+      customer_count: home_broadband_customer_count_area_day
+
+  - name: home_broadband_severe_weak_light_rate_area_day
+    display_name: 当月重度弱光占比（区县-日）
+    description: 区县重度弱光数 / 区县全量弱光数，按弱光 ONU 统计报表昨日快照计算
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - severe_weak_light
+      - kpi
+      - area
+    time_grain: day
+    rollup_strategy: null
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: '%'
+    expression: |
+      ROUND((CAST({severe_weak_light} AS DECIMAL) / {weak_light}) * 100, 2)
+    dependencies:
+      severe_weak_light: home_broadband_severe_weak_light_count_area_day
+      weak_light: home_broadband_weak_light_count_area_day
+
+  - name: enterprise_broadband_weak_light_rate_area_day
+    display_name: 企宽弱光占比（区县-日）
+    description: 区县企宽弱光数 / 区县家宽客户数，按感知系统弱光 ONU 统计报表昨日快照计算，分母沿用家宽客户数口径
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - enterprise_broadband
+      - kpi
+      - area
+    time_grain: day
+    rollup_strategy: null
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: '%'
+    expression: |
+      ROUND((CAST({enterprise_weak_light} AS DECIMAL) / {customer_count}) * 100, 2)
+    dependencies:
+      enterprise_weak_light: enterprise_broadband_weak_light_count_area_day
+      customer_count: home_broadband_customer_count_area_day
+
+  # ============ 新装弱光指标（日粒度，支持按日期范围累计）============
+  - name: post_installation_weak_light_count_area_day
+    display_name: 新装弱光数（区县-日）
+    description: 感知系统新装弱光明细中，按归档时间统计的区县日度新装弱光数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - post_installation
+      - area
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_post_installation_weak_light
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: not_null
+
+  - name: post_installation_archived_order_count_area_day
+    display_name: 新装弱光分母归档工单数（区县-日）
+    description: 施工调度系统当月全量归档工单的区县日度数量，用于新装弱光占比分母
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - post_installation
+      - denominator
+      - area
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: not_null
+
+  - name: post_installation_weak_light_rate_area_day
+    display_name: 新装弱光（区县-日）
+    description: 感知系统新装弱光明细数 / 施工调度系统全量归档工单数，支持选择当月1日至前天做累计
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - post_installation
+      - kpi
+      - area
+    time_grain: day
+    rollup_strategy: null
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: '%'
+    expression: |
+      CASE
+        WHEN CAST({archived_orders} AS DECIMAL) > 0
+        THEN ROUND((CAST(COALESCE({weak_light}, 0) AS DECIMAL) / {archived_orders}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      weak_light: post_installation_weak_light_count_area_day
+      archived_orders: post_installation_archived_order_count_area_day
+
+  - name: post_installation_weak_light_count_team_day
+    display_name: 新装弱光数（班组-日）
+    description: 感知系统新装弱光明细中，按归档时间统计的班组日度新装弱光数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - post_installation
+      - team
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_post_installation_weak_light
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: not_null
+
+  - name: post_installation_archived_order_count_team_day
+    display_name: 新装弱光分母归档工单数（班组-日）
+    description: 施工调度系统当月全量归档工单的班组日度数量，用于新装弱光占比分母
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - post_installation
+      - denominator
+      - team
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: not_null
+
+  - name: post_installation_weak_light_rate_team_day
+    display_name: 新装弱光（班组-日）
+    description: 感知系统新装弱光明细数 / 施工调度系统全量归档工单数，支持选择当月1日至前天做累计
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - weak_light
+      - post_installation
+      - kpi
+      - team
+    time_grain: day
+    rollup_strategy: null
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: '%'
+    expression: |
+      CASE
+        WHEN CAST({archived_orders} AS DECIMAL) > 0
+        THEN ROUND((CAST(COALESCE({weak_light}, 0) AS DECIMAL) / {archived_orders}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      weak_light: post_installation_weak_light_count_team_day
+      archived_orders: post_installation_archived_order_count_team_day

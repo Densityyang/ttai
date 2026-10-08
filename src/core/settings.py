@@ -92,8 +92,62 @@ class Settings(BaseSettings):
         default="nl2sql:stream",
         description="stream ????????",
     )
+    # Deployment-level typed-runtime activation.  "disabled" (the default) keeps
+    # the EXISTING v2 product path and leaves the typed runtime DORMANT.  The
+    # ONLY enabling value is "trusted_backend_authorization", which requires the
+    # trusted Backend Agent AuthorizationContext carrier to be configured.  There
+    # is deliberately no generic boolean "security off" switch and no
+    # per-request bypass: the decision is taken once, deployment-wide, when the
+    # engine is built.
+    typed_runtime_activation: Literal[
+        "disabled",
+        "trusted_backend_authorization",
+        "demo_synthetic_authorization",
+        "local_real_data_demo",
+    ] = Field(
+        default="disabled",
+        description=(
+            "Deployment-level typed-runtime activation.  "
+            "trusted_backend_authorization uses the real Backend carrier.  "
+            "demo_synthetic_authorization issues SYNTHETIC demo authority and is "
+            "legal ONLY when service_mode is infra-dev.  "
+            "local_real_data_demo reads the REAL business database read-only under "
+            "a server-owned local authority, and is legal ONLY when service_mode "
+            "is infra-dev."
+        ),
+    )
     api_port: int = Field(default=9001, description="API ????")
     service_mode: Literal["infra-dev", "product"] = Field(default="infra-dev")
+    # SERVER-OWNED demo identity, used ONLY when auth is disabled AND demo
+    # activation is on.  It is never taken from a request body/query/header, so
+    # a client can never select its own demo identity.
+    local_real_demo_user_id: str = Field(
+        default="local-real-demo",
+        min_length=1,
+        max_length=128,
+        description=(
+            "Server-owned identity used when AUTH_ENABLED=false and "
+            "TYPED_RUNTIME_ACTIVATION=local_real_data_demo."
+        ),
+    )
+    local_demo_certification_admin_user_id: str = Field(
+        default="local-real-demo",
+        min_length=1,
+        max_length=128,
+        description=(
+            "INDEPENDENT server-owned authority for LOCAL-DEMO certification. "
+            "Authority comes from this setting, never from publication ownership."
+        ),
+    )
+    demo_synthetic_user_id: str = Field(
+        default="demo-analyst",
+        min_length=1,
+        max_length=128,
+        description=(
+            "Synthetic identity used when AUTH_ENABLED=false and "
+            "TYPED_RUNTIME_ACTIVATION=demo_synthetic_authorization."
+        ),
+    )
     model_required: bool = Field(default=False)
     cors_allowed_origins: str = Field(
         default="http://localhost:3000,http://127.0.0.1:3000",
@@ -137,6 +191,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_auth_settings(self) -> "Settings":
+        if self.service_mode == "product" and not self.auth_enabled:
+            raise ValueError("AUTH_ENABLED=false is not permitted in product mode")
         if self.auth_enabled and not self.tt_api_base_url.strip():
             raise ValueError("AUTH_ENABLED=true ????? TT_API_BASE_URL")
         return self
@@ -165,6 +221,56 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def validate_demo_activation_is_never_product(self) -> "Settings":
+        """Demo synthetic authority must be structurally impossible in product.
+
+        Evaluated at Settings CONSTRUCTION, so the forbidden pair can never be
+        minted - not even transiently - and cache clearing cannot skip it.
+        """
+
+        if self.service_mode == "product" and self.typed_runtime_activation in (
+            "demo_synthetic_authorization",
+            "local_real_data_demo",
+        ):
+            raise ValueError(
+                "typed_runtime_activation="
+                f"{self.typed_runtime_activation} is not permitted when "
+                "service_mode=product: demo/local authority must never be "
+                "reachable in a product deployment"
+            )
+        if (
+            self.service_mode != "product"
+            and self.typed_runtime_activation == "demo_synthetic_authorization"
+            and not self.auth_enabled
+        ):
+            # The configured demo identity must be an EXPLICIT demo fixture, so a
+            # typo fails at startup instead of silently yielding no authority.
+            from src.core.auth.demo_provider import DEFAULT_DEMO_IDENTITIES
+
+            known = {item.user_id for item in DEFAULT_DEMO_IDENTITIES}
+            if self.demo_synthetic_user_id not in known:
+                raise ValueError(
+                    "demo_synthetic_user_id must name an explicit demo fixture "
+                    f"identity (known: {sorted(known)})"
+                )
+        if (
+            self.service_mode != "product"
+            and self.typed_runtime_activation == "local_real_data_demo"
+            and not self.auth_enabled
+        ):
+            from src.core.auth.local_real_provider import (
+                DEFAULT_LOCAL_REAL_IDENTITIES,
+            )
+
+            local_known = {item.user_id for item in DEFAULT_LOCAL_REAL_IDENTITIES}
+            if self.local_real_demo_user_id not in local_known:
+                raise ValueError(
+                    "local_real_demo_user_id must name an explicit local-real "
+                    f"fixture identity (known: {sorted(local_known)})"
+                )
+        return self
+
+    @model_validator(mode="after")
     def validate_cors_settings(self) -> "Settings":
         origins = self.cors_origins
         if self.cors_allow_credentials and "*" in origins:
@@ -176,6 +282,38 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
+
+    @property
+    def typed_runtime_enabled(self) -> bool:
+        """True for a deployment that enabled a typed path.
+
+        Both enabling values turn the typed runtime ON, but their authority
+        construction is COMPLETELY DISTINCT: trusted_backend_authorization reads
+        the real Backend carrier, while demo_synthetic_authorization issues
+        synthetic demo authority (legal only outside product mode).
+        """
+
+        return self.typed_runtime_activation in (
+            "trusted_backend_authorization",
+            "demo_synthetic_authorization",
+            "local_real_data_demo",
+        )
+
+    @property
+    def demo_synthetic_authorization_enabled(self) -> bool:
+        """True only for the EXPLICIT synthetic demo activation.
+
+        LOCAL-REAL activation is deliberately NOT included: the synthetic demo
+        must remain completely DB-free, and local-real is a distinct profile.
+        """
+
+        return self.typed_runtime_activation == "demo_synthetic_authorization"
+
+    @property
+    def local_real_data_demo_enabled(self) -> bool:
+        """True only for the EXPLICIT local real-data profile.  Never implied."""
+
+        return self.typed_runtime_activation == "local_real_data_demo"
 
 
 @lru_cache

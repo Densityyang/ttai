@@ -1,0 +1,2379 @@
+{
+  "task_id": "v4_p2_org_db_evidence",
+  "provenance": {
+    "dsn_source": "file:P2_BUSINESS_RO_DSN_FILE",
+    "current_user": "postgres",
+    "session_user": "postgres",
+    "is_superuser": true,
+    "transaction_read_only": "on",
+    "server_version": "18.1 (Debian 18.1-1.pgdg13+2)",
+    "statement_timeout": "5s",
+    "lock_timeout": "1s",
+    "checked_at": "2026-09-18T02:06:21.034532+00:00"
+  },
+  "check1_schema": {
+    "organization_company": {
+      "exists": true,
+      "columns": [
+        {
+          "column_name": "name",
+          "data_type": "character varying(100)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "code",
+          "data_type": "character varying(50)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "short_name",
+          "data_type": "character varying(50)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "contact_person",
+          "data_type": "character varying(50)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "contact_phone",
+          "data_type": "character varying(20)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "address",
+          "data_type": "character varying(200)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "is_active",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "true"
+        },
+        {
+          "column_name": "order_num",
+          "data_type": "integer",
+          "not_null": true,
+          "default_expr": "0"
+        },
+        {
+          "column_name": "remark",
+          "data_type": "character varying(500)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": "nextval('organization_company_id_seq'::regclass)"
+        },
+        {
+          "column_name": "created_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "updated_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "is_deleted",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "false"
+        },
+        {
+          "column_name": "delete_datetime",
+          "data_type": "timestamp with time zone",
+          "not_null": false,
+          "default_expr": null
+        }
+      ],
+      "constraints": [
+        {
+          "name": "organization_company_code_not_null",
+          "kind": "n",
+          "definition": "NOT NULL code"
+        },
+        {
+          "name": "organization_company_created_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL created_at"
+        },
+        {
+          "name": "organization_company_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL id"
+        },
+        {
+          "name": "organization_company_is_active_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_active"
+        },
+        {
+          "name": "organization_company_is_deleted_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_deleted"
+        },
+        {
+          "name": "organization_company_name_not_null",
+          "kind": "n",
+          "definition": "NOT NULL name"
+        },
+        {
+          "name": "organization_company_order_num_not_null",
+          "kind": "n",
+          "definition": "NOT NULL order_num"
+        },
+        {
+          "name": "organization_company_updated_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL updated_at"
+        },
+        {
+          "name": "organization_company_pkey",
+          "kind": "p",
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "organization_company_code_key",
+          "kind": "u",
+          "definition": "UNIQUE (code)"
+        }
+      ]
+    },
+    "organization_department": {
+      "exists": true,
+      "columns": [
+        {
+          "column_name": "name",
+          "data_type": "character varying(100)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "code",
+          "data_type": "character varying(50)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "short_name",
+          "data_type": "character varying(50)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "company_id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "parent_id",
+          "data_type": "bigint",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "manager",
+          "data_type": "character varying(50)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "contact_phone",
+          "data_type": "character varying(20)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "is_active",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "true"
+        },
+        {
+          "column_name": "order_num",
+          "data_type": "integer",
+          "not_null": true,
+          "default_expr": "0"
+        },
+        {
+          "column_name": "remark",
+          "data_type": "character varying(500)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": "nextval('organization_department_id_seq'::regclass)"
+        },
+        {
+          "column_name": "created_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "updated_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "is_deleted",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "false"
+        },
+        {
+          "column_name": "delete_datetime",
+          "data_type": "timestamp with time zone",
+          "not_null": false,
+          "default_expr": null
+        }
+      ],
+      "constraints": [
+        {
+          "name": "organization_department_company_id_fkey",
+          "kind": "f",
+          "definition": "FOREIGN KEY (company_id) REFERENCES organization_company(id) ON DELETE RESTRICT"
+        },
+        {
+          "name": "organization_department_parent_id_fkey",
+          "kind": "f",
+          "definition": "FOREIGN KEY (parent_id) REFERENCES organization_department(id) ON DELETE CASCADE"
+        },
+        {
+          "name": "organization_department_code_not_null",
+          "kind": "n",
+          "definition": "NOT NULL code"
+        },
+        {
+          "name": "organization_department_company_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL company_id"
+        },
+        {
+          "name": "organization_department_created_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL created_at"
+        },
+        {
+          "name": "organization_department_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL id"
+        },
+        {
+          "name": "organization_department_is_active_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_active"
+        },
+        {
+          "name": "organization_department_is_deleted_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_deleted"
+        },
+        {
+          "name": "organization_department_name_not_null",
+          "kind": "n",
+          "definition": "NOT NULL name"
+        },
+        {
+          "name": "organization_department_order_num_not_null",
+          "kind": "n",
+          "definition": "NOT NULL order_num"
+        },
+        {
+          "name": "organization_department_updated_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL updated_at"
+        },
+        {
+          "name": "organization_department_pkey",
+          "kind": "p",
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "organization_department_code_key",
+          "kind": "u",
+          "definition": "UNIQUE (code)"
+        }
+      ]
+    },
+    "organization_team": {
+      "exists": true,
+      "columns": [
+        {
+          "column_name": "name",
+          "data_type": "character varying(100)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "code",
+          "data_type": "character varying(50)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "department_id",
+          "data_type": "bigint",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "leader",
+          "data_type": "character varying(50)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "contact_phone",
+          "data_type": "character varying(20)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "is_active",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "true"
+        },
+        {
+          "column_name": "remark",
+          "data_type": "character varying(500)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": "nextval('organization_team_id_seq'::regclass)"
+        },
+        {
+          "column_name": "created_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "updated_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "is_deleted",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "false"
+        },
+        {
+          "column_name": "delete_datetime",
+          "data_type": "timestamp with time zone",
+          "not_null": false,
+          "default_expr": null
+        }
+      ],
+      "constraints": [
+        {
+          "name": "organization_team_department_id_fkey",
+          "kind": "f",
+          "definition": "FOREIGN KEY (department_id) REFERENCES organization_department(id) ON DELETE SET NULL"
+        },
+        {
+          "name": "organization_team_code_not_null",
+          "kind": "n",
+          "definition": "NOT NULL code"
+        },
+        {
+          "name": "organization_team_created_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL created_at"
+        },
+        {
+          "name": "organization_team_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL id"
+        },
+        {
+          "name": "organization_team_is_active_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_active"
+        },
+        {
+          "name": "organization_team_is_deleted_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_deleted"
+        },
+        {
+          "name": "organization_team_name_not_null",
+          "kind": "n",
+          "definition": "NOT NULL name"
+        },
+        {
+          "name": "organization_team_updated_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL updated_at"
+        },
+        {
+          "name": "organization_team_pkey",
+          "kind": "p",
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "organization_team_code_key",
+          "kind": "u",
+          "definition": "UNIQUE (code)"
+        }
+      ]
+    },
+    "organization_employee": {
+      "exists": true,
+      "columns": [
+        {
+          "column_name": "name",
+          "data_type": "character varying(50)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "employee_code",
+          "data_type": "character varying(50)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "id_card",
+          "data_type": "character varying(18)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "gender",
+          "data_type": "character varying(10)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "birth_date",
+          "data_type": "date",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "company_id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "department_id",
+          "data_type": "bigint",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "team_id",
+          "data_type": "bigint",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "position",
+          "data_type": "character varying(100)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "entry_date",
+          "data_type": "date",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "personnel_center",
+          "data_type": "character varying(100)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "business_type",
+          "data_type": "character varying(100)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "position_category",
+          "data_type": "character varying(100)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "major_specialty",
+          "data_type": "character varying(100)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "grid",
+          "data_type": "character varying(100)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "business_line",
+          "data_type": "character varying(100)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "phone",
+          "data_type": "character varying(20)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "email",
+          "data_type": "character varying(100)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "emergency_contact",
+          "data_type": "character varying(50)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "emergency_phone",
+          "data_type": "character varying(20)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "status",
+          "data_type": "character varying(20)",
+          "not_null": true,
+          "default_expr": "'active'::character varying"
+        },
+        {
+          "column_name": "is_active",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "true"
+        },
+        {
+          "column_name": "user_id",
+          "data_type": "bigint",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "remark",
+          "data_type": "character varying(500)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": "nextval('organization_employee_id_seq'::regclass)"
+        },
+        {
+          "column_name": "created_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "updated_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "is_deleted",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "false"
+        },
+        {
+          "column_name": "delete_datetime",
+          "data_type": "timestamp with time zone",
+          "not_null": false,
+          "default_expr": null
+        }
+      ],
+      "constraints": [
+        {
+          "name": "fk_employee_user_id",
+          "kind": "f",
+          "definition": "FOREIGN KEY (user_id) REFERENCES vadmin_auth_user(id) ON DELETE SET NULL"
+        },
+        {
+          "name": "organization_employee_company_id_fkey",
+          "kind": "f",
+          "definition": "FOREIGN KEY (company_id) REFERENCES organization_company(id) ON DELETE RESTRICT"
+        },
+        {
+          "name": "organization_employee_department_id_fkey",
+          "kind": "f",
+          "definition": "FOREIGN KEY (department_id) REFERENCES organization_department(id) ON DELETE RESTRICT"
+        },
+        {
+          "name": "organization_employee_team_id_fkey",
+          "kind": "f",
+          "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE RESTRICT"
+        },
+        {
+          "name": "organization_employee_company_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL company_id"
+        },
+        {
+          "name": "organization_employee_created_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL created_at"
+        },
+        {
+          "name": "organization_employee_employee_code_not_null",
+          "kind": "n",
+          "definition": "NOT NULL employee_code"
+        },
+        {
+          "name": "organization_employee_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL id"
+        },
+        {
+          "name": "organization_employee_is_active_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_active"
+        },
+        {
+          "name": "organization_employee_is_deleted_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_deleted"
+        },
+        {
+          "name": "organization_employee_name_not_null",
+          "kind": "n",
+          "definition": "NOT NULL name"
+        },
+        {
+          "name": "organization_employee_status_not_null",
+          "kind": "n",
+          "definition": "NOT NULL status"
+        },
+        {
+          "name": "organization_employee_updated_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL updated_at"
+        },
+        {
+          "name": "organization_employee_pkey",
+          "kind": "p",
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "organization_employee_employee_code_key",
+          "kind": "u",
+          "definition": "UNIQUE (employee_code)"
+        }
+      ]
+    },
+    "vadmin_area": {
+      "exists": true,
+      "columns": [
+        {
+          "column_name": "name",
+          "data_type": "character varying(64)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "code",
+          "data_type": "character varying(12)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "level",
+          "data_type": "integer",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "parent_id",
+          "data_type": "integer",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "is_active",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "order_num",
+          "data_type": "integer",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": "nextval('vadmin_area_id_seq'::regclass)"
+        },
+        {
+          "column_name": "created_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "updated_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "is_deleted",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "false"
+        },
+        {
+          "column_name": "delete_datetime",
+          "data_type": "timestamp with time zone",
+          "not_null": false,
+          "default_expr": null
+        }
+      ],
+      "constraints": [
+        {
+          "name": "vadmin_area_parent_id_fkey",
+          "kind": "f",
+          "definition": "FOREIGN KEY (parent_id) REFERENCES vadmin_area(id) ON DELETE CASCADE"
+        },
+        {
+          "name": "vadmin_area_created_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL created_at"
+        },
+        {
+          "name": "vadmin_area_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL id"
+        },
+        {
+          "name": "vadmin_area_is_active_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_active"
+        },
+        {
+          "name": "vadmin_area_is_deleted_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_deleted"
+        },
+        {
+          "name": "vadmin_area_level_not_null",
+          "kind": "n",
+          "definition": "NOT NULL level"
+        },
+        {
+          "name": "vadmin_area_name_not_null",
+          "kind": "n",
+          "definition": "NOT NULL name"
+        },
+        {
+          "name": "vadmin_area_order_num_not_null",
+          "kind": "n",
+          "definition": "NOT NULL order_num"
+        },
+        {
+          "name": "vadmin_area_updated_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL updated_at"
+        },
+        {
+          "name": "vadmin_area_pkey",
+          "kind": "p",
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "vadmin_area_code_key",
+          "kind": "u",
+          "definition": "UNIQUE (code)"
+        }
+      ]
+    },
+    "vadmin_data_resource": {
+      "exists": true,
+      "columns": [
+        {
+          "column_name": "code",
+          "data_type": "character varying(50)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "name",
+          "data_type": "character varying(100)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "table_name",
+          "data_type": "character varying(100)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "org_field",
+          "data_type": "character varying(50)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "org_level",
+          "data_type": "character varying(20)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "description",
+          "data_type": "character varying(500)",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "is_active",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "true"
+        },
+        {
+          "column_name": "id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": "nextval('vadmin_data_resource_id_seq'::regclass)"
+        },
+        {
+          "column_name": "created_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "updated_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        }
+      ],
+      "constraints": [
+        {
+          "name": "vadmin_data_resource_code_not_null",
+          "kind": "n",
+          "definition": "NOT NULL code"
+        },
+        {
+          "name": "vadmin_data_resource_created_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL created_at"
+        },
+        {
+          "name": "vadmin_data_resource_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL id"
+        },
+        {
+          "name": "vadmin_data_resource_is_active_not_null",
+          "kind": "n",
+          "definition": "NOT NULL is_active"
+        },
+        {
+          "name": "vadmin_data_resource_name_not_null",
+          "kind": "n",
+          "definition": "NOT NULL name"
+        },
+        {
+          "name": "vadmin_data_resource_org_field_not_null",
+          "kind": "n",
+          "definition": "NOT NULL org_field"
+        },
+        {
+          "name": "vadmin_data_resource_org_level_not_null",
+          "kind": "n",
+          "definition": "NOT NULL org_level"
+        },
+        {
+          "name": "vadmin_data_resource_table_name_not_null",
+          "kind": "n",
+          "definition": "NOT NULL table_name"
+        },
+        {
+          "name": "vadmin_data_resource_updated_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL updated_at"
+        },
+        {
+          "name": "vadmin_data_resource_pkey",
+          "kind": "p",
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "vadmin_data_resource_code_key",
+          "kind": "u",
+          "definition": "UNIQUE (code)"
+        }
+      ]
+    },
+    "vadmin_role_resource_permission": {
+      "exists": true,
+      "columns": [
+        {
+          "column_name": "role_id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "resource_id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "can_create",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "false"
+        },
+        {
+          "column_name": "can_read",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "true"
+        },
+        {
+          "column_name": "can_update",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "false"
+        },
+        {
+          "column_name": "can_delete",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "false"
+        },
+        {
+          "column_name": "can_agent",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "false"
+        },
+        {
+          "column_name": "column_permissions",
+          "data_type": "jsonb",
+          "not_null": false,
+          "default_expr": null
+        },
+        {
+          "column_name": "id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": "nextval('vadmin_role_resource_permission_id_seq'::regclass)"
+        },
+        {
+          "column_name": "created_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "updated_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        }
+      ],
+      "constraints": [
+        {
+          "name": "vadmin_role_resource_permission_resource_id_fkey",
+          "kind": "f",
+          "definition": "FOREIGN KEY (resource_id) REFERENCES vadmin_data_resource(id) ON DELETE CASCADE"
+        },
+        {
+          "name": "vadmin_role_resource_permission_role_id_fkey",
+          "kind": "f",
+          "definition": "FOREIGN KEY (role_id) REFERENCES vadmin_auth_role(id) ON DELETE CASCADE"
+        },
+        {
+          "name": "vadmin_role_resource_permission_can_agent_not_null",
+          "kind": "n",
+          "definition": "NOT NULL can_agent"
+        },
+        {
+          "name": "vadmin_role_resource_permission_can_create_not_null",
+          "kind": "n",
+          "definition": "NOT NULL can_create"
+        },
+        {
+          "name": "vadmin_role_resource_permission_can_delete_not_null",
+          "kind": "n",
+          "definition": "NOT NULL can_delete"
+        },
+        {
+          "name": "vadmin_role_resource_permission_can_read_not_null",
+          "kind": "n",
+          "definition": "NOT NULL can_read"
+        },
+        {
+          "name": "vadmin_role_resource_permission_can_update_not_null",
+          "kind": "n",
+          "definition": "NOT NULL can_update"
+        },
+        {
+          "name": "vadmin_role_resource_permission_created_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL created_at"
+        },
+        {
+          "name": "vadmin_role_resource_permission_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL id"
+        },
+        {
+          "name": "vadmin_role_resource_permission_resource_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL resource_id"
+        },
+        {
+          "name": "vadmin_role_resource_permission_role_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL role_id"
+        },
+        {
+          "name": "vadmin_role_resource_permission_updated_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL updated_at"
+        },
+        {
+          "name": "vadmin_role_resource_permission_pkey",
+          "kind": "p",
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "uq_role_resource",
+          "kind": "u",
+          "definition": "UNIQUE (role_id, resource_id)"
+        }
+      ]
+    },
+    "vadmin_role_org_scope": {
+      "exists": true,
+      "columns": [
+        {
+          "column_name": "role_id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "org_type",
+          "data_type": "character varying(20)",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "org_id",
+          "data_type": "integer",
+          "not_null": true,
+          "default_expr": null
+        },
+        {
+          "column_name": "include_children",
+          "data_type": "boolean",
+          "not_null": true,
+          "default_expr": "true"
+        },
+        {
+          "column_name": "id",
+          "data_type": "bigint",
+          "not_null": true,
+          "default_expr": "nextval('vadmin_role_org_scope_id_seq'::regclass)"
+        },
+        {
+          "column_name": "created_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        },
+        {
+          "column_name": "updated_at",
+          "data_type": "timestamp with time zone",
+          "not_null": true,
+          "default_expr": "now()"
+        }
+      ],
+      "constraints": [
+        {
+          "name": "vadmin_role_org_scope_role_id_fkey",
+          "kind": "f",
+          "definition": "FOREIGN KEY (role_id) REFERENCES vadmin_auth_role(id) ON DELETE CASCADE"
+        },
+        {
+          "name": "vadmin_role_org_scope_created_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL created_at"
+        },
+        {
+          "name": "vadmin_role_org_scope_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL id"
+        },
+        {
+          "name": "vadmin_role_org_scope_include_children_not_null",
+          "kind": "n",
+          "definition": "NOT NULL include_children"
+        },
+        {
+          "name": "vadmin_role_org_scope_org_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL org_id"
+        },
+        {
+          "name": "vadmin_role_org_scope_org_type_not_null",
+          "kind": "n",
+          "definition": "NOT NULL org_type"
+        },
+        {
+          "name": "vadmin_role_org_scope_role_id_not_null",
+          "kind": "n",
+          "definition": "NOT NULL role_id"
+        },
+        {
+          "name": "vadmin_role_org_scope_updated_at_not_null",
+          "kind": "n",
+          "definition": "NOT NULL updated_at"
+        },
+        {
+          "name": "vadmin_role_org_scope_pkey",
+          "kind": "p",
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "uq_role_org_scope",
+          "kind": "u",
+          "definition": "UNIQUE (role_id, org_type, org_id)"
+        }
+      ]
+    }
+  },
+  "check2_org_aggregates": {
+    "counts": {
+      "organization_company": 1,
+      "organization_department": 0,
+      "organization_team": 318,
+      "organization_employee": 2160
+    },
+    "null_fk": {
+      "organization_department.company_id": 0,
+      "organization_team.department_id": 318,
+      "organization_employee.company_id": 0,
+      "organization_employee.department_id": 2160,
+      "organization_employee.team_id": 0
+    },
+    "orphan_fk": {
+      "organization_department.company_id": 0,
+      "organization_team.department_id": 0,
+      "organization_employee.company_id": 0,
+      "organization_employee.department_id": 0,
+      "organization_employee.team_id": 0
+    }
+  },
+  "check3_area_mapping": {
+    "foreign_keys": [
+      {
+        "child_table": "consumer",
+        "name": "consumer_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id)",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "consumer_home_broadband_customer_count_snapshot",
+        "name": "consumer_home_broadband_customer_count_snapshot_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "customer_service_relationship",
+        "name": "customer_service_relationship_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id)",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "gold_maintenance_metric_daily",
+        "name": "gold_maintenance_metric_daily_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "gold_maintenance_metric_daily",
+        "name": "gold_maintenance_metric_daily_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "gold_metric_result",
+        "name": "gold_metric_result_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "gold_metric_result",
+        "name": "gold_metric_result_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "gold_metric_result",
+        "name": "gold_metric_result_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "organization_certificate",
+        "name": "organization_certificate_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE CASCADE",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "organization_department",
+        "name": "organization_department_company_id_fkey",
+        "definition": "FOREIGN KEY (company_id) REFERENCES organization_company(id) ON DELETE RESTRICT",
+        "parent_table": "organization_company"
+      },
+      {
+        "child_table": "organization_department",
+        "name": "organization_department_parent_id_fkey",
+        "definition": "FOREIGN KEY (parent_id) REFERENCES organization_department(id) ON DELETE CASCADE",
+        "parent_table": "organization_department"
+      },
+      {
+        "child_table": "organization_employee",
+        "name": "fk_employee_user_id",
+        "definition": "FOREIGN KEY (user_id) REFERENCES vadmin_auth_user(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_auth_user"
+      },
+      {
+        "child_table": "organization_employee",
+        "name": "organization_employee_company_id_fkey",
+        "definition": "FOREIGN KEY (company_id) REFERENCES organization_company(id) ON DELETE RESTRICT",
+        "parent_table": "organization_company"
+      },
+      {
+        "child_table": "organization_employee",
+        "name": "organization_employee_department_id_fkey",
+        "definition": "FOREIGN KEY (department_id) REFERENCES organization_department(id) ON DELETE RESTRICT",
+        "parent_table": "organization_department"
+      },
+      {
+        "child_table": "organization_employee",
+        "name": "organization_employee_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE RESTRICT",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "organization_external_account",
+        "name": "organization_external_account_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE CASCADE",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "organization_team",
+        "name": "organization_team_department_id_fkey",
+        "definition": "FOREIGN KEY (department_id) REFERENCES organization_department(id) ON DELETE SET NULL",
+        "parent_table": "organization_department"
+      },
+      {
+        "child_table": "silver_care_work_order",
+        "name": "silver_care_work_order_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_care_work_order",
+        "name": "silver_care_work_order_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_care_work_order",
+        "name": "silver_care_work_order_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_complaint_verification",
+        "name": "silver_complaint_verification_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_complaint_verification",
+        "name": "silver_complaint_verification_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_complaint_verification",
+        "name": "silver_complaint_verification_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_customer_service_rating",
+        "name": "silver_customer_service_rating_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_customer_service_rating",
+        "name": "silver_customer_service_rating_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_customer_service_rating",
+        "name": "silver_customer_service_rating_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_external_metric_import",
+        "name": "silver_external_metric_import_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_external_metric_import",
+        "name": "silver_external_metric_import_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_external_metric_import",
+        "name": "silver_external_metric_import_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_fault_delivery_external_metric",
+        "name": "silver_fault_delivery_external_metric_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_fault_delivery_external_metric",
+        "name": "silver_fault_delivery_external_metric_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_fault_delivery_external_metric",
+        "name": "silver_fault_delivery_external_metric_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_fault_reporting_order",
+        "name": "silver_fault_reporting_order_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_fault_reporting_order",
+        "name": "silver_fault_reporting_order_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_fault_reporting_order",
+        "name": "silver_fault_reporting_order_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_installation_delivery",
+        "name": "silver_installation_delivery_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_installation_delivery",
+        "name": "silver_installation_delivery_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_installation_delivery",
+        "name": "silver_installation_delivery_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_installation_work_order",
+        "name": "silver_installation_work_order_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_installation_work_order",
+        "name": "silver_installation_work_order_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_installation_work_order",
+        "name": "silver_installation_work_order_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_machine_inspection_detail",
+        "name": "silver_machine_inspection_detail_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_machine_inspection_detail",
+        "name": "silver_machine_inspection_detail_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_machine_inspection_detail",
+        "name": "silver_machine_inspection_detail_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_onsite_inspection_detail",
+        "name": "silver_onsite_inspection_detail_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_onsite_inspection_detail",
+        "name": "silver_onsite_inspection_detail_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_onsite_inspection_detail",
+        "name": "silver_onsite_inspection_detail_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_poor_quality_customer",
+        "name": "silver_poor_quality_customer_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_poor_quality_customer",
+        "name": "silver_poor_quality_customer_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_poor_quality_customer",
+        "name": "silver_poor_quality_customer_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_post_installation_poor_quality",
+        "name": "silver_post_installation_poor_quality_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_post_installation_poor_quality",
+        "name": "silver_post_installation_poor_quality_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_post_installation_poor_quality",
+        "name": "silver_post_installation_poor_quality_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_post_installation_weak_light",
+        "name": "silver_post_installation_weak_light_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_post_installation_weak_light",
+        "name": "silver_post_installation_weak_light_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_post_installation_weak_light",
+        "name": "silver_post_installation_weak_light_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_repair_service",
+        "name": "silver_repair_service_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_repair_service",
+        "name": "silver_repair_service_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_repair_service",
+        "name": "silver_repair_service_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_repair_work_order",
+        "name": "silver_repair_work_order_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_repair_work_order",
+        "name": "silver_repair_work_order_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_repair_work_order",
+        "name": "silver_repair_work_order_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_satisfaction_evaluation",
+        "name": "silver_satisfaction_evaluation_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_satisfaction_evaluation",
+        "name": "silver_satisfaction_evaluation_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_satisfaction_evaluation",
+        "name": "silver_satisfaction_evaluation_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_single_faulty_order",
+        "name": "silver_single_faulty_order_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_single_faulty_order",
+        "name": "silver_single_faulty_order_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_single_faulty_order",
+        "name": "silver_single_faulty_order_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "silver_weak_light_onu_statistics",
+        "name": "silver_weak_light_onu_statistics_area_id_fkey",
+        "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "silver_weak_light_onu_statistics",
+        "name": "silver_weak_light_onu_statistics_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "silver_weak_light_onu_statistics",
+        "name": "silver_weak_light_onu_statistics_team_id_fkey",
+        "definition": "FOREIGN KEY (team_id) REFERENCES organization_team(id) ON DELETE SET NULL",
+        "parent_table": "organization_team"
+      },
+      {
+        "child_table": "vadmin_area",
+        "name": "vadmin_area_parent_id_fkey",
+        "definition": "FOREIGN KEY (parent_id) REFERENCES vadmin_area(id) ON DELETE CASCADE",
+        "parent_table": "vadmin_area"
+      },
+      {
+        "child_table": "vadmin_auth_user",
+        "name": "vadmin_auth_user_employee_id_fkey",
+        "definition": "FOREIGN KEY (employee_id) REFERENCES organization_employee(id) ON DELETE SET NULL",
+        "parent_table": "organization_employee"
+      },
+      {
+        "child_table": "vadmin_role_org_scope",
+        "name": "vadmin_role_org_scope_role_id_fkey",
+        "definition": "FOREIGN KEY (role_id) REFERENCES vadmin_auth_role(id) ON DELETE CASCADE",
+        "parent_table": "vadmin_auth_role"
+      },
+      {
+        "child_table": "vadmin_role_resource_permission",
+        "name": "vadmin_role_resource_permission_resource_id_fkey",
+        "definition": "FOREIGN KEY (resource_id) REFERENCES vadmin_data_resource(id) ON DELETE CASCADE",
+        "parent_table": "vadmin_data_resource"
+      },
+      {
+        "child_table": "vadmin_role_resource_permission",
+        "name": "vadmin_role_resource_permission_role_id_fkey",
+        "definition": "FOREIGN KEY (role_id) REFERENCES vadmin_auth_role(id) ON DELETE CASCADE",
+        "parent_table": "vadmin_auth_role"
+      }
+    ],
+    "area_column_probe": [
+      {
+        "table": "organization_company",
+        "area_columns": [],
+        "all_columns_sample": [
+          "name",
+          "code",
+          "short_name",
+          "contact_person",
+          "contact_phone",
+          "address",
+          "is_active",
+          "order_num",
+          "remark",
+          "id",
+          "created_at",
+          "updated_at",
+          "is_deleted",
+          "delete_datetime"
+        ]
+      },
+      {
+        "table": "organization_department",
+        "area_columns": [],
+        "all_columns_sample": [
+          "name",
+          "code",
+          "short_name",
+          "company_id",
+          "parent_id",
+          "manager",
+          "contact_phone",
+          "is_active",
+          "order_num",
+          "remark",
+          "id",
+          "created_at",
+          "updated_at",
+          "is_deleted",
+          "delete_datetime"
+        ]
+      },
+      {
+        "table": "organization_team",
+        "area_columns": [],
+        "all_columns_sample": [
+          "name",
+          "code",
+          "department_id",
+          "leader",
+          "contact_phone",
+          "is_active",
+          "remark",
+          "id",
+          "created_at",
+          "updated_at",
+          "is_deleted",
+          "delete_datetime"
+        ]
+      },
+      {
+        "table": "organization_employee",
+        "area_columns": [],
+        "all_columns_sample": [
+          "name",
+          "employee_code",
+          "id_card",
+          "gender",
+          "birth_date",
+          "company_id",
+          "department_id",
+          "team_id",
+          "position",
+          "entry_date",
+          "personnel_center",
+          "business_type",
+          "position_category",
+          "major_specialty",
+          "grid",
+          "business_line",
+          "phone",
+          "email",
+          "emergency_contact",
+          "emergency_phone",
+          "status",
+          "is_active",
+          "user_id",
+          "remark",
+          "id",
+          "created_at",
+          "updated_at",
+          "is_deleted",
+          "delete_datetime"
+        ]
+      },
+      {
+        "table": "vadmin_data_resource",
+        "area_columns": [],
+        "all_columns_sample": [
+          "code",
+          "name",
+          "table_name",
+          "org_field",
+          "org_level",
+          "description",
+          "is_active",
+          "id",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      {
+        "table": "vadmin_role_org_scope",
+        "area_columns": [],
+        "all_columns_sample": [
+          "role_id",
+          "org_type",
+          "org_id",
+          "include_children",
+          "id",
+          "created_at",
+          "updated_at"
+        ]
+      }
+    ]
+  },
+  "check4_data_resource": {
+    "exists": true,
+    "columns": [
+      {
+        "column_name": "code",
+        "data_type": "character varying(50)",
+        "not_null": true,
+        "default_expr": null
+      },
+      {
+        "column_name": "name",
+        "data_type": "character varying(100)",
+        "not_null": true,
+        "default_expr": null
+      },
+      {
+        "column_name": "table_name",
+        "data_type": "character varying(100)",
+        "not_null": true,
+        "default_expr": null
+      },
+      {
+        "column_name": "org_field",
+        "data_type": "character varying(50)",
+        "not_null": true,
+        "default_expr": null
+      },
+      {
+        "column_name": "org_level",
+        "data_type": "character varying(20)",
+        "not_null": true,
+        "default_expr": null
+      },
+      {
+        "column_name": "description",
+        "data_type": "character varying(500)",
+        "not_null": false,
+        "default_expr": null
+      },
+      {
+        "column_name": "is_active",
+        "data_type": "boolean",
+        "not_null": true,
+        "default_expr": "true"
+      },
+      {
+        "column_name": "id",
+        "data_type": "bigint",
+        "not_null": true,
+        "default_expr": "nextval('vadmin_data_resource_id_seq'::regclass)"
+      },
+      {
+        "column_name": "created_at",
+        "data_type": "timestamp with time zone",
+        "not_null": true,
+        "default_expr": "now()"
+      },
+      {
+        "column_name": "updated_at",
+        "data_type": "timestamp with time zone",
+        "not_null": true,
+        "default_expr": "now()"
+      }
+    ],
+    "org_field_org_level": [],
+    "resources": []
+  },
+  "check5_role_org_scope": {
+    "exists": true,
+    "columns": [
+      {
+        "column_name": "role_id",
+        "data_type": "bigint",
+        "not_null": true,
+        "default_expr": null
+      },
+      {
+        "column_name": "org_type",
+        "data_type": "character varying(20)",
+        "not_null": true,
+        "default_expr": null
+      },
+      {
+        "column_name": "org_id",
+        "data_type": "integer",
+        "not_null": true,
+        "default_expr": null
+      },
+      {
+        "column_name": "include_children",
+        "data_type": "boolean",
+        "not_null": true,
+        "default_expr": "true"
+      },
+      {
+        "column_name": "id",
+        "data_type": "bigint",
+        "not_null": true,
+        "default_expr": "nextval('vadmin_role_org_scope_id_seq'::regclass)"
+      },
+      {
+        "column_name": "created_at",
+        "data_type": "timestamp with time zone",
+        "not_null": true,
+        "default_expr": "now()"
+      },
+      {
+        "column_name": "updated_at",
+        "data_type": "timestamp with time zone",
+        "not_null": true,
+        "default_expr": "now()"
+      }
+    ],
+    "org_type": [],
+    "include_children": []
+  },
+  "check6_column_permissions": {
+    "exists": true,
+    "columns": [
+      {
+        "column_name": "role_id",
+        "data_type": "bigint",
+        "not_null": true,
+        "default_expr": null
+      },
+      {
+        "column_name": "resource_id",
+        "data_type": "bigint",
+        "not_null": true,
+        "default_expr": null
+      },
+      {
+        "column_name": "can_create",
+        "data_type": "boolean",
+        "not_null": true,
+        "default_expr": "false"
+      },
+      {
+        "column_name": "can_read",
+        "data_type": "boolean",
+        "not_null": true,
+        "default_expr": "true"
+      },
+      {
+        "column_name": "can_update",
+        "data_type": "boolean",
+        "not_null": true,
+        "default_expr": "false"
+      },
+      {
+        "column_name": "can_delete",
+        "data_type": "boolean",
+        "not_null": true,
+        "default_expr": "false"
+      },
+      {
+        "column_name": "can_agent",
+        "data_type": "boolean",
+        "not_null": true,
+        "default_expr": "false"
+      },
+      {
+        "column_name": "column_permissions",
+        "data_type": "jsonb",
+        "not_null": false,
+        "default_expr": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "bigint",
+        "not_null": true,
+        "default_expr": "nextval('vadmin_role_resource_permission_id_seq'::regclass)"
+      },
+      {
+        "column_name": "created_at",
+        "data_type": "timestamp with time zone",
+        "not_null": true,
+        "default_expr": "now()"
+      },
+      {
+        "column_name": "updated_at",
+        "data_type": "timestamp with time zone",
+        "not_null": true,
+        "default_expr": "now()"
+      }
+    ],
+    "null_count": [],
+    "json_type": [],
+    "key_sets": []
+  },
+  "check7_gold_shape": {
+    "exists": true,
+    "dimension_type": [
+      {
+        "dimension_type": "area_team_employee",
+        "n": 60417
+      },
+      {
+        "dimension_type": "team",
+        "n": 40767
+      },
+      {
+        "dimension_type": "area_team",
+        "n": 40706
+      },
+      {
+        "dimension_type": "area",
+        "n": 9079
+      },
+      {
+        "dimension_type": "all",
+        "n": 1016
+      }
+    ],
+    "null_patterns": [
+      {
+        "dimension_type": "all",
+        "area_id_null": 1016,
+        "area_id_not_null": 0,
+        "team_id_null": 1016,
+        "team_id_not_null": 0,
+        "employee_id_null": 1016,
+        "employee_id_not_null": 0
+      },
+      {
+        "dimension_type": "area",
+        "area_id_null": 48,
+        "area_id_not_null": 9031,
+        "team_id_null": 9079,
+        "team_id_not_null": 0,
+        "employee_id_null": 9079,
+        "employee_id_not_null": 0
+      },
+      {
+        "dimension_type": "area_team",
+        "area_id_null": 0,
+        "area_id_not_null": 40706,
+        "team_id_null": 0,
+        "team_id_not_null": 40706,
+        "employee_id_null": 40706,
+        "employee_id_not_null": 0
+      },
+      {
+        "dimension_type": "area_team_employee",
+        "area_id_null": 0,
+        "area_id_not_null": 60417,
+        "team_id_null": 0,
+        "team_id_not_null": 60417,
+        "employee_id_null": 0,
+        "employee_id_not_null": 60417
+      },
+      {
+        "dimension_type": "team",
+        "area_id_null": 40767,
+        "area_id_not_null": 0,
+        "team_id_null": 256,
+        "team_id_not_null": 40511,
+        "employee_id_null": 40767,
+        "employee_id_not_null": 0
+      }
+    ],
+    "columns_present": {
+      "area_id": true,
+      "team_id": true,
+      "employee_id": true
+    }
+  },
+  "check8_read_transport": {
+    "views": [
+      {
+        "table_schema": "ai_views",
+        "table_name": "v_area"
+      },
+      {
+        "table_schema": "ai_views",
+        "table_name": "v_fault_reporting_order"
+      },
+      {
+        "table_schema": "ai_views",
+        "table_name": "v_installation_work_order"
+      },
+      {
+        "table_schema": "ai_views",
+        "table_name": "v_maintenance_metric_daily"
+      },
+      {
+        "table_schema": "ai_views",
+        "table_name": "v_metric_metadata"
+      },
+      {
+        "table_schema": "ai_views",
+        "table_name": "v_metric_result"
+      },
+      {
+        "table_schema": "ai_views",
+        "table_name": "v_repair_service"
+      },
+      {
+        "table_schema": "ai_views",
+        "table_name": "v_single_fault_order"
+      },
+      {
+        "table_schema": "ai_views",
+        "table_name": "v_team"
+      }
+    ],
+    "select_grants_by_grantee": [
+      {
+        "grantee": "PUBLIC",
+        "table_schema": "information_schema",
+        "n": 62
+      },
+      {
+        "grantee": "PUBLIC",
+        "table_schema": "pg_catalog",
+        "n": 128
+      },
+      {
+        "grantee": "agent_reader",
+        "table_schema": "public",
+        "n": 27
+      },
+      {
+        "grantee": "agent_reader_user",
+        "table_schema": "ai_views",
+        "n": 9
+      },
+      {
+        "grantee": "pg_read_all_stats",
+        "table_schema": "pg_catalog",
+        "n": 4
+      },
+      {
+        "grantee": "postgres",
+        "table_schema": "ai_views",
+        "n": 9
+      },
+      {
+        "grantee": "postgres",
+        "table_schema": "information_schema",
+        "n": 69
+      },
+      {
+        "grantee": "postgres",
+        "table_schema": "pg_catalog",
+        "n": 144
+      },
+      {
+        "grantee": "postgres",
+        "table_schema": "public",
+        "n": 74
+      }
+    ],
+    "roles": [
+      {
+        "rolname": "agent_reader",
+        "rolcanlogin": false,
+        "rolsuper": false,
+        "rolconfig": null
+      },
+      {
+        "rolname": "agent_reader_user",
+        "rolcanlogin": true,
+        "rolsuper": false,
+        "rolconfig": null
+      },
+      {
+        "rolname": "postgres",
+        "rolcanlogin": true,
+        "rolsuper": true,
+        "rolconfig": null
+      }
+    ]
+  },
+  "check9_conclusions": {
+    "A_auth_organization_tree": [
+      "organization_company",
+      "organization_department",
+      "organization_team",
+      "organization_employee"
+    ],
+    "A2_effective_tree_shape": {
+      "row_counts": {
+        "organization_company": 1,
+        "organization_department": 0,
+        "organization_team": 318,
+        "organization_employee": 2160
+      },
+      "null_fk": {
+        "organization_department.company_id": 0,
+        "organization_team.department_id": 318,
+        "organization_employee.company_id": 0,
+        "organization_employee.department_id": 2160,
+        "organization_employee.team_id": 0
+      },
+      "department_level_empty": true,
+      "all_teams_lack_department": true,
+      "all_employees_lack_department": true
+    },
+    "A3_authorization_layer_populated": {
+      "vadmin_data_resource": 0,
+      "vadmin_role_org_scope_org_type": 0,
+      "vadmin_role_resource_permission_key_sets": 0
+    },
+    "B_business_dimension_tree": {
+      "area_table_present": true,
+      "vadmin_area_has_parent_and_level": [
+        "code",
+        "level",
+        "parent_id"
+      ]
+    },
+    "C_db_level_mapping_between_trees": {
+      "foreign_keys_to_vadmin_area": [
+        {
+          "child_table": "consumer",
+          "name": "consumer_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id)",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "consumer_home_broadband_customer_count_snapshot",
+          "name": "consumer_home_broadband_customer_count_snapshot_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "gold_maintenance_metric_daily",
+          "name": "gold_maintenance_metric_daily_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "gold_metric_result",
+          "name": "gold_metric_result_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_care_work_order",
+          "name": "silver_care_work_order_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_complaint_verification",
+          "name": "silver_complaint_verification_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_customer_service_rating",
+          "name": "silver_customer_service_rating_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_external_metric_import",
+          "name": "silver_external_metric_import_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_fault_delivery_external_metric",
+          "name": "silver_fault_delivery_external_metric_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_fault_reporting_order",
+          "name": "silver_fault_reporting_order_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_installation_delivery",
+          "name": "silver_installation_delivery_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_installation_work_order",
+          "name": "silver_installation_work_order_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_machine_inspection_detail",
+          "name": "silver_machine_inspection_detail_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_onsite_inspection_detail",
+          "name": "silver_onsite_inspection_detail_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_poor_quality_customer",
+          "name": "silver_poor_quality_customer_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_post_installation_poor_quality",
+          "name": "silver_post_installation_poor_quality_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_post_installation_weak_light",
+          "name": "silver_post_installation_weak_light_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_repair_service",
+          "name": "silver_repair_service_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_repair_work_order",
+          "name": "silver_repair_work_order_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_satisfaction_evaluation",
+          "name": "silver_satisfaction_evaluation_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_single_faulty_order",
+          "name": "silver_single_faulty_order_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "silver_weak_light_onu_statistics",
+          "name": "silver_weak_light_onu_statistics_area_id_fkey",
+          "definition": "FOREIGN KEY (area_id) REFERENCES vadmin_area(id) ON DELETE SET NULL",
+          "parent_table": "vadmin_area"
+        },
+        {
+          "child_table": "vadmin_area",
+          "name": "vadmin_area_parent_id_fkey",
+          "definition": "FOREIGN KEY (parent_id) REFERENCES vadmin_area(id) ON DELETE CASCADE",
+          "parent_table": "vadmin_area"
+        }
+      ],
+      "organization_employee_area_like_columns": []
+    },
+    "D_relations_derivable_from_existing_metadata": {
+      "vadmin_data_resource_rows": 0,
+      "distinct_org_field_org_level": "NO org_field/org_level columns",
+      "org_level_values": []
+    },
+    "E_must_be_contracted_by_backend_not_inferred": [
+      "any per-relation coverage_root_org / coverage_org_level / minimum_query_org_level",
+      "detail_sensitivity per relation",
+      "whether vadmin_area.level may gate query permission at all",
+      "authorization revision / snapshot semantics"
+    ],
+    "remaining_unknowns": [
+      "vadmin_role_org_scope carries no org_type rows; no explicit custom org scope is configured",
+      "gold dimension_type coverage observed; per-dimension org coverage still needs approval"
+    ]
+  },
+  "safety": {
+    "statements_guarded": 63,
+    "refused": null,
+    "ended_with": "ROLLBACK"
+  }
+}

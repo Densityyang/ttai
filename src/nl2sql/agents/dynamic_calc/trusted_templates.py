@@ -7,6 +7,8 @@ can be selected in ``trusted-template`` mode.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -69,8 +71,31 @@ def _ratio(payload: BaseModel) -> RatioOutput:
     return RatioOutput(ratio=values.numerator / values.denominator)
 
 
+class TemplateMetadata(_TemplateModel):
+    """Versioned, deterministic identity of one registered calculation template."""
+
+    template_id: str
+    version: str
+    input_roles: tuple[str, ...]
+    output_role: str
+
+    @property
+    def checksum(self) -> str:
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 class TrustedTemplateRegistry:
-    """The only calculation executor available in ``trusted-template`` mode."""
+    """The only calculation executor available in ``trusted-template`` mode.
+
+    Registry membership means "this executor exists and is technically governed".
+    It is execution-capability authority only, never business approval authority.
+    """
 
     _templates: dict[str, tuple[type[BaseModel], _TemplateExecutor]] = {
         "sum_values": (ValuesInput, _sum_values),
@@ -78,9 +103,36 @@ class TrustedTemplateRegistry:
         "ratio": (RatioInput, _ratio),
     }
 
+    _metadata: dict[str, TemplateMetadata] = {
+        "sum_values": TemplateMetadata(
+            template_id="sum_values", version="1.0", input_roles=("values",), output_role="total"
+        ),
+        "mean_values": TemplateMetadata(
+            template_id="mean_values", version="1.0", input_roles=("values",), output_role="mean"
+        ),
+        "ratio": TemplateMetadata(
+            template_id="ratio",
+            version="1.0",
+            input_roles=("numerator", "denominator"),
+            output_role="ratio",
+        ),
+    }
+
     @property
     def template_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._templates))
+
+    @property
+    def registry_checksum(self) -> str:
+        payload = [self._metadata[key].model_dump(mode="json") for key in sorted(self._metadata)]
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def metadata(self, template_id: str) -> TemplateMetadata:
+        metadata = self._metadata.get(template_id)
+        if metadata is None:
+            raise TrustedTemplateError(f"unapproved calculation template: {template_id}")
+        return metadata
 
     def execute(self, template_id: str, inputs: dict[str, Any]) -> TemplateOutput:
         template = self._templates.get(template_id)

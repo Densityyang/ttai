@@ -12,6 +12,7 @@ services:
       TT_API_BASE_URL: ${TT_API_BASE_URL:?TT_API_BASE_URL must be set for product}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS must be set for product}
       CODEACT_MODE: disabled
+      TYPED_RUNTIME_ACTIVATION: disabled
       ENABLE_DYNAMIC_CALC: "false"
       DATABASE_URL_FILE: /run/secrets/business_ro_database_url
       CONTROL_DATABASE_URL_FILE: /run/secrets/control_app_database_url
@@ -50,6 +51,7 @@ services:
       TT_API_BASE_URL: ${TT_API_BASE_URL:?TT_API_BASE_URL must be set for product}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS must be set for product}
       CODEACT_MODE: disabled
+      TYPED_RUNTIME_ACTIVATION: disabled
       ENABLE_DYNAMIC_CALC: "false"
       DATABASE_URL_FILE: /run/secrets/business_ro_database_url
       CONTROL_DATABASE_URL_FILE: /run/secrets/control_app_database_url
@@ -106,7 +108,7 @@ services:
       - control_migrator_password
       - control_backup_password
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U control_owner -d ttai_control"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U control_owner -d ttai_control"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -138,7 +140,7 @@ services:
       - checkpoint_migrator_password
       - checkpoint_backup_password
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U checkpoint_owner -d ttai_checkpoint"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U checkpoint_owner -d ttai_checkpoint"]
       interval: 5s
       timeout: 3s
       retries: 12

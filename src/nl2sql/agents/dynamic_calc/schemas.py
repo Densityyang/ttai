@@ -71,3 +71,7 @@ class SandboxResult(BaseModel):
     stdout: str = ""
     error: str | None = None
     elapsed_ms: float = 0.0
+    resource_limits_applied: bool = Field(
+        default=True,
+        description="本次执行是否施加了内核资源上限；False 表示降级为无上限运行",
+    )

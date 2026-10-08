@@ -276,7 +276,7 @@ sqlalchemy==2.0.51
     #   nl2sql
 sqlglot==30.13.0
     # via nl2sql
-sqlparse==0.5.5
+sqlparse==0.6.0
     # via nl2sql
 sse-starlette==3.4.6
     # via nl2sql

@@ -3,7 +3,13 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
+      - feature/nl2sql-v3-production
+      # Bounded agent branches are pushed directly (no PR) during the
+      # owner-gated workflow, so the exact-commit gate must run on push too.
+      # Without this an agent branch has NO CI at all.
+      - 'agent/**'
 
 permissions:
   contents: read
@@ -22,6 +28,30 @@ jobs:
           enable-cache: true
       - run: uv python install 3.13
       - run: uv sync --frozen --all-groups
+      - name: Whitespace gate (git diff --check)
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PR_BASE_SHA}" ]; then
+            RANGE="$(git merge-base "${PR_BASE_SHA}" HEAD)..HEAD"
+          elif [ -n "${PUSH_BEFORE_SHA}" ] && ! printf '%s' "${PUSH_BEFORE_SHA}" | grep -qE '^0+$'; then
+            RANGE="${PUSH_BEFORE_SHA}..HEAD"
+          else
+            RANGE="HEAD^..HEAD"
+          fi
+          # tests/fixtures/v4_p1/authoritative/ is a byte-identical, SHA-256-bound copy of an
+          # external producer's output (see src/nl2sql/semantic/authoritative_sources.py). Its
+          # legacy/semantic.md depends on semantically meaningful Markdown two-space hard line
+          # breaks, so it must not be reformatted: those trailing spaces are content, not a
+          # whitespace defect to fix.
+          #
+          # MASTER_PR_PLAN_V4.md is the same case: its header block uses Markdown two-space hard
+          # line breaks, so those trailing spaces are rendering content, not a defect.
+          git diff --check "${RANGE}" -- . \
+            ':(exclude)tests/fixtures/v4_p1/authoritative/**' \
+            ':(exclude)MASTER_PR_PLAN_V4.md'
       - run: uv run ruff check src tests
       - run: uv run pyright
       - run: uv run pytest
@@ -91,8 +121,8 @@ jobs:
           enable-cache: true
       - run: uv python install 3.13
       - run: uv sync --frozen --all-groups
-      - name: Verify PostgreSQL roles, migrations, recovery, and HITL resume
-        run: uv run pytest -vv -s tests/integration/test_postgres_governance.py
+      - name: Verify PostgreSQL governance, QueryGateway, and metric execution
+        run: uv run pytest -vv -s tests/integration/test_postgres_governance.py tests/integration/test_query_gateway_postgres.py
 
   compose-contract:
     runs-on: ubuntu-latest

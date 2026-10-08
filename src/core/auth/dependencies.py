@@ -12,7 +12,7 @@ from fastapi import Depends, HTTPException
 from starlette.requests import Request
 
 from src.core.auth.provider import AuthError, TTApiAuthProvider
-from src.core.auth.types import AuthUser
+from src.core.auth.types import AuthUser, OrganizationIdentity
 from src.core.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,38 @@ _THREAD_INVOKE_ROUTES = (
     ("GET", re.compile(rf"^{_V2_NL2SQL_PREFIX}/threads/[^/]+$")),
     ("GET", re.compile(rf"^{_V2_NL2SQL_PREFIX}/threads/[^/]+/history$")),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/threads/[^/]+/actions$")),
+    # Definition resources.  NOTE: PATCH is absent from this tuple's history,
+    # which is exactly why every method below is listed EXPLICITLY - an
+    # unmapped route fails closed with 403 AUTH_PERMISSION_POLICY_MISSING.
+    (
+        "GET",
+        re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/versions/[0-9]+$"),
+    ),
+    ("PATCH", re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/draft$")),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/semantic-close$")),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/confirm$")),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/save$")),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/revisions$")),
+    (
+        "POST",
+        re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/versions/[0-9]+/publish$"),
+    ),
+    (
+        "POST",
+        re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/versions/[0-9]+/execute$"),
+    ),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/install$")),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/uninstall$")),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/star$")),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/unstar$")),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/upgrade$")),
+    (
+        "POST",
+        re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/acknowledge-withdrawal$"),
+    ),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/fork$")),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/certify$")),
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/withdraw$")),
 )
 
 
@@ -60,6 +92,12 @@ def _required_nl2sql_permission(method: str, path: str, settings: Settings) -> s
         ("POST", f"{_V2_NL2SQL_PREFIX}/queries"),
         ("POST", f"{_V2_NL2SQL_PREFIX}/feedback"),
         ("GET", f"{_V2_NL2SQL_PREFIX}/capabilities"),
+        ("POST", f"{_V2_NL2SQL_PREFIX}/definitions"),
+        ("GET", f"{_V2_NL2SQL_PREFIX}/definitions"),
+        ("GET", f"{_V2_NL2SQL_PREFIX}/library"),
+        ("GET", f"{_V2_NL2SQL_PREFIX}/library/catalogue"),
+        ("GET", f"{_V2_NL2SQL_PREFIX}/conflicts/personal"),
+        ("POST", f"{_V2_NL2SQL_PREFIX}/conflicts/personal/select"),
     }:
         return settings.auth_required_permission_invoke
     if any(
@@ -82,17 +120,56 @@ def get_auth_provider() -> TTApiAuthProvider:
     return TTApiAuthProvider()
 
 
+def _demo_identity_when_activated(settings: Settings) -> str | None:
+    """The server-configured demo identity, ONLY under explicit demo activation.
+
+    Returns None for every other deployment, so the ordinary auth-disabled
+    identity is preserved.  The value comes from immutable Settings - never
+    from a request body, query, header or cookie.
+    """
+
+    if settings.service_mode == "product":
+        return None
+    if settings.typed_runtime_activation == "demo_synthetic_authorization":
+        return settings.demo_synthetic_user_id
+    if settings.typed_runtime_activation == "local_real_data_demo":
+        return settings.local_real_demo_user_id
+    return None
+
+
 async def require_user(
     request: Request,
     provider: TTApiAuthProvider = Depends(get_auth_provider),
     settings: Settings = Depends(get_settings),
 ) -> AuthUser:
     if not settings.auth_enabled:
+        # EXPLICIT demo deployment: auth is disabled AND demo activation is on,
+        # so the caller is the SERVER-CONFIGURED synthetic demo identity.  This
+        # never changes the ordinary auth-disabled semantics below, and the
+        # identity is never taken from the request.
+        demo_user = _demo_identity_when_activated(settings)
+        # An explicit demo/local identity gets ONLY the bounded NL2SQL
+        # permissions this local application needs - never a "*" wildcard.
+        # The historical auth_disabled path keeps its existing behavior.
+        demo_permissions = (
+            []
+            if demo_user is None
+            else sorted(
+                {
+                    settings.auth_required_permission_invoke,
+                    settings.auth_required_permission_stream,
+                }
+            )
+        )
         return AuthUser(
-            user_id="auth_disabled",
+            user_id=demo_user or "auth_disabled",
             telephone=None,
-            roles=["system"],
-            permissions=["*"],
+            roles=["system"] if demo_user is None else ["demo"],
+            permissions=["*"] if demo_user is None else demo_permissions,
+            # With auth disabled there is NO Backend truth, so an all-None
+            # identity is the honest value - distinct from "built without org
+            # resolution" (which is organization=None).
+            organization=OrganizationIdentity(),
         )
 
     started_at = time.perf_counter()

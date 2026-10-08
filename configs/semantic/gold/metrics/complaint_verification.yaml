@@ -1,0 +1,100 @@
+# 投诉验真日报指标。源数据是每次上传的区县当前状态，按上传月份发布。
+metrics:
+  - name: complaint_reason_verification_pass_rate_area_month
+    display_name: 投诉原因验真合格率（区县-月）
+    description: 投诉验真上传数据中的投诉原因验真合格率
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, verification, daily_report]
+    time_grain: month
+    time_column: created_at
+    rollup_strategy: last
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    source_table: silver_complaint_verification
+    aggregation:
+      operation: avg
+      column: complaint_reason_pass_rate
+
+  - name: hotline_scene_pass_rate_area_month
+    display_name: 服务热线来电场景合格率（区县-月）
+    description: 投诉验真上传数据中的服务热线来电场景合格率
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, verification, daily_report]
+    time_grain: month
+    time_column: created_at
+    rollup_strategy: last
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    source_table: silver_complaint_verification
+    aggregation:
+      operation: avg
+      column: hotline_scene_pass_rate
+
+  - name: verification_maintenance_coverage_rate_area_month
+    display_name: 验真装维覆盖率（区县-月）
+    description: 投诉验真上传数据中的验真装维覆盖率
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, verification, daily_report]
+    time_grain: month
+    time_column: created_at
+    rollup_strategy: last
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    source_table: silver_complaint_verification
+    aggregation:
+      operation: avg
+      column: verification_maintenance_coverage_rate
+
+  - name: complaint_verification_qualified_rate_area_month
+    display_name: 投诉验真合格率（区县-月）
+    description: （投诉原因验真合格率*0.5 + 服务热线来电场景合格率*0.5）* 验真装维覆盖率，兼容百分比和小数导入值
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [complaint, verification, daily_report, kpi]
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {reason_rate} IS NOT NULL
+          AND {hotline_rate} IS NOT NULL
+          AND {coverage_rate} IS NOT NULL
+        THEN ROUND(
+          CASE
+            WHEN {reason_rate} <= 1 AND {hotline_rate} <= 1 AND {coverage_rate} <= 1
+              THEN (({reason_rate} + {hotline_rate}) / 2) * {coverage_rate} * 100
+            WHEN {coverage_rate} <= 1
+              THEN (({reason_rate} + {hotline_rate}) / 2) * {coverage_rate}
+            ELSE (({reason_rate} + {hotline_rate}) / 2) * {coverage_rate} / 100
+          END,
+          2
+        )
+        ELSE NULL
+      END
+    dependencies:
+      reason_rate: complaint_reason_verification_pass_rate_area_month
+      hotline_rate: hotline_scene_pass_rate_area_month
+      coverage_rate: verification_maintenance_coverage_rate_area_month

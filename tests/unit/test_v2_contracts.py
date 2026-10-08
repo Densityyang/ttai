@@ -248,4 +248,6 @@ def test_capabilities_explain_when_codeact_is_disabled(monkeypatch: pytest.Monke
 
     assert response.status_code == 200
     assert response.json()["codeact"] is False
+    # R8: the default deployment must not claim the typed runtime is active.
+    assert response.json()["typed_runtime"] is False
     assert "dynamic calculation is disabled" in response.json()["degradation_reasons"]

@@ -76,7 +76,7 @@ async def test_explicit_engine_promotes_model_required_fast_candidate_to_standar
 
     assert result["route_record"]["route"] == "standard"
     assert result["route_record"]["reason"] == "model_required"
-    assert result["route_record"]["policy_version"] == "route.bootstrap.v1"
+    assert result["route_record"]["policy_version"] == "route.bootstrap.v2"
     assert result["model_receipt"]["profile_version"] == "test-v1"
     assert len(result["model_receipt"]["profile_checksum"]) == 64
     assert result["model_receipt"]["prompt_version"] == "v2-engine-v1"
@@ -151,3 +151,51 @@ async def test_policy_denial_is_terminal_without_a_provider_call_or_retry() -> N
         "model_alias_not_allowed_for_stage": 1
     }
     assert result["degradation_flags"] == ["ModelPolicyDenied"]
+
+@pytest.mark.asyncio
+async def test_explicit_engine_stamps_policy_evidence_and_scrubs_checkpoint_secrets() -> None:
+    provider = FakeProvider(
+        {
+            "small": ProviderResponse(
+                content="Revenue plan password = 'hunter2'",
+                model="small",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="stop",
+            )
+        }
+    )
+    gateway = ModelGateway(
+        providers={"fake": provider},
+        profiles={
+            "fast.default": ModelProfile(
+                "fast.default",
+                "test-v1",
+                frozenset({"answer"}),
+                ModelTarget("fake", "small", "small"),
+                None,
+            ),
+            "plan.standard": ModelProfile(
+                "plan.standard",
+                "test-v1",
+                frozenset({"plan"}),
+                ModelTarget("fake", "small", "small"),
+                None,
+            ),
+        },
+    )
+    engine = create_v2_engine(checkpointer=MemorySaver(), model_gateway=gateway)
+
+    result = await engine.ainvoke(
+        {"messages": [{"role": "user", "content": "show revenue"}]},
+        {"configurable": {"thread_id": "alice:scrub"}},
+    )
+
+    receipt = result["model_receipt"]
+    assert receipt["egress_outcome"] == "allow"
+    assert receipt["model_input_policy_version"] == "model-input.bootstrap.v1"
+    assert len(receipt["model_input_policy_checksum"]) == 64
+    assert len(receipt["content_sha256"]) == 64
+    assert "hunter2" not in receipt["content"]
+    assert "[REDACTED]" in receipt["content"]
+    assert "Revenue plan" in receipt["content"]
+    assert "hunter2" not in result["messages"][-1].content

@@ -43,6 +43,10 @@ secrets/
 deploy/private/
 *.secret
 
+# Reference snapshot of the sibling product tree: untracked and NOT a deliverable.
+# Ignored so an accidental root-level staging cannot capture it.
+/tt-intelligent-main/
+
 # Logs and traces
 logs/
 *.log
@@ -76,3 +80,15 @@ tmp/
 .mypy_cache/
 .serena/
 docs/
+
+# Local-only operator artifacts (never product deliverables)
+.local/
+_build_slide2.py
+.demo_tokens.json
+周例会ppt_928_yhx.pptx
+
+# Tool workspaces and shell artifacts (never product deliverables)
+.opencode/
+.mobilework-workspace
+.mobilework-sessions.json
+%SystemDrive%/

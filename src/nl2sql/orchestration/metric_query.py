@@ -1,0 +1,1366 @@
+"""Deterministic, release-bound aggregate queries through QueryGateway.
+
+Only deployment code supplies sources, eligibility policies and identity. Plans
+cannot select physical names, executable expressions, or disable predicates.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import re
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, time, timedelta
+from decimal import ROUND_HALF_UP, Decimal, localcontext
+from typing import Any, Literal, cast
+from zoneinfo import ZoneInfo
+
+from pydantic import Field, JsonValue, model_validator
+
+from src.nl2sql.contracts import (
+    AuthorizationContext,
+    AuthorizationDecision,
+    ContextBundle,
+    FetchMetricStep,
+    QueryPlan,
+    RequestIdentity,
+    evaluate_authorization,
+    query_plan_payload,
+)
+from src.nl2sql.infra.governance.query_gateway import QueryGateway
+from src.nl2sql.orchestration.approved_compute import (
+    ApprovedCalculationBinding,
+    ApprovedCalculationCatalog,
+)
+from src.nl2sql.orchestration.candidates import rowset_sha256
+from src.nl2sql.orchestration.execution import (
+    MetricStepResult,
+    PlanExecutor,
+    PlanStepError,
+    PreparedMetricStep,
+    RegistryTrustedCalculationRunner,
+    TrustedCalculationRunner,
+)
+from src.nl2sql.orchestration.planning import PlanValidator
+from src.nl2sql.ownership import bind_execution_receipt_authorization
+from src.nl2sql.semantic.metric_contract import (
+    ContractId,
+    FrozenContract,
+    Identifier,
+    MetricContract,
+    Predicate,
+)
+from src.nl2sql.semantic.registry import SemanticRelease, SemanticReleaseState
+from src.nl2sql.semantic.schema_snapshot import (
+    OrganizationCoverageBinding,
+    SchemaSnapshot,
+    SchemaSnapshotState,
+    validate_organization_coverage,
+)
+
+logger = logging.getLogger(__name__)
+
+_SOURCE_REJECTIONS = frozenset({
+    "metric_permission_denied", "metric_relation_unapproved", "metric_aggregate_coverage_unapproved",
+    "metric_aggregate_sensitivity_denied", "metric_column_unapproved", "metric_column_type_mismatch",
+    "metric_scan_rows_exceeded", "metric_time_index_required", "metric_time_range_too_large",
+    "metric_grain_or_dimension_unsupported", "metric_dimension_combination_unsupported",
+    "metric_aggregate_sla_missing", "metric_freshness_evidence_invalid", "metric_freshness_authority_mismatch",
+})
+
+
+class EligibilityPolicy(FrozenContract):
+    policy_id: ContractId
+    # The base eligibility is unconditional in the compiler; these are extra
+    # deployment requirements, which a metric definition cannot remove.
+    predicates: tuple[Predicate, ...] = ()
+
+
+# Query-granularity order ONLY: a narrower caller may not request a broader
+# organizational view.  It never authorizes ids and never establishes
+# membership -- membership is enforced exclusively by the authorization row
+# predicate built from the relation's approved organization coverage.
+_SCOPE_ORDER = {"city_company": 0, "area": 1, "team": 2, "employee": 3}
+_ORGANIZATION_SCOPE_NAMES = frozenset(_SCOPE_ORDER)
+# Canonical strict integer syntax: optional minus, no plus sign, no leading
+# zeros, no whitespace, no float/exponent form.  Never float, never fuzzy.
+_AUTHORIZATION_INTEGER_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)$")
+
+
+class AggregateColumns(FrozenContract):
+    """Daily additive facts; every field is a column identifier, never SQL."""
+
+    metric_key: Identifier
+    formula_version: Identifier
+    release_id: Identifier
+    snapshot_id: Identifier
+    checkpoint: Identifier
+    time: Identifier
+    grain: Identifier
+    dimension: Identifier
+    value: Identifier
+    numerator: Identifier
+    denominator: Identifier
+    status: Identifier
+    data_as_of: Identifier
+
+    @model_validator(mode="after")
+    def unique_columns(self) -> AggregateColumns:
+        names = tuple(self.model_dump().values())
+        if len(set(names)) != len(names):
+            raise ValueError("aggregate roles require distinct columns")
+        return self
+
+
+class AggregateContract(FrozenContract):
+    metric_key: ContractId
+    formula_version: ContractId
+    operation: Literal["count", "ratio"]
+    columns: AggregateColumns
+    # Approval attests one row per day/scope/stable ID/filter combination.
+    unique_daily_facts: Literal[True]
+    # Approval covers the complete executable definition, including additional
+    # deployment eligibility. A version label alone cannot attest equivalence.
+    metric_contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    eligibility_policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SourceFreshnessRecord(FrozenContract):
+    source_id: ContractId
+    status: Literal["fresh", "stale", "unknown"]
+    data_as_of: datetime | None = None
+    checked_at: datetime | None = None
+    checkpoint: ContractId | None = None
+    release_id: str | None = None
+    snapshot_id: str | None = None
+    snapshot_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def fresh_requires_evidence(self) -> SourceFreshnessRecord:
+        for instant in (self.data_as_of, self.checked_at):
+            if instant is not None and (instant.tzinfo is None or instant.utcoffset() is None):
+                raise ValueError("freshness timestamps must be timezone aware")
+        if (self.checked_at is not None and self.data_as_of is not None
+                and self.data_as_of > self.checked_at):
+            raise ValueError("watermark cannot follow its observation")
+        if self.status == "fresh" and (
+            self.data_as_of is None or self.data_as_of.tzinfo is None
+            or self.checkpoint is None or self.release_id is None
+            or self.snapshot_id is None or self.snapshot_checksum is None
+        ):
+            raise ValueError("fresh source requires versioned watermark evidence")
+        return self
+
+
+class RelationBinding(FrozenContract):
+    """Typed execution object binding an executable metric to one relation.
+
+    V1 construction source: (1) the published legacy AI-view deployment
+    (``configs/semantic/ai_views.yaml``), (2) the active SemanticRelease and
+    (3) the release-bound validated SchemaSnapshot.  ``approved`` is retained as
+    ``Literal[True]`` for contract compatibility, but its V1 meaning is
+    "constructed from a Backend-published deployment relation" -- NOT "a human
+    approved this inside Agent".  There is no approval attestation, approval
+    record, approval lookup or approval workflow here; Backend/data publication
+    is the authority boundary (O3).
+    """
+
+    source_ref: ContractId
+    relation_asset_id: str = Field(min_length=1)
+    schema_name: Identifier
+    relation_name: Identifier
+    allowed_columns: tuple[Identifier, ...] = Field(min_length=1)
+    # V1 has NO extra relation-level permission layer.  The metric-level
+    # Backend-provided entry permission (MetricContract.required_permissions)
+    # stays authoritative; this field defaults to an EMPTY tuple and must never
+    # duplicate ``nl2sql:invoke`` into a second binding-level permission gate.
+    required_permissions: tuple[str, ...] = ()
+    approved: Literal[True]
+    timestamp_kind: Literal["timestamp", "timestamptz"]
+    # Optional deployment-proven canonical count identity.  When present,
+    # COUNT(column) is compiled instead of COUNT(*); absence preserves the
+    # existing non-local compatibility binding.
+    count_column: Identifier | None = None
+    max_days: int = Field(default=366, ge=1, le=3660)
+    source_id: ContractId | None = None
+    aggregate: AggregateContract | None = None
+    allow_detail_fallback: bool = False
+    allow_detail_required: bool = True
+    max_estimated_rows: int = Field(default=1_000_000, ge=1)
+    bootstrap_scan_max_rows: int | None = Field(default=None, ge=1)
+    # NOTE: physical organization scope -> column truth lives ONLY on the
+    # versioned SchemaSnapshot relation policy (RelationSnapshot.
+    # organization_coverage).  The compiler DERIVES its organization bindings
+    # from that snapshot and proves they are the approved projection, so there is
+    # no second, writable, silently-divergent source of physical org truth here.
+
+    @property
+    def relation_id(self) -> str:
+        return f"{self.schema_name}.{self.relation_name}"
+
+    @property
+    def deployment_source_id(self) -> str:
+        return self.source_id or self.source_ref
+
+
+@dataclass(frozen=True)
+class CompiledMetricQuery:
+    sql: str = field(repr=False)
+    params: dict[str, Any] = field(repr=False)
+    release_id: str
+    snapshot_id: str
+    snapshot_checksum: str
+    query_plan: QueryPlan = field(repr=False)
+    context: ContextBundle = field(repr=False)
+    operation: Literal["count", "ratio"] = "count"
+    dimension: OrganizationCoverageBinding | None = None
+    source_kind: Literal["approved_aggregate", "approved_detail"] = "approved_detail"
+    source_id: str = ""
+    selection_reason: str = "approved_detail"
+    degradation: tuple[str, ...] = ()
+    freshness: SourceFreshnessRecord | None = None
+    semantic_signature: str = ""
+    # Deterministic replay identity of the injected trusted authorization.  Only
+    # the opaque revision and the effective scope level are bound; the allowed
+    # scope id collection is NEVER copied into a public receipt or log.
+    authorization_revision: str | None = None
+    authorization_scope_level: str | None = None
+
+
+class MetricQueryCompiler:
+    def __init__(
+        self,
+        *,
+        read_active: Callable[[], Awaitable[SemanticRelease | None]],
+        read_snapshot: Callable[[str], Awaitable[SchemaSnapshot | None]],
+        bindings: tuple[RelationBinding, ...],
+        eligibility_policies: tuple[EligibilityPolicy, ...],
+        identity: RequestIdentity,
+        read_freshness: Callable[[str], Awaitable[SourceFreshnessRecord | None]] | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        # Dormant/test seam: an INJECTED trusted Backend authorization context.
+        # The S1c request-scoped factory IS wired into the engine and the
+        # AppContainer, but v2.py still does not populate
+        # RequestContext.authorization, so production requests fail closed at the
+        # engine's run-start resolution with authorization_context_missing before
+        # this compiler is ever constructed.  Direct/test callers may still inject
+        # None, which preserves the pre-slice-2B compatibility behaviour below --
+        # the S1c path itself never does.
+        #
+        # Without a context the compiler preserves the pre-slice-2B non-authorized
+        # decision behavior, and this is enforced by code and regression tests:
+        # no authorization predicate is added, organization coverage is NOT
+        # enforced, city_company stays available as the default total scope, an
+        # uncovered-but-metric-supported scope keeps the DEGRADABLE
+        # metric_grain_or_dimension_unsupported (so the detail fallback stays
+        # reachable), and the compiled signature omits the authorization keys so
+        # its hash is byte-identical for the same inputs.  The one representational
+        # change is that physical organization bindings are read from the snapshot
+        # RelationSnapshot.organization_coverage -- the retired
+        # RelationBinding.organization_dimensions field no longer exists -- so a
+        # deployment whose coverage differs from the old binding would bind
+        # differently; there is no longer any second source to disagree with it.
+        authorization: AuthorizationContext | None = None,
+        # S1c A4 / frozen V1: the revision BOUND TO THIS RUN and restored from
+        # run state (None on an initial request).  A supplied snapshot whose
+        # revision differs is a RUN-BINDING mismatch, not a live revocation.
+        expected_revision: str | None = None,
+    ) -> None:
+        if authorization is not None and not isinstance(authorization, AuthorizationContext):
+            raise ValueError("compiler authorization must be an AuthorizationContext")
+        self._authorization = authorization
+        self._expected_revision = expected_revision
+        self._read_active = read_active
+        self._read_snapshot = read_snapshot
+        bindings = tuple(RelationBinding.model_validate_json(item.model_dump_json()) for item in bindings)
+        eligibility_policies = tuple(
+            EligibilityPolicy.model_validate_json(item.model_dump_json()) for item in eligibility_policies
+        )
+        self._bindings = {item.deployment_source_id: item for item in bindings}
+        self._policies = {item.policy_id: item for item in eligibility_policies}
+        if len(self._bindings) != len(bindings) or len(self._policies) != len(eligibility_policies):
+            raise ValueError("duplicate deployment binding or eligibility policy")
+        self._identity = RequestIdentity.model_validate_json(identity.model_dump_json())
+        self._read_freshness = read_freshness
+        self._clock = clock
+
+    def authorization_decision(self) -> AuthorizationDecision | None:
+        """Return the decision for the injected trusted context, or None.
+
+        None means NO authorization was injected at all (the preserved
+        non-authorized compatibility seam).  An injected but unusable context
+        yields the canonical deny; a usable one yields its explicit ALLOW.
+        Receipt provenance is taken ONLY from an allow outcome of THIS call.
+        """
+
+        if self._authorization is None:
+            return None
+        return evaluate_authorization(
+            self._authorization,
+            expected_revision=self._expected_revision,
+        )
+
+    async def compile(self, plan: QueryPlan, context: ContextBundle) -> CompiledMetricQuery:
+        plan = QueryPlan.model_validate(query_plan_payload(plan))
+        context = ContextBundle.model_validate_json(context.model_dump_json())
+        # FIRST, the frozen admission semantics: a disabled agent, an empty
+        # effective scope, or a malformed/unusable injected context denies
+        # canonically before any source is considered.  This is NON-DEGRADABLE:
+        # authorization_denied is not in _SOURCE_REJECTIONS, so it can never be
+        # laundered into a detail fallback.
+        if self._authorization is not None:
+            # Frozen V1 run binding: expected_revision is INTERNAL RUN
+            # CONSISTENCY.  A mismatch is a run-binding failure, not a live
+            # revocation of an in-flight run.
+            if (
+                self._expected_revision is not None
+                and self._authorization.authorization_revision != self._expected_revision
+            ):
+                raise PlanStepError("authorization_run_binding_mismatch")
+            decision = self.authorization_decision()
+            assert decision is not None
+            if decision.outcome != "allow":
+                raise PlanStepError("authorization_denied")
+        validation = PlanValidator().validate_query_plan(
+            plan=plan, context=context, identity=self._identity,
+        )
+        if validation.outcome != "allow":
+            raise PlanStepError("metric_plan_denied")
+        if len(plan.metric_keys) != 1 or plan.intent not in {"metric", "trend", "comparison", "ranking"}:
+            raise PlanStepError("metric_operation_unsupported")
+        release = await self._read_active()
+        if (release is None or release.state != SemanticReleaseState.ACTIVE
+                or release.release_id != str(context.semantic_release_id)):
+            raise PlanStepError("metric_active_release_mismatch")
+        snapshot = await self._read_snapshot(str(context.schema_snapshot_id))
+        if (snapshot is None or snapshot.state != SchemaSnapshotState.VALIDATED
+                or snapshot.snapshot_id != str(context.schema_snapshot_id)
+                or release.schema_snapshot_id != snapshot.snapshot_id
+                or release.schema_snapshot_checksum != snapshot.checksum):
+            raise PlanStepError("metric_schema_snapshot_mismatch")
+        documents = [doc for doc in release.documents if doc.document_id == plan.metric_keys[0]]
+        if len(documents) != 1:
+            raise PlanStepError("metric_contract_missing")
+        document = documents[0]
+        try:
+            metric = MetricContract.model_validate_json(document.metadata.get("execution_contract", ""))
+        except ValueError as exc:
+            raise PlanStepError("metric_contract_invalid") from exc
+        if (metric.asset_id != document.document_id or metric.domain != plan.domain
+                or document.metadata.get("status") != "active"
+                or document.metadata.get("domain") != metric.domain
+                or document.metadata.get("owner") != metric.owner
+                or metric.release_status != "active" or not metric.assistant_enabled):
+            raise PlanStepError("metric_contract_inactive")
+        policy = self._policies.get(metric.eligibility_policy_id)
+        if policy is None:
+            raise PlanStepError("metric_source_or_policy_missing")
+        if ("*" not in self._identity.permissions
+                and not set(metric.required_permissions) <= self._identity.permissions):
+            raise PlanStepError("metric_permission_denied")
+        evaluated_at = self._clock()
+        if (not isinstance(evaluated_at, datetime) or evaluated_at.tzinfo is None
+                or evaluated_at.utcoffset() != timedelta(0)):
+            raise PlanStepError("metric_evaluation_clock_invalid")
+        return await self._select_source(plan, context, metric, policy, release, snapshot, evaluated_at)
+
+    def _compile_source(
+        self, plan: QueryPlan, context: ContextBundle, metric: MetricContract,
+        policy: EligibilityPolicy, release: SemanticRelease, snapshot: SchemaSnapshot,
+        binding: RelationBinding, freshness: SourceFreshnessRecord,
+        reason: str, degradation: tuple[str, ...],
+    ) -> CompiledMetricQuery:
+        permissions = set(metric.required_permissions) | set(binding.required_permissions)
+        if (any(not permission.strip() for permission in permissions)
+                or ("*" not in self._identity.permissions
+                    and not permissions <= self._identity.permissions)):
+            raise PlanStepError("metric_permission_denied")
+        if binding.relation_asset_id not in context.approved_relation_ids:
+            raise PlanStepError("metric_relation_unapproved")
+        # A context relation id alone is not evidence: require the active release
+        # relation document and the approved physical snapshot relation as well.
+        relation_docs = [doc for doc in release.documents
+                         if doc.document_id == binding.relation_asset_id
+                         and doc.metadata.get("status") == "active"
+                         and doc.metadata.get("asset_type") == "relation"]
+        relations = [item for item in snapshot.candidate.relations
+                     if item.relation_id == binding.relation_id]
+        if len(relation_docs) != 1 or len(relations) != 1:
+            raise PlanStepError("metric_relation_unapproved")
+        relation = relations[0]
+        coverage = relation.organization_coverage
+        authorization = self._authorization
+        # Organization-coverage ENFORCEMENT is authorized-path-only: with no
+        # injected context the compiler must keep its pre-slice-2B behavior and
+        # never fail closed on coverage it was not previously consulting.  When a
+        # context IS injected, the versioned snapshot relation policy is the
+        # SINGLE source of physical organization scope -> column truth and a
+        # malformed declaration is NON-DEGRADABLE.
+        if authorization is not None and validate_organization_coverage(relation):
+            raise PlanStepError("metric_organization_coverage_invalid")
+        if binding.aggregate is not None and relation.sensitivity not in {"public", "internal"}:
+            raise PlanStepError("metric_aggregate_sensitivity_denied")
+        if binding.aggregate is not None and metric.metric_key not in relation.aggregate_coverage:
+            raise PlanStepError("metric_aggregate_coverage_unapproved")
+        columns = {column.name: column.data_type.lower() for column in relation.columns}
+        if binding.count_column is not None and binding.count_column not in columns:
+            raise PlanStepError("metric_count_column_unapproved")
+        authorized_coverage = (
+            _authorization_coverage(coverage, authorization.scope_level)
+            if authorization is not None
+            else None
+        )
+        aggregate = binding.aggregate
+        business_time_column = aggregate.columns.time if aggregate else metric.business_time_column
+        predicates = (Predicate(field="is_valid_for_metrics", operator="is_true"),
+                      *policy.predicates, *metric.predicates)
+        formula_predicates = (*predicates, *metric.formula_predicates)
+        dimension, filter_dimensions = _organization_scope(
+            plan, metric, coverage, authorization_required=authorization is not None,
+        )
+        if authorization is not None and authorized_coverage is not None:
+            _validate_authorized_organization_request(
+                dimension, filter_dimensions, authorization,
+            )
+        used = {business_time_column, *(item.field for item in formula_predicates),
+                *(item.field for item in metric.filters)}
+        if binding.count_column is not None:
+            used.add(binding.count_column)
+        if aggregate:
+            used = {*aggregate.columns.model_dump().values(), *(item.field for item in metric.filters)}
+        used.update(item.field for item in filter_dimensions.values() if item.field is not None)
+        if dimension is not None and dimension.field is not None:
+            used.add(dimension.field)
+        if authorized_coverage is not None and authorized_coverage.field is not None:
+            used.add(authorized_coverage.field)
+            field = authorized_coverage.field
+            # Authorization field/type mismatch is NON-DEGRADABLE; it must not
+            # borrow the degradable metric_column_unapproved path.
+            if (field not in set(binding.allowed_columns) or field not in columns
+                    or field in set(relation.sensitive_columns)):
+                raise PlanStepError("metric_organization_coverage_invalid")
+        if (not used <= set(binding.allowed_columns) or not used <= columns.keys()
+                or used & set(relation.sensitive_columns)):
+            raise PlanStepError("metric_column_unapproved")
+        time_type = columns[business_time_column]
+        expected_types = ({"timestamp without time zone", "timestamp"}
+                          if binding.timestamp_kind == "timestamp"
+                          else {"timestamp with time zone", "timestamptz"})
+        if time_type not in expected_types or any(
+            item.operator == "is_true" and columns[item.field] not in {"boolean", "bool"}
+            for item in (() if aggregate else formula_predicates)
+        ):
+            raise PlanStepError("metric_column_type_mismatch")
+        if aggregate:
+            _validate_aggregate_columns(aggregate.columns, columns)
+        else:
+            indexed = any(index.columns and index.columns[0] == business_time_column
+                          and index.predicate is None for index in relation.indexes)
+            # Arbitrary partition expressions and partial predicates are not
+            # sufficient index evidence. Bootstrap scans require explicit caps.
+            bootstrap = (binding.bootstrap_scan_max_rows is not None
+                         and 0 <= relation.estimated_rows <= binding.bootstrap_scan_max_rows)
+            if relation.estimated_rows < 0 or relation.estimated_rows > binding.max_estimated_rows:
+                raise PlanStepError("metric_scan_rows_exceeded")
+            if not indexed and not bootstrap:
+                raise PlanStepError("metric_time_index_required")
+        for rule in metric.filters:
+            _validate_column_type(rule.value_type, columns[rule.field])
+        for organization in (*filter_dimensions.values(), *((dimension,) if dimension else ())):
+            assert organization.field is not None and organization.value_type is not None
+            _validate_column_type(organization.value_type, columns[organization.field])
+        if (plan.grain not in metric.supported_grains
+                or any(item not in metric.supported_dimensions for item in plan.dimensions)):
+            raise PlanStepError("metric_grain_or_dimension_unsupported")
+        if plan.time_range.timezone != "Asia/Shanghai":
+            raise PlanStepError("metric_timezone_unsupported")
+        days = (plan.time_range.end - plan.time_range.start).days + 1
+        if days > binding.max_days:
+            raise PlanStepError("metric_time_range_too_large")
+        if plan.available_dates and (
+            plan.intent != "trend"
+            or plan.grain != "day"
+            or plan.dimensions
+        ):
+            raise PlanStepError("metric_available_period_shape_invalid")
+        try:
+            # Existing TimeRange is a pair of inclusive dates (same-day allowed).
+            # Convert once to a half-open interval; month/day grain only groups.
+            start = datetime.combine(plan.time_range.start, time.min)
+            end = datetime.combine(plan.time_range.end + timedelta(days=1), time.min)
+        except OverflowError as exc:
+            raise PlanStepError("metric_time_range_overflow") from exc
+        if binding.timestamp_kind == "timestamptz":
+            start = start.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+            end = end.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        params: dict[str, Any] = {"start_at": start, "end_at": end}
+        business_time = _quote(business_time_column)
+        where = [f"{business_time} >= :start_at", f"{business_time} < :end_at"]
+        if plan.available_dates:
+            local_business_date = (
+                f"DATE({business_time} AT TIME ZONE 'Asia/Shanghai')"
+                if binding.timestamp_kind == "timestamptz"
+                else f"DATE({business_time})"
+            )
+            available_keys = [
+                f"available_date_{position}"
+                for position in range(len(plan.available_dates))
+            ]
+            where.append(
+                f"{local_business_date} IN ({', '.join(':' + key for key in available_keys)})"
+            )
+            params.update(
+                dict(zip(available_keys, plan.available_dates, strict=True))
+            )
+        # SYSTEM-AUTHORED authorization predicate, independent of QueryPlan and
+        # of user filters.  It is built ONLY from the trusted context ids and the
+        # relation's approved coverage, and ids are always bound parameters.
+        if (authorization is not None and authorized_coverage is not None
+                and authorized_coverage.field is not None):
+            assert authorized_coverage.value_type is not None
+            authorization_ids = _authorization_scope_values(
+                authorization.allowed_scope_ids,
+                authorized_coverage.value_type,
+                columns[authorized_coverage.field],
+            )
+            authorization_keys = [
+                f"auth_scope_{position}" for position in range(len(authorization_ids))
+            ]
+            where.append(
+                f"{_quote(authorized_coverage.field)} IN "
+                f"({', '.join(':' + key for key in authorization_keys)})"
+            )
+            params.update(zip(authorization_keys, authorization_ids, strict=True))
+        if aggregate:
+            assert freshness is not None
+            scope = (
+                dimension.scope_level
+                if dimension is not None
+                else next(iter(filter_dimensions), None)
+                or (authorization.scope_level if authorization is not None else "city_company")
+            )
+            for key, column, value in (
+                ("metric", aggregate.columns.metric_key, metric.metric_key),
+                ("formula", aggregate.columns.formula_version, metric.formula_version),
+                ("release", aggregate.columns.release_id, release.release_id),
+                ("snapshot", aggregate.columns.snapshot_id, snapshot.snapshot_id),
+                ("checkpoint", aggregate.columns.checkpoint, freshness.checkpoint),
+                ("data_as_of", aggregate.columns.data_as_of, freshness.data_as_of),
+                ("grain", aggregate.columns.grain, "day"),
+                ("dimension", aggregate.columns.dimension, scope),
+            ):
+                params[f"source_{key}"] = value
+                where.append(f"{_quote(column)} = :source_{key}")
+        else:
+            where.extend(_predicate_sql(item) for item in predicates)
+        if dimension is not None:
+            assert dimension.field is not None
+            where.append(f"{_quote(dimension.field)} IS NOT NULL")
+        filters = {item.field: item for item in metric.filters}
+        seen_filters: set[str] = set()
+        for index, item in enumerate(plan.filters):
+            if item.field_ref in seen_filters:
+                raise PlanStepError("metric_filter_unsupported")
+            seen_filters.add(item.field_ref)
+            organization = filter_dimensions.get(item.field_ref)
+            rule = filters.get(item.field_ref)
+            if organization is not None:
+                assert organization.field is not None and organization.value_type is not None
+                field_name, value_type = organization.field, organization.value_type
+                if item.operator not in {"eq", "in"}:
+                    raise PlanStepError("metric_filter_unsupported")
+            elif rule is not None and item.operator == "eq":
+                field_name, value_type = rule.field, rule.value_type
+            else:
+                raise PlanStepError("metric_filter_unsupported")
+            key = f"filter_{index}"
+            values = item.value if item.operator == "in" else [item.value]
+            if not isinstance(values, list) or not 1 <= len(values) <= 100:
+                raise PlanStepError("metric_filter_list_invalid")
+            for value in values:
+                _validate_filter_value(value, value_type, columns[field_name])
+            if (organization is not None and authorization is not None
+                    and organization.scope_level == authorization.scope_level):
+                # Same-level user filter: typed membership against the trusted
+                # authorized set.  ONE unauthorized value in an IN list denies the
+                # whole request; the authorized subset is never silently returned.
+                authorized_values = _authorization_scope_values(
+                    authorization.allowed_scope_ids, value_type, columns[field_name],
+                )
+                for value in values:
+                    if value not in authorized_values:
+                        raise PlanStepError("authorization_denied")
+            if item.operator == "in":
+                if len(set(values)) != len(values):
+                    raise PlanStepError("metric_filter_list_invalid")
+                keys = [f"{key}_{position}" for position in range(len(values))]
+                where.append(f"{_quote(field_name)} IN ({', '.join(':' + name for name in keys)})")
+                params.update(zip(keys, values, strict=True))
+            else:
+                where.append(f"{_quote(field_name)} = :{key}")
+                params[key] = item.value
+        group = ""
+        order = ""
+        prefix = ""
+        count_expression = (
+            _quote(binding.count_column) if binding.count_column is not None else "*"
+        )
+        select = f"COUNT({count_expression}) AS value"
+        if aggregate:
+            select = f"CAST(COALESCE(SUM({_quote(aggregate.columns.value)}), 0) AS bigint) AS value"
+        if plan.intent == "trend":
+            local_time = (f"{business_time} AT TIME ZONE 'Asia/Shanghai'"
+                          if binding.timestamp_kind == "timestamptz" else business_time)
+            # grain is a typed allowlist, not a raw SQL fragment.
+            bucket = f"DATE_TRUNC('{plan.grain}', {local_time})"
+            prefix = f"{bucket} AS period, "
+            group = f" GROUP BY {bucket}"
+            order = " ORDER BY period"
+        elif dimension is not None:
+            assert dimension.field is not None
+            identifier = _quote(dimension.field)
+            if dimension.value_type == "text":
+                identifier += ' COLLATE "C"'
+            prefix = f"{identifier} AS dimension_id, "
+            group = f" GROUP BY {identifier}"
+            order = " ORDER BY dimension_id"
+            if plan.intent == "ranking":
+                # QueryGateway accepts a literal LIMIT. It comes exclusively from
+                # the validated finite integer, never from a question or filter.
+                order = f" ORDER BY value DESC NULLS LAST, dimension_id LIMIT {plan.ranking_limit}"
+        if metric.ratio is not None:
+            denominator = " AND ".join(_predicate_sql(item) for item in metric.ratio.denominator_predicates)
+            numerator = " AND ".join(_predicate_sql(item) for item in metric.ratio.numerator_predicates)
+            select = (
+                f"COUNT({count_expression}) FILTER (WHERE {denominator} AND {numerator}) AS numerator, "
+                f"COUNT({count_expression}) FILTER (WHERE {denominator}) AS denominator"
+            )
+            if aggregate:
+                select = (f"CAST(COALESCE(SUM({_quote(aggregate.columns.numerator)}), 0) AS bigint) AS numerator, "
+                          f"CAST(COALESCE(SUM({_quote(aggregate.columns.denominator)}), 0) AS bigint) AS denominator")
+        sql = (f"SELECT {prefix}{select} FROM {_quote(binding.schema_name)}.{_quote(binding.relation_name)}"
+               f" WHERE {' AND '.join(where)}{group}")
+        if metric.ratio is not None:
+            output_prefix = "period, " if plan.intent == "trend" else "dimension_id, " if dimension else ""
+            # ZERO-DENOMINATOR SEMANTICS.  NULLIF would erase the distinction
+            # between an UNDEFINED calculation and genuinely absent data, so the
+            # division is guarded explicitly and the two outcomes stay separate:
+            #   denominator = 0 -> status "calculation_error" (undefined), value NULL;
+            #   denominator > 0 -> status "success", including a VALID 0.00 ratio
+            #                      when the numerator is zero.
+            sql = (f"SELECT {output_prefix}numerator, denominator, "
+                   "CASE WHEN denominator = 0 THEN NULL "
+                   "ELSE ROUND(100 * CAST(numerator AS numeric) / denominator, 2) END AS value, "
+                   "CASE WHEN denominator = 0 THEN 'calculation_error' ELSE 'success' END AS status "
+                   f"FROM ({sql}) AS metric_counts")
+        sql += order
+        signature_exclusions = {"source_strategy"}
+        if not plan.available_dates:
+            # Preserve the pre-sparse-window semantic signature for ordinary
+            # contiguous plans; the server-owned sparse set participates only
+            # when it is actually present.
+            signature_exclusions.add("available_dates")
+        signature_plan = plan.model_dump(mode="json", exclude=signature_exclusions)
+        signature_payload: dict[str, Any] = {
+            "plan": signature_plan, "metric": metric.model_dump(mode="json"),
+            "policy": policy.model_dump(mode="json"), "release": release.release_id,
+            "snapshot": snapshot.snapshot_id, "checksum": snapshot.checksum,
+            "checkpoint": freshness.checkpoint if freshness else None,
+        }
+        if plan.available_dates:
+            signature_payload["available_dates"] = [
+                item.isoformat() for item in plan.available_dates
+            ]
+        if binding.count_column is not None:
+            signature_payload["count_column"] = binding.count_column
+        if authorization is not None:
+            # Deterministic replay identity for the injected trusted authority.
+            # A changed authorization revision or effective scope level MUST
+            # change the compiled authority; the allowed id collection is never
+            # part of the public identity.  With NO injected authority these keys
+            # are absent, so the no-auth signature stays byte-identical to
+            # pre-slice-2B.
+            signature_payload["authorization_revision"] = authorization.authorization_revision
+            signature_payload["authorization_scope_level"] = authorization.scope_level
+        signature = hashlib.sha256(json.dumps(
+            signature_payload, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        return CompiledMetricQuery(
+            sql, params, release.release_id, snapshot.snapshot_id, snapshot.checksum, plan, context,
+            metric.operation, dimension, "approved_aggregate" if aggregate else "approved_detail",
+            binding.deployment_source_id, reason, degradation, freshness, signature,
+            authorization.authorization_revision if authorization is not None else None,
+            authorization.scope_level if authorization is not None else None,
+        )
+
+    async def _select_source(
+        self, plan: QueryPlan, context: ContextBundle, metric: MetricContract, policy: EligibilityPolicy,
+        release: SemanticRelease, snapshot: SchemaSnapshot, evaluated_at: datetime,
+    ) -> CompiledMetricQuery:
+        sources = sorted((item for item in self._bindings.values() if item.source_ref == metric.source_ref),
+                         key=lambda item: item.deployment_source_id)
+        degradation: list[str] = []
+        blocked: list[str] = []
+        rejected: list[str] = []
+        for source in sources:
+            aggregate = source.aggregate
+            if plan.source_strategy == "detail_required" or aggregate is None:
+                continue
+            if (aggregate.metric_key != metric.metric_key or aggregate.formula_version != metric.formula_version
+                    or aggregate.operation != metric.operation
+                    or aggregate.metric_contract_sha256 != aggregate_definition_checksum(metric)
+                    or aggregate.eligibility_policy_sha256 != aggregate_definition_checksum(policy)):
+                continue
+            try:
+                freshness = await self._freshness(source, metric, release, snapshot, evaluated_at)
+                query = self._compile_source(plan, context, metric, policy, release, snapshot,
+                                             source, freshness, "fresh_approved_aggregate", ())
+                if freshness.status == "fresh":
+                    return query
+                code = "metric_aggregate_freshness_denied"
+                degradation.append(f"aggregate_{freshness.status}")
+            except PlanStepError as exc:
+                if exc.code not in _SOURCE_REJECTIONS:
+                    raise
+                code = exc.code
+                degradation.append(code)
+            rejected.append(code)
+            if not source.allow_detail_fallback:
+                blocked.append(code)
+        if blocked:
+            # The exception keeps its single-code contract, but the FULL blocked
+            # set is what a batch-deployment operator needs: every code after
+            # the first is otherwise lost.
+            logger.warning(
+                "metric aggregate source selection blocked; failure_codes=%s", blocked
+            )
+            raise PlanStepError(blocked[0])
+        for source in sources:
+            if source.aggregate is not None:
+                continue
+            if plan.source_strategy == "detail_required" and not source.allow_detail_required:
+                raise PlanStepError("metric_detail_strategy_denied")
+            try:
+                freshness = await self._freshness(source, metric, release, snapshot, evaluated_at)
+                return self._compile_source(
+                    plan, context, metric, policy, release, snapshot, source, freshness,
+                    "approved_detail_fallback" if degradation else "approved_detail",
+                    tuple(sorted(set(degradation))),
+                )
+            except PlanStepError as exc:
+                if exc.code not in _SOURCE_REJECTIONS:
+                    raise
+                rejected.append(exc.code)
+        if rejected:
+            # Same contract: one code on the exception, the complete rejected
+            # set in the log.
+            logger.warning(
+                "metric source selection rejected every candidate; failure_codes=%s",
+                rejected,
+            )
+            raise PlanStepError(rejected[0])
+        raise PlanStepError("metric_source_or_policy_missing")
+
+    async def _freshness(self, source: RelationBinding, metric: MetricContract, release: SemanticRelease,
+                         snapshot: SchemaSnapshot, evaluated_at: datetime) -> SourceFreshnessRecord:
+        if source.aggregate is not None and metric.freshness_sla_seconds is None:
+            raise PlanStepError("metric_aggregate_sla_missing")
+        record = await self._read_freshness(source.deployment_source_id) if self._read_freshness else None
+        if record is None:
+            return SourceFreshnessRecord(source_id=source.deployment_source_id, status="unknown")
+        try:
+            record = SourceFreshnessRecord.model_validate_json(record.model_dump_json())
+        except ValueError as exc:
+            raise PlanStepError("metric_freshness_evidence_invalid") from exc
+        if (record.source_id != source.deployment_source_id
+                or (record.release_id is not None and record.release_id != release.release_id)
+                or (record.snapshot_id is not None and record.snapshot_id != snapshot.snapshot_id)
+                or (record.snapshot_checksum is not None and record.snapshot_checksum != snapshot.checksum)):
+            raise PlanStepError("metric_freshness_authority_mismatch")
+        if ((record.data_as_of is not None and record.data_as_of > evaluated_at)
+                or (record.checked_at is not None and record.checked_at > evaluated_at)):
+            raise PlanStepError("metric_freshness_evidence_invalid")
+        if (record.status == "fresh" and record.data_as_of is not None
+                and metric.freshness_sla_seconds is not None
+                and evaluated_at - record.data_as_of > timedelta(seconds=metric.freshness_sla_seconds)):
+            return record.model_copy(update={"status": "stale"})
+        return record
+
+
+class GatewayMetricStepRunner:
+    def __init__(
+        self,
+        compiler: MetricQueryCompiler,
+        gateway: QueryGateway,
+        *,
+        calculation_catalog: ApprovedCalculationCatalog | None = None,
+    ) -> None:
+        self._compiler = compiler
+        self._gateway = gateway
+        # Dependency fetches are authorized ONLY by an injected, already-resolved
+        # trusted binding catalog; without one they fail closed.
+        self._calculation_catalog = calculation_catalog
+
+    async def prepare(self, *, step: FetchMetricStep, query_plan: QueryPlan,
+                      context: ContextBundle) -> PreparedMetricStep:
+        if step.ad_hoc_input_role is not None:
+            ad_hoc_plan = self._adhoc_dependency_plan(
+                step=step, query_plan=query_plan, context=context
+            )
+            query = await self._compiler.compile(ad_hoc_plan, context)
+            prepared = self._gateway.prepare(query.sql)
+            return PreparedMetricStep(
+                prepared.fingerprint, 0, query, dependency_fetch=True
+            )
+        if step.calculation_input_role is None:
+            if step.metric_keys != query_plan.metric_keys:
+                raise PlanStepError("metric_step_mismatch")
+            query = await self._compiler.compile(query_plan, context)
+            prepared = self._gateway.prepare(query.sql)
+            return PreparedMetricStep(prepared.fingerprint, 0, query)
+        dependency_plan = self._dependency_plan(
+            step=step, query_plan=query_plan, context=context
+        )
+        query = await self._compiler.compile(dependency_plan, context)
+        prepared = self._gateway.prepare(query.sql)
+        return PreparedMetricStep(prepared.fingerprint, 0, query, dependency_fetch=True)
+
+    def _dependency_plan(
+        self,
+        *,
+        step: FetchMetricStep,
+        query_plan: QueryPlan,
+        context: ContextBundle,
+    ) -> QueryPlan:
+        """Derive the ephemeral child plan fetching ONE trusted binding input.
+
+        A dependency fetch names a single metric key that is deliberately NOT the
+        requested plan's metric key, so the direct equality invariant cannot
+        apply.  The trusted binding is instead re-proved here from the injected
+        catalog: the binding owning the compiled output key must exist, its
+        checksum must match the step's declared checksum, the declared role must
+        be one of its inputs, that input must be exactly the fetched metric, and
+        the metric must be resolved in this request's context.  Everything else
+        fails closed before any SQL is compiled.
+        """
+
+        catalog = self._calculation_catalog
+        output_metric_key = step.calculation_output_metric_key
+        binding: ApprovedCalculationBinding | None = (
+            catalog.binding_for(output_metric_key)
+            if catalog is not None and output_metric_key is not None
+            else None
+        )
+        if binding is None:
+            raise PlanStepError("metric_dependency_binding_missing")
+        if step.calculation_binding_checksum != binding.checksum:
+            raise PlanStepError("metric_dependency_binding_mismatch")
+        role = step.calculation_input_role
+        inputs = [item for item in binding.inputs if item.role == role]
+        if len(inputs) != 1:
+            raise PlanStepError("metric_dependency_role_mismatch")
+        if step.metric_keys != (inputs[0].metric_key,):
+            raise PlanStepError("metric_dependency_metric_mismatch")
+        if catalog is not None and catalog.binding_for(inputs[0].metric_key) is not None:
+            # V1 has no recursive canonical DAG: a catalog-bound dependency
+            # would itself require a governed calculation, so this seam refuses
+            # it even for a caller that bypassed PlanValidator.
+            raise PlanStepError("metric_dependency_nested_calculation_unsupported")
+        if query_plan.intent != "metric":
+            raise PlanStepError("metric_dependency_intent_unsupported")
+        if query_plan.metric_keys != (binding.canonical_metric_key,):
+            raise PlanStepError("metric_dependency_output_mismatch")
+        if inputs[0].metric_key not in context.asset_ids:
+            raise PlanStepError("metric_dependency_metric_unresolved")
+        # Only the requested metric identity changes: domain, filters, time
+        # range, grain, source strategy and permission requirements stay exactly
+        # as the validated plan declared them, and compile() re-validates.
+        return query_plan.model_copy(update={"metric_keys": step.metric_keys})
+
+    def _adhoc_dependency_plan(
+        self,
+        *,
+        step: FetchMetricStep,
+        query_plan: QueryPlan,
+        context: ContextBundle,
+    ) -> QueryPlan:
+        """Derive the ephemeral child plan fetching ONE AD_HOC input.
+
+        No catalog is consulted.  The input metric must be resolved in this
+        request's context and must not itself be catalog-bound: V1 refuses a
+        nested approved calculation, and it never direct-fetches a computed
+        metric as a substitute for its governed compute path.  Domain, filters,
+        time range, grain, source strategy and permissions stay exactly as the
+        validated plan declared them, and compile() re-validates.
+        """
+
+        if len(step.metric_keys) != 1:
+            raise PlanStepError("metric_adhoc_dependency_shape_invalid")
+        if step.ad_hoc_derived_output_id is None:
+            raise PlanStepError("metric_adhoc_dependency_output_missing")
+        if query_plan.intent != "metric":
+            raise PlanStepError("metric_adhoc_dependency_intent_unsupported")
+        metric_key = step.metric_keys[0]
+        if metric_key not in context.asset_ids:
+            raise PlanStepError("metric_adhoc_dependency_metric_unresolved")
+        catalog = self._calculation_catalog
+        if catalog is not None and catalog.binding_for(metric_key) is not None:
+            raise PlanStepError("metric_adhoc_dependency_catalog_bound")
+        return query_plan.model_copy(update={"metric_keys": step.metric_keys})
+
+    async def execute(self, prepared: PreparedMetricStep, *, timeout_ms: int) -> MetricStepResult:
+        query = prepared.payload
+        if not isinstance(query, CompiledMetricQuery):
+            raise PlanStepError("metric_prepared_query_invalid")
+        async with asyncio.timeout(timeout_ms / 1000):
+            # Re-read active authority immediately before gateway execution.
+            current = await self._compiler.compile(query.query_plan, query.context)
+            if (current.sql != query.sql or current.params != query.params
+                    or current.snapshot_checksum != query.snapshot_checksum
+                    or current.operation != query.operation or current.dimension != query.dimension
+                    or current.freshness != query.freshness
+                    or current.semantic_signature != query.semantic_signature
+                    or current.source_id != query.source_id
+                    or current.source_kind != query.source_kind
+                    or current.selection_reason != query.selection_reason
+                    or current.degradation != query.degradation
+                    or current.authorization_revision != query.authorization_revision
+                    or current.authorization_scope_level != query.authorization_scope_level
+                    or self._gateway.prepare(current.sql).fingerprint != prepared.sql_fingerprint):
+                raise PlanStepError("metric_prepared_query_changed")
+            result = await self._gateway.execute(current.sql, current.params)
+        if not result.accepted:
+            raise PlanStepError("metric_gateway_denied")
+        # Reaching an explicit top-N boundary is complete for a ranking, but
+        # reaching a stricter gateway cap may have discarded requested rows.
+        ranking_complete = (query.query_plan.intent == "ranking"
+                            and result.max_rows is not None
+                            and query.query_plan.ranking_limit <= result.max_rows)
+        if result.max_rows is not None and (
+            result.row_count > result.max_rows
+            or (result.row_count == result.max_rows and not ranking_complete)
+        ):
+            raise PlanStepError("metric_result_may_be_truncated")
+        if result.row_count != len(result.rows):
+            raise PlanStepError("metric_result_shape_invalid")
+        # An UNDEFINED ratio calculation is rejected BEFORE shape validation and
+        # before any grounding, so it can never be mistaken for absent data, for a
+        # legitimate zero, or for a database failure.
+        _reject_calculation_error_rows(query, result.rows)
+        _validate_rows(result.rows, query)
+        digest = rowset_sha256(result.rows)
+        # Decimal is an exact two-place JSON string; hash the typed database
+        # rowset before serialization so decimal and text remain distinct.
+        rows: list[JsonValue] = []
+        for row in result.rows:
+            json_row: dict[str, JsonValue] = {}
+            for key, value in row.items():
+                if type(value) is int:
+                    json_row[key] = value
+                elif isinstance(value, datetime):
+                    json_row[key] = value.isoformat()
+                elif isinstance(value, Decimal):
+                    json_row[key] = format(value, ".2f")
+                elif value is None or isinstance(value, str):
+                    json_row[key] = value
+                else:
+                    raise PlanStepError("metric_result_shape_invalid")
+            rows.append(json_row)
+        payload = result.execution_receipt.model_dump()
+        payload.update(
+            rowset_sha256=digest, source_kind=current.source_kind, source_id=current.source_id,
+            selection_reason=current.selection_reason, source_degradation=current.degradation,
+            semantic_signature=current.semantic_signature,
+            source_checkpoint=current.freshness.checkpoint if current.freshness else None,
+            freshness_status=current.freshness.status if current.freshness else "unknown",
+            data_as_of=current.freshness.data_as_of if current.freshness else None,
+        )
+        receipt = type(result.execution_receipt).model_validate(payload)
+        # Authorization provenance (S1c A5): stamp the revision PROVEN by the
+        # explicit ALLOW that admitted this execution.  No allow decision means
+        # no revision is stamped; the optional no-auth compatibility seam keeps
+        # its unstamped receipt.  The binder is the existing single seam and it
+        # raises on a deny, so a deny can never produce provenance.
+        decision = self._compiler.authorization_decision()
+        if decision is not None and decision.outcome == "allow":
+            receipt = bind_execution_receipt_authorization(receipt, decision)
+        # Only genuine absence may produce no_data; an undefined calculation was
+        # already rejected above.
+        no_data = not rows or (
+            query.operation == "ratio"
+            and all(row["status"] == "no_data" for row in result.rows)
+        )
+        if prepared.dependency_fetch:
+            # A calculation input is the typed scalar only: the rowset wrapper
+            # never reaches the trusted calculation runner.
+            output: dict[str, JsonValue] = {
+                "value": project_dependency_scalar(rows, no_data=no_data)
+            }
+        else:
+            output = {"rows": rows, "no_data": no_data}
+        return MetricStepResult(value=output, receipt=receipt)
+
+
+# Row statuses a dependency fetch may legitimately carry.  "calculation_error" is
+# deliberately ABSENT: an undefined calculation is not a scalar a dependent step
+# may consume, so it must fail as undefined rather than be coerced or dropped.
+_DEPENDENCY_ROW_STATUSES = frozenset({"success", "no_data"})
+
+# The stable, exact reason for an undefined ratio calculation (division by zero).
+METRIC_CALCULATION_UNDEFINED = "metric_calculation_undefined_division_by_zero"
+
+
+def _reject_calculation_error_rows(query: Any, rows: Sequence[Any]) -> None:
+    """Fail closed when a row carries an UNDEFINED calculation.
+
+    A zero denominator is an undefined calculation.  Reporting it as "no data"
+    would let an undefined result reach grounding as a legitimate absence, so it
+    is raised with its own stable reason instead.
+    """
+
+    del query
+    for row in rows:
+        if isinstance(row, Mapping) and row.get("status") == "calculation_error":
+            raise PlanStepError(METRIC_CALCULATION_UNDEFINED)
+
+
+def project_dependency_scalar(rows: Sequence[Any], *, no_data: bool) -> JsonValue:
+    """Project one dependency fetch's rows to the single typed scalar input.
+
+    V1 admits exactly ONE business row/value per dependency.  Multi-row results,
+    alignment, trend and ranking shapes fail closed with a stable reason instead
+    of being reduced, and no missing or no-data value is ever coerced to zero.
+    """
+
+    if no_data:
+        raise PlanStepError("metric_dependency_no_data")
+    if len(rows) != 1:
+        raise PlanStepError("metric_dependency_scalar_required")
+    row = rows[0]
+    if not isinstance(row, Mapping) or "value" not in row:
+        raise PlanStepError("metric_dependency_value_missing")
+    status = row.get("status")
+    if status == "calculation_error":
+        # An undefined dependency is a CALCULATION failure, never absent data.
+        raise PlanStepError(METRIC_CALCULATION_UNDEFINED)
+    if status is not None and status not in _DEPENDENCY_ROW_STATUSES:
+        raise PlanStepError("metric_dependency_status_invalid")
+    if status == "no_data":
+        raise PlanStepError("metric_dependency_no_data")
+    value = row["value"]
+    if value is None:
+        # A NULL value is only legitimate no-data when the row says so; an
+        # undefined calculation was already rejected above.
+        raise PlanStepError("metric_dependency_no_data")
+    if isinstance(value, (dict, list)):
+        raise PlanStepError("metric_dependency_scalar_required")
+    return cast(JsonValue, value)
+
+
+def metric_plan_executor(
+    compiler: MetricQueryCompiler,
+    gateway: QueryGateway,
+    *,
+    trusted_calculation_runner: TrustedCalculationRunner | None = None,
+    calculation_catalog: ApprovedCalculationCatalog | None = None,
+) -> PlanExecutor:
+    """Explicit request-scoped wiring; default AppContainer remains fail closed.
+
+    A calculation step can only be emitted/validated when an explicit trusted
+    binding catalog is supplied elsewhere, so injecting the registered runner
+    here does not make any unbound production metric executable.  The same holds
+    for calculation_catalog: without it no dependency fetch is ever admitted, so
+    the AppContainer default remains fail closed.
+    """
+
+    return PlanExecutor(
+        metric_runner=GatewayMetricStepRunner(
+            compiler, gateway, calculation_catalog=calculation_catalog
+        ),
+        trusted_calculation_runner=(
+            trusted_calculation_runner
+            if trusted_calculation_runner is not None
+            else RegistryTrustedCalculationRunner()
+        ),
+    )
+
+
+def _quote(identifier: str) -> str:
+    # All identifiers originate from typed, deployment-controlled contracts.
+    return f'"{identifier}"'
+
+
+def aggregate_definition_checksum(contract: FrozenContract) -> str:
+    """Deployment approval fingerprint for the complete typed definition."""
+    payload = json.dumps(contract.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _validate_aggregate_columns(mapping: AggregateColumns, columns: dict[str, str]) -> None:
+    text_fields = (mapping.metric_key, mapping.formula_version, mapping.release_id, mapping.snapshot_id,
+                   mapping.checkpoint, mapping.grain, mapping.dimension, mapping.status)
+    for name in text_fields:
+        _validate_column_type("text", columns[name])
+    for name in (mapping.numerator, mapping.denominator):
+        _validate_column_type("integer", columns[name])
+    if (columns[mapping.value] not in {"numeric", "decimal", "bigint", "int8", "integer", "int4"}
+            or columns[mapping.data_as_of] not in {"timestamp with time zone", "timestamptz"}):
+        raise PlanStepError("metric_column_type_mismatch")
+
+
+def _predicate_sql(predicate: Predicate) -> str:
+    operation = {"is_true": "TRUE", "is_null": "NULL", "is_not_null": "NOT NULL"}
+    return f"{_quote(predicate.field)} IS {operation[predicate.operator]}"
+
+
+def _organization_scope(
+    plan: QueryPlan,
+    metric: MetricContract,
+    coverage: tuple[OrganizationCoverageBinding, ...],
+    *,
+    authorization_required: bool,
+) -> tuple[OrganizationCoverageBinding | None, dict[str, OrganizationCoverageBinding]]:
+    """Resolve requested organization dimensions/filters against relation coverage.
+
+    When a trusted context was injected (authorization_required), the snapshot
+    relation policy is the authority and a requested scope the metric supports but
+    the relation does not cover is a NON-DEGRADABLE coverage failure.
+
+    With NO injected context the compiler keeps the pre-slice-2B decision
+    behavior: city_company is always available as the retired RelationBinding
+    default total scope, and a supported-but-uncovered scope keeps the
+    pre-existing DEGRADABLE metric_grain_or_dimension_unsupported so its detail
+    fallback stays reachable.
+    """
+
+    bindings = {item.scope_level: item for item in coverage}
+    if not authorization_required:
+        # No coverage enforcement on this path, so ignore a structurally
+        # unusable non-city binding rather than tripping a downstream assertion;
+        # it is treated exactly like "scope not covered" below.  city_company is
+        # always restored as the default total scope.
+        bindings = {
+            level: binding
+            for level, binding in bindings.items()
+            if level == "city_company"
+            or (binding.field is not None and binding.value_type is not None)
+        }
+        bindings.setdefault("city_company", OrganizationCoverageBinding("city_company"))
+    for item in plan.dimensions:
+        if item not in metric.supported_dimensions:
+            raise PlanStepError("metric_grain_or_dimension_unsupported")
+        if item not in bindings:
+            if authorization_required:
+                raise PlanStepError("metric_organization_coverage_unapproved")
+            raise PlanStepError("metric_grain_or_dimension_unsupported")
+    if len(plan.dimensions) > 1:
+        raise PlanStepError("metric_dimension_combination_unsupported")
+    dimension_name = next(iter(plan.dimensions), None)
+    grouped = plan.intent in {"comparison", "ranking"}
+    if grouped and (dimension_name is None or dimension_name == "city_company"):
+        raise PlanStepError("metric_operation_unsupported")
+    if not grouped and any(item != "city_company" for item in plan.dimensions):
+        raise PlanStepError("metric_dimension_combination_unsupported")
+    dimension = bindings[dimension_name] if grouped and dimension_name is not None else None
+    organization_filters: dict[str, OrganizationCoverageBinding] = {}
+    for item in plan.filters:
+        if item.field_ref in _ORGANIZATION_SCOPE_NAMES:
+            if item.source != "entity_alias" or item.field_ref == "city_company":
+                raise PlanStepError("metric_filter_unsupported")
+            if item.field_ref not in metric.supported_dimensions:
+                raise PlanStepError("metric_filter_unsupported")
+            if item.field_ref not in bindings:
+                if authorization_required:
+                    raise PlanStepError("metric_organization_coverage_unapproved")
+                raise PlanStepError("metric_filter_unsupported")
+            organization_filters[item.field_ref] = bindings[item.field_ref]
+    scopes = set(plan.dimensions) | set(organization_filters)
+    if len(scopes) > 1:
+        raise PlanStepError("metric_dimension_combination_unsupported")
+    # Ordinary YAML filters cannot provide a second route to physical org IDs.
+    org_fields = {item.field for item in bindings.values() if item.field is not None}
+    if any(item.field in org_fields | set(_ORGANIZATION_SCOPE_NAMES) for item in metric.filters):
+        raise PlanStepError("metric_filter_unsupported")
+    return dimension, organization_filters
+
+
+def _authorization_coverage(
+    coverage: tuple[OrganizationCoverageBinding, ...],
+    scope_level: str,
+) -> OrganizationCoverageBinding:
+    """Select the approved coverage entry for the caller's effective scope.
+
+    No matching coverage for the context scope level is fail-closed and
+    NON-DEGRADABLE: the relation cannot be safely constrained for this caller.
+    city_company is an explicit deployment/root authorization scope -- NOT
+    authorization-disabled and NOT default unrestricted access -- so it too must
+    be explicitly declared.
+    """
+
+    for binding in coverage:
+        if binding.scope_level == scope_level:
+            return binding
+    raise PlanStepError("metric_organization_coverage_unapproved")
+
+
+def _validate_authorized_organization_request(
+    dimension: OrganizationCoverageBinding | None,
+    filter_dimensions: dict[str, OrganizationCoverageBinding],
+    authorization: AuthorizationContext,
+) -> None:
+    """Enforce the query-granularity rule only.
+
+    The caller's scope level establishes NO id authorization and NO membership:
+    it only prevents a narrower caller from requesting a broader organizational
+    view.  Same-level id membership and the narrowing behavior of child filters
+    are handled where the physical predicates are built.
+    """
+
+    context_rank = _SCOPE_ORDER[authorization.scope_level]
+    requested_levels: list[str] = []
+    if dimension is not None:
+        requested_levels.append(dimension.scope_level)
+    requested_levels.extend(binding.scope_level for binding in filter_dimensions.values())
+    for requested_level in requested_levels:
+        if _SCOPE_ORDER[requested_level] < context_rank:
+            raise PlanStepError("metric_organization_scope_denied")
+
+
+def _authorization_scope_values(
+    allowed_scope_ids: tuple[str, ...],
+    value_type: str,
+    column_type: str | None,
+) -> tuple[Any, ...]:
+    """Convert the frozen opaque string ids to the physical column family.
+
+    Text columns bind the ids as text.  Integer-backed columns use a
+    deterministic, STRICT canonical conversion; malformed, non-canonical or
+    out-of-range values fail closed.  Floating point is never used and ids are
+    never fuzzy-normalized.
+    """
+
+    if value_type == "text":
+        return tuple(allowed_scope_ids)
+    if column_type is None:
+        raise PlanStepError("metric_organization_coverage_invalid")
+    return tuple(_strict_integer_scope_id(item, column_type) for item in allowed_scope_ids)
+
+
+def _strict_integer_scope_id(value: str, column_type: str) -> int:
+    if not isinstance(value, str) or not _AUTHORIZATION_INTEGER_RE.fullmatch(value):
+        raise PlanStepError("metric_organization_coverage_invalid")
+    number = int(value)
+    bits = (
+        16
+        if column_type in {"smallint", "int2"}
+        else 32
+        if column_type in {"integer", "int4"}
+        else 64
+    )
+    if not -(2 ** (bits - 1)) <= number < 2 ** (bits - 1):
+        raise PlanStepError("metric_organization_coverage_invalid")
+    return number
+
+
+def _validate_column_type(value_type: str, column_type: str) -> None:
+    allowed = ({"text", "character varying", "varchar"} if value_type == "text"
+               else {"smallint", "int2", "integer", "int4", "bigint", "int8"})
+    if column_type not in allowed:
+        raise PlanStepError("metric_column_type_mismatch")
+
+
+def _validate_filter_value(value: Any, value_type: str, column_type: str) -> None:
+    if value_type == "text":
+        valid = isinstance(value, str) and 1 <= len(value) <= 256 and "\x00" not in value
+    else:
+        bits = 16 if column_type in {"smallint", "int2"} else 32 if column_type in {"integer", "int4"} else 64
+        valid = type(value) is int and -(2 ** (bits - 1)) <= value < 2 ** (bits - 1)
+    if not valid:
+        raise PlanStepError("metric_filter_type_mismatch")
+
+
+def _validate_rows(rows: list[dict[str, Any]], query: CompiledMetricQuery) -> None:
+    plan = query.query_plan
+    expected = {"value"} if query.operation == "count" else {"numerator", "denominator", "value", "status"}
+    if plan.intent == "trend":
+        expected.add("period")
+    if query.dimension is not None:
+        expected.add("dimension_id")
+    if ((plan.intent == "metric" and len(rows) != 1)
+            or (plan.intent == "ranking" and len(rows) > plan.ranking_limit)):
+        raise PlanStepError("metric_result_shape_invalid")
+    keys: list[Any] = []
+    for row in rows:
+        if set(row) != expected:
+            raise PlanStepError("metric_result_shape_invalid")
+        value = row["value"]
+        if query.operation == "count":
+            if type(value) is not int or value < 0:
+                raise PlanStepError("metric_result_shape_invalid")
+        else:
+            _validate_ratio_row(row)
+        if "period" in row:
+            period = row["period"]
+            if (not isinstance(period, datetime) or period.tzinfo is not None
+                    or period.time() != time.min
+                    or (plan.grain == "month" and period.day != 1)):
+                raise PlanStepError("metric_result_shape_invalid")
+            first = plan.time_range.start
+            if plan.grain == "month":
+                first = first.replace(day=1)
+            if not first <= period.date() <= plan.time_range.end:
+                raise PlanStepError("metric_result_shape_invalid")
+            keys.append(period)
+        if query.dimension is not None:
+            identifier = row["dimension_id"]
+            value_type = query.dimension.value_type
+            if ((value_type == "text" and (not isinstance(identifier, str) or not identifier
+                                          or len(identifier) > 256 or "\x00" in identifier))
+                    or (value_type == "integer" and (type(identifier) is not int
+                                                     or not -(2 ** 63) <= identifier < 2 ** 63))):
+                raise PlanStepError("metric_result_shape_invalid")
+            keys.append(identifier)
+    if len(set(keys)) != len(keys):
+        raise PlanStepError("metric_result_shape_invalid")
+    if plan.available_dates:
+        returned_periods = tuple(period.date() for period in keys)
+        if returned_periods != plan.available_dates:
+            raise PlanStepError("metric_available_period_set_invalid")
+    if plan.intent == "ranking":
+        # Stable passes preserve ascending ID ties without Decimal arithmetic
+        # (unary minus would round under the caller's ambient context).
+        ordered = sorted(rows, key=lambda row: row["dimension_id"])
+        ordered = sorted(ordered, key=lambda row: (
+            row["value"] is not None, row["value"] if row["value"] is not None else 0,
+        ), reverse=True)
+        if rows != ordered:
+            raise PlanStepError("metric_result_shape_invalid")
+    elif keys != sorted(keys):
+        raise PlanStepError("metric_result_shape_invalid")
+
+
+def _validate_ratio_row(row: dict[str, Any]) -> None:
+    numerator, denominator, value = row["numerator"], row["denominator"], row["value"]
+    if (type(numerator) is not int or type(denominator) is not int
+            or not 0 <= numerator <= denominator <= 2 ** 63 - 1):
+        raise PlanStepError("metric_result_shape_invalid")
+    if denominator == 0:
+        # UNDEFINED CALCULATION, not absent data: a zero denominator carries no
+        # value and its own status, never the genuine no_data outcome.
+        valid = value is None and row["status"] == "calculation_error"
+    else:
+        # PostgreSQL COUNT is int8; this precision is ample for exact rounding
+        # of its ratio. Never use the ambient Decimal context or binary float.
+        with localcontext() as context:
+            context.prec = 64
+            expected = (Decimal(100) * numerator / denominator).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP,
+            )
+        valid = (isinstance(value, Decimal) and value.is_finite()
+                 and value.as_tuple().exponent == -2
+                 and value == expected and row["status"] == "success")
+    if not valid:
+        raise PlanStepError("metric_result_shape_invalid")

@@ -16,7 +16,17 @@ from pydantic import BaseModel, ValidationError
 from src.core.secrets import SecretProvider
 from src.core.settings import get_settings
 from src.nl2sql.config.settings import get_agent_config
-from src.nl2sql.contracts import ModelFailure, ModelReceipt, ModelRequest, ModelStage
+from src.nl2sql.contracts import (
+    ModelFailure,
+    ModelInputDecision,
+    ModelReceipt,
+    ModelRequest,
+    ModelStage,
+)
+from src.nl2sql.infra.llm.model_input_policy import (
+    ModelInputPolicy,
+    bootstrap_model_input_policy,
+)
 from src.nl2sql.infra.llm.profiles import ModelProfile, ModelTarget
 from src.nl2sql.orchestration.budget import BudgetExceeded, CallBudget, should_stop
 
@@ -58,6 +68,19 @@ class ModelGatewayError(RuntimeError):
 
 class ModelPolicyDenied(ModelGatewayError):
     pass
+
+
+class ModelInputPolicyDenied(ModelPolicyDenied):
+    """A resolved target was denied by ModelInputPolicy BEFORE any provider call.
+
+    The target-scoped decision is carried as safe evidence; no raw payload is
+    retained.  Being a policy denial (not a provider failure) it is terminal:
+    the gateway never re-enters a fallback target for it.
+    """
+
+    def __init__(self, decision: ModelInputDecision) -> None:
+        self.decision = decision
+        super().__init__(decision.reason or "model_input_policy_denied")
 
 
 class ProviderUnavailable(ModelGatewayError):
@@ -305,7 +328,11 @@ class ModelGateway:
     """Enforce profile, stage, timeout, budget and single-fallback invariants."""
 
     def __init__(
-        self, *, providers: dict[str, ProviderAdapter], profiles: dict[str, ModelProfile]
+        self,
+        *,
+        providers: dict[str, ProviderAdapter],
+        profiles: dict[str, ModelProfile],
+        model_input_policy: ModelInputPolicy | None = None,
     ) -> None:
         for name, provider in providers.items():
             if name != provider.provider_name:
@@ -318,6 +345,24 @@ class ModelGateway:
         self._providers = dict(providers)
         self._profiles = dict(profiles)
         self._circuits: dict[str, _Circuit] = {}
+        # An explicitly injected (deployment-calibrated) policy wins; otherwise a
+        # BOOTSTRAP policy derived from the known targets keeps a directly
+        # constructed gateway fail-closed.  Bootstrap is never production-ready.
+        self._model_input_policy = (
+            model_input_policy
+            if model_input_policy is not None
+            else bootstrap_model_input_policy(_profile_targets(self._profiles))
+        )
+
+    @property
+    def model_input_policy(self) -> ModelInputPolicy:
+        return self._model_input_policy
+
+    def require_model_input_policy_ready(self, *, product_mode: bool) -> None:
+        """Reject a production deployment whose model input policy is uncalibrated."""
+
+        if product_mode:
+            self._model_input_policy.require_production_ready()
 
     def profile_checksum(self, alias: str) -> str:
         return self._profile(alias).checksum
@@ -346,14 +391,14 @@ class ModelGateway:
         target, fallback_used = profile.primary, False
         started_at = monotonic()
         try:
-            response = await self._invoke_target(target, request, budget)
+            response, decision = await self._invoke_target(target, request, budget)
         except ProviderUnavailable as primary_error:
             if profile.fallback is None or not primary_error.retryable:
                 raise
             target, fallback_used = profile.fallback, True
             self._enforce_target_policy(target, request)
             try:
-                response = await self._invoke_target(target, request, budget)
+                response, decision = await self._invoke_target(target, request, budget)
             except ProviderUnavailable as fallback_error:
                 attempted = (
                     primary_error.failure.provider or profile.primary.provider,
@@ -387,6 +432,11 @@ class ModelGateway:
             output_schema_checksum=_schema_checksum(request.tool_schema),
             content=response.content,
             estimated_cost=cost,
+            model_input_policy_version=decision.policy_version,
+            model_input_policy_checksum=decision.policy_checksum,
+            egress_outcome=decision.outcome,
+            matched_categories=decision.matched_categories,
+            content_sha256=decision.content_sha256,
         )
 
     async def invoke_structured(
@@ -413,7 +463,17 @@ class ModelGateway:
 
     async def _invoke_target(
         self, target: ModelTarget, request: ModelRequest, budget: CallBudget
-    ) -> ProviderResponse:
+    ) -> tuple[ProviderResponse, ModelInputDecision]:
+        # P2-S2 ENFORCEMENT POINT.  This is the FIRST statement of the single
+        # call site shared by the primary dispatch and the fallback re-entry, so
+        # a deny here leaves BOTH unreachable: it precedes the circuit lookup,
+        # budget.begin_attempt() and the only self._provider(target).complete()
+        # call, guaranteeing zero provider/network calls on deny.  Each target
+        # is evaluated independently, so a permitted primary grants the fallback
+        # nothing.
+        decision = self._model_input_policy.evaluate(target, request)
+        if decision.outcome == "deny":
+            raise ModelInputPolicyDenied(decision)
         circuit = self._circuits.setdefault(target.provider, _Circuit())
         if circuit.opened_at is not None and monotonic() - circuit.opened_at < 30:
             raise ProviderUnavailable(
@@ -445,7 +505,7 @@ class ModelGateway:
             raise
         circuit.failures = 0
         circuit.opened_at = None
-        return response
+        return response, decision
 
     def _profile(self, alias: str) -> ModelProfile:
         try:
@@ -478,7 +538,9 @@ class ModelGateway:
                 raise ModelPolicyDenied("pro_plan_reason_required")
 
 
-def build_model_gateway() -> ModelGateway:
+def build_model_gateway(
+    *, model_input_policy: ModelInputPolicy | None = None
+) -> ModelGateway:
     """Build profiles from public configuration and secrets only at the gateway boundary."""
     config = get_agent_config()
     settings = get_settings()
@@ -524,7 +586,26 @@ def build_model_gateway() -> ModelGateway:
             ModelTarget("deepseek", config.deepseek_flash_model, "small"),
         ),
     }
-    return ModelGateway(providers=providers, profiles=profiles)
+    # R2: configured profile targets are DISPATCH configuration, not a security
+    # approval.  Without an explicitly injected deployment-approved policy this
+    # deployment runs a BOOTSTRAP policy derived from its known targets: the
+    # target/secret gate is still enforced for development dispatch, but the
+    # policy is never production-ready.  Never promote configured targets into a
+    # calibrated/approved production policy on their own.
+    policy = model_input_policy or bootstrap_model_input_policy(
+        _profile_targets(profiles),
+        secret_values=_configured_secret_values(
+            deepseek_key, nvidia_key, settings.openai_api_key
+        ),
+    )
+    if settings.service_mode == "product":
+        # Required outcome: a production deployment must not silently run an
+        # uncalibrated or destination-empty model input policy, and profile
+        # configuration alone can never satisfy this assertion.
+        policy.require_production_ready()
+    return ModelGateway(
+        providers=providers, profiles=profiles, model_input_policy=policy
+    )
 
 
 def model_gateway_available() -> bool:
@@ -557,6 +638,27 @@ def _secret(name: str) -> str:
     if f"{name}_FILE" in os.environ:
         return SecretProvider().get(name) or ""
     return os.environ.get(name) or ""
+
+
+def _profile_targets(profiles: dict[str, ModelProfile]) -> tuple[ModelTarget, ...]:
+    """Every provider/model pair this deployment can actually dispatch to."""
+
+    targets: list[ModelTarget] = []
+    for profile in profiles.values():
+        targets.append(profile.primary)
+        if profile.fallback is not None:
+            targets.append(profile.fallback)
+    return tuple(targets)
+
+
+def _configured_secret_values(*candidates: str) -> tuple[str, ...]:
+    """Hold this deployment's real credential VALUES for Layer-1 matching.
+
+    These are ADDITIONAL policy values unioned with the bounded deployment
+    source; they never replace or disable it.
+    """
+
+    return tuple(value for value in candidates if value)
 
 
 def _cost(target: ModelTarget, input_tokens: int, output_tokens: int) -> float:
@@ -607,6 +709,18 @@ def _completion_payload(
         return payload
     if structured_output_mode == "json_object":
         payload["response_format"] = {"type": "json_object"}
+        if not _messages_mention_json(messages):
+            # OpenAI-compatible providers (notably DeepSeek) reject
+            # response_format=json_object unless the prompt mentions JSON.
+            # The gateway owns provider compatibility, so the hint is added
+            # HERE rather than leaking a provider quirk into every prompt.
+            payload["messages"] = [
+                {
+                    "role": "system",
+                    "content": "Respond with a single valid JSON object.",
+                },
+                *messages,
+            ]
         return payload
     payload["response_format"] = {
         "type": "json_schema",
@@ -617,6 +731,14 @@ def _completion_payload(
         },
     }
     return payload
+
+
+def _messages_mention_json(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(message.get("content"), str)
+        and "json" in message["content"].lower()
+        for message in messages
+    )
 
 
 def _schema_name(schema: dict[str, Any]) -> str:

@@ -53,7 +53,7 @@ services:
       - control_migrator_password
       - control_backup_password
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U control_owner -d ttai_control"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U control_owner -d ttai_control"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -84,7 +84,7 @@ services:
       - checkpoint_migrator_password
       - checkpoint_backup_password
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U checkpoint_owner -d ttai_checkpoint"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U checkpoint_owner -d ttai_checkpoint"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -108,7 +108,7 @@ services:
       - business_owner_password
       - business_reader_password
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U business_owner -d ttai_business"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U business_owner -d ttai_business"]
       interval: 5s
       timeout: 3s
       retries: 12

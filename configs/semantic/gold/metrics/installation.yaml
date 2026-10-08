@@ -1,0 +1,1501 @@
+# INSTALLATION 业务域指标配置
+metrics:
+  # ============ 无维度指标（日粒度）============
+  - name: installation_total_count_day
+    display_name: 装机工单总数（日）
+    description: 装机工单日度总数（无维度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+
+  - name: installation_in_transit_count_day
+    display_name: 装机在途工单数（日）
+    description: 装机工单日度在途数量（无维度，归档时间为空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 在途
+    time_grain: day
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: is_null
+
+  - name: installation_archived_count_day
+    display_name: 装机已归档工单数（日）
+    description: 装机工单日度已归档数量（无维度，归档时间非空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 已归档
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  # ============ 无维度指标（月粒度）============
+  - name: installation_total_count_month
+    display_name: 装机工单总数（月）
+    description: 装机工单月度总数（无维度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+
+  - name: installation_in_transit_count_month
+    display_name: 装机在途工单数（月）
+    description: 装机工单月度在途数量（无维度，归档时间为空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 在途
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: is_null
+
+  - name: installation_archived_count_month
+    display_name: 装机已归档工单数（月）
+    description: 装机工单月度已归档数量（无维度，归档时间非空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 已归档
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  # ============ 及时工单数指标 - 区县维度 ============
+  - name: installation_first_response_on_time_count_area_month
+    display_name: 装机首响及时工单数（区县-月）
+    description: 装机工单月累计首响及时数量（归档时间归月，剔除短流程和泛房间）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: work_order_type
+        operator: ne
+        value: 泛房间
+      - column: is_first_response_on_time
+        operator: eq
+        value: true
+
+  - name: installation_arrival_on_time_count_area_month
+    display_name: 装机上门及时工单数（区县-月）
+    description: 装机工单月累计上门及时数量（归档时间归月，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_arrival_on_time
+        operator: eq
+        value: true
+
+  - name: installation_archive_on_time_count_area_day
+    display_name: 装机归档及时工单数（区县-日）
+    description: 装机工单中归档及时数量（区县维度，日粒度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_archive_on_time
+        operator: eq
+        value: true
+
+  - name: installation_same_day_archive_on_time_count_area_month
+    display_name: 装机当日装及时工单数（区县-月）
+    description: 装机工单月累计当日装及时数量（受理时间归月，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_same_day_archive_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  # ============ 辅助计算指标 - 当日装分母(归档) ============
+  - name: installation_same_day_calc_total_count_area_month
+    display_name: 装机当日装计算分母（区县-月）
+    description: 用于当日装及时率计算的分母（受理时间归月，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, calc]
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+
+  - name: installation_same_day_calc_total_count_team_day
+    display_name: 装机当日装计算分母（班组-日）
+    description: 用于当日装及时率计算的分母（班组维度，日粒度，剔除短流程，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, calc]
+    time_grain: day
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  - name: installation_same_day_calc_total_count_overall_day
+    display_name: 装机当日装计算分母（全局-日）
+    description: 用于当日装及时率计算的分母（全局维度，日粒度，剔除短流程，已归档）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, calc]
+    time_grain: day
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  # ============ 及时工单数指标 - 班组维度 ============
+  - name: installation_first_response_on_time_count_team_day
+    display_name: 装机首响及时工单数（班组-日）
+    description: 装机工单中首响及时数量（班组维度，日粒度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_first_response_on_time
+        operator: eq
+        value: true
+
+  - name: installation_arrival_on_time_count_team_day
+    display_name: 装机上门及时工单数（班组-日）
+    description: 装机工单中上门及时数量（班组维度，日粒度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_arrival_on_time
+        operator: eq
+        value: true
+
+  - name: installation_archive_on_time_count_team_day
+    display_name: 装机归档及时工单数（班组-日）
+    description: 装机工单中归档及时数量（班组维度，日粒度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_archive_on_time
+        operator: eq
+        value: true
+
+  - name: installation_same_day_archive_on_time_count_team_day
+    display_name: 装机当日装及时工单数（班组-日）
+    description: 装机工单中当日装及时数量（班组维度，日粒度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+    time_grain: day
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_same_day_archive_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  # ============ 工单总数指标 - 区县维度 ============
+  - name: installation_total_count_area_day
+    display_name: 装机工单总数（区县-日）
+    description: 装机工单日度总数（区县维度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+
+  - name: installation_arrival_total_count_area_month
+    display_name: 装机上门计算分母（区县-月）
+    description: 用于装机上门及时率计算的分母（归档时间归月，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, calc]
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  - name: installation_first_response_total_count_area_month
+    display_name: 装机首响计算分母（区县-月）
+    description: 用于装机首响及时率计算的分母（归档时间归月，剔除短流程和泛房间）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, calc]
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: work_order_type
+        operator: ne
+        value: 泛房间
+      - column: archive_time
+        operator: not_null
+
+  - name: installation_in_transit_count_area_day
+    display_name: 装机在途工单数（区县-日）
+    description: 装机工单日度在途数量（区县维度，归档时间为空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 在途
+    time_grain: day
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: is_null
+
+  - name: installation_archived_count_area_day
+    display_name: 装机已归档工单数（区县-日）
+    description: 装机工单日度已归档数量（区县维度，归档时间非空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 已归档
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  # ============ 工单总数指标 - 班组维度 ============
+  - name: installation_total_count_team_day
+    display_name: 装机工单总数（班组-日）
+    description: 装机工单日度总数（班组维度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+
+  - name: installation_in_transit_count_team_day
+    display_name: 装机在途工单数（班组-日）
+    description: 装机工单日度在途数量（班组维度，归档时间为空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 在途
+    time_grain: day
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: is_null
+
+  - name: installation_archived_count_team_day
+    display_name: 装机已归档工单数（班组-日）
+    description: 装机工单日度已归档数量（班组维度，归档时间非空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 已归档
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  # ============ 月度指标 - 区县维度 ============
+  - name: installation_total_count_area_month
+    display_name: 装机工单总数（区县-月）
+    description: 装机工单月度总数（区县维度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+
+  - name: installation_in_transit_count_area_month
+    display_name: 装机在途工单数（区县-月）
+    description: 装机工单月度在途数量（区县维度，归档时间为空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 在途
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: is_null
+
+  - name: installation_archived_count_area_month
+    display_name: 装机已归档工单数（区县-月）
+    description: 装机工单月度已归档数量（区县维度，归档时间非空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_    dept
+    tags:
+      - 装机
+      - 已归档
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  # ============ 月度指标 - 班组维度 ============
+  - name: installation_total_count_team_month
+    display_name: 装机工单总数（班组-月）
+    description: 装机工单月度总数（班组维度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+
+  - name: installation_in_transit_count_team_month
+    display_name: 装机在途工单数（班组-月）
+    description: 装机工单月度在途数量（班组维度，归档时间为空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 在途
+    time_grain: month
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: is_null
+
+  - name: installation_archived_count_team_month
+    display_name: 装机已归档工单数（班组-月）
+    description: 装机工单月度已归档数量（班组维度，归档时间非空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 已归档
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  # ============ KPI 指标 - 区县维度 ============
+  - name: installation_first_response_rate_area_month
+    display_name: 装机首响及时率（区县-月）
+    description: 装机工单首响及时率（区县自然月累计，归档时间归月）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+      - kpi
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_first_response_on_time_count_area_month
+      total: installation_first_response_total_count_area_month
+
+  - name: installation_arrival_rate_area_month
+    display_name: 装机上门及时率（区县-月）
+    description: 装机工单上门及时率（区县自然月累计，归档时间归月）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+      - kpi
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_arrival_on_time_count_area_month
+      total: installation_arrival_total_count_area_month
+
+  - name: installation_standard_rate_area_day
+    display_name: 装机标准及时率（区县-日）
+    description: 装机工单归档及时率（区县维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_archive_on_time_count_area_day
+      total: installation_total_count_area_day
+
+  - name: installation_same_day_rate_area_month
+    display_name: 装机当日装及时率（区县-月）
+    description: 装机工单当日装及时率（区县自然月累计，受理时间归月）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+      - kpi
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_same_day_archive_on_time_count_area_month
+      total: installation_same_day_calc_total_count_area_month
+
+  # ============ KPI 指标 - 班组维度 ============
+  - name: installation_first_response_rate_team_day
+    display_name: 装机首响及时率（班组-日）
+    description: 装机工单首响及时率（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_first_response_on_time_count_team_day
+      total: installation_total_count_team_day
+
+  - name: installation_arrival_rate_team_day
+    display_name: 装机上门及时率（班组-日）
+    description: 装机工单上门及时率（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_arrival_on_time_count_team_day
+      total: installation_total_count_team_day
+
+  - name: installation_standard_rate_team_day
+    display_name: 装机标准及时率（班组-日）
+    description: 装机工单归档及时率（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_archive_on_time_count_team_day
+      total: installation_total_count_team_day
+
+  - name: installation_same_day_rate_team_day
+    display_name: 装机当日装及时率（班组-日）
+    description: 装机工单当日装及时率（班组维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags:
+      - 装机
+      - 时效
+      - kpi
+    time_grain: day
+    dimensions:
+      - name: team_id
+        type: team
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_same_day_archive_on_time_count_team_day
+      total: installation_same_day_calc_total_count_team_day
+
+  # ============ 全局总览 (Overall) ============
+  - name: installation_total_count_overall_day
+    display_name: 装机工单总数（全局-日）
+    description: 装机工单日度总数（全局维度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    time_column: archive_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+
+  - name: installation_first_response_on_time_count_overall_day
+    display_name: 装机首响及时工单数（全局-日）
+    description: 装机工单中首响及时数量（全局维度，日粒度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 时效, overall]
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_first_response_on_time
+        operator: eq
+        value: true
+
+  - name: installation_arrival_on_time_count_overall_day
+    display_name: 装机上门及时工单数（全局-日）
+    description: 装机工单中上门及时数量（全局维度，日粒度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 时效, overall]
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_arrival_on_time
+        operator: eq
+        value: true
+
+  - name: installation_archive_on_time_count_overall_day
+    display_name: 装机归档及时工单数（全局-日）
+    description: 装机工单中归档及时数量（全局维度，日粒度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 时效, overall]
+    time_grain: day
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_archive_on_time
+        operator: eq
+        value: true
+
+  - name: installation_same_day_archive_on_time_count_overall_day
+    display_name: 装机当日装及时工单数（全局-日）
+    description: 装机工单中当日装及时数量（全局维度，日粒度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 时效, overall]
+    time_grain: day
+    time_column: acceptance_time
+    rollup_strategy: sum
+    dimensions: []
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: is_same_day_archive_on_time
+        operator: eq
+        value: true
+      - column: archive_time
+        operator: not_null
+
+  # ============ KPI 指标 - 全局维度 ============
+  - name: installation_first_response_rate_overall_day
+    display_name: 装机首响及时率（全局-日）
+    description: 装机工单首响及时率（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 时效, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_first_response_on_time_count_overall_day
+      total: installation_total_count_overall_day
+
+  - name: installation_arrival_rate_overall_day
+    display_name: 装机上门及时率（全局-日）
+    description: 装机工单上门及时率（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 时效, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_arrival_on_time_count_overall_day
+      total: installation_total_count_overall_day
+
+  - name: installation_standard_rate_overall_day
+    display_name: 装机标准及时率（全局-日）
+    description: 装机工单归档及时率（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 时效, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_archive_on_time_count_overall_day
+      total: installation_total_count_overall_day
+
+  - name: installation_same_day_rate_overall_day
+    display_name: 装机当日装及时率（全局-日）
+    description: 装机工单当日装及时率（全局维度，日粒度）
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 时效, kpi, overall]
+    time_grain: day
+    dimensions: []
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_same_day_archive_on_time_count_overall_day
+      total: installation_same_day_calc_total_count_overall_day
+
+  - name: installation_in_transit_count_overall_day
+    display_name: 装机在途工单数（全局-日）
+    description: 装机工单日度在途数量（全局维度，归档时间为空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 在途, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    time_column: acceptance_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: is_null
+
+  - name: installation_archived_count_overall_day
+    display_name: 装机已归档工单数（全局-日）
+    description: 装机工单日度已归档数量（全局维度，归档时间非空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 已归档, overall]
+    time_grain: day
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    time_column: archive_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  - name: installation_total_count_month_overall
+    display_name: 装机工单总数（全局-月）
+    description: 装机工单月度总数（全局维度，剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    time_column: archive_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+
+  - name: installation_in_transit_count_month_overall
+    display_name: 装机在途工单数（全局-月）
+    description: 装机工单月度在途数量（全局维度，归档时间为空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 在途, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    time_column: acceptance_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: archive_time
+        operator: is_null
+
+  - name: installation_archived_count_month_overall
+    display_name: 装机已归档工单数（全局-月）
+    description: 装机工单月度已归档数量（全局维度，归档时间非空且剔除短流程）
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [装机, 已归档, overall]
+    time_grain: month
+    rollup_strategy: sum
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    time_column: archive_time
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: archive_time
+        operator: not_null
+
+  # ============ 日报专用：装机处理及时率（区县-月） ============
+  - name: installation_processing_on_time_count_area_month
+    display_name: 装机处理及时工单数（区县-月）
+    description: 已归档且非短流程的装机工单中，预约前120分钟至预约后240分钟归档的数量
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [installation, daily_report, 时效]
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: work_order_status
+        operator: eq
+        value: 已归档
+      - column: archive_time
+        operator: not_null
+      - column: is_archive_on_time
+        operator: eq
+        value: true
+
+  - name: installation_processing_total_count_area_month
+    display_name: 装机处理计算分母（区县-月）
+    description: 已归档且非短流程的装机工单总数，按归档时间归月
+    source_type: raw
+    calculation_type: aggregation
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [installation, daily_report, calc]
+    time_grain: month
+    time_column: archive_time
+    rollup_strategy: sum
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: count
+    unit: 单
+    source_table: silver_installation_work_order
+    aggregation:
+      operation: count
+      column: id
+    filters:
+      - column: is_short_process
+        operator: eq
+        value: false
+      - column: work_order_status
+        operator: eq
+        value: 已归档
+      - column: archive_time
+        operator: not_null
+
+  - name: installation_processing_timely_rate_area_month
+    display_name: 装机处理及时率（区县-月）
+    description: 已归档且非短流程的装机工单处理及时率，按归档时间归月
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    owner: maintenance_dept
+    tags: [installation, daily_report, 时效, kpi]
+    time_grain: month
+    dimensions:
+      - name: area_id
+        type: area
+    value_type: percent
+    unit: "%"
+    expression: |
+      CASE
+        WHEN {total} > 0
+        THEN ROUND((CAST(COALESCE({on_time}, 0) AS DECIMAL) / {total}) * 100, 2)
+        ELSE NULL
+      END
+    dependencies:
+      on_time: installation_processing_on_time_count_area_month
+      total: installation_processing_total_count_area_month

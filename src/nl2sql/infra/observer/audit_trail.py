@@ -178,29 +178,45 @@ class AuditTrail:
         幂等操作：多次调用不会重复写入（Langfuse trace 按 id 去重）。
         """
         from src.nl2sql.infra.observer.langfuse import _init_langfuse_client
+        from src.nl2sql.observability.sink_policy import (
+            LANGFUSE_SINK,
+            build_sink_envelope,
+        )
 
         client = _init_langfuse_client()
         if client is None:
             logger.debug("Langfuse 未启用，审计轨迹未写入: trace_id=%s", self.trace_id)
             return
 
+        # R3: the raw question and every event payload go through the approved
+        # envelope, and technical secrets are scrubbed from every exported field.
         try:
+            trace_record = build_sink_envelope(
+                LANGFUSE_SINK,
+                metadata={
+                    "total_events": len(self.events),
+                    "total_elapsed_seconds": round(time.time() - self.start_time, 2),
+                },
+                content={"input": self.question[:500]},
+            ).as_record()
             trace = cast(Any, client).trace(
                 id=self.trace_id,
                 name="nl2sql_request",
                 session_id=self.thread_id or None,
                 user_id=self.user_id or None,
-                input=self.question[:500],
-                metadata={
-                    "total_events": len(self.events),
-                    "total_elapsed_seconds": round(time.time() - self.start_time, 2),
-                },
+                input=trace_record.pop("input", None),
+                metadata=trace_record,
             )
 
             for event in self.events:
+                event_record = build_sink_envelope(
+                    LANGFUSE_SINK,
+                    metadata={"stage": event.stage, "event_type": event.event_type},
+                    content=dict(event.data),
+                ).as_record()
                 trace.event(
                     name=f"{event.stage}.{event.event_type}",
-                    metadata=event.data,
+                    metadata=event_record,
                     start_time=event.timestamp,
                 )
 

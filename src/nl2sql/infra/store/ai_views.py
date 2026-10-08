@@ -510,6 +510,30 @@ def _load_config(config_path: str) -> AIViewsConfig:
     return AIViewsConfig.model_validate(raw_data)
 
 
+def load_ai_views_config(config_path: str) -> AIViewsConfig:
+    """Read-only loader for the Backend-published AI-view deployment config.
+
+    Parses and validates the YAML definition only.  It never connects to
+    PostgreSQL and never publishes: no ``CREATE VIEW`` / ``CREATE OR REPLACE
+    VIEW``, ``GRANT`` or ``ALTER DEFAULT PRIVILEGES`` is executed.  Publishing
+    remains the Backend/data-deployment responsibility; the typed runtime must
+    never call :func:`sync_ai_views_from_yaml`.
+    """
+
+    return _load_config(config_path)
+
+
+def view_output_columns(definition: ViewDefinition) -> tuple[str, ...]:
+    """Return the PUBLISHED output column names of one AI-view definition.
+
+    The definition is configuration evidence; the actually published database
+    relation is runtime truth.  Output names are extracted with the exact same
+    rule the legacy publisher uses to name view columns.
+    """
+
+    return tuple(_extract_output_column_name(column) for column in definition.columns)
+
+
 def _normalize_grantee_roles(roles: list[str] | None) -> list[str]:
     """规范化并去重授权角色列表。
 

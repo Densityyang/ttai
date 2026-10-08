@@ -18,17 +18,17 @@ services:
     environment:
       POSTGRES_DB: ttai_control_test
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U control_owner -d ttai_control_test"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U control_owner -d ttai_control_test"]
   checkpoint-postgres:
     environment:
       POSTGRES_DB: ttai_checkpoint_test
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U checkpoint_owner -d ttai_checkpoint_test"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U checkpoint_owner -d ttai_checkpoint_test"]
   business-postgres:
     environment:
       POSTGRES_DB: ttai_business_test
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U business_owner -d ttai_business_test"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U business_owner -d ttai_business_test"]
 
 volumes:
   control_pgdata:

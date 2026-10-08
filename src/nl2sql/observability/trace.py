@@ -9,9 +9,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.nl2sql.observability.content_policy import scrub_text, scrub_value
+
 TraceStage = Literal["query", "retrieval", "candidate", "policy", "sql", "answer"]
 _SENSITIVE_KEYS = frozenset({"authorization", "password", "secret", "token", "api_key", "prompt", "rows"})
 _SAFE_PROMPT_METADATA = frozenset({"prompt_hash", "prompt_version"})
+# Derived credential field names that stay redacted although the key is not
+# an exact match.  This is an explicit allowlist, not a substring rule:
+# matching substrings redacted legitimate telemetry such as
+# authorization_revision, token_cost, input_tokens or secret_version.
+_SENSITIVE_KEY_SUFFIXES = ("_authorization", "_password", "_secret", "_token", "_api_key")
 
 
 class _TraceModel(BaseModel):
@@ -53,10 +60,12 @@ def _sanitize_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
         normalized = key.lower().replace("-", "_")
         if normalized in _SAFE_PROMPT_METADATA and isinstance(value, str):
             safe[key] = value[:512]
-        elif normalized in _SENSITIVE_KEYS or any(part in normalized for part in _SENSITIVE_KEYS):
+        elif normalized in _SENSITIVE_KEYS or normalized.endswith(_SENSITIVE_KEY_SUFFIXES):
             safe[key] = "[REDACTED]"
         elif isinstance(value, str):
-            safe[key] = value[:512]
+            safe[key] = scrub_text(value)[:512]
         else:
-            safe[key] = value
+            # Value-level scrub so a technical secret nested inside an
+            # otherwise safe attribute can never reach an audit sink.
+            safe[key] = scrub_value(value)
     return safe

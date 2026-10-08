@@ -1,0 +1,219 @@
+# 达标标准可按指标配置：threshold: {target: 95, operator: gte}。
+# 未配置 threshold 的指标不参与达标判断；百分比标准使用 0-100 口径（95 即 95%）。
+metrics:
+  - &h5_satisfaction_notice
+    name: h5_install_satisfaction_performance_value_month
+    display_name: 装机满意度表现值（月）
+    description: 从 H5 满意度通报直接导入，不由测评明细计算
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [h5, satisfaction, external]
+    time_grain: month
+    rollup_strategy: null
+    dimensions:
+      - {name: area_id, type: area}
+      - {name: category_code, type: category, required: true}
+    value_type: score
+    unit: 分
+  - <<: *h5_satisfaction_notice
+    name: h5_fault_satisfaction_performance_value_month
+    display_name: 故障/投诉满意度表现值（月）
+  - <<: *h5_satisfaction_notice
+    name: h5_overall_satisfaction_performance_value_month
+    display_name: 整体满意度表现值（月）
+  - <<: *h5_satisfaction_notice
+    name: h5_satisfaction_participation_rate_month
+    display_name: H5满意度参评率（月）
+    value_type: percentage
+    unit: '%'
+  - &home_delivery
+    name: home_install_delivery_compliance_rate_day
+    display_name: 家宽装机交付达标率（日）
+    description: 外部导入的家宽装机交付累计达标率日快照
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [home_install, external]
+    time_grain: day
+    rollup_strategy: null
+    dimensions: &external_dimensions
+      - {name: area_id, type: area}
+      - {name: team_id, type: team}
+      - {name: employee_id, type: employee}
+      - {name: category_code, type: category, required: true}
+    value_type: percentage
+    unit: '%'
+  - <<: *home_delivery
+    name: home_install_timely_first_response_rate_day
+    display_name: 家宽装机及时首响占比（日）
+  - <<: *home_delivery
+    name: home_install_recording_quality_pass_rate_day
+    display_name: 家宽装机录音质检合格占比（日）
+  - <<: *home_delivery
+    name: home_install_timely_reschedule_rate_day
+    display_name: 家宽装机及时改约占比（日）
+  - <<: *home_delivery
+    name: home_install_timely_arrival_rate_day
+    display_name: 家宽装机及时上门占比（日）
+  - <<: *home_delivery
+    name: home_install_communication_plan_rate_day
+    display_name: 家宽装机沟通方案占比（日）
+  - <<: *home_delivery
+    name: home_install_onsite_speed_test_rate_day
+    display_name: 家宽装机现场测速占比（日）
+  - <<: *home_delivery
+    name: home_install_normal_archive_rate_day
+    display_name: 家宽装机正常归档占比（日）
+  - <<: *home_delivery
+    name: home_install_multi_point_test_rate_day
+    display_name: 家宽装机多点测试占比（日）
+  - <<: *home_delivery
+    name: home_install_service_guidance_rate_day
+    display_name: 家宽装机业务使用指导占比（日）
+  - <<: *home_delivery
+    name: home_install_review_invitation_rate_day
+    display_name: 家宽装机引评占比（日）
+  - <<: *home_delivery
+    name: home_install_electronic_delivery_rate_day
+    display_name: 家宽装机电子交付占比（日）
+  - <<: *home_delivery
+    name: home_install_authentic_signature_rate_day
+    display_name: 家宽装机客户真实签字占比（日）
+
+  - &post_install_quality
+    name: post_install_60d_poor_quality_rate_day
+    display_name: 家宽装后质差率（日）
+    description: 外部导入的装后60天质差日指标
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [post_install, poor_quality, external]
+    time_grain: day
+    rollup_strategy: null
+    dimensions: *external_dimensions
+    value_type: percentage
+    unit: '%'
+  - <<: *post_install_quality
+    name: post_install_60d_fault_report_rate_day
+    display_name: 报障60日内占比（日）
+  - <<: *post_install_quality
+    name: post_install_60d_repair_rate_day
+    display_name: 报修60日内占比（日）
+  - <<: *post_install_quality
+    name: post_install_60d_optical_power_failure_rate_day
+    display_name: 光功率不达标60日内占比（日）
+  - <<: *post_install_quality
+    name: post_install_60d_indoor_network_poor_quality_rate_day
+    display_name: 户内网质差60日内占比（日）
+  - <<: *post_install_quality
+    name: post_install_60d_poor_quality_with_close_mesh_rate_day
+    display_name: 家宽装后质差率（含主从过近）（日）
+  - <<: *post_install_quality
+    name: post_install_60d_indoor_network_poor_quality_with_close_mesh_rate_day
+    display_name: 户内网质差60日内占比（含主从过近）（日）
+
+  - &complaint_reduction
+    name: home_broadband_complaint_per_10k_yoy_reduction_month
+    display_name: 同期万投比压降
+    description: 外部导入的家宽区县投诉压降当前状态
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [complaint, reduction, external, current_state]
+    time_grain: month
+    rollup_strategy: null
+    dimensions:
+      - {name: area_id, type: area}
+      - {name: category_code, type: category, required: true}
+    value_type: percentage
+    unit: '%'
+  - <<: *complaint_reduction
+    name: home_broadband_complaint_per_10k_reduction_challenge_month
+    display_name: 万投比压降挑战值
+  - <<: *complaint_reduction
+    name: home_broadband_complaint_per_10k_month
+    display_name: 万投诉比
+    value_type: decimal
+    unit: 次/万户
+  - <<: *complaint_reduction
+    name: home_broadband_repeat_complaint_rate_month
+    display_name: 重投投诉率
+  - <<: *complaint_reduction
+    name: home_broadband_repeat_complaint_per_million_reduction_challenge_month
+    display_name: 百万重复投诉比压降挑战值
+  - <<: *complaint_reduction
+    name: home_broadband_repeat_complaint_per_million_per_10k_month
+    display_name: 百万重复投诉万比
+    value_type: decimal
+    unit: 次/万户
+  - <<: *complaint_reduction
+    name: home_broadband_repeat_complaint_per_million_yoy_reduction_month
+    display_name: 百万重复投诉比压降
+
+  - &single_fault_post_receipt_reinvestment
+    name: single_fault_post_receipt_reinvestment_per_10k_customer_month
+    display_name: 万客户单障回单后转投数
+    description: 当月回单后转投数乘以一万除以 ONU 规模数的外部导入当前状态
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [single_fault, reinvestment, external, current_state]
+    time_grain: month
+    rollup_strategy: null
+    dimensions:
+      - {name: area_id, type: area}
+      - {name: category_code, type: category, required: true}
+    value_type: decimal
+    unit: 次/万客户
+
+  - &quality_remediation
+    name: quality_remediation_quarterly_score
+    display_name: 季度积分
+    description: 质差整治区县季度积分目标
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [quality_remediation, quarterly, external]
+    time_grain: quarter
+    rollup_strategy: null
+    dimensions:
+      - {name: area_id, type: area}
+      - {name: category_code, type: category, required: true}
+    value_type: decimal
+    unit: 积分
+  - <<: *quality_remediation
+    name: quality_remediation_quarterly_completed_value
+    display_name: 季度完成值
+    description: 质差整治区县季度累计完成积分
+  - name: quality_remediation_quarterly_completion_rate
+    display_name: 季度完成率
+    description: 季度完成值除以季度积分
+    source_type: derived
+    calculation_type: expression
+    domain: maintenance
+    tags: [quality_remediation, quarterly, derived]
+    time_grain: quarter
+    rollup_strategy: null
+    dimensions:
+      - {name: area_id, type: area}
+      - {name: category_code, type: category, required: true}
+    value_type: percentage
+    unit: '%'
+    expression: "{completed_value} / {score} * 100"
+    dependencies:
+      completed_value: quality_remediation_quarterly_completed_value
+      score: quality_remediation_quarterly_score
+
+  - name: home_broadband_customer_count
+    display_name: 家宽客户数（日）
+    description: Consumer 模块手工维护的家宽客户数规模快照，供万投比等派生指标计算使用
+    source_type: external
+    calculation_type: imported
+    domain: maintenance
+    tags: [consumer, home_broadband, customer_count, external, manual]
+    time_grain: day
+    rollup_strategy: last
+    dimensions: []
+    value_type: integer
+    unit: 户

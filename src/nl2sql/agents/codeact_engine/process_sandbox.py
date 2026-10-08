@@ -11,6 +11,7 @@ import ast
 import asyncio
 import logging
 import multiprocessing as mp
+import os
 import re
 import time
 from multiprocessing import Queue
@@ -41,6 +42,12 @@ _FORBIDDEN_PATTERNS: list[str] = [
     r"\bdelattr\s*\(",
     r"\bopen\s*\(",
     r"\bbreakpoint\s*\(",
+    # Dunder names are the object-graph escape primitive
+    # (`().__class__.__bases__[0].__subclasses__()`, `type(x).__mro__`).
+    # The AST check below rejects dunder ATTRIBUTES; this pattern additionally
+    # covers the string/format forms the AST cannot see
+    # (e.g. `"{0.__globals__}".format(f)`).
+    r"__[A-Za-z][A-Za-z0-9_]*__",
 ]
 
 _FORBIDDEN_AST_NODES = (
@@ -50,17 +57,51 @@ _FORBIDDEN_AST_NODES = (
     ast.Nonlocal,
 )
 
+# Dunder ATTRIBUTE access is the escape primitive itself: from any value the
+# __class__/__bases__/__mro__/__subclasses__ chain reaches the whole object
+# graph.  The shape is rejected outright, so no name list can be bypassed.
+_DUNDER_ATTRIBUTE = re.compile(r"^__[A-Za-z0-9_]*__$")
+
+
+class SandboxResourceLimitError(RuntimeError):
+    """沙箱无法施加 CPU/内存/NPROC 限制时抛出。"""
+
+
+# 无法施加内核资源限制时，沙箱默认 fail-closed（拒绝执行）。仅当运维显式接受
+# “无资源上限”的降级运行时才设置该环境变量为真值；降级运行会在日志和返回结果
+# （SandboxResult.resource_limits_applied）中被显式标记。
+_ALLOW_UNLIMITED_RESOURCES_ENV = "TTAI_SANDBOX_ALLOW_UNLIMITED_RESOURCES"
+_ALLOW_UNLIMITED_RESOURCES_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def _unlimited_resources_allowed() -> bool:
+    """是否显式允许在无资源上限的降级模式下执行。"""
+
+    raw = os.environ.get(_ALLOW_UNLIMITED_RESOURCES_ENV, "")
+    return raw.strip().lower() in _ALLOW_UNLIMITED_RESOURCES_VALUES
+
 
 def _apply_resource_limits(cpu_seconds: int, memory_mb: int) -> None:
-    """在子进程启动时设置资源限制（Linux only）。"""
+    """在子进程启动时设置资源限制（POSIX）。
+
+    失败不再静默忽略：调用方据此拒绝执行或显式标记降级运行。
+
+    Raises:
+        SandboxResourceLimitError: 平台缺少 resource 模块，或内核拒绝设置限制。
+    """
     try:
         import resource
+    except ImportError as exc:
+        raise SandboxResourceLimitError(
+            "当前平台不支持 resource 模块，无法限制 CPU/内存/NPROC"
+        ) from exc
+    try:
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
         mem_bytes = memory_mb * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
         resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
-    except (ImportError, ValueError, OSError):
-        pass
+    except (ValueError, OSError) as exc:
+        raise SandboxResourceLimitError(f"设置资源限制失败: {exc}") from exc
 
 
 def _sandbox_worker(
@@ -75,7 +116,25 @@ def _sandbox_worker(
     import contextlib
     import io
 
-    _apply_resource_limits(cpu_seconds, memory_mb)
+    resource_limits_applied = True
+    try:
+        _apply_resource_limits(cpu_seconds, memory_mb)
+    except SandboxResourceLimitError as exc:
+        if not _unlimited_resources_allowed():
+            logger.error("沙箱资源限制不可用，已拒绝执行: %s", exc)
+            result_queue.put({
+                "success": False,
+                "error": f"沙箱无资源上限，已拒绝执行: {exc}",
+                "stdout": "",
+                "resource_limits_applied": False,
+            })
+            return
+        logger.error(
+            "沙箱在无资源上限的降级模式下执行（%s=1）: %s",
+            _ALLOW_UNLIMITED_RESOURCES_ENV,
+            exc,
+        )
+        resource_limits_applied = False
 
     try:
         import numpy as np
@@ -116,7 +175,9 @@ def _sandbox_worker(
         "min": min, "next": next, "print": print, "range": range,
         "reversed": reversed, "round": round, "set": set,
         "slice": slice, "sorted": sorted, "str": str,
-        "sum": sum, "tuple": tuple, "type": type, "zip": zip,
+        # "type" is deliberately absent: type(x).__mro__ is a standard escape
+        # step, and no approved template needs it.
+        "sum": sum, "tuple": tuple, "zip": zip,
         "True": True, "False": False, "None": None,
         "__import__": restricted_import,
     }
@@ -153,12 +214,14 @@ def _sandbox_worker(
             "result": result_val,
             "stats": stats_val,
             "stdout": stdout_capture.getvalue(),
+            "resource_limits_applied": resource_limits_applied,
         })
     except Exception as e:
         result_queue.put({
             "success": False,
             "error": f"{type(e).__name__}: {e}",
             "stdout": stdout_capture.getvalue(),
+            "resource_limits_applied": resource_limits_applied,
         })
 
 
@@ -206,6 +269,9 @@ class ProcessSandbox:
                 timeout=self._timeout + 5,
             )
             elapsed = (time.perf_counter() - start) * 1000
+            resource_limits_applied = bool(result.get("resource_limits_applied", True))
+            if not resource_limits_applied:
+                logger.warning("沙箱执行未施加资源上限（降级模式）")
             if result["success"]:
                 return SandboxResult(
                     success=True,
@@ -213,12 +279,14 @@ class ProcessSandbox:
                     stats=result.get("stats", {}),
                     stdout=result.get("stdout", ""),
                     elapsed_ms=elapsed,
+                    resource_limits_applied=resource_limits_applied,
                 )
             return SandboxResult(
                 success=False,
                 error=result.get("error", "未知错误"),
                 stdout=result.get("stdout", ""),
                 elapsed_ms=elapsed,
+                resource_limits_applied=resource_limits_applied,
             )
         except TimeoutError:
             elapsed = (time.perf_counter() - start) * 1000
@@ -300,6 +368,9 @@ class ProcessSandbox:
         for node in ast.walk(tree):
             if isinstance(node, _FORBIDDEN_AST_NODES):
                 return f"禁止的语法结构: {type(node).__name__}"
+
+            if isinstance(node, ast.Attribute) and _DUNDER_ATTRIBUTE.match(node.attr):
+                return f"禁止访问 dunder 属性: {node.attr}"
 
             if isinstance(node, ast.Import):
                 for alias in node.names:
