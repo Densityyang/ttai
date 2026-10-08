@@ -18,6 +18,7 @@ from src.nl2sql.semantic.inventory_release import (
     InventoryReleaseError,
     MetricIdentityIndex,
     MetricResolutionError,
+    MetricResolutionFailure,
     ResolutionCode,
     bridge_metric_contract,
     build_inventory_authoring_ir,
@@ -123,23 +124,28 @@ def test_exact_resolution_rejects_unknown_and_non_exact_key_shapes() -> None:
     index = build_metric_identity_index(snapshot)
 
     unknown = index.try_resolve("not_a_real_metric_identity")
+    assert isinstance(unknown, MetricResolutionFailure)
     assert unknown.code is ResolutionCode.UNKNOWN
     assert unknown.canonical_match is False and unknown.legacy_match is False
 
     # The legacy compact declaration is a source alias, never an exact identity,
     # and it must not be mapped implicitly to either time grain.
     compact = index.try_resolve("installation_in_transit_count_day/month")
+    assert isinstance(compact, MetricResolutionFailure)
     assert compact.code is ResolutionCode.UNKNOWN
     assert index.resolve("installation_in_transit_count_day").namespace == "canonical_gold"
     assert index.resolve("installation_in_transit_count_month").namespace == "canonical_gold"
 
     approximate = index.try_resolve("installation_in_transit_count_da")
+    assert isinstance(approximate, MetricResolutionFailure)
     assert approximate.code is ResolutionCode.UNKNOWN
     padded = index.try_resolve(" installation_in_transit_count_day")
+    assert isinstance(padded, MetricResolutionFailure)
     assert padded.code is ResolutionCode.UNKNOWN
-    assert index.try_resolve(" ").code is ResolutionCode.INVALID
-    assert index.try_resolve("").code is ResolutionCode.INVALID
-    assert index.try_resolve(1234).code is ResolutionCode.INVALID
+    for invalid_key in (" ", "", 1234):
+        invalid = index.try_resolve(invalid_key)
+        assert isinstance(invalid, MetricResolutionFailure)
+        assert invalid.code is ResolutionCode.INVALID
 
 
 def test_ambiguous_namespace_resolution_fails_closed() -> None:

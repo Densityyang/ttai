@@ -1,0 +1,252 @@
+{
+  "task_id": "v4_p5_remote_db_calculation_capability",
+  "iteration": 1,
+  "state": "EXECUTED",
+  "audited_at": "2026-09-18",
+  "repo": "E:\\平台开发\\ttai-pr07a-next",
+  "branch": "agent/v4-ci-hardening",
+  "db_engine": {
+    "version": "PostgreSQL 18.1 (Debian 18.1-1.pgdg13+2) x86_64-pc-linux-gnu",
+    "server_encoding": "UTF8",
+    "timezone": "Asia/Shanghai",
+    "database": "tt",
+    "installed_extensions": [
+      "plpgsql 1.0"
+    ],
+    "untrusted_procedural_languages": [],
+    "available_not_installed_relevant": [
+      "pg_stat_statements 1.12",
+      "tablefunc 1.0",
+      "pg_trgm 1.6",
+      "postgres_fdw 1.2"
+    ],
+    "not_available_at_all": [
+      "vector/pgvector",
+      "timescaledb",
+      "plpython3u",
+      "plpython",
+      "hll",
+      "tdigest",
+      "pg_cron",
+      "pg_partman",
+      "postgis",
+      "madlib",
+      "plr",
+      "plperl",
+      "plv8",
+      "pltcl"
+    ],
+    "shared_preload_libraries": []
+  },
+  "analytical_sql_capability": {
+    "extension_required": "NONE",
+    "not_available": [
+      "grouping_id()"
+    ],
+    "verdict": "all requested aggregate/window/relational/time capabilities are SUPPORTED_BUILTIN on core PostgreSQL 18.1",
+    "detail": "see report section 3"
+  },
+  "size_profile": {
+    "database_total_mb": 7887,
+    "public_tables": 74,
+    "views_ai_views": 9,
+    "indexes": 429,
+    "matviews": 0,
+    "partitioned": 0,
+    "rls": 0,
+    "triggers": 0,
+    "user_functions": 0,
+    "very_large_relations": 0,
+    "largest_relation": {
+      "name": "batch_error_record",
+      "rows_est": 1580897,
+      "total": "2.1 GB"
+    },
+    "all_indexes_btree": true,
+    "extended_statistics": 0,
+    "composite_time_dimension_index_only_on": [
+      "gold_metric_result"
+    ]
+  },
+  "empty_relations": [
+    "gold_metric_metadata",
+    "gold_metric_dependency",
+    "silver_customer_service_rating",
+    "silver_weak_light_onu_statistics",
+    "consumer_home_broadband_customer_count_snapshot",
+    "organization_department"
+  ],
+  "sql_pushdown_fit": {
+    "families_total": 16,
+    "sql_native_reachable_today": [
+      "direct_aggregation",
+      "filtered_aggregation",
+      "ratios_percentages",
+      "group_by_dimension",
+      "conditional_aggregation",
+      "ranking_top_k"
+    ],
+    "sql_native_needs_compiler_support": [
+      "weighted_averages",
+      "multi_source_joins",
+      "mom_yoy",
+      "lag_lead",
+      "rolling_windows",
+      "cumulative_totals",
+      "percentiles",
+      "standard_deviation",
+      "correlation",
+      "cohort_segment"
+    ],
+    "forces_post_query_runtime": [
+      "multi_step_cohort_orchestration"
+    ],
+    "blocking_constraints": [
+      "compiler contract admits only count|ratio, day|month, single area|team dimension",
+      "AggregateContract requires formula_version/release_id/snapshot_id/checkpoint/data_as_of (and numerator/denominator) which neither Gold table has",
+      "gateway envelope: 1 SELECT, <=5 CTEs, depth<=5, <=200 rows, <=1MB, cost<=500000, plan rows<=100000"
+    ],
+    "reachable_path_today": "approved_detail over ai_views.v_metric_result"
+  },
+  "ml_forecast_readiness": {
+    "history_is_binding_constraint": true,
+    "day_buckets_max_per_metric": 76,
+    "metrics_with_ge_30_buckets": 21,
+    "metrics_with_ge_90_buckets": 0,
+    "month_buckets_max_per_metric": 4,
+    "sentinel_date": "2000-01-01",
+    "db_sql_possible": [
+      "moving_average",
+      "linear_trend",
+      "simple_regression",
+      "anomaly_detection_statistical_baseline"
+    ],
+    "app_runtime_needed": [
+      "exponential_smoothing",
+      "forecast_with_uncertainty_notice"
+    ],
+    "not_enough_data": [
+      "seasonal_decomposition"
+    ],
+    "model_trained": false,
+    "predictive_accuracy_claimed": false
+  },
+  "runtime_db_identity": {
+    "audit_identity": "postgres (SUPERUSER) - provenance upper bound, NOT the product identity",
+    "product_login": "agent_reader_user",
+    "confidence": "CONFIG-EVIDENCED",
+    "roles": {
+      "agent_reader": "NOLOGIN, inherits SELECT on 27 public relations",
+      "agent_reader_user": "LOGIN, member of agent_reader, SELECT on 9 ai_views"
+    },
+    "effective_relations": 36,
+    "write_privileges_on_business_relations": false,
+    "role_level_default_transaction_read_only": null,
+    "role_level_statement_timeout": null,
+    "role_level_lock_timeout": null,
+    "readonly_enforced_by": "SELECT-only privileges, not by a transaction-read-only GUC"
+  },
+  "legacy_patterns": {
+    "keep_concept": [
+      "dedicated_read_role",
+      "whitelist_grants",
+      "ai_views_exposure_layer"
+    ],
+    "superseded_by_querygateway": [
+      "schema_restriction",
+      "select_cte_only_enforcement",
+      "explain_validation",
+      "statement_timeout",
+      "max_rows_cap"
+    ],
+    "do_not_reuse": [
+      "model_authored_freeform_sql_as_authorship_authority"
+    ]
+  },
+  "sandbox_implication": {
+    "verdict": "PARTIAL",
+    "meaning": "a sandbox is useful only for bounded advanced/ML jobs; the evidence does NOT justify a general arbitrary-code sandbox",
+    "rationale": [
+      "all 16 requested analytical families are native SQL with zero extensions",
+      "no untrusted procedural language is installed and plpython3u is not even available",
+      "no relation is VERY_LARGE; largest is 2.1GB / 1.58M rows",
+      "residual app-side needs are five enumerable bounded categories"
+    ],
+    "not_yes_because": "the requested business computation does not fundamentally require arbitrary code",
+    "qualifications": [
+      "ultimate sandbox scope is a product decision about forecast/ML ambition, not a DB question",
+      "the repo already contains codeact_engine and dynamic_calc agents; the question addressed is whether the data/SQL layer demands one"
+    ],
+    "max_input_shape": {
+      "preferred": "aggregated to (metric, time bucket, dimension) - the gold_metric_result shape",
+      "caps": "must come from a single gateway-admitted SELECT: <=200 rows, <=1MB",
+      "never": [
+        "silver_poor_quality_customer (1.18M rows / 883MB)",
+        "batch_error_record (1.58M / 2.1GB)",
+        "consumer",
+        "any raw Silver event table"
+      ]
+    },
+    "responsibility_split": {
+      "sql_compiler": [
+        "direct/filtered/conditional aggregation",
+        "ratios",
+        "group-by dimension",
+        "top-k ranking",
+        "joins over approved relations",
+        "(after extension) weighted averages, MoM/YoY, rolling/cumulative windows, percentiles, stddev/variance, correlation, regression"
+      ],
+      "calculation_runtime": [
+        "staged multi-step cohort composition",
+        "result post-processing beyond the envelope",
+        "unit/percentage normalisation",
+        "orchestrating several gateway queries"
+      ],
+      "ml_forecast_runtime": [
+        "exponential smoothing",
+        "seasonal decomposition (currently unsupportable)",
+        "model-based anomaly detection",
+        "forecast intervals + uncertainty notice; advisory only, never Gold fact"
+      ]
+    }
+  },
+  "architectural_flag": {
+    "finding": "the model-authored freeform SQL path is still alive in the current repo while the deterministic typed pipeline is dormant",
+    "current_surfaces": [
+      "src/nl2sql/tools/async_sql_tools.py:44-64",
+      "src/nl2sql/agents/sql_agent/sql_generator.py",
+      "src/nl2sql/infra/runtime/registry.py:9-36",
+      "tests/unit/test_query_gateway.py:677"
+    ],
+    "dormant_deterministic_path": [
+      "src/nl2sql/orchestration/planning.py:294-335",
+      "src/nl2sql/orchestration/metric_query.py:221-466"
+    ],
+    "root_cause": "src/nl2sql/container.py:119-123 wires no context_resolver/query_plan_provider/plan_executor so typed_pipeline_enabled=False; after_route engine.py:826-831",
+    "consequence": "QueryGateway currently GOVERNS model-authored SQL rather than replacing it; pushed-down calculation must travel the compiled path"
+  },
+  "true_external_unknowns": [
+    "can the Gold aggregate path ever be used (AggregateContract column mismatch on both Gold tables)",
+    "are gold_metric_metadata/gold_metric_dependency retired or merely unpopulated",
+    "is the 2000-01-01 sentinel intentional; how should it be treated",
+    "which of value_type percent vs percentage is canonical",
+    "why does most Silver business data end in Feb 2026 while the audit runs Sep 2026",
+    "organization_department is empty and team.department_id all-NULL - is the department layer intended at all",
+    "may any extension be installed (needs DDL, and pg_stat_statements needs a restart)",
+    "is role-level read-only/timeout hardening intended for agent_reader/agent_reader_user",
+    "is the model-authored SQL path to be retired, and when"
+  ],
+  "safety": {
+    "read_only_transaction": true,
+    "server_asserted_transaction_read_only": true,
+    "statement_timeout_ms": 10000,
+    "lock_timeout_ms": 1000,
+    "always_rollback": true,
+    "ddl_dml_executed": false,
+    "temp_tables": false,
+    "stored_procedures_executed": false,
+    "raw_business_rows_output": false,
+    "credentials_printed": false,
+    "provenance_caveat": "audit identity was the postgres SUPERUSER; findings are an UPPER BOUND"
+  }
+}

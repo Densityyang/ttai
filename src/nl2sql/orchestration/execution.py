@@ -22,6 +22,7 @@ from src.nl2sql.agents.dynamic_calc.trusted_templates import (
     trusted_template_registry,
 )
 from src.nl2sql.contracts import (
+    AdHocCalculationStep,
     ContextBundle,
     ExecutionPlan,
     ExecutionReceipt,
@@ -29,11 +30,16 @@ from src.nl2sql.contracts import (
     PlanExecutionRecord,
     PlanStep,
     PlanStepReceipt,
+    PlanValidationRecord,
     QueryPlan,
     TrustedCalculationStep,
     VerifyStep,
 )
 from src.nl2sql.orchestration.budget import BudgetExceeded, RouteBudgetLedger
+from src.nl2sql.semantic.calculation_runtime import (
+    CalculationRuntimeError,
+    evaluate_calculation,
+)
 
 _JSON_VALUE = TypeAdapter(JsonValue)
 
@@ -100,6 +106,54 @@ class TrustedCalculationRunner(Protocol):
         step: TrustedCalculationStep,
         inputs: dict[str, JsonValue],
     ) -> JsonValue: ...
+
+
+class AdHocCalculationRunner(Protocol):
+    """NONCANONICAL AD_HOC execution seam.
+
+    Receives ONLY the validated step and resolved JSON-safe scalar inputs: no
+    raw SQL, rowset, authorization object or catalog authority object.  V1 has
+    no production runner, so an AdHocCalculationStep fails closed by default.
+    """
+
+    async def execute(
+        self,
+        *,
+        step: AdHocCalculationStep,
+        inputs: dict[str, JsonValue],
+    ) -> JsonValue: ...
+
+
+class RuntimeCalculationRunner:
+    """The ONE reusable adapter from a validated step to the shared evaluator.
+
+    It performs NO arithmetic of its own and holds NO authority, catalog,
+    gateway or context state: it projects the step into the pure typed evaluator
+    and
+    maps its stable error codes onto PlanStepError.  Future AD_HOC, Custom
+    Definition and Published wrappers all reuse this single implementation, so
+    arithmetic semantics exist in exactly one place.
+    """
+
+    async def execute(
+        self,
+        *,
+        step: AdHocCalculationStep,
+        inputs: dict[str, JsonValue],
+    ) -> JsonValue:
+        # The step contract already proved binding<->spec identity, checksum
+        # agreement and that input_refs are exactly the referenced roles.
+        try:
+            result = evaluate_calculation(
+                step.calculation_spec,
+                inputs=cast("dict[str, object]", dict(inputs)),
+                binding=step.execution_binding,
+            )
+        except CalculationRuntimeError as exc:
+            # 1:1 mapping: never swallow, never substitute a default value.
+            raise PlanStepError(exc.code) from exc
+        # Deterministic, lossless wire form for an exact decimal.
+        return str(result.value)
 
 
 class ResultVerifier(Protocol):
@@ -170,10 +224,14 @@ class PlanExecutor:
         *,
         metric_runner: MetricStepRunner,
         trusted_calculation_runner: TrustedCalculationRunner | None = None,
+        ad_hoc_calculation_runner: AdHocCalculationRunner | None = None,
         result_verifier: ResultVerifier | None = None,
     ) -> None:
         self._metric_runner = metric_runner
         self._trusted_calculation_runner = trusted_calculation_runner
+        # V1 default is None: an AD_HOC calculation step fails closed until a
+        # production arithmetic runner is separately authorized.
+        self._ad_hoc_calculation_runner = ad_hoc_calculation_runner
         self._result_verifier = result_verifier or TypedResultVerifier()
 
     async def execute(
@@ -182,16 +240,36 @@ class PlanExecutor:
         query_plan: QueryPlan,
         context: ContextBundle,
         execution_plan: ExecutionPlan,
+        validation: PlanValidationRecord,
+        expected_policy_version: str,
+        expected_policy_checksum: str,
         budget: RouteBudgetLedger,
         deadline_ms: int,
     ) -> PlanExecutionResult:
         # Deep snapshots close mutation windows in nested JSON filter/ref values.
-        query_plan = QueryPlan.model_validate_json(query_plan.model_dump_json())
+        from src.nl2sql.contracts import query_plan_payload
+
+        query_plan = QueryPlan.model_validate(query_plan_payload(query_plan))
         context = ContextBundle.model_validate_json(context.model_dump_json())
         execution_plan = ExecutionPlan.model_validate_json(
             execution_plan.model_dump_json()
         )
+        validation = PlanValidationRecord.model_validate_json(
+            validation.model_dump_json()
+        )
         mismatch = _execution_plan_mismatch(query_plan, context, execution_plan)
+        if mismatch is None:
+            # Trust boundary: prove the supplied allow record names THIS exact
+            # content AND was produced by the expected server-side validator
+            # policy before any step runs; no skip flag exists.
+            mismatch = _execution_validation_mismatch(
+                validation,
+                query_plan,
+                context,
+                execution_plan,
+                expected_policy_version=expected_policy_version,
+                expected_policy_checksum=expected_policy_checksum,
+            )
         if mismatch is not None:
             budget.halt(mismatch)
             return _failed_result(execution_plan, mismatch)
@@ -275,16 +353,26 @@ class PlanExecutor:
                         )
                     outputs[current_step.step_id] = output
                     gateway_receipt = gateway_receipts.get(current_step.step_id)
-                    calculation = (
-                        {
+                    if isinstance(current_step, TrustedCalculationStep):
+                        calculation: dict[str, Any] = {
                             "template_id": current_step.template_id,
                             "template_version": current_step.template_version,
                             "binding_checksum": current_step.binding_checksum,
                             "output_metric_key": current_step.output_metric_key,
                         }
-                        if isinstance(current_step, TrustedCalculationStep)
-                        else {}
-                    )
+                    elif isinstance(current_step, AdHocCalculationStep):
+                        calculation = {
+                            "calculation_spec_checksum": (
+                                current_step.calculation_spec.checksum
+                            ),
+                            "execution_binding_checksum": (
+                                current_step.execution_binding.checksum
+                            ),
+                            "derived_output_id": current_step.derived_output_id,
+                            "calculation_scope": "ad_hoc_noncanonical",
+                        }
+                    else:
+                        calculation = {}
                     receipts.append(
                         PlanStepReceipt(
                             step_id=current_step.step_id,
@@ -386,12 +474,60 @@ class PlanExecutor:
             )
             return _json_value(output)
 
+        if isinstance(step, AdHocCalculationStep):
+            if self._ad_hoc_calculation_runner is None:
+                raise PlanStepError("ad_hoc_calculation_unavailable")
+            inputs = {
+                name: _resolve_ref(reference, outputs)
+                for name, reference in step.input_refs.items()
+            }
+            if any(isinstance(value, (dict, list)) for value in inputs.values()):
+                # Shape enforcement only: the runner contract accepts resolved
+                # JSON scalars, never a rowset or nested structure.
+                raise PlanStepError("ad_hoc_calculation_scalar_input_required")
+            output = await self._ad_hoc_calculation_runner.execute(
+                step=step,
+                inputs=inputs,
+            )
+            return _json_value(output)
+
         if isinstance(step, VerifyStep):
             inputs = tuple(_resolve_ref(reference, outputs) for reference in step.input_refs)
             output = await self._result_verifier.verify(step=step, inputs=inputs)
             return _json_value(output)
 
         raise PlanStepError("execution_plan_step_unregistered")
+
+
+def _execution_validation_mismatch(
+    validation: PlanValidationRecord,
+    query_plan: QueryPlan,
+    context: ContextBundle,
+    execution_plan: ExecutionPlan,
+    *,
+    expected_policy_version: str,
+    expected_policy_checksum: str,
+) -> str | None:
+    """Prove the record names THIS content under the EXPECTED policy.
+
+    expected_policy_version/expected_policy_checksum are server-side inputs
+    and are NEVER derived from the validation record itself: a well-formed
+    forged record cannot self-authorize.
+    """
+
+    if validation.outcome != "allow":
+        return "execution_plan_validation_denied"
+    if validation.query_plan_sha256 != query_plan.checksum:
+        return "execution_plan_query_hash_mismatch"
+    if validation.context_checksum != context.checksum:
+        return "execution_plan_context_hash_mismatch"
+    if validation.execution_plan_sha256 != execution_plan.checksum:
+        return "execution_plan_checksum_mismatch"
+    if validation.policy_version != expected_policy_version:
+        return "execution_plan_policy_version_mismatch"
+    if validation.policy_checksum != expected_policy_checksum:
+        return "execution_plan_policy_checksum_mismatch"
+    return None
 
 
 def _execution_plan_mismatch(

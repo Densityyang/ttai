@@ -40,7 +40,10 @@ def create_app():
         CORSMiddleware,
         allow_origins=settings.cors_origins,
         allow_credentials=settings.cors_allow_credentials,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        # PATCH is REQUIRED: the product Definition draft edit is
+        # PATCH /definitions/{id}/draft, which a real browser preflights.
+        # The list stays EXPLICIT - never a wildcard.
+        allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
         allow_headers=[
             "Accept",
             "Authorization",
@@ -49,6 +52,8 @@ def create_app():
             "Last-Event-ID",
             "X-Request-ID",
             "X-Trace-ID",
+            "X-TT-Build-Thread-ID",
+            "X-TT-Build-Run-ID",
         ],
     )
 
@@ -69,6 +74,8 @@ def create_app():
                 "degradation_reasons": ["runtime_container_unavailable"],
             }
         else:
+            if hasattr(container, "prepare_readiness"):
+                await container.prepare_readiness()
             payload = container.readiness_report(model_available=model_gateway_available())
         if payload["status"] == "ready":
             return payload

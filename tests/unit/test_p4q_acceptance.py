@@ -780,6 +780,40 @@ def test_published_gold_does_not_require_a_metric_code_mapping() -> None:
     assert _gold_manifest().case_results[0].passed is True
 
 
+# --- A1: grounding mismatch consumer ---
+
+
+def test_grounding_mismatch_degradation_flag_fails_the_case() -> None:
+    """The grounding producer flag must reach the acceptance verdict.
+
+    The agent never gets a fact in this situation (grounding fails closed), so
+    the flag is the ONLY machine-readable signal that a real re-binding
+    mismatch occurred.
+    """
+    artifact = AnswerArtifact(facts=(), degradation_flags=("grounding_execution_mismatch",))
+    manifest = _gold_with_artifact(artifact)
+    assert manifest.verdict == "P4-Q-FAIL"
+    assert "grounding_execution_mismatch" in manifest.case_results[0].failures
+
+
+def test_ordinary_degradation_flags_do_not_fail_the_case() -> None:
+    # stale / unknown-freshness / source degradation are evidence, not mismatch
+    for flag in (
+        "GroundedAnswerStale",
+        "GroundedAnswerFreshnessUnknown",
+        "weak_light_source_degraded",
+    ):
+        artifact = _artifact()
+        flagged = AnswerArtifact(facts=artifact.facts, degradation_flags=(flag,))
+        manifest = _gold_with_artifact(flagged)
+        assert "grounding_execution_mismatch" not in manifest.case_results[0].failures, flag
+
+
+def test_clean_artifact_has_no_grounding_mismatch_failure() -> None:
+    manifest = _gold_with_artifact(_artifact())
+    assert "grounding_execution_mismatch" not in manifest.case_results[0].failures
+
+
 # --- approved compute ---
 
 

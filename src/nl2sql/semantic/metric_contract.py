@@ -27,14 +27,26 @@ class Predicate(FrozenContract):
 
 
 class RatioDefinition(FrozenContract):
-    """Numerator is a subset of the explicit denominator, never a formula string."""
+    """Numerator is a subset of the explicit denominator, never a formula string.
+
+    ZERO-DENOMINATOR SEMANTICS (frozen V4 numeric constitution).  These are two
+    DISTINCT outcomes and must never be conflated:
+
+    * numerator = 0 with denominator > 0 is a VALID NUMERIC ZERO (0.00);
+    * denominator = 0 is an UNDEFINED CALCULATION, not absent data.
+
+    The "no_data" outcome therefore stays reserved for genuinely absent data
+    (for example no rows at all for the period) and is NOT an admissible
+    zero-denominator policy.
+    """
 
     denominator_predicates: tuple[Predicate, ...] = Field(min_length=1)
     numerator_predicates: tuple[Predicate, ...] = Field(min_length=1)
     unit: Literal["percent"]
     value_scale: Literal["0_100"]
     decimal_places: Literal[2]
-    zero_denominator_policy: Literal["no_data"]
+    # Division by zero is an undefined calculation, never "no data".
+    zero_denominator_policy: Literal["calculation_error"] = "calculation_error"
 
 
 class FilterField(FrozenContract):

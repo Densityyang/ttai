@@ -6,6 +6,10 @@ on:
     branches:
       - main
       - feature/nl2sql-v3-production
+      # Bounded agent branches are pushed directly (no PR) during the
+      # owner-gated workflow, so the exact-commit gate must run on push too.
+      # Without this an agent branch has NO CI at all.
+      - 'agent/**'
 
 permissions:
   contents: read
@@ -42,7 +46,12 @@ jobs:
           # legacy/semantic.md depends on semantically meaningful Markdown two-space hard line
           # breaks, so it must not be reformatted: those trailing spaces are content, not a
           # whitespace defect to fix.
-          git diff --check "${RANGE}" -- . ':(exclude)tests/fixtures/v4_p1/authoritative/**'
+          #
+          # MASTER_PR_PLAN_V4.md is the same case: its header block uses Markdown two-space hard
+          # line breaks, so those trailing spaces are rendering content, not a defect.
+          git diff --check "${RANGE}" -- . \
+            ':(exclude)tests/fixtures/v4_p1/authoritative/**' \
+            ':(exclude)MASTER_PR_PLAN_V4.md'
       - run: uv run ruff check src tests
       - run: uv run pyright
       - run: uv run pytest

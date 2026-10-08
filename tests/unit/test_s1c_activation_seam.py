@@ -9,7 +9,7 @@ provenance) at the seam that the engine actually calls.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
@@ -511,14 +511,17 @@ def test_s1c_run_binding_restores_snapshot_and_ignores_current_config() -> None:
     # mid-run).  V1 intentionally does NOT apply it: with no explicitly supplied
     # snapshot the run-bound snapshot is RESTORED and the current configurable is
     # never used as a comparison source.
-    changed_configurable = runtime_config(
-        RequestContext(
-            identity=_identity(),
-            thread_id=THREAD_A,
-            trace_id="trace-s1c",
-            authorization=_authorization("rev-2"),
-        )
-    )["configurable"]
+    changed_configurable = cast(
+        dict[str, object],
+        runtime_config(
+            RequestContext(
+                identity=_identity(),
+                thread_id=THREAD_A,
+                trace_id="trace-s1c",
+                authorization=_authorization("rev-2"),
+            )
+        )["configurable"],
+    )
     assert changed_configurable.get("authorization_context") is not None
     assert authorization_run_binding_failure(state, None) is None
 
@@ -679,7 +682,9 @@ async def test_s1c_default_deployment_keeps_v2_capability_reachable(
     monkeypatch.setattr(container_module, "get_settings", lambda: settings)
     monkeypatch.setattr(container_module, "build_model_gateway", _deep_model_gateway)
     container = AppContainer()
-    container._checkpointer_manager = SimpleNamespace(checkpointer=MemorySaver())
+    cast(Any, container)._checkpointer_manager = SimpleNamespace(
+        checkpointer=MemorySaver()
+    )
     container._checkpoint_available = True
 
     engine = await container.get_engine()

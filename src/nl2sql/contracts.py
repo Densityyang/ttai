@@ -10,6 +10,13 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
+from src.nl2sql.semantic.calculation_contract import (
+    CalculationExecutionBinding,
+    CalculationSpec,
+    derived_output_id,
+    referenced_input_roles,
+)
+
 ModelStage = Literal["classify", "retrieve", "plan", "generate_sql", "verify", "answer"]
 ModelDataClassification = Literal["public", "internal", "confidential", "restricted"]
 RouteName = Literal["fast", "standard", "deep"]
@@ -29,6 +36,14 @@ SourceDegradation = Literal[
 ConfidenceBand = Literal["low", "medium", "high"]
 # Final Agent-facing scope vocabulary owned by Backend/DB; tt-ai only consumes it.
 ScopeLevel = Literal["city_company", "area", "team", "employee"]
+# Shared product-mode vocabulary.  MODE is decided by THIS RUN's user intent and
+# is independent of definition lifecycle and metric authority: arithmetic,
+# comparison, ranking, trend, execution count, Save and SAVED identity never
+# determine it.  It is deliberately NOT the same axis as QueryPlan.intent
+# (metric/trend/comparison/ranking/detail), which only describes execution
+# shape.  P4-Q's observed-mode vocabulary reuses this type rather than keeping a
+# second duplicate mode literal.
+ProductMode = Literal["QUERY", "ANALYZE", "BUILD"]
 
 
 class StrictContract(BaseModel):
@@ -372,6 +387,12 @@ class QueryPlan(StrictContract):
     dimensions: tuple[str, ...] = Field(default=(), max_length=16)
     filters: tuple[BoundFilter, ...] = Field(default=(), max_length=32)
     time_range: TimeRange
+    # Server-owned sparse business-day availability for bounded recent windows.
+    # Empty means an ordinary contiguous time range; non-empty values are an
+    # exact typed execution set and are never client authority.
+    available_dates: tuple[date, ...] = Field(
+        default=(), max_length=31, exclude=True
+    )
     grain: Literal["hour", "day", "week", "month", "quarter", "year"]
     source_strategy: Literal["aggregate_first", "detail_required"]
     # Ranking defaults to ten; other intents must leave this unset.
@@ -383,6 +404,21 @@ class QueryPlan(StrictContract):
     def validate_result_limit(self) -> QueryPlan:
         if self.intent != "ranking" and self.result_limit is not None:
             raise ValueError("result_limit is only supported for ranking")
+        return self
+
+    @model_validator(mode="after")
+    def validate_available_dates(self) -> QueryPlan:
+        if self.available_dates:
+            if self.intent != "trend":
+                raise ValueError("available_dates is only supported for trends")
+            if len(set(self.available_dates)) != len(self.available_dates):
+                raise ValueError("available_dates must be unique")
+            if tuple(sorted(self.available_dates)) != self.available_dates:
+                raise ValueError("available_dates must be ordered")
+            if self.available_dates[0] < self.time_range.start:
+                raise ValueError("available_dates start is outside time_range")
+            if self.available_dates[-1] > self.time_range.end:
+                raise ValueError("available_dates end is outside time_range")
         return self
 
     @property
@@ -405,10 +441,35 @@ class QueryPlan(StrictContract):
 
     @property
     def checksum(self) -> str:
-        return _contract_checksum(self)
+        payload = self.model_dump(mode="json")
+        if self.available_dates:
+            payload["available_dates"] = [item.isoformat() for item in self.available_dates]
+        canonical = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def query_plan_payload(plan: QueryPlan) -> dict[str, JsonValue]:
+    """Serialize a plan while retaining the server-owned sparse date set."""
+
+    payload = plan.model_dump(mode="json")
+    if plan.available_dates:
+        payload["available_dates"] = [item.isoformat() for item in plan.available_dates]
+    return payload
 
 
 PlanStepId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
+# Bounded NONCANONICAL derived-output identity.  It identifies CalculationSpec
+# + CalculationExecutionBinding CONTENT only: never a metric_key, never a
+# canonical/SAVED identity, and never a global execution/result id (two runs of
+# the same spec+binding may share it over different data).  AnswerFact.fact_id
+# remains the concrete grounded-fact identity.
+DerivedOutputId = Annotated[str, Field(pattern=r"^adhoc_[0-9a-f]{32}$")]
 PlanInputName = Annotated[
     str,
     Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$"),
@@ -445,6 +506,16 @@ class FetchMetricStep(StrictContract):
     calculation_output_metric_key: str | None = Field(
         default=None, min_length=1, max_length=256
     )
+    # Compiler-produced NONCANONICAL AD_HOC dependency provenance marking this
+    # fetch as an INTERNAL AD_HOC calculation input.  It is mutually exclusive
+    # with the canonical calculation_input_role group above and never carries a
+    # canonical binding checksum.  All three fields are present together or
+    # absent together.
+    ad_hoc_input_role: str | None = Field(
+        default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+    )
+    ad_hoc_spec_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    ad_hoc_derived_output_id: DerivedOutputId | None = None
 
     @field_validator("metric_keys", "depends_on")
     @classmethod
@@ -455,15 +526,27 @@ class FetchMetricStep(StrictContract):
 
     @model_validator(mode="after")
     def validate_dependency_fetch_provenance(self) -> FetchMetricStep:
-        provenance = (
+        canonical = (
             self.calculation_input_role,
             self.calculation_binding_checksum,
             self.calculation_output_metric_key,
         )
-        declared = sum(1 for item in provenance if item is not None)
-        if declared not in (0, len(provenance)):
+        ad_hoc = (
+            self.ad_hoc_input_role,
+            self.ad_hoc_spec_checksum,
+            self.ad_hoc_derived_output_id,
+        )
+        canonical_declared = sum(1 for item in canonical if item is not None)
+        ad_hoc_declared = sum(1 for item in ad_hoc if item is not None)
+        if canonical_declared not in (0, len(canonical)):
             raise ValueError("dependency fetch provenance must be all-or-none")
-        if declared and len(self.metric_keys) != 1:
+        if ad_hoc_declared not in (0, len(ad_hoc)):
+            raise ValueError("ad hoc dependency fetch provenance must be all-or-none")
+        if canonical_declared and ad_hoc_declared:
+            raise ValueError(
+                "canonical and ad hoc dependency provenance are mutually exclusive"
+            )
+        if (canonical_declared or ad_hoc_declared) and len(self.metric_keys) != 1:
             raise ValueError("dependency fetch must project exactly one metric key")
         return self
 
@@ -515,6 +598,56 @@ class TrustedCalculationStep(StrictContract):
         return self
 
 
+class AdHocCalculationStep(StrictContract):
+    """One NONCANONICAL AD_HOC calculation over already-resolved inputs.
+
+    Structurally distinct from TrustedCalculationStep: it carries NO template
+    approval, NO canonical output_metric_key and NO binding checksum authority.
+    Shared calculation SEMANTICS are reused; authority stays outside.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["ad_hoc_calculation"] = "ad_hoc_calculation"
+    step_id: PlanStepId
+    calculation_spec: CalculationSpec
+    execution_binding: CalculationExecutionBinding
+    input_refs: dict[PlanInputName, PlanInputRef] = Field(min_length=1, max_length=32)
+    depends_on: tuple[PlanStepId, ...] = Field(min_length=1, max_length=16)
+    derived_output_id: DerivedOutputId
+
+    @field_validator("depends_on")
+    @classmethod
+    def validate_unique_ad_hoc_dependencies(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("ad hoc calculation dependencies must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def validate_ad_hoc_semantics(self) -> AdHocCalculationStep:
+        spec = self.calculation_spec
+        binding = self.execution_binding
+        if binding.calculation_id != spec.calculation_id:
+            raise ValueError("ad hoc execution binding spec identity mismatch")
+        if binding.spec_checksum != spec.checksum:
+            raise ValueError("ad hoc execution binding spec checksum mismatch")
+        if binding.binding_failures(spec):
+            raise ValueError("ad hoc execution binding is not contract-valid")
+        roles = set(referenced_input_roles(spec.expression))
+        if set(self.input_refs) != roles:
+            raise ValueError(
+                "ad hoc input refs must match the expression input roles exactly"
+            )
+        if self.derived_output_id != derived_output_id(spec, binding):
+            raise ValueError(
+                "ad hoc derived output id must derive from the spec and binding"
+            )
+        return self
+
+
 class VerifyStep(StrictContract):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -533,7 +666,7 @@ class VerifyStep(StrictContract):
 
 
 PlanStep = Annotated[
-    FetchMetricStep | TrustedCalculationStep | VerifyStep,
+    FetchMetricStep | TrustedCalculationStep | AdHocCalculationStep | VerifyStep,
     Field(discriminator="kind"),
 ]
 
@@ -566,6 +699,8 @@ class ExecutionPlan(StrictContract):
             dependencies[step.step_id] = current
             refs: tuple[str, ...]
             if isinstance(step, TrustedCalculationStep):
+                refs = tuple(step.input_refs.values())
+            elif isinstance(step, AdHocCalculationStep):
                 refs = tuple(step.input_refs.values())
             elif isinstance(step, VerifyStep):
                 refs = step.input_refs
@@ -614,6 +749,10 @@ class PlanValidationRecord(StrictContract):
     outcome: Literal["allow", "deny", "clarify", "approval"]
     query_plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     context_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # Exact ExecutionPlan content identity when (and only when) this record is
+    # the result of validating a compiled execution plan.  Never overloads
+    # query_plan_sha256: the two hashes name different artifacts.
+    execution_plan_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     issues: tuple[PlanValidationIssue, ...] = Field(default=(), max_length=32)
 
     @model_validator(mode="after")
@@ -631,7 +770,9 @@ class PlanStepReceipt(StrictContract):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     step_id: PlanStepId
-    kind: Literal["fetch_metric", "trusted_calculation", "verify"]
+    kind: Literal[
+        "fetch_metric", "trusted_calculation", "ad_hoc_calculation", "verify"
+    ]
     status: Literal["succeeded", "failed"]
     elapsed_ms: int = Field(ge=0)
     output_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -649,6 +790,15 @@ class PlanStepReceipt(StrictContract):
     template_version: str | None = Field(default=None, min_length=1, max_length=64)
     binding_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     output_metric_key: str | None = Field(default=None, min_length=1, max_length=256)
+    # NONCANONICAL AD_HOC provenance (never mixed with the canonical fields above).
+    calculation_spec_checksum: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    execution_binding_checksum: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    derived_output_id: DerivedOutputId | None = None
+    calculation_scope: Literal["ad_hoc_noncanonical"] | None = None
     error_code: str | None = Field(default=None, min_length=1, max_length=128)
 
     @model_validator(mode="after")
@@ -661,6 +811,37 @@ class PlanStepReceipt(StrictContract):
             raise ValueError("failed step requires an error code")
         if self.status == "failed" and self.output_digest is not None:
             raise ValueError("failed step cannot contain an output digest")
+        ad_hoc = (
+            self.calculation_spec_checksum,
+            self.execution_binding_checksum,
+            self.derived_output_id,
+            self.calculation_scope,
+        )
+        ad_hoc_declared = sum(1 for item in ad_hoc if item is not None)
+        if self.kind == "ad_hoc_calculation":
+            if self.status == "succeeded":
+                if ad_hoc_declared != len(ad_hoc):
+                    raise ValueError(
+                        "ad hoc receipt requires full noncanonical provenance"
+                    )
+                if self.calculation_scope != "ad_hoc_noncanonical":
+                    raise ValueError(
+                        "ad hoc receipt requires ad_hoc_noncanonical scope"
+                    )
+            elif ad_hoc_declared:
+                # A failed AD_HOC receipt carries ONLY a stable error code.
+                raise ValueError(
+                    "failed ad hoc receipt must not carry provenance"
+                )
+            if (
+                self.output_metric_key is not None
+                or self.binding_checksum is not None
+                or self.template_id is not None
+                or self.template_version is not None
+            ):
+                raise ValueError("ad hoc receipt must not carry canonical provenance")
+        elif ad_hoc_declared:
+            raise ValueError("non-ad-hoc receipt must not carry ad hoc provenance")
         return self
 
 
@@ -849,7 +1030,11 @@ class AnswerFact(StrictContract):
 
     fact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     step_id: PlanStepId
-    metric_key: str = Field(min_length=1, max_length=256)
+    # Exactly one result identity: a canonical metric_key OR a NONCANONICAL
+    # derived_output_id, never both and never neither.
+    metric_key: str | None = Field(default=None, min_length=1, max_length=256)
+    derived_output_id: DerivedOutputId | None = None
+    calculation_scope: Literal["ad_hoc_noncanonical"] | None = None
     status: Literal["grounded", "unavailable"] = "grounded"
     value: JsonValue = None
     rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -875,6 +1060,14 @@ class AnswerFact(StrictContract):
     def validate_unavailable_carries_no_value(self) -> AnswerFact:
         if self.status == "unavailable" and self.value is not None:
             raise ValueError("unavailable answer fact cannot carry a value")
+        has_metric = self.metric_key is not None
+        has_derived = self.derived_output_id is not None
+        if has_metric == has_derived:
+            raise ValueError("answer fact requires exactly one result identity")
+        if has_derived != (self.calculation_scope == "ad_hoc_noncanonical"):
+            raise ValueError(
+                "derived output identity requires ad_hoc_noncanonical scope"
+            )
         return self
 
 

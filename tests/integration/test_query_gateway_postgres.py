@@ -31,7 +31,10 @@ from src.nl2sql.infra.governance.query_gateway import (
 )
 from src.nl2sql.infra.store.database import DatabaseManager
 from src.nl2sql.orchestration.budget import RouteBudgetLedger
-from src.nl2sql.orchestration.metric_query import metric_plan_executor
+from src.nl2sql.orchestration.metric_query import (
+    METRIC_CALCULATION_UNDEFINED,
+    metric_plan_executor,
+)
 from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
 from src.nl2sql.semantic.metric_layer import MetricSemanticLayer
 from tests.metric_fixtures import AggregateAuthority, MetricAuthority, ratio_contract, seed_contract
@@ -369,11 +372,16 @@ async def _slice2_execute(
     validation = validator.validate_query_plan(plan=plan, context=authority.context, identity=authority.identity)
     execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
     budget = RouteBudgetLedger(route="standard")
-    assert validator.validate_execution_plan(
+    execution_validation = validator.validate_execution_plan(
         execution_plan=execution, query_plan=plan, context=authority.context, route_budget=budget.limits,
-    ).outcome == "allow"
+    )
+    assert execution_validation.outcome == "allow"
     result = await metric_plan_executor(authority.compiler(), gateway).execute(
-        query_plan=plan, context=authority.context, execution_plan=execution, budget=budget, deadline_ms=10000,
+        query_plan=plan, context=authority.context, execution_plan=execution,
+        validation=execution_validation,
+        expected_policy_version=validator.policy_version,
+        expected_policy_checksum=validator.policy_checksum,
+        budget=budget, deadline_ms=10000,
     )
     assert budget.sql_executions == 1
     return result
@@ -389,12 +397,15 @@ def _organization_filter(dimension: str, value: Any, operator: str = "eq") -> Bo
 @pytest.mark.parametrize(("filters", "expected"), [
     ((), {"numerator": 4, "denominator": 7, "value": "57.14", "status": "success"}),
     ((_organization_filter("area", "area-d"),), {"numerator": 0, "denominator": 2, "value": "0.00", "status": "success"}),
-    ((_organization_filter("team", 5),), {"numerator": 0, "denominator": 0, "value": None, "status": "no_data"}),
-    ((_organization_filter("area", "unknown-id"),), {"numerator": 0, "denominator": 0, "value": None, "status": "no_data"}),
+    # A zero denominator is an UNDEFINED calculation, NOT absent data: the frozen
+    # V4 contract raises a typed error instead of reporting NO_DATA (see
+    # docs-v4-calculation-runtime-release-candidate.md, "Divide-by-zero").
+    ((_organization_filter("team", 5),), {"numerator": 0, "denominator": 0, "value": None, "status": "calculation_error"}),
+    ((_organization_filter("area", "unknown-id"),), {"numerator": 0, "denominator": 0, "value": None, "status": "calculation_error"}),
     ((_organization_filter("area", ["area-a", "area-b"], "in"),), {"numerator": 2, "denominator": 3, "value": "66.67", "status": "success"}),
     ((_organization_filter("team", [1, 2], "in"),), {"numerator": 2, "denominator": 3, "value": "66.67", "status": "success"}),
-    ((_organization_filter("area", "成都"),), {"numerator": 0, "denominator": 0, "value": None, "status": "no_data"}),
-    ((_organization_filter("area", ["x'; DROP TABLE complaint_orders; --"], "in"),), {"numerator": 0, "denominator": 0, "value": None, "status": "no_data"}),
+    ((_organization_filter("area", "成都"),), {"numerator": 0, "denominator": 0, "value": None, "status": "calculation_error"}),
+    ((_organization_filter("area", ["x'; DROP TABLE complaint_orders; --"], "in"),), {"numerator": 0, "denominator": 0, "value": None, "status": "calculation_error"}),
 ])
 async def test_pr07a_ratio_real_gateway_scalar_nulls_and_binds(
     gateway_postgres: _GatewayPostgres, filters: tuple[BoundFilter, ...], expected: dict[str, Any],
@@ -403,8 +414,12 @@ async def test_pr07a_ratio_real_gateway_scalar_nulls_and_binds(
     engine, gateway = _gateway(gateway_postgres.reader_url, max_rows=200)
     try:
         result = await _slice2_execute(gateway, authority, filters=filters)
+        if expected["status"] == "calculation_error":
+            assert result.record.status == "failed", result.record
+            assert result.record.stop_reason == METRIC_CALCULATION_UNDEFINED
+            return
         assert result.record.status == "succeeded", result.record
-        assert result.outputs["fetch_metrics"] == {"rows": [expected], "no_data": expected["status"] == "no_data"}
+        assert result.outputs["fetch_metrics"] == {"rows": [expected], "no_data": False}
         receipt = result.record.step_receipts[0]
         assert receipt.rowset_sha256 is not None
         assert receipt.data_as_of is None and receipt.freshness_status == "unknown"
@@ -425,18 +440,20 @@ async def test_pr07a_ratio_real_gateway_organizations_and_ranking_ties(
     try:
         result = await _slice2_execute(gateway, authority, intent=intent, dimensions=(dimension,),
                                        **({"result_limit": 2} if intent == "ranking" else {}))
+        if intent == "comparison":
+            # The grouped result contains a group whose denominator is zero, which
+            # is an UNDEFINED calculation under the frozen V4 contract: the step
+            # fails closed instead of reporting that group as "no data".  The
+            # successful grouped shape stays covered by the ranking case below and
+            # by the count-operation comparison in the parity test.
+            assert result.record.status == "failed", result.record
+            assert result.record.stop_reason == METRIC_CALCULATION_UNDEFINED
+            return
         assert result.record.status == "succeeded", result.record
         rows = result.outputs["fetch_metrics"]["rows"]
         ids = ["area-a", "area-b", "area-c", "area-d", "area-e"] if dimension == "area" else [1, 2, 3, 4, 5]
-        if intent == "ranking":
-            assert [row["dimension_id"] for row in rows] == ids[1:3]
-            assert [row["value"] for row in rows] == ["100.00", "100.00"]
-        else:
-            assert [row["dimension_id"] for row in rows] == ids
-            assert [row["value"] for row in rows] == ["50.00", "100.00", "100.00", "0.00", None]
-            assert sum(row["denominator"] for row in rows) == 6  # city total = 7
-            assert sum(row["numerator"] for row in rows) == 3  # city total = 4
-            assert rows[-1]["status"] == "no_data"
+        assert [row["dimension_id"] for row in rows] == ids[1:3]
+        assert [row["value"] for row in rows] == ["100.00", "100.00"]
         assert not result.outputs["fetch_metrics"]["no_data"]
     finally:
         await engine.dispose()
@@ -465,8 +482,15 @@ async def test_pr07a_ratio_real_gateway_period_attribution_and_no_widening(
         plan = authority.plan(intent="trend", grain=grain, time_range=TimeRange(start=start, end=end))
         validation = PlanValidator().validate_query_plan(plan=plan, context=authority.context, identity=authority.identity)
         execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
+        execution_validation = PlanValidator().validate_execution_plan(
+            execution_plan=execution, query_plan=plan, context=authority.context,
+            route_budget=RouteBudgetLedger(route="standard").limits,
+        )
         result = await metric_plan_executor(authority.compiler(), gateway).execute(
             query_plan=plan, context=authority.context, execution_plan=execution,
+            validation=execution_validation,
+            expected_policy_version=PlanValidator().policy_version,
+            expected_policy_checksum=PlanValidator().policy_checksum,
             budget=RouteBudgetLedger(route="standard"), deadline_ms=10000,
         )
         assert result.record.status == "succeeded", result.record
@@ -688,13 +712,17 @@ async def test_pr07a_metric_executor_real_gateway_contract(
         )
         execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
         budget = RouteBudgetLedger(route="standard")
-        assert validator.validate_execution_plan(
+        execution_validation = validator.validate_execution_plan(
             execution_plan=execution, query_plan=plan, context=authority.context,
             route_budget=budget.limits,
-        ).outcome == "allow"
+        )
+        assert execution_validation.outcome == "allow"
         result = await metric_plan_executor(authority.compiler(), gateway).execute(
             query_plan=plan, context=authority.context, execution_plan=execution,
-            budget=budget, deadline_ms=10000,
+            validation=execution_validation,
+        expected_policy_version=validator.policy_version,
+        expected_policy_checksum=validator.policy_checksum,
+        budget=budget, deadline_ms=10000,
         )
         assert result.record.status == "succeeded", result.record
         value = result.outputs["fetch_metrics"]
@@ -741,6 +769,7 @@ async def test_pr07a_synthetic_aggregate_detail_hash_parity(
     try:
         records = []
         outputs = []
+        failure_reasons: list[str | None] = []
         for strategy in ("aggregate_first", "detail_required"):
             plan = authority.plan(intent=intent, grain=grain, dimensions=dimensions, source_strategy=strategy,
                                   time_range=TimeRange(start=date(2028, 2, 28), end=date(2028, 3, 1)))
@@ -748,16 +777,33 @@ async def test_pr07a_synthetic_aggregate_detail_hash_parity(
                                                               identity=authority.identity)
             execution = PlanCompiler().compile(plan=plan, context=authority.context, validation=validation)
             budget = RouteBudgetLedger(route="standard")
+            execution_validation = PlanValidator().validate_execution_plan(
+                execution_plan=execution, query_plan=plan, context=authority.context,
+                route_budget=budget.limits,
+            )
             result = await metric_plan_executor(authority.compiler(), gateway).execute(
                 query_plan=plan, context=authority.context, execution_plan=execution,
+                validation=execution_validation,
+                expected_policy_version=PlanValidator().policy_version,
+                expected_policy_checksum=PlanValidator().policy_checksum,
                 budget=budget, deadline_ms=10_000,
             )
-            assert result.record.status == "succeeded", result.record
             assert budget.sql_executions == 1
+            if operation == "ratio" and dimensions:
+                # A zero-denominator group is an UNDEFINED calculation under the
+                # frozen V4 contract: both source strategies must fail closed with
+                # the SAME stable reason rather than report "no data".
+                assert result.record.status == "failed", result.record
+                failure_reasons.append(result.record.stop_reason)
+                continue
+            assert result.record.status == "succeeded", result.record
             records.append(result.record.step_receipts[0])
             outputs.append(result.outputs)
             checkpoint = result.record.model_dump_json()
             assert "SELECT" not in checkpoint and "source_metric" not in checkpoint and "area-a" not in checkpoint
+        if operation == "ratio" and dimensions:
+            assert failure_reasons == [METRIC_CALCULATION_UNDEFINED, METRIC_CALCULATION_UNDEFINED]
+            return
         assert outputs[0] == outputs[1]
         assert records[0].rowset_sha256 == records[1].rowset_sha256
         assert records[0].semantic_signature == records[1].semantic_signature

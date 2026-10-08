@@ -32,11 +32,18 @@ from src.nl2sql.contracts import (
     ExecutionReceipt,
     PlanExecutionRecord,
     PlanStepReceipt,
+    ProductMode,
     TrustedCalculationStep,
 )
 from src.nl2sql.semantic.published_reader import PublishedMetricReadOutcome
 
 P4Q_SCHEMA_VERSION: Final[Literal["1.0"]] = "1.0"
+
+# Produced by grounding (AnswerArtifact.degradation_flags) when a successful
+# calculation receipt could not be rebound to its real execution step.  The
+# acceptance harness consumes it as a failure; it is NOT inferred from ordinary
+# degradation (stale/unknown freshness, source_degradation, NO_DATA).
+_GROUNDING_EXECUTION_MISMATCH: Final[str] = "grounding_execution_mismatch"
 
 P4QVerdict = Literal["P4-Q-CONTRACT_READY", "P4-Q-PASS", "P4-Q-FAIL"]
 P4QCaseKind = Literal[
@@ -48,7 +55,9 @@ P4QCaseKind = Literal[
     "unavailable",
 ]
 P4QTerminal = Literal["answered", "denied", "missing", "unavailable"]
-P4QObservedMode = Literal["QUERY", "ANALYZE", "BUILD"]
+# P4-Q observes the SAME shared product-mode vocabulary; this name is retained
+# only as a compatibility alias and is no longer a duplicate literal.
+P4QObservedMode = ProductMode
 P4QEvidenceOrigin = Literal["fixture", "local_integration", "real"]
 P4QAuthorizationOutcome = Literal["allow", "deny", "missing"]
 P4QOracleKind = Literal[
@@ -442,6 +451,11 @@ def _grounding_failures(evidence: P4QCaseEvidence) -> list[str]:
         return ["grounded_answer_missing"]
     grounded = [fact for fact in artifact.facts if fact.status == "grounded"]
     failures: list[str] = []
+    if _GROUNDING_EXECUTION_MISMATCH in artifact.degradation_flags:
+        # The producer (grounding) refused a fact because a successful
+        # calculation receipt could not be rebound to its real execution step.
+        # That is an acceptance failure, not ordinary degradation.
+        failures.append(_GROUNDING_EXECUTION_MISMATCH)
     if not grounded or all(fact.value is None for fact in grounded):
         failures.append("grounded_answer_missing")
     receipts = _plan_bound_successful_receipts(evidence)

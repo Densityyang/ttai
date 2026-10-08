@@ -9,6 +9,7 @@ from uuid import UUID
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 from pydantic import JsonValue, ValidationError
 
 from src.nl2sql.contracts import (
@@ -21,6 +22,8 @@ from src.nl2sql.contracts import (
     FetchMetricStep,
     PlanExecutionRecord,
     PlanStepReceipt,
+    PlanValidationIssue,
+    PlanValidationRecord,
     QueryPlan,
     RequestContext,
     RequestIdentity,
@@ -497,6 +500,154 @@ def test_engine_rejects_a_model_backed_provider_before_route_selection() -> None
     assert provider.calls == 0
 
 
+_EXPECTED_POLICY = PlanValidator()
+
+
+def _execution_validation(
+    query_plan: QueryPlan,
+    context: ContextBundle,
+    execution_plan: ExecutionPlan,
+    *,
+    validator: PlanValidator | None = None,
+) -> PlanValidationRecord:
+    return (validator or PlanValidator()).validate_execution_plan(
+        execution_plan=execution_plan,
+        query_plan=query_plan,
+        context=context,
+        route_budget=RouteBudgetLedger(route="fast").limits,
+    )
+
+
+def _alt_execution_plan(query_plan: QueryPlan, context: ContextBundle) -> ExecutionPlan:
+    return ExecutionPlan(
+        query_plan_sha256=query_plan.checksum,
+        semantic_release_id=context.semantic_release_id,
+        schema_snapshot_id=context.schema_snapshot_id,
+        policy_version="plan-compiler.test.v1",
+        steps=(
+            FetchMetricStep(step_id="fetch_alt", metric_keys=query_plan.metric_keys),
+            VerifyStep(
+                step_id="verify_alt",
+                input_refs=("fetch_alt",),
+                invariant_ids=("typed_result_present",),
+                depends_on=("fetch_alt",),
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_plan_executor_refuses_a_validation_record_for_another_plan() -> None:
+    context = _context()
+    plan = _query_plan()
+    validation = PlanValidator().validate_query_plan(plan=plan, context=context, identity=_identity())
+    execution_plan = PlanCompiler().compile(plan=plan, context=context, validation=validation)
+    other_plan = _alt_execution_plan(plan, context)
+    runner = _MetricRunner()
+    result = await PlanExecutor(metric_runner=runner).execute(
+        query_plan=plan,
+        context=context,
+        execution_plan=execution_plan,
+        validation=_execution_validation(plan, context, other_plan),
+        expected_policy_version=_EXPECTED_POLICY.policy_version,
+        expected_policy_checksum=_EXPECTED_POLICY.policy_checksum,
+        budget=RouteBudgetLedger(route="fast"),
+        deadline_ms=4_000,
+    )
+    assert result.record.status == "failed"
+    assert result.record.stop_reason == "execution_plan_checksum_mismatch"
+    assert runner.execute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_executor_refuses_a_foreign_policy_identity() -> None:
+    context = _context()
+    plan = _query_plan()
+    validation = PlanValidator().validate_query_plan(plan=plan, context=context, identity=_identity())
+    execution_plan = PlanCompiler().compile(plan=plan, context=context, validation=validation)
+    record = _execution_validation(plan, context, execution_plan)
+    for overrides, expected in (
+        (
+            {"expected_policy_version": "plan-validation.other.v9"},
+            "execution_plan_policy_version_mismatch",
+        ),
+        (
+            {"expected_policy_checksum": "f" * 64},
+            "execution_plan_policy_checksum_mismatch",
+        ),
+    ):
+        runner = _MetricRunner()
+        result = await PlanExecutor(metric_runner=runner).execute(
+            query_plan=plan,
+            context=context,
+            execution_plan=execution_plan,
+            validation=record,
+            expected_policy_version=overrides.get(
+                "expected_policy_version", record.policy_version
+            ),
+            expected_policy_checksum=overrides.get(
+                "expected_policy_checksum", record.policy_checksum
+            ),
+            budget=RouteBudgetLedger(route="fast"),
+            deadline_ms=4_000,
+        )
+        assert result.record.status == "failed"
+        assert result.record.stop_reason == expected
+        assert runner.execute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_executor_refuses_a_non_allow_or_mismatched_validation() -> None:
+    context = _context()
+    plan = _query_plan()
+    validation = PlanValidator().validate_query_plan(plan=plan, context=context, identity=_identity())
+    execution_plan = PlanCompiler().compile(plan=plan, context=context, validation=validation)
+    denied = PlanValidationRecord(
+        policy_version="plan-validation.bootstrap.v1",
+        policy_checksum="a" * 64,
+        outcome="deny",
+        query_plan_sha256=plan.checksum,
+        context_checksum=context.checksum,
+        execution_plan_sha256=execution_plan.checksum,
+        issues=(PlanValidationIssue(code="denied", safe_message="denied"),),
+    )
+    stale_query = PlanValidationRecord(
+        policy_version="plan-validation.bootstrap.v1",
+        policy_checksum="a" * 64,
+        outcome="allow",
+        query_plan_sha256="0" * 64,
+        context_checksum=context.checksum,
+        execution_plan_sha256=execution_plan.checksum,
+    )
+    stale_context = PlanValidationRecord(
+        policy_version="plan-validation.bootstrap.v1",
+        policy_checksum="a" * 64,
+        outcome="allow",
+        query_plan_sha256=plan.checksum,
+        context_checksum="0" * 64,
+        execution_plan_sha256=execution_plan.checksum,
+    )
+    for record, expected in (
+        (denied, "execution_plan_validation_denied"),
+        (stale_query, "execution_plan_query_hash_mismatch"),
+        (stale_context, "execution_plan_context_hash_mismatch"),
+    ):
+        runner = _MetricRunner()
+        result = await PlanExecutor(metric_runner=runner).execute(
+            query_plan=plan,
+            context=context,
+            execution_plan=execution_plan,
+            validation=record,
+            expected_policy_version=_EXPECTED_POLICY.policy_version,
+            expected_policy_checksum=_EXPECTED_POLICY.policy_checksum,
+            budget=RouteBudgetLedger(route="fast"),
+            deadline_ms=4_000,
+        )
+        assert result.record.status == "failed"
+        assert result.record.stop_reason == expected
+        assert runner.execute_calls == 0
+
+
 @pytest.mark.asyncio
 async def test_plan_executor_charges_before_execution_and_checkpoints_only_receipts() -> None:
     context = _context()
@@ -518,6 +669,9 @@ async def test_plan_executor_charges_before_execution_and_checkpoints_only_recei
         query_plan=plan,
         context=context,
         execution_plan=execution_plan,
+        validation=_execution_validation(plan, context, execution_plan),
+        expected_policy_version=_EXPECTED_POLICY.policy_version,
+        expected_policy_checksum=_EXPECTED_POLICY.policy_checksum,
         budget=ledger,
         deadline_ms=4_000,
     )
@@ -556,6 +710,9 @@ async def test_plan_executor_preserves_the_response_deadline_reserve() -> None:
         query_plan=plan,
         context=context,
         execution_plan=execution_plan,
+        validation=_execution_validation(plan, context, execution_plan),
+        expected_policy_version=_EXPECTED_POLICY.policy_version,
+        expected_policy_checksum=_EXPECTED_POLICY.policy_checksum,
         budget=ledger,
         deadline_ms=ledger.policy.reserve_ms,
     )
@@ -587,6 +744,9 @@ async def test_plan_executor_rejects_non_json_step_output() -> None:
         query_plan=plan,
         context=context,
         execution_plan=execution_plan,
+        validation=_execution_validation(plan, context, execution_plan),
+        expected_policy_version=_EXPECTED_POLICY.policy_version,
+        expected_policy_checksum=_EXPECTED_POLICY.policy_checksum,
         budget=RouteBudgetLedger(route="fast"),
         deadline_ms=4_000,
     )
@@ -659,6 +819,9 @@ async def test_trusted_calculation_step_uses_only_the_approved_registry() -> Non
         query_plan=plan,
         context=context,
         execution_plan=execution_plan,
+        validation=execution_validation,
+        expected_policy_version=validator.policy_version,
+        expected_policy_checksum=validator.policy_checksum,
         budget=RouteBudgetLedger(route="fast"),
         deadline_ms=4_000,
     )
@@ -752,6 +915,9 @@ async def test_plan_executor_propagates_request_cancellation() -> None:
             query_plan=plan,
             context=context,
             execution_plan=execution_plan,
+            validation=_execution_validation(plan, context, execution_plan),
+            expected_policy_version=_EXPECTED_POLICY.policy_version,
+            expected_policy_checksum=_EXPECTED_POLICY.policy_checksum,
             budget=RouteBudgetLedger(route="fast"),
             deadline_ms=4_000,
         )
@@ -881,6 +1047,78 @@ async def test_engine_uses_zero_model_fast_path_for_a_validated_typed_plan() -> 
 
 
 @pytest.mark.asyncio
+async def test_engine_rejects_an_execution_validation_from_a_foreign_policy() -> None:
+    from src.nl2sql.agents.dynamic_calc.trusted_templates import (
+        trusted_template_registry,
+    )
+    from src.nl2sql.orchestration.approved_compute import (
+        ApprovedCalculationBinding,
+        ApprovedCalculationCatalog,
+        ApprovedCalculationInput,
+    )
+
+    context = _context()
+    plan = _query_plan()
+    metric_runner = _MetricRunner()
+    engine = create_v2_engine(
+        checkpointer=MemorySaver(),
+        model_gateway=_model_gateway(_CountingProvider()),
+        context_resolver=_StaticContextResolver(context),
+        query_plan_provider=_StaticQueryPlanProvider(plan),
+        plan_executor=PlanExecutor(metric_runner=metric_runner),
+    )
+    request_context = RequestContext(
+        identity=_identity(),
+        thread_id=THREAD_ID,
+        trace_id="trace-policy-swap",
+        deadline_ms=4_000,
+    )
+    config = runtime_config(request_context)
+    first = await engine.ainvoke(
+        {"messages": [{"role": "user", "content": "show revenue"}]}, config
+    )
+    assert first["execution_record"]["status"] == "succeeded"
+    assert metric_runner.execute_calls == 1
+
+    snapshot = await engine.aget_state(config)
+    stored = cast(dict[str, object], snapshot.values)["execution_plan_validation"]
+    assert isinstance(stored, dict)
+
+    meta = trusted_template_registry.metadata("ratio")
+    catalog = ApprovedCalculationCatalog([
+        ApprovedCalculationBinding(
+            canonical_metric_key="metric.revenue",
+            template_id="ratio",
+            template_version=meta.version,
+            template_checksum=meta.checksum,
+            inputs=(
+                ApprovedCalculationInput(
+                    role="numerator",
+                    metric_key="metric.stores",
+                    metric_contract_sha256="b" * 64,
+                ),
+            ),
+            binding_revision="1",
+            semantic_release_id="release-1",
+            semantic_release_checksum="c" * 64,
+        )
+    ])
+    catalog_checksum = PlanValidator(calculation_catalog=catalog).policy_checksum
+    assert catalog_checksum != PlanValidator().policy_checksum
+
+    for foreign_checksum in ("0" * 64, catalog_checksum):
+        tampered = dict(stored)
+        tampered["policy_checksum"] = foreign_checksum
+        await engine.aupdate_state(
+            config, {"execution_plan_validation": tampered}, as_node="compile"
+        )
+        resumed = await engine.ainvoke(None, config)
+        assert resumed["stop_reason"] == "execution_plan_validation_missing"
+        assert metric_runner.execute_calls == 1
+        assert "ExecutionPlanValidationMissing" in resumed["degradation_flags"]
+
+
+@pytest.mark.asyncio
 async def test_engine_resets_request_state_after_a_terminal_clarification() -> None:
     context_resolver = _SequenceContextResolver(
         (
@@ -913,13 +1151,31 @@ async def test_engine_resets_request_state_after_a_terminal_clarification() -> N
         {"messages": [{"role": "user", "content": "show revenue"}]},
         config,
     )
+    # Typed suspension: the clarify run pauses with a server-owned request and
+    # does not execute.  It is no longer a terminal stop_reason.
+    assert first["stop_reason"] is None
+    assert first["decision_status"] == "awaiting_decision"
+    assert first["pending_decision"]["unresolved_slots"] == ["metric"]
+    assert "__interrupt__" in first
+    assert metric_runner.execute_calls == 0
+
+    # A typed decision closes the suspension without executing business work.
+    resumed = await engine.ainvoke(
+        Command(resume={"action": "reject", "idempotency_key": "reset-1"}),
+        config,
+    )
+    assert resumed["decision_status"] == "rejected"
+    assert resumed["stop_reason"] is None
+    assert metric_runner.execute_calls == 0
+
+    # A fresh run on the SAME thread starts clean (no stale suspension state).
     second = await engine.ainvoke(
         {"messages": [{"role": "user", "content": "show revenue"}]},
         config,
     )
-
-    assert first["stop_reason"] == "query_plan_clarification_required"
     assert second["stop_reason"] is None
+    assert second["decision_status"] is None
+    assert second["pending_decision"] is None
     assert second["route_record"]["route"] == "fast"
     assert second["execution_record"]["status"] == "succeeded"
     assert second["trace_events"][0]["name"] == "received"
@@ -1186,6 +1442,22 @@ def test_grounded_renderer_keeps_raw_rows_out_and_marks_stale_freshness() -> Non
         "aggregate_stale",
         "GroundedAnswerStale",
     )
+
+
+def test_grounded_trend_renderer_preserves_business_period_mapping() -> None:
+    fact = AnswerFact(
+        fact_id="e" * 64,
+        step_id="fetch_metrics",
+        metric_key="metric.revenue",
+        value=75,
+        time_range=TimeRange(
+            start=date(2026, 9, 12), end=date(2026, 9, 12)
+        ),
+    )
+    rendered = render_grounded_answer(query_plan=_query_plan(), facts=(fact,))
+    assert rendered == "metric.revenue [2026-09-12]: 75"
+    assert "rows" not in rendered
+    assert "SELECT" not in rendered
 
 
 @pytest.mark.asyncio

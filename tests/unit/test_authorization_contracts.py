@@ -7,6 +7,7 @@ network access, tests/metric_fixtures.py, or any existing test.
 from __future__ import annotations
 
 import inspect
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -50,7 +51,7 @@ class _StubProvider:
     async def load(self, user: AuthUser) -> AuthorizationContext | None:
         del user
         self.calls += 1
-        return self._result
+        return cast(AuthorizationContext | None, self._result)
 
 
 class _RaisingProvider:

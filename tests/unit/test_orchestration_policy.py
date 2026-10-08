@@ -67,7 +67,7 @@ def test_bootstrap_budget_policy_matches_the_versioned_plan_limits() -> None:
     assert policy.state == "bootstrap"
     assert policy.routes["fast"].model_dump() == {
         "deadline_ms": 4_000,
-        "max_model_calls": 0,
+        "max_model_calls": 1,
         "max_sql_candidates": 1,
         "max_sql_executions": 1,
         "max_join_hops": 0,
@@ -96,14 +96,15 @@ def test_bootstrap_budget_policy_matches_the_versioned_plan_limits() -> None:
     assert len(policy.checksum) == 64
 
 
-def test_fast_budget_blocks_a_model_call_before_it_is_counted() -> None:
+def test_fast_budget_admits_one_analysis_call_then_blocks() -> None:
     ledger = RouteBudgetLedger(route="fast")
 
+    ledger.begin_model_call()
     with pytest.raises(BudgetExceeded, match="model_call_budget_exhausted"):
         ledger.begin_model_call()
 
     record = ledger.checkpoint_record()
-    assert record.usage.model_calls == 0
+    assert record.usage.model_calls == 1
     assert record.stop_reason == "model_call_budget_exhausted"
 
 

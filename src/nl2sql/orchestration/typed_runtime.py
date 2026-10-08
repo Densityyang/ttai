@@ -90,8 +90,8 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Literal
+from datetime import UTC, date, datetime
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import ValidationError
 
@@ -110,6 +110,7 @@ from src.nl2sql.infra.store.ai_views import (
     ViewDefinition,
     view_output_columns,
 )
+from src.nl2sql.orchestration.decision_contract import SlotBinding
 from src.nl2sql.orchestration.deterministic_query_plan import (
     DeterministicQueryPlanProvider,
 )
@@ -118,6 +119,7 @@ from src.nl2sql.orchestration.metric_query import (
     EligibilityPolicy,
     MetricQueryCompiler,
     RelationBinding,
+    SourceFreshnessRecord,
     metric_plan_executor,
 )
 from src.nl2sql.semantic.context_compiler import (
@@ -262,6 +264,67 @@ class _IdentityBoundQueryPlanProvider:
             identity=identity,
         )
 
+    async def propose_with_slot_bindings(
+        self,
+        *,
+        question: str,
+        context: ContextBundle,
+        identity: RequestIdentity,
+        slot_bindings: tuple[SlotBinding, ...],
+    ) -> QueryPlan:
+        _require_same_identity(self._identity, identity)
+        return await self._provider.propose_with_slot_bindings(
+            question=question,
+            context=context,
+            identity=identity,
+            slot_bindings=slot_bindings,
+        )
+
+    async def replan_with_slot_bindings(
+        self,
+        *,
+        question: str,
+        context: ContextBundle,
+        identity: RequestIdentity,
+        base_plan: QueryPlan,
+        slot_bindings: tuple[SlotBinding, ...],
+    ) -> QueryPlan:
+        _require_same_identity(self._identity, identity)
+        return await self._provider.replan_with_slot_bindings(
+            question=question,
+            context=context,
+            identity=identity,
+            base_plan=base_plan,
+            slot_bindings=slot_bindings,
+        )
+
+
+@runtime_checkable
+class TypedRuntimeBundle(Protocol):
+    """The SMALLEST runtime surface create_v2_engine actually consumes.
+
+    Derived from real engine consumers: the context resolver, the query-plan
+    provider, the plan executor, and the bound identity/authorization.  It
+    deliberately EXCLUDES production deployment internals (QueryGateway, active
+    release registry, control-store handles, raw DB resources) that the engine
+    never reads, so a demo runtime can satisfy the same contract without
+    fabricating a database or a gateway.
+
+    Production: RequestTypedRuntime satisfies this unchanged.  Demo:
+    DemoRequestTypedRuntime satisfies the same contract.
+    """
+
+    context_resolver: Any
+    query_plan_provider: Any
+    plan_executor: PlanExecutor
+    identity: RequestIdentity
+    authorization: AuthorizationContext
+    authorization_revision: str
+
+    def authorization_decision(self) -> AuthorizationDecision:
+        """The explicit ALLOW proven by the bound trusted context."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class RequestTypedRuntime:
@@ -368,6 +431,9 @@ def build_relation_bindings(
     release: SemanticRelease,
     snapshot: SchemaSnapshot,
     metrics: Iterable[MetricContract],
+    count_column: str | None = None,
+    source_freshness: SourceFreshnessRecord | None = None,
+    bootstrap_scan_max_rows: int | None = None,
 ) -> tuple[RelationBinding, ...]:
     """Build ONE RelationBinding per DISTINCT published source_ref.
 
@@ -386,6 +452,8 @@ def build_relation_bindings(
             snapshot=snapshot,
             source_ref=source_ref,
             metrics=tuple(grouped[source_ref]),
+            count_column=count_column,
+            bootstrap_scan_max_rows=bootstrap_scan_max_rows,
         )
         for source_ref in sorted(grouped)
     )
@@ -397,6 +465,8 @@ def build_relation_binding(
     release: SemanticRelease,
     snapshot: SchemaSnapshot,
     metric: MetricContract,
+    count_column: str | None = None,
+    bootstrap_scan_max_rows: int | None = None,
 ) -> RelationBinding:
     """Build the one typed execution binding for a single metric's source_ref."""
 
@@ -406,6 +476,8 @@ def build_relation_binding(
         snapshot=snapshot,
         source_ref=metric.source_ref,
         metrics=(metric,),
+        count_column=count_column,
+        bootstrap_scan_max_rows=bootstrap_scan_max_rows,
     )
 
 
@@ -416,6 +488,8 @@ def _build_binding(
     snapshot: SchemaSnapshot,
     source_ref: str,
     metrics: tuple[MetricContract, ...],
+    count_column: str | None = None,
+    bootstrap_scan_max_rows: int | None = None,
 ) -> RelationBinding:
     """Build one typed execution binding from published deployment evidence.
 
@@ -475,6 +549,10 @@ def _build_binding(
                 f"{qualified}.{metric.business_time_column}",
             )
         time_kinds.add(_TIMESTAMP_KINDS[time_type])
+        if count_column is not None and count_column not in published:
+            raise TypedDeploymentError(
+                "metric_count_column_not_published", f"{qualified}.{count_column}"
+            )
     if len(time_kinds) != 1:
         # One binding carries one timestamp_kind; disagreeing metrics fail closed.
         raise TypedDeploymentError("business_time_type_ambiguous", qualified)
@@ -490,6 +568,11 @@ def _build_binding(
             required_permissions=(),
             approved=True,
             timestamp_kind=next(iter(time_kinds)),
+            count_column=count_column,
+            # A published VIEW carries no physical index evidence, so a bounded
+            # deployment scan cap is the ONLY legal admission for it.  The cap is
+            # supplied by the deployment, never inferred from the request.
+            bootstrap_scan_max_rows=bootstrap_scan_max_rows,
         )
     except ValidationError as exc:
         raise TypedDeploymentError("relation_binding_invalid", source_ref) from exc
@@ -504,6 +587,11 @@ async def build_request_typed_runtime(
     identity: RequestIdentity,
     authorization: AuthorizationContext | None,
     clock: Callable[[], datetime] | None = None,
+    availability_window: Callable[[], tuple[date, ...]] | None = None,
+    authoritative_date: Callable[[], date] | None = None,
+    count_column: str | None = None,
+    source_freshness: SourceFreshnessRecord | None = None,
+    bootstrap_scan_max_rows: int | None = None,
     expected_revision: str | None = None,
 ) -> RequestTypedRuntime | TypedRuntimeUnavailable:
     """Compose ONE request-scoped typed component set, or fail closed.
@@ -561,10 +649,28 @@ async def build_request_typed_runtime(
             return None
         return snapshot
 
+    async def bound_read_freshness(source_id: str) -> SourceFreshnessRecord | None:
+        if source_freshness is None:
+            return None
+        if source_id != source_freshness.source_id:
+            return None
+        return source_freshness.model_copy(
+            update={
+                "release_id": release.release_id,
+                "snapshot_id": snapshot.snapshot_id,
+                "snapshot_checksum": snapshot.checksum,
+            }
+        )
+
     metrics = executable_metric_contracts(release)
     try:
         bindings = build_relation_bindings(
-            views=views, release=release, snapshot=snapshot, metrics=metrics
+            views=views,
+            release=release,
+            snapshot=snapshot,
+            metrics=metrics,
+            count_column=count_column,
+            bootstrap_scan_max_rows=bootstrap_scan_max_rows,
         )
         policies = build_eligibility_policies(metrics)
     except TypedDeploymentError as exc:
@@ -589,7 +695,12 @@ async def build_request_typed_runtime(
         identity,
     )
     query_plan_provider = _IdentityBoundQueryPlanProvider(
-        DeterministicQueryPlanProvider(registry, request_clock),
+        DeterministicQueryPlanProvider(
+            registry,
+            request_clock,
+            availability_window=availability_window,
+            authoritative_date=authoritative_date,
+        ),
         identity,
     )
     compiler = MetricQueryCompiler(
@@ -599,6 +710,7 @@ async def build_request_typed_runtime(
         eligibility_policies=policies,
         identity=identity,
         authorization=authorization,
+        read_freshness=bound_read_freshness if source_freshness else None,
         clock=request_clock,
         expected_revision=expected_revision,
     )

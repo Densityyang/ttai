@@ -6,6 +6,7 @@ from datetime import date
 from uuid import UUID
 
 import pytest
+from pydantic import ValidationError
 
 from src.nl2sql.agents.dynamic_calc.trusted_templates import (
     TrustedTemplateError,
@@ -263,8 +264,72 @@ def test_registry_is_versioned_and_checksum_deterministic() -> None:
 
 def test_binding_checksum_is_stable_and_duplicate_keys_rejected() -> None:
     assert _binding().checksum == _binding().checksum
+    # Frozen serialization lock, re-pinned for approved-calculation schema 1.1:
+    # the inert global null/zero policy fields were removed and schema_version
+    # moved to "1.1", so the accepted payload intentionally changes.
+    assert (
+        _binding().checksum
+        == "b0b0b1485ce9b4e10730ad41d4c7c5524082b3b50b08d413e496b23f6bf97df6"
+    )
     with pytest.raises(ApprovedComputeError):
         ApprovedCalculationCatalog([_binding(), _binding()])
+
+
+def test_binding_rounding_requires_an_explicit_precision() -> None:
+    with pytest.raises(ValidationError, match="rounding requires an explicit precision"):
+        _binding(rounding="half_up")
+    # precision-only and both-set remain legal and preserve their identity.
+    assert _binding(precision=2).rounding is None
+    both = _binding(precision=2, rounding="half_up")
+    assert both.checksum == _binding(precision=2, rounding="half_up").checksum
+    assert both.checksum != _binding(precision=2).checksum
+
+
+def test_catalog_checksum_is_order_independent_and_content_sensitive() -> None:
+    first = _binding()
+    second = _rogue_binding()
+    assert (
+        ApprovedCalculationCatalog([first, second]).checksum
+        == ApprovedCalculationCatalog([second, first]).checksum
+    )
+    assert (
+        ApprovedCalculationCatalog([first]).checksum
+        == ApprovedCalculationCatalog([first]).checksum
+    )
+    changed = first.model_copy(update={"binding_revision": "rev-2"})
+    assert (
+        ApprovedCalculationCatalog([changed]).checksum
+        != ApprovedCalculationCatalog([first]).checksum
+    )
+    assert (
+        ApprovedCalculationCatalog([]).checksum
+        != ApprovedCalculationCatalog([first]).checksum
+    )
+    assert len(ApprovedCalculationCatalog([first]).checksum) == 64
+
+
+def test_validator_policy_identity_binds_the_calculation_catalog() -> None:
+    catalog = _canonical_catalog()
+    assert (
+        PlanValidator(calculation_catalog=catalog).policy_checksum
+        == PlanValidator(calculation_catalog=_canonical_catalog()).policy_checksum
+    )
+    assert (
+        PlanValidator(calculation_catalog=catalog).policy_checksum
+        != PlanValidator().policy_checksum
+    )
+    other = ApprovedCalculationCatalog([_rogue_binding()])
+    assert (
+        PlanValidator(calculation_catalog=catalog).policy_checksum
+        != PlanValidator(calculation_catalog=other).policy_checksum
+    )
+    assert len(PlanValidator(calculation_catalog=catalog).policy_checksum) == 64
+    # No catalog configured: the legacy payload is byte-for-byte unchanged, so
+    # no empty-catalog authority marker is invented.
+    assert (
+        PlanValidator().policy_checksum
+        == "c1659573c04ee1a5da9f78e5fa16157652b0a62b648b689736db647869304cbc"
+    )
 
 
 def test_calculation_provenance_is_all_or_none() -> None:
@@ -634,7 +699,9 @@ def test_single_unbound_metric_still_compiles_an_ordinary_fetch() -> None:
         plan=plan, context=context, validation=_allow(plan, context)
     )
     assert [step.kind for step in execution_plan.steps] == ["fetch_metric", "verify"]
-    assert execution_plan.steps[0].metric_keys == ("metric.stores",)
+    first = execution_plan.steps[0]
+    assert isinstance(first, FetchMetricStep)
+    assert first.metric_keys == ("metric.stores",)
 
 
 def test_single_bound_metric_compiles_the_canonical_dag() -> None:

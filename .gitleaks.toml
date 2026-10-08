@@ -1,8 +1,46 @@
 [extend]
 useDefault = true
 
+# Two unit-test modules exist SPECIFICALLY to hold fake credential shapes so the
+# detection rules and the observability scrubber can be exercised.  Their values
+# are synthetic, so the rules are allowlisted for those files only; every other
+# path -- including the CI canary directory -- is still scanned by every rule.
+[allowlist]
+description = "Synthetic credential fixtures in the secret-detection unit tests"
+paths = [
+  '''tests/unit/test_content_policy_shapes\.py$''',
+  '''tests/unit/test_gitleaks_config\.py$''',
+]
+
 [[rules]]
 id = "tt-ai-secret-canary"
 description = "TT-AI secret-scanning canary"
 regex = '''TT_AI_SECRET_CANARY_[A-F0-9]{32}'''
+secretGroup = 0
+
+[[rules]]
+id = "tt-ai-postgres-dsn-credentials"
+description = "PostgreSQL DSN embedding a password"
+regex = '''\bpostgres(?:ql)?(?:\+\w+)?://[^:@\s/]+:([^@\s/]+)@'''
+secretGroup = 1
+# Only the password is the secret.  Short, low-entropy passwords are
+# documentation/test placeholders (e.g. postgresql://user:password@db/app),
+# not credentials, so they are filtered by entropy and by the allowlist below.
+entropy = 3.5
+  [rules.allowlist]
+  description = "template and documentation placeholders"
+  regexes = [
+    '''(?i)^(?:\{.*\}|<.*>|\$\{.*\}|password|passwd|pwd|secret|redacted|example|placeholder|changeme|hunter2|test|xxx+|\*+|\.\.\.)$'''
+  ]
+
+[[rules]]
+id = "tt-ai-langfuse-key"
+description = "Langfuse API key (pk-lf-/sk-lf- + UUID)"
+regex = '''\b(?:pk|sk)-lf-[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}\b'''
+secretGroup = 0
+
+[[rules]]
+id = "tt-ai-jwt"
+description = "JSON Web Token (three dot-separated base64url segments)"
+regex = '''\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'''
 secretGroup = 0

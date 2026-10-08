@@ -16,7 +16,7 @@ import json
 from collections.abc import Iterable, Mapping
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.nl2sql.agents.dynamic_calc.trusted_templates import (
     TrustedTemplateError,
@@ -74,7 +74,7 @@ class ApprovedCalculationInput(_FrozenModel):
 class ApprovedCalculationBinding(_FrozenModel):
     """Immutable evidence binding a canonical metric to a governed calculation."""
 
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["1.1"] = "1.1"
     canonical_metric_key: str = Field(min_length=1, max_length=256)
     template_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
     template_version: str = Field(min_length=1, max_length=64)
@@ -86,8 +86,6 @@ class ApprovedCalculationBinding(_FrozenModel):
     unit: str | None = Field(default=None, min_length=1, max_length=32)
     precision: int | None = Field(default=None, ge=0, le=12)
     rounding: Literal["half_up", "half_even", "half_down", "floor", "ceil"] | None = None
-    null_policy: Literal["preserve", "zero", "no_data"] | None = None
-    zero_policy: Literal["preserve", "no_data"] | None = None
 
     @field_validator("inputs")
     @classmethod
@@ -96,6 +94,19 @@ class ApprovedCalculationBinding(_FrozenModel):
         if len(set(roles)) != len(roles):
             raise ValueError("calculation input roles must be unique")
         return value
+
+    @model_validator(mode="after")
+    def _rounding_requires_precision(self) -> ApprovedCalculationBinding:
+        """A rounding policy is meaningless without an explicit precision.
+
+        This mirrors the already-frozen shared CalculationSpec invariant.  It is
+        a reject-only rule: no field or default changes, so every accepted
+        binding serializes byte-identically and its checksum is unchanged.
+        """
+
+        if self.rounding is not None and self.precision is None:
+            raise ValueError("rounding requires an explicit precision")
+        return self
 
     @property
     def checksum(self) -> str:
@@ -124,6 +135,20 @@ class ApprovedCalculationCatalog:
     @property
     def metric_keys(self) -> tuple[str, ...]:
         return tuple(sorted(self._bindings))
+
+    @property
+    def checksum(self) -> str:
+        """Deterministic content identity of the already-resolved binding map.
+
+        Order-independent (bindings sorted by canonical metric key) and derived
+        only from the frozen binding checksums: the same resolved set always
+        yields the same identity, and adding, removing or changing any binding
+        yields a new one.  This is identity, NOT approval authority.
+        """
+
+        return _checksum(
+            {key: self._bindings[key].checksum for key in sorted(self._bindings)}
+        )
 
     def binding_for(self, metric_key: str) -> ApprovedCalculationBinding | None:
         return self._bindings.get(metric_key)
