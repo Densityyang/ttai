@@ -2,15 +2,24 @@
 
 Scope and non-goals
 -------------------
-This module is PREPARATION/COMPOSITION only.  It is NOT wired into AppContainer
-or the v2 production request path, and it activates no typed path.  Production
-activation stays a later slice because a production AuthorizationContext is
-still absent (the Backend source remains BLOCKED_BACKEND).  The factory is a PURE
-constructor: it takes (identity, authorization) parameters and returns a
-request-scoped component set.  Nothing here may be cached in the engine, and no
-lifetime/lifespan hook may hold this factory's output, because
-MetricQueryCompiler stores request identity and authorization and must be
-created fresh per request.
+This module is the S1b COMPOSITION plus the S1c request-scope guard.  The engine
+(S1c) may hold this constructor as an application-scoped CALLABLE, but the
+OUTPUT is request-scoped: nothing here may be cached in AppContainer or at graph
+lifetime, because MetricQueryCompiler stores request identity and authorization
+and must be created fresh per request.
+
+The returned RequestTypedRuntime binds its OWN identity and authorization (S1c
+A1).  The resolver and plan provider are wrapped so a call carrying a DIFFERENT
+identity is REFUSED with request_identity_mismatch instead of being served with
+the runtime owner's authority.  The caller may pass an expected_revision (S1c
+A4); it is the revision BOUND TO THIS RUN and restored from run state, and an
+internally inconsistent snapshot is a run-binding failure rather than a live
+revalidation against a newly fetched Backend revision.
+
+Production activation is still incomplete: until a real Backend
+AuthorizationContext exists the engine path fails closed with
+typed_runtime_unavailable / authorization_context_missing (the Backend source
+remains BLOCKED_BACKEND).
 
 Deployment model (O1)
 ---------------------
@@ -88,7 +97,11 @@ from pydantic import ValidationError
 
 from src.nl2sql.contracts import (
     AuthorizationContext,
+    AuthorizationDecision,
+    ContextBundle,
+    QueryPlan,
     RequestIdentity,
+    RouteName,
     evaluate_authorization,
 )
 from src.nl2sql.infra.governance.query_gateway import QueryGateway
@@ -167,11 +180,87 @@ class TypedDeploymentError(RuntimeError):
         self.code = code
 
 
+class TypedRequestScopeError(RuntimeError):
+    """A request-scoped component was called with a foreign identity (S1c A1).
+
+    This is deliberately NOT a TypedRuntimeUnavailable: the runtime was built
+    correctly, but the call crossed the request boundary, so it is refused.
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 @dataclass(frozen=True, slots=True)
 class TypedRuntimeUnavailable:
     """The typed runtime could not be constructed; reason is fail-closed."""
 
     reason: str
+
+
+def _require_same_identity(
+    expected: RequestIdentity,
+    supplied: RequestIdentity,
+) -> None:
+    if supplied != expected:
+        raise TypedRequestScopeError("request_identity_mismatch")
+
+
+class _IdentityBoundContextResolver:
+    """Bind the runtime owner's identity onto the request-scoped resolver."""
+
+    def __init__(
+        self,
+        resolver: SemanticContextResolver,
+        identity: RequestIdentity,
+    ) -> None:
+        self._resolver = resolver
+        self._identity = identity
+
+    async def resolve(
+        self,
+        *,
+        question: str,
+        identity: RequestIdentity,
+        route_hint: RouteName,
+    ) -> ContextBundle:
+        _require_same_identity(self._identity, identity)
+        return await self._resolver.resolve(
+            question=question,
+            identity=identity,
+            route_hint=route_hint,
+        )
+
+
+class _IdentityBoundQueryPlanProvider:
+    """Bind the runtime owner's identity onto the deterministic plan provider."""
+
+    def __init__(
+        self,
+        provider: DeterministicQueryPlanProvider,
+        identity: RequestIdentity,
+    ) -> None:
+        self._provider = provider
+        self._identity = identity
+
+    @property
+    def is_deterministic(self) -> bool:
+        return bool(getattr(self._provider, "is_deterministic", False))
+
+    async def propose(
+        self,
+        *,
+        question: str,
+        context: ContextBundle,
+        identity: RequestIdentity,
+    ) -> QueryPlan:
+        _require_same_identity(self._identity, identity)
+        return await self._provider.propose(
+            question=question,
+            context=context,
+            identity=identity,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +271,13 @@ class RequestTypedRuntime:
     deployment/application-scoped inputs (the parsed AIViewsConfig, the control
     read callables and the single shared QueryGateway) are reused across
     requests.
+
+    S1c A1: identity and authorization are BOUND here as request-scope guard
+    state.  context_resolver and query_plan_provider refuse a call whose
+    identity differs from this runtime's owner instead of silently serving the
+    owner's compiler authority.  The AuthorizationContext is never synthesized
+    from roles, permissions, user_id, scope fields, the legacy DataScopeService
+    or the request payload.
     """
 
     release: SemanticRelease
@@ -191,11 +287,33 @@ class RequestTypedRuntime:
     active_release_registry: ActiveReleaseRegistry
     evidence_provider: ReleaseScopedPolicyEvidenceProvider
     context_compiler: ContextCompiler
-    context_resolver: SemanticContextResolver
-    query_plan_provider: DeterministicQueryPlanProvider
+    context_resolver: _IdentityBoundContextResolver
+    query_plan_provider: _IdentityBoundQueryPlanProvider
     metric_query_compiler: MetricQueryCompiler
     plan_executor: PlanExecutor
     gateway: QueryGateway
+    identity: RequestIdentity
+    authorization: AuthorizationContext
+    authorization_revision: str
+    expected_revision: str | None
+
+    def authorization_decision(self) -> AuthorizationDecision:
+        """Return the explicit ALLOW proven by the bound trusted context.
+
+        The bound context was admitted by the factory, so this decision is
+        always an allow; it exists so the execution path can pass the EXISTING
+        receipt binder an explicit allow rather than a copied context field.
+        """
+
+        return evaluate_authorization(
+            self.authorization,
+            expected_revision=self.expected_revision,
+        )
+
+    def require_identity(self, identity: RequestIdentity) -> None:
+        """Refuse a foreign request identity (S1c A1 public guard)."""
+
+        _require_same_identity(self.identity, identity)
 
 
 def resolve_eligibility_policy(policy_id: str) -> EligibilityPolicy:
@@ -386,6 +504,7 @@ async def build_request_typed_runtime(
     identity: RequestIdentity,
     authorization: AuthorizationContext | None,
     clock: Callable[[], datetime] | None = None,
+    expected_revision: str | None = None,
 ) -> RequestTypedRuntime | TypedRuntimeUnavailable:
     """Compose ONE request-scoped typed component set, or fail closed.
 
@@ -393,6 +512,13 @@ async def build_request_typed_runtime(
     are created fresh together.  The active release is read exactly once here and
     pinned behind a request-local read callable shared by the evidence provider
     and the compiler, together with the release-bound snapshot.
+
+    S1c A4 / frozen V1 run binding: expected_revision is the revision BOUND TO
+    THIS RUN and restored from existing run/checkpoint state (None on an initial
+    request).  It is INTERNAL RUN CONSISTENCY only: a supplied authorization
+    snapshot whose revision differs is a RUN-BINDING mismatch, NOT a live
+    revocation, and the run is never silently resumed under a different
+    snapshot.
     """
 
     # REQUIRED trusted Backend authority.  Never substitute a wildcard scope, old
@@ -400,7 +526,14 @@ async def build_request_typed_runtime(
     # authorization=None compatibility seam (see the module docstring).
     if not isinstance(authorization, AuthorizationContext):
         return TypedRuntimeUnavailable(reason="authorization_context_missing")
-    if evaluate_authorization(authorization, expected_revision=None).outcome != "allow":
+    if (
+        expected_revision is not None
+        and authorization.authorization_revision != expected_revision
+    ):
+        return TypedRuntimeUnavailable(reason="authorization_run_binding_mismatch")
+    if evaluate_authorization(
+        authorization, expected_revision=expected_revision
+    ).outcome != "allow":
         return TypedRuntimeUnavailable(reason="authorization_denied")
 
     # ONE read of the active pointer for the whole request.
@@ -448,11 +581,17 @@ async def build_request_typed_runtime(
         registry=registry,
     )
     context_compiler = ContextCompiler(registry)
-    context_resolver = SemanticContextResolver(
-        compiler=context_compiler,
-        evidence_provider=evidence_provider,
+    context_resolver = _IdentityBoundContextResolver(
+        SemanticContextResolver(
+            compiler=context_compiler,
+            evidence_provider=evidence_provider,
+        ),
+        identity,
     )
-    query_plan_provider = DeterministicQueryPlanProvider(registry, request_clock)
+    query_plan_provider = _IdentityBoundQueryPlanProvider(
+        DeterministicQueryPlanProvider(registry, request_clock),
+        identity,
+    )
     compiler = MetricQueryCompiler(
         read_active=bound_read_active,
         read_snapshot=bound_read_snapshot,
@@ -461,6 +600,7 @@ async def build_request_typed_runtime(
         identity=identity,
         authorization=authorization,
         clock=request_clock,
+        expected_revision=expected_revision,
     )
     return RequestTypedRuntime(
         release=release,
@@ -475,6 +615,10 @@ async def build_request_typed_runtime(
         metric_query_compiler=compiler,
         plan_executor=metric_plan_executor(compiler, gateway),
         gateway=gateway,
+        identity=identity,
+        authorization=authorization,
+        authorization_revision=authorization.authorization_revision,
+        expected_revision=expected_revision,
     )
 
 
@@ -547,6 +691,7 @@ __all__ = [
     "V1_ELIGIBILITY_POLICIES",
     "RequestTypedRuntime",
     "TypedDeploymentError",
+    "TypedRequestScopeError",
     "TypedRuntimeUnavailable",
     "build_eligibility_policies",
     "build_relation_binding",

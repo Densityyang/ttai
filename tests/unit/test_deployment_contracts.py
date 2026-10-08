@@ -111,6 +111,7 @@ def test_product_profile_uses_external_business_network_and_file_secrets() -> No
         service = product["services"][service_name]
         environment = service["environment"]
         assert environment["CODEACT_MODE"] == "disabled"
+        assert environment["TYPED_RUNTIME_ACTIVATION"] == "disabled"
         assert environment["ENABLE_DYNAMIC_CALC"] == "false"
         assert environment["MEMORY_BACKEND"] == "postgresql"
         assert not sensitive_names.intersection(environment)
@@ -219,6 +220,12 @@ def test_release_compose_pins_app_image_and_keeps_ops_profiles() -> None:
     release = _load_yaml("docker/compose.release.yml")
     for service_name in ("api-a", "api-b", "indexer", "migrate", "schema-snapshot"):
         assert "TTAI_IMAGE_REF" in release["services"][service_name]["image"]
+    # The default deployment posture keeps the existing v2 product path: the
+    # typed runtime must stay DISABLED unless a deployment explicitly opts in.
+    for service_name in ("api-a", "api-b"):
+        assert release["services"][service_name]["environment"]["TYPED_RUNTIME_ACTIVATION"] == (
+            "disabled"
+        )
     assert release["services"]["migrate"]["profiles"] == ["ops"]
     assert release["services"]["migrate"]["command"] == ["--phase", "expand"]
     assert release["services"]["migrate"]["user"] == "0:0"

@@ -102,6 +102,10 @@ class CapabilityResponse(StrictContract):
     graph_rag: bool
     hitl: bool
     codeact: bool
+    # Purely additive, informational: whether THIS deployment activated the
+    # trusted typed runtime.  It reflects a deployment-level setting only and
+    # grants nothing; it is not a per-request toggle.
+    typed_runtime: bool = False
     degradation_reasons: tuple[str, ...] = ()
 
 
@@ -338,6 +342,7 @@ def register_v2_routes(app: FastAPI) -> None:
     ) -> CapabilityResponse:
         del auth_user
         config = get_agent_config()
+        from src.core.settings import get_settings
         from src.nl2sql.infra.llm.gateway import model_gateway_available
 
         codeact_available, codeact_reason = config.codeact_capability()
@@ -361,6 +366,7 @@ def register_v2_routes(app: FastAPI) -> None:
             graph_rag=config.enable_graph_rag,
             hitl=bool(getattr(container, "checkpoint_available", False)),
             codeact=codeact_available,
+            typed_runtime=get_settings().typed_runtime_enabled,
             degradation_reasons=tuple(dict.fromkeys(degradation_reasons)),
         )
 

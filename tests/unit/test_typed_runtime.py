@@ -31,7 +31,7 @@ from src.nl2sql.orchestration.typed_runtime import (
     resolve_eligibility_policy,
 )
 from src.nl2sql.semantic.authoring import validate_authoring_ir
-from src.nl2sql.semantic.context_compiler import ContextCompiler, SemanticContextResolver
+from src.nl2sql.semantic.context_compiler import ContextCompiler
 from src.nl2sql.semantic.materialization import materialize_authoring_ir
 from src.nl2sql.semantic.metric_contract import (
     MetricCatalog,
@@ -542,7 +542,8 @@ async def test_factory_fails_closed_for_the_pending_product_config() -> None:
 async def test_factory_with_valid_authorization_builds_one_coherent_set() -> None:
     runtime = await _factory()
     assert isinstance(runtime, RequestTypedRuntime)
-    assert isinstance(runtime.context_resolver, SemanticContextResolver)
+    assert runtime.context_resolver is not None
+    assert runtime.authorization_revision == _authorization().authorization_revision
     assert isinstance(runtime.context_compiler, ContextCompiler)
     assert isinstance(runtime.query_plan_provider.is_deterministic, bool)
     assert runtime.query_plan_provider.is_deterministic is True

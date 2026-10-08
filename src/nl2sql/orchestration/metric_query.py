@@ -21,6 +21,7 @@ from pydantic import Field, JsonValue, model_validator
 
 from src.nl2sql.contracts import (
     AuthorizationContext,
+    AuthorizationDecision,
     ContextBundle,
     FetchMetricStep,
     QueryPlan,
@@ -36,6 +37,7 @@ from src.nl2sql.orchestration.execution import (
     PreparedMetricStep,
 )
 from src.nl2sql.orchestration.planning import PlanValidator
+from src.nl2sql.ownership import bind_execution_receipt_authorization
 from src.nl2sql.semantic.metric_contract import (
     ContractId,
     FrozenContract,
@@ -226,10 +228,13 @@ class MetricQueryCompiler:
         read_freshness: Callable[[str], Awaitable[SourceFreshnessRecord | None]] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         # Dormant/test seam: an INJECTED trusted Backend authorization context.
-        # Production never supplies one in this slice -- the engine path is not
-        # activated and v2.py never populates RequestContext.authorization -- so
-        # production fail-closed admission remains a later integration slice
-        # gated on real Backend evidence.
+        # The S1c request-scoped factory IS wired into the engine and the
+        # AppContainer, but v2.py still does not populate
+        # RequestContext.authorization, so production requests fail closed at the
+        # engine's run-start resolution with authorization_context_missing before
+        # this compiler is ever constructed.  Direct/test callers may still inject
+        # None, which preserves the pre-slice-2B compatibility behaviour below --
+        # the S1c path itself never does.
         #
         # Without a context the compiler preserves the pre-slice-2B non-authorized
         # decision behavior, and this is enforced by code and regression tests:
@@ -245,10 +250,15 @@ class MetricQueryCompiler:
         # deployment whose coverage differs from the old binding would bind
         # differently; there is no longer any second source to disagree with it.
         authorization: AuthorizationContext | None = None,
+        # S1c A4 / frozen V1: the revision BOUND TO THIS RUN and restored from
+        # run state (None on an initial request).  A supplied snapshot whose
+        # revision differs is a RUN-BINDING mismatch, not a live revocation.
+        expected_revision: str | None = None,
     ) -> None:
         if authorization is not None and not isinstance(authorization, AuthorizationContext):
             raise ValueError("compiler authorization must be an AuthorizationContext")
         self._authorization = authorization
+        self._expected_revision = expected_revision
         self._read_active = read_active
         self._read_snapshot = read_snapshot
         bindings = tuple(RelationBinding.model_validate_json(item.model_dump_json()) for item in bindings)
@@ -263,6 +273,22 @@ class MetricQueryCompiler:
         self._read_freshness = read_freshness
         self._clock = clock
 
+    def authorization_decision(self) -> AuthorizationDecision | None:
+        """Return the decision for the injected trusted context, or None.
+
+        None means NO authorization was injected at all (the preserved
+        non-authorized compatibility seam).  An injected but unusable context
+        yields the canonical deny; a usable one yields its explicit ALLOW.
+        Receipt provenance is taken ONLY from an allow outcome of THIS call.
+        """
+
+        if self._authorization is None:
+            return None
+        return evaluate_authorization(
+            self._authorization,
+            expected_revision=self._expected_revision,
+        )
+
     async def compile(self, plan: QueryPlan, context: ContextBundle) -> CompiledMetricQuery:
         plan = QueryPlan.model_validate_json(plan.model_dump_json())
         context = ContextBundle.model_validate_json(context.model_dump_json())
@@ -272,7 +298,16 @@ class MetricQueryCompiler:
         # authorization_denied is not in _SOURCE_REJECTIONS, so it can never be
         # laundered into a detail fallback.
         if self._authorization is not None:
-            decision = evaluate_authorization(self._authorization, expected_revision=None)
+            # Frozen V1 run binding: expected_revision is INTERNAL RUN
+            # CONSISTENCY.  A mismatch is a run-binding failure, not a live
+            # revocation of an in-flight run.
+            if (
+                self._expected_revision is not None
+                and self._authorization.authorization_revision != self._expected_revision
+            ):
+                raise PlanStepError("authorization_run_binding_mismatch")
+            decision = self.authorization_decision()
+            assert decision is not None
             if decision.outcome != "allow":
                 raise PlanStepError("authorization_denied")
         validation = PlanValidator().validate_query_plan(
@@ -756,11 +791,14 @@ class GatewayMetricStepRunner:
             data_as_of=current.freshness.data_as_of if current.freshness else None,
         )
         receipt = type(result.execution_receipt).model_validate(payload)
-        # Authorization provenance binding is intentionally absent from this SQL
-        # step in slice 2A: the enforcement seam is not yet part of the execution
-        # path, so no real decision exists to bind.  An ad-hoc evaluation here
-        # would manufacture a late gate; the real call site belongs to the later
-        # end-to-end authority lifecycle.
+        # Authorization provenance (S1c A5): stamp the revision PROVEN by the
+        # explicit ALLOW that admitted this execution.  No allow decision means
+        # no revision is stamped; the optional no-auth compatibility seam keeps
+        # its unstamped receipt.  The binder is the existing single seam and it
+        # raises on a deny, so a deny can never produce provenance.
+        decision = self._compiler.authorization_decision()
+        if decision is not None and decision.outcome == "allow":
+            receipt = bind_execution_receipt_authorization(receipt, decision)
         output: dict[str, JsonValue] = {
             "rows": rows,
             "no_data": not rows or (query.operation == "ratio"

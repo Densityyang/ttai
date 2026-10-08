@@ -7,6 +7,9 @@ only through a validated typed plan after routing and budget selection.
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NotRequired, Protocol, TypedDict, cast
 
@@ -19,6 +22,7 @@ from langgraph.types import interrupt
 
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import (
+    AuthorizationContext,
     ContextBundle,
     ExecutionPlan,
     ModelRequest,
@@ -46,6 +50,15 @@ from src.nl2sql.orchestration.planning import (
     QueryPlanProvider,
 )
 from src.nl2sql.orchestration.routing import RiskSignals, bootstrap_route_policy, choose_route
+from src.nl2sql.orchestration.typed_runtime import (
+    TYPED_RUNTIME_UNAVAILABLE,
+    RequestTypedRuntime,
+    TypedRuntimeUnavailable,
+)
+from src.nl2sql.ownership import (
+    authorization_context_from_config,
+    evaluate_authorization,
+)
 
 _TRACE_SINK_TIMEOUT_SECONDS = 0.25
 _INVALID_REQUEST_ELAPSED_MS = 120_000
@@ -71,10 +84,118 @@ class V2EngineState(TypedDict):
     applied_actions: NotRequired[dict[str, dict[str, object]]]
     trace_events: NotRequired[list[dict[str, object]]]
     request_started_at: NotRequired[str]
+    # S1c / frozen V1 authorization lifetime: the trusted authorization snapshot
+    # resolved ONCE at run start and BOUND TO THIS RUN.  It is restored (not
+    # re-fetched) for HITL suspension, resume and continuation of the same run,
+    # and a supplied snapshot that differs is a run-binding mismatch.
+    authorization_context: NotRequired[dict[str, object] | None]
+    authorization_revision: NotRequired[str | None]
+    typed_runtime_unavailable_reason: NotRequired[str | None]
 
 
 class TraceSink(Protocol):
     async def append(self, event: TraceEvent) -> None: ...
+
+
+class TypedRuntimeFactory(Protocol):
+    """Application-scoped CALLABLE; its output is constructed per request.
+
+    The engine stores this callable (deployment-scoped) and nothing it returns.
+    """
+
+    async def __call__(
+        self,
+        *,
+        identity: RequestIdentity,
+        authorization: AuthorizationContext | None,
+        expected_revision: str | None,
+    ) -> RequestTypedRuntime | TypedRuntimeUnavailable: ...
+
+
+class _RequestTypedScope:
+    """One request's memo cell for the factory output.
+
+    The engine holds only the factory callable; this cell is created per graph
+    invocation and discarded when the invocation ends, so no request identity,
+    authorization or compiler survives a request in AppContainer or the graph.
+    """
+
+    __slots__ = ("_factory", "_resolved", "runtime")
+
+    def __init__(self, factory: TypedRuntimeFactory) -> None:
+        self._factory = factory
+        self._resolved = False
+        self.runtime: RequestTypedRuntime | TypedRuntimeUnavailable | None = None
+
+    async def resolve(
+        self,
+        *,
+        identity: RequestIdentity,
+        authorization: AuthorizationContext | None,
+        expected_revision: str | None,
+    ) -> RequestTypedRuntime | TypedRuntimeUnavailable:
+        if self._resolved:
+            assert self.runtime is not None
+            return self.runtime
+        self._resolved = True
+        self.runtime = await self._factory(
+            identity=identity,
+            authorization=authorization,
+            expected_revision=expected_revision,
+        )
+        return self.runtime
+
+
+_REQUEST_TYPED_SCOPE: ContextVar[_RequestTypedScope | None] = ContextVar(
+    "nl2sql_request_typed_scope", default=None
+)
+
+
+class _RequestScopedTypedEngine:
+    """Set a fresh typed-runtime memo cell around each graph invocation.
+
+    Node tasks inherit this context (langgraph copies the caller context at
+    submit time), so the whole invocation shares ONE runtime while the runtime
+    still dies with the invocation.  The compiled graph is unchanged for the
+    non-factory wiring, which is returned directly.
+    """
+
+    def __init__(self, compiled: Any, factory: TypedRuntimeFactory) -> None:
+        self._compiled = compiled
+        self._factory = factory
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_compiled"), name)
+
+    def _new_scope(self) -> _RequestTypedScope:
+        return _RequestTypedScope(self._factory)
+
+    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+        token = _REQUEST_TYPED_SCOPE.set(self._new_scope())
+        try:
+            return await self._compiled.ainvoke(input, config, **kwargs)
+        finally:
+            _REQUEST_TYPED_SCOPE.reset(token)
+
+    async def astream(
+        self, input: Any, config: Any = None, **kwargs: Any
+    ) -> AsyncIterator[Any]:
+        token = _REQUEST_TYPED_SCOPE.set(self._new_scope())
+        try:
+            async for item in self._compiled.astream(input, config, **kwargs):
+                yield item
+        finally:
+            _REQUEST_TYPED_SCOPE.reset(token)
+
+    async def astream_events(
+        self, input: Any, config: Any = None, **kwargs: Any
+    ) -> AsyncIterator[Any]:
+        token = _REQUEST_TYPED_SCOPE.set(self._new_scope())
+        try:
+            async for item in self._compiled.astream_events(input, config, **kwargs):
+                yield item
+        finally:
+            _REQUEST_TYPED_SCOPE.reset(token)
 
 
 def create_v2_engine(
@@ -89,10 +210,15 @@ def create_v2_engine(
     plan_validator: PlanValidator | None = None,
     plan_compiler: PlanCompiler | None = None,
     plan_executor: PlanExecutor | None = None,
+    typed_runtime_factory: TypedRuntimeFactory | None = None,
 ) -> Any:
     resolved_route_policy = route_policy or bootstrap_route_policy()
     resolved_budget_policy = budget_policy or bootstrap_routing_budget_policy()
-    typed_pipeline_requested = any(
+    # S1c: the request-scoped components MUST NOT be engine/graph-lifetime state,
+    # so the factory is the only way to reach them.  It participates in BOTH
+    # guard tuples below, so a half-wired configuration is impossible.
+    static_request_components = (context_resolver, query_plan_provider, plan_executor)
+    typed_pipeline_requested = typed_runtime_factory is not None or any(
         component is not None
         for component in (
             context_resolver,
@@ -102,22 +228,55 @@ def create_v2_engine(
             plan_executor,
         )
     )
-    typed_pipeline_enabled = all(
-        component is not None
-        for component in (context_resolver, query_plan_provider, plan_executor)
+    if typed_runtime_factory is not None and any(
+        component is not None for component in static_request_components
+    ):
+        raise ValueError(
+            "typed runtime factory cannot be combined with static typed collaborators"
+        )
+    typed_pipeline_enabled = typed_runtime_factory is not None or all(
+        component is not None for component in static_request_components
     )
     if typed_pipeline_requested and not typed_pipeline_enabled:
         raise ValueError(
             "typed plan pipeline requires context resolver, query plan provider, and executor"
         )
-    if typed_pipeline_enabled and not bool(
-        getattr(query_plan_provider, "is_deterministic", False)
+    if (
+        typed_runtime_factory is None
+        and typed_pipeline_enabled
+        and not bool(getattr(query_plan_provider, "is_deterministic", False))
     ):
         raise ValueError(
             "pre-route query plan provider must be deterministic and zero-model"
         )
     resolved_plan_validator = plan_validator or PlanValidator()
     resolved_plan_compiler = plan_compiler or PlanCompiler()
+
+    def _request_runtime() -> RequestTypedRuntime:
+        scope = _REQUEST_TYPED_SCOPE.get()
+        runtime = scope.runtime if scope is not None else None
+        if not isinstance(runtime, RequestTypedRuntime):
+            raise RuntimeError("request-scoped typed runtime is unavailable")
+        return runtime
+
+    def _typed_context_resolver() -> ContextResolver:
+        if typed_runtime_factory is None:
+            assert context_resolver is not None
+            return context_resolver
+        return _request_runtime().context_resolver
+
+    def _typed_query_plan_provider() -> QueryPlanProvider:
+        if typed_runtime_factory is None:
+            assert query_plan_provider is not None
+            return query_plan_provider
+        return _request_runtime().query_plan_provider
+
+    def _typed_plan_executor() -> PlanExecutor:
+        if typed_runtime_factory is None:
+            assert plan_executor is not None
+            return plan_executor
+        return _request_runtime().plan_executor
+
     graph = StateGraph(V2EngineState)
 
     async def receive_node(state: V2EngineState) -> dict[str, object]:
@@ -131,6 +290,10 @@ def create_v2_engine(
             question_length=len(question),
         )
         await _persist_new_events(trace_sink, trace.events[-1:])
+        # Frozen V1: the ONE authority read of this engine happens HERE, at run
+        # start.  The trusted snapshot is bound to the run; no later node
+        # re-reads the configurable for authority.
+        authorization_context, authorization_revision = _resolve_run_authorization()
         return {
             "context_bundle": None,
             "query_plan": None,
@@ -146,21 +309,96 @@ def create_v2_engine(
             "pending_answer": None,
             "needs_hitl": False,
             "hitl_status": None,
+            "authorization_context": authorization_context,
+            "authorization_revision": authorization_revision,
+            "typed_runtime_unavailable_reason": None,
             "trace_events": _events(trace),
             "request_started_at": request_started_at,
+        }
+
+    async def typed_runtime_node(state: V2EngineState) -> dict[str, object]:
+        """Resolve ONE request-scoped typed runtime, or fail closed canonically.
+
+        The factory is invoked with the identity read from the EXISTING runtime
+        configurable and the AuthorizationContext RESTORED from the run-bound
+        snapshot (resolve-once at receive_node), plus the revision previously
+        bound to this run (if any).  The output is memoized only inside this
+        invocation's scope cell.
+        """
+
+        trace = _trace(state)
+        scope = _REQUEST_TYPED_SCOPE.get()
+        if scope is None:
+            runtime_or_unavailable: RequestTypedRuntime | TypedRuntimeUnavailable = (
+                TypedRuntimeUnavailable(reason="request_scope_missing")
+            )
+        else:
+            try:
+                identity = _request_identity()
+            except ValueError:
+                identity = None
+            # Frozen V1: authorization was resolved ONCE at run start and bound to
+            # this run.  This node ONLY restores that snapshot; it never re-reads
+            # the configurable for authority.
+            authorization = _bound_authorization_context(state)
+            if identity is None:
+                runtime_or_unavailable = TypedRuntimeUnavailable(
+                    reason="request_identity_missing"
+                )
+            else:
+                runtime_or_unavailable = await scope.resolve(
+                    identity=identity,
+                    authorization=authorization,
+                    expected_revision=_bound_authorization_revision(state),
+                )
+        if isinstance(runtime_or_unavailable, TypedRuntimeUnavailable):
+            trace.record(
+                "policy",
+                "typed_runtime_unavailable",
+                reason=runtime_or_unavailable.reason,
+            )
+            await _persist_new_events(trace_sink, trace.events[-1:])
+            return {
+                "messages": [
+                    AIMessage(
+                        content="The typed query runtime is unavailable for this request."
+                    )
+                ],
+                "stop_reason": TYPED_RUNTIME_UNAVAILABLE,
+                "typed_runtime_unavailable_reason": runtime_or_unavailable.reason,
+                "degradation_flags": _degradation_flags(
+                    state,
+                    "TypedRuntimeUnavailable",
+                ),
+                "trace_events": _events(trace),
+            }
+        trace.record(
+            "policy",
+            "typed_runtime_resolved",
+            authorization_revision=runtime_or_unavailable.authorization_revision,
+        )
+        await _persist_new_events(trace_sink, trace.events[-1:])
+        return {
+            "authorization_context": runtime_or_unavailable.authorization.model_dump(
+                mode="json"
+            ),
+            "authorization_revision": runtime_or_unavailable.authorization_revision,
+            "typed_runtime_unavailable_reason": None,
+            "degradation_flags": _degradation_flags(state),
+            "trace_events": _events(trace),
         }
 
     async def context_node(state: V2EngineState) -> dict[str, object]:
         if not typed_pipeline_enabled:
             return {}
-        assert context_resolver is not None
+        resolver = _typed_context_resolver()
         trace = _trace(state)
         try:
             timeout_ms = _pre_route_timeout_ms(state, resolved_budget_policy)
             if timeout_ms < 1:
                 raise TimeoutError
             async with asyncio.timeout(timeout_ms / 1000):
-                context = await context_resolver.resolve(
+                context = await resolver.resolve(
                     question=_question(state),
                     identity=_request_identity(),
                     route_hint="standard",
@@ -219,7 +457,7 @@ def create_v2_engine(
     async def plan_node(state: V2EngineState) -> dict[str, object]:
         if not typed_pipeline_enabled:
             return {}
-        assert query_plan_provider is not None
+        provider = _typed_query_plan_provider()
         trace = _trace(state)
         try:
             context = _context_bundle(state)
@@ -227,7 +465,7 @@ def create_v2_engine(
             if timeout_ms < 1:
                 raise TimeoutError
             async with asyncio.timeout(timeout_ms / 1000):
-                plan = await query_plan_provider.propose(
+                plan = await provider.propose(
                     question=_question(state),
                     context=context,
                     identity=_request_identity(),
@@ -497,7 +735,10 @@ def create_v2_engine(
         return result
 
     async def execute_node(state: V2EngineState) -> dict[str, object]:
-        assert plan_executor is not None
+        # Local name intentionally mirrors the static collaborator so the
+        # database-execution allowlist keeps one stable receiver (executor.execute
+        # would be a second, unlisted call site).
+        plan_executor = _typed_plan_executor()
         trace = _trace(state)
         route = _route(state)
         route_budget = _route_budget_from_state(
@@ -599,6 +840,14 @@ def create_v2_engine(
         config = get_agent_config()
         runtime = var_child_runnable_config.get()
         configurable = runtime.get("configurable", {}) if isinstance(runtime, dict) else {}
+        # S1c / frozen V1: a deep/BUILD suspension RESTORES the authorization
+        # snapshot bound to this run at run start.  It must NOT re-read the
+        # configurable, so a config drift between run start and suspension cannot
+        # rebind the run.  Nothing bound => existing authorization-free behaviour.
+        authorization_snapshot = state.get("authorization_context")
+        if not isinstance(authorization_snapshot, dict):
+            authorization_snapshot = None
+        authorization_revision = _bound_authorization_revision(state)
         route = _route(state)
         route_budget = _route_budget_from_state(
             state,
@@ -755,6 +1004,8 @@ def create_v2_engine(
                     "hitl_version": 1,
                     "hitl_status": "awaiting_action",
                     "applied_actions": {},
+                    "authorization_context": authorization_snapshot,
+                    "authorization_revision": authorization_revision,
                 }
             )
         else:
@@ -782,6 +1033,22 @@ def create_v2_engine(
             return _failed_action("missing_idempotency_key", version)
         if expected_version != version:
             return _failed_action("stale_action_version", version)
+
+        # S1c A4 / frozen V1 run binding: BEFORE the action is applied, any
+        # EXPLICITLY supplied snapshot is compared against the snapshot BOUND TO
+        # THIS RUN and restored from run state.  A mismatch is a run-binding
+        # mismatch; the current configurable is never re-fetched as a new
+        # Backend revision for the same run.
+        supplied_authorization = _authorization_from_payload(
+            action_payload.get("authorization_context")
+        )
+        binding_failure = authorization_run_binding_failure(
+            state, supplied_authorization
+        )
+        if binding_failure is not None:
+            failure = _failed_action(binding_failure, version)
+            failure["stop_reason"] = "authorization_run_binding_mismatch"
+            return failure
 
         applied_actions = dict(state.get("applied_actions", {}))
         existing = applied_actions.get(idempotency_key)
@@ -814,6 +1081,9 @@ def create_v2_engine(
             "applied_actions": applied_actions,
         }
 
+    def after_typed_runtime(state: V2EngineState) -> Literal["context", "__end__"]:
+        return "__end__" if state.get("stop_reason") else "context"
+
     def after_context(state: V2EngineState) -> Literal["plan", "__end__"]:
         return "__end__" if state.get("stop_reason") else "plan"
 
@@ -837,6 +1107,8 @@ def create_v2_engine(
         return "hitl" if state.get("needs_hitl") else "__end__"
 
     graph.add_node("receive", receive_node)
+    if typed_runtime_factory is not None:
+        graph.add_node("typed_runtime", typed_runtime_node)
     graph.add_node("context", context_node)
     graph.add_node("plan", plan_node)
     graph.add_node("validate", validate_node)
@@ -846,7 +1118,15 @@ def create_v2_engine(
     graph.add_node("model", model_node)
     graph.add_node("hitl", hitl_node)
     graph.add_edge(START, "receive")
-    graph.add_edge("receive", "context")
+    if typed_runtime_factory is not None:
+        graph.add_edge("receive", "typed_runtime")
+        graph.add_conditional_edges(
+            "typed_runtime",
+            after_typed_runtime,
+            {"context": "context", END: END},
+        )
+    else:
+        graph.add_edge("receive", "context")
     graph.add_conditional_edges("context", after_context, {"plan": "plan", END: END})
     graph.add_conditional_edges("plan", after_plan, {"validate": "validate", END: END})
     graph.add_conditional_edges(
@@ -866,7 +1146,10 @@ def create_v2_engine(
     )
     graph.add_edge("execute", END)
     graph.add_conditional_edges("model", after_model, {"hitl": "hitl", END: END})
-    return graph.compile(checkpointer=checkpointer, name="nl2sql_v2_explicit")
+    compiled = graph.compile(checkpointer=checkpointer, name="nl2sql_v2_explicit")
+    if typed_runtime_factory is not None:
+        return _RequestScopedTypedEngine(compiled, typed_runtime_factory)
+    return compiled
 
 
 def _question(state: V2EngineState) -> str:
@@ -1009,6 +1292,103 @@ def _runtime_configurable() -> dict[str, object]:
     return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
 
 
+def _resolve_run_authorization() -> tuple[dict[str, object] | None, str | None]:
+    """The ONE authority read of the engine: resolve ONCE at run start.
+
+    Authorization is read from the EXISTING trusted configurable carrier exactly
+    here, at run start, and bound to the run.  No later node re-reads the
+    configurable for authority; suspension/resume restore the run-bound snapshot
+    from run state.  The revision is stamped ONLY on an explicit trusted ALLOW.
+    """
+
+    authorization = authorization_context_from_config(_runtime_configurable())
+    if not isinstance(authorization, AuthorizationContext):
+        return None, None
+    snapshot = authorization.model_dump(mode="json")
+    decision = evaluate_authorization(authorization, expected_revision=None)
+    revision = decision.authorization_revision if decision.outcome == "allow" else None
+    return snapshot, revision
+
+
+def _bound_authorization_revision(state: V2EngineState) -> str | None:
+    raw = state.get("authorization_revision")
+    return raw if isinstance(raw, str) and raw.strip() else None
+
+
+def _bound_authorization_context(state: V2EngineState) -> AuthorizationContext | None:
+    """Restore the authorization snapshot BOUND TO THIS RUN from run state.
+
+    This is the frozen V1 model: authorization is resolved once at run start and
+    restored from the existing checkpoint/run state afterwards.  It is NEVER
+    re-fetched from a newly supplied configurable during the same run, so a
+    permission change mid-run is intentionally not applied.
+    """
+
+    raw = state.get("authorization_context")
+    if isinstance(raw, AuthorizationContext):
+        return raw
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return AuthorizationContext.model_validate_json(json.dumps(dict(raw)))
+    except Exception:
+        return None
+
+
+def _authorization_from_payload(raw: object) -> AuthorizationContext | None:
+    """Parse an OPTIONALLY supplied run-binding snapshot from a resume payload.
+
+    Absent, wrong-typed or malformed payloads collapse to None exactly like an
+    absent carrier, which means "restore the run-bound snapshot".
+    """
+
+    if isinstance(raw, AuthorizationContext):
+        return raw
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return AuthorizationContext.model_validate_json(json.dumps(dict(raw)))
+    except Exception:
+        return None
+
+
+def authorization_run_binding_failure(
+    state: V2EngineState,
+    supplied: AuthorizationContext | None,
+) -> str | None:
+    """Return a fail-closed reason for a RUN-BINDING mismatch, else None.
+
+    * No snapshot was bound to this run -> the authorization-free path is
+      unchanged.
+    * No snapshot is supplied on resume -> RESTORE the run-bound snapshot; the
+      current configurable is deliberately NOT consulted, so an in-flight run
+      keeps its original authority.
+    * A supplied snapshot differs from the run-bound one -> RUN-BINDING
+      MISMATCH (run-consistency failure, NOT a live revocation).
+
+    The comparison target is always the run-bound snapshot restored from run
+    state, never a newly fetched Backend revision.
+    """
+
+    bound = _bound_authorization_context(state)
+    bound_revision = _bound_authorization_revision(state)
+    if bound is None and bound_revision is None:
+        return None
+    if bound is None:
+        # A revision was bound but its snapshot is gone from run state: fail
+        # closed rather than continue without the run's authority.
+        return "authorization_run_binding_mismatch"
+    if supplied is None:
+        # RESTORE the run-bound snapshot; the current configurable is ignored.
+        return None
+    if (
+        supplied.authorization_revision != bound.authorization_revision
+        or supplied != bound
+    ):
+        return "authorization_run_binding_mismatch"
+    return None
+
+
 def _degradation_flags(state: V2EngineState, *flags: str) -> list[str]:
     return list(
         dict.fromkeys(
@@ -1121,6 +1501,11 @@ def _signals(
         )
         # The typed path relies on policy-filtered context and declared plan intent;
         # prompt keywords never stand in for internal authorization or plan state.
+        # V1 sensitivity: ordinary authorized business data inside the caller's
+        # effective organization scope is default-allowed for Agent users, so
+        # there is no second business-field sensitivity gate.  This routing
+        # signal stays non-authoritative, is NEVER derived from scope_level, and
+        # no data access decision may depend on it.
         restricted_data = False
         dynamic_calculation = plan is not None and plan.intent in {
             "comparison",
