@@ -184,14 +184,14 @@ def definition_execution_service(request: Request) -> CustomDefinitionExecutionS
     return cast(CustomDefinitionExecutionService, accessor())
 
 
-def publication_service(request: Request) -> PublicationService:
+async def publication_service(request: Request) -> PublicationService:
     container = getattr(request.app.state, "container", None)
     if container is None or not hasattr(container, "publication_service"):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="runtime dependency unavailable",
         )
-    return container.publication_service()
+    return await container.publication_service()
 
 
 def _not_found() -> HTTPException:
@@ -228,7 +228,7 @@ def _definition_view(definition: Any) -> DefinitionView:
     )
 
 
-def _exact_catalogue_state(
+async def _exact_catalogue_state(
     request: Request, *, identity_id: str, version: int
 ) -> tuple[str, str, bool]:
     """Publication state of THIS EXACT version, never the current axes."""
@@ -236,14 +236,14 @@ def _exact_catalogue_state(
     container = getattr(request.app.state, "container", None)
     if container is None or not hasattr(container, "publication_catalogue"):
         return ("UNPUBLISHED", "UNCERTIFIED", False)
-    catalogue = container.publication_catalogue()
-    if catalogue.get(identity_id, version) is None:
+    catalogue = await container.publication_catalogue()
+    if await catalogue.get(identity_id, version) is None:
         return ("UNPUBLISHED", "UNCERTIFIED", False)
-    certification = catalogue.certification_state(identity_id, version)
+    certification = await catalogue.certification_state(identity_id, version)
     return (
         "PUBLISHED",
         "CERTIFIED" if certification == "certified" else "UNCERTIFIED",
-        bool(catalogue.is_withdrawn(identity_id, version)),
+        bool(await catalogue.is_withdrawn(identity_id, version)),
     )
 
 
@@ -260,12 +260,12 @@ def register_definition_routes(app: Any) -> None:
     ) -> DefinitionView:
         await require_build_run(request, auth_user)
         service = definition_service(request)
-        draft = service.create_draft(
+        draft = await service.create_draft(
             owner_user_id=owner_identity(auth_user),
             title=body.title,
             calculation=body.calculation,
         )
-        definition = service.get_owned_definition(
+        definition = await service.get_owned_definition(
             owner_user_id=owner_identity(auth_user), definition_id=draft.definition_id
         )
         return _definition_view(definition)
@@ -276,7 +276,7 @@ def register_definition_routes(app: Any) -> None:
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> DefinitionListResponse:
         service = definition_service(request)
-        owned = service.list_owned(owner_user_id=owner_identity(auth_user))
+        owned = await service.list_owned(owner_user_id=owner_identity(auth_user))
         return DefinitionListResponse(
             definitions=tuple(_definition_view(item) for item in owned)
         )
@@ -293,19 +293,19 @@ def register_definition_routes(app: Any) -> None:
     ) -> DefinitionVersionView:
         service = definition_service(request)
         try:
-            exact = service.get_exact_version(
+            exact = await service.get_exact_version(
                 owner_user_id=owner_identity(auth_user),
                 definition_id=definition_id,
                 version=version,
             )
-            lifecycle = service.get_version_lifecycle(
+            lifecycle = await service.get_version_lifecycle(
                 owner_user_id=owner_identity(auth_user),
                 definition_id=definition_id,
                 version=version,
             )
         except DefinitionNotFound as exc:
             raise _not_found() from exc
-        publication, certification, withdrawn = _exact_catalogue_state(
+        publication, certification, withdrawn = await _exact_catalogue_state(
             request, identity_id=definition_id, version=version
         )
         return DefinitionVersionView(
@@ -335,13 +335,13 @@ def register_definition_routes(app: Any) -> None:
         await require_build_run(request, auth_user)
         service = definition_service(request)
         try:
-            service.update_draft(
+            await service.update_draft(
                 owner_user_id=owner_identity(auth_user),
                 definition_id=definition_id,
                 calculation=body.calculation,
                 title=body.title,
             )
-            definition = service.get_owned_definition(
+            definition = await service.get_owned_definition(
                 owner_user_id=owner_identity(auth_user), definition_id=definition_id
             )
         except DefinitionNotFound as exc:
@@ -362,10 +362,10 @@ def register_definition_routes(app: Any) -> None:
         await require_build_run(request, auth_user)
         service = definition_service(request)
         try:
-            service.mark_semantic_closed(
+            await service.mark_semantic_closed(
                 owner_user_id=owner_identity(auth_user), definition_id=definition_id
             )
-            definition = service.get_owned_definition(
+            definition = await service.get_owned_definition(
                 owner_user_id=owner_identity(auth_user), definition_id=definition_id
             )
         except DefinitionNotFound as exc:
@@ -383,7 +383,7 @@ def register_definition_routes(app: Any) -> None:
         await require_build_run(request, auth_user)
         service = definition_service(request)
         try:
-            definition = service.confirm(
+            definition = await service.confirm(
                 owner_user_id=owner_identity(auth_user), definition_id=definition_id
             )
         except DefinitionNotFound as exc:
@@ -401,7 +401,7 @@ def register_definition_routes(app: Any) -> None:
         await require_build_run(request, auth_user)
         service = definition_service(request)
         try:
-            definition = service.save(
+            definition = await service.save(
                 owner_user_id=owner_identity(auth_user), definition_id=definition_id
             )
         except DefinitionNotFound as exc:
@@ -422,10 +422,10 @@ def register_definition_routes(app: Any) -> None:
         await require_build_run(request, auth_user)
         service = definition_service(request)
         try:
-            service.create_revision(
+            await service.create_revision(
                 owner_user_id=owner_identity(auth_user), definition_id=definition_id
             )
-            definition = service.get_owned_definition(
+            definition = await service.get_owned_definition(
                 owner_user_id=owner_identity(auth_user), definition_id=definition_id
             )
         except DefinitionNotFound as exc:
@@ -446,18 +446,19 @@ def register_definition_routes(app: Any) -> None:
     ) -> DefinitionVersionView:
         await require_build_run(request, auth_user)
         service = definition_service(request)
+        publications = await publication_service(request)
         try:
-            publication_service(request).publish(
+            await publications.publish(
                 owner_user_id=owner_identity(auth_user),
                 definition_id=definition_id,
                 version=version,
             )
-            exact = service.get_exact_version(
+            exact = await service.get_exact_version(
                 owner_user_id=owner_identity(auth_user),
                 definition_id=definition_id,
                 version=version,
             )
-            lifecycle = service.get_version_lifecycle(
+            lifecycle = await service.get_version_lifecycle(
                 owner_user_id=owner_identity(auth_user),
                 definition_id=definition_id,
                 version=version,
@@ -468,7 +469,7 @@ def register_definition_routes(app: Any) -> None:
             raise _conflict(exc.reason) from exc
         except PublicationNotEligible as exc:
             raise _conflict(exc.reason) from exc
-        publication, certification, withdrawn = _exact_catalogue_state(
+        publication, certification, withdrawn = await _exact_catalogue_state(
             request, identity_id=definition_id, version=version
         )
         return DefinitionVersionView(

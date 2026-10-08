@@ -625,19 +625,19 @@ class _GovernedFetcher:
         return ResolvedCalculationInput(**payload)
 
 
-def _execution_service(
+async def _execution_service(
     fetcher: Any | None,
 ) -> tuple[CustomDefinitionExecutionService, CustomDefinitionService, str]:
     definitions = CustomDefinitionService(governed_metric_keys={_METRIC})
     spec = _actual_to_target_spec()
-    draft = definitions.create_draft(
+    draft = await definitions.create_draft(
         owner_user_id="alice", title="Actual to target", calculation=spec
     )
-    definitions.mark_semantic_closed(
+    await definitions.mark_semantic_closed(
         owner_user_id="alice", definition_id=draft.definition_id
     )
-    definitions.confirm(owner_user_id="alice", definition_id=draft.definition_id)
-    definitions.save(owner_user_id="alice", definition_id=draft.definition_id)
+    await definitions.confirm(owner_user_id="alice", definition_id=draft.definition_id)
+    await definitions.save(owner_user_id="alice", definition_id=draft.definition_id)
     service = CustomDefinitionExecutionService(
         definitions=definitions,
         input_resolver=(
@@ -650,7 +650,7 @@ def _execution_service(
 @pytest.mark.asyncio
 async def test_controlled_flow_through_the_real_service_and_shared_runtime() -> None:
     fetcher = _GovernedFetcher(Decimal("45"))
-    service, definitions, definition_id = _execution_service(fetcher)
+    service, definitions, definition_id = await _execution_service(fetcher)
     spec = _actual_to_target_spec()
 
     first = await service.execute(
@@ -671,7 +671,7 @@ async def test_controlled_flow_through_the_real_service_and_shared_runtime() -> 
     # Changing ONLY a parameter VALUE never creates a new Definition version.
     assert first.version == second.version == 1
     assert first.definition_checksum == second.definition_checksum
-    assert len(definitions.list_owned(owner_user_id="alice")) == 1
+    assert len(await definitions.list_owned(owner_user_id="alice")) == 1
     assert first.result.spec_checksum == second.result.spec_checksum
     # The governed evidence is carried in the result provenance.
     provenance = first.result.input_provenance[0]
@@ -685,7 +685,7 @@ async def test_controlled_flow_through_the_real_service_and_shared_runtime() -> 
 @pytest.mark.asyncio
 async def test_zero_target_is_undefined_division_not_no_data() -> None:
     fetcher = _GovernedFetcher(Decimal("45"))
-    service, _, definition_id = _execution_service(fetcher)
+    service, _, definition_id = await _execution_service(fetcher)
     spec = _actual_to_target_spec()
     with pytest.raises(CustomCalculationExecutionError) as raised:
         await service.execute(
@@ -716,7 +716,7 @@ async def test_resolver_rejects_every_incomplete_or_mismatched_evidence(
     overrides: dict[str, Any], expected: str
 ) -> None:
     fetcher = _GovernedFetcher(**overrides)
-    service, _, definition_id = _execution_service(fetcher)
+    service, _, definition_id = await _execution_service(fetcher)
     spec = _actual_to_target_spec()
     with pytest.raises(GovernedMetricInputResolutionError) as raised:
         await service.execute(
@@ -755,7 +755,7 @@ async def test_resolver_rejects_an_empty_or_unbound_input_contract() -> None:
 
     definitions = CustomDefinitionService()
     spec = _actual_to_target_spec()
-    draft = definitions.create_draft(
+    draft = await definitions.create_draft(
         owner_user_id="alice", title="dup", calculation=spec
     )
     resolver = TypedMetricCalculationInputResolver(_GovernedFetcher())
@@ -912,17 +912,17 @@ def test_unknown_route_resolves_to_the_missing_policy_sentinel() -> None:
     )
 
 
-def test_stock_container_produces_one_object_graph_with_injected_fetcher() -> None:
+async def test_stock_container_produces_one_object_graph_with_injected_fetcher() -> None:
     fetcher = _GovernedFetcher()
     container = AppContainer(governed_metric_input_fetcher=fetcher)
     assert container.custom_definition_service() is container.custom_definition_service()
-    assert container.publication_catalogue() is container.publication_catalogue()
-    assert container.publication_service() is container.publication_service()
-    assert container.library_repository() is container.library_repository()
-    assert container.product_library_service() is container.product_library_service()
+    assert await container.publication_catalogue() is await container.publication_catalogue()
+    assert await container.publication_service() is await container.publication_service()
+    assert await container.library_repository() is await container.library_repository()
+    assert await container.product_library_service() is await container.product_library_service()
     assert (
-        container.personal_conflict_product_service()
-        is container.personal_conflict_product_service()
+        await container.personal_conflict_product_service()
+        is await container.personal_conflict_product_service()
     )
     assert (
         container.custom_definition_execution_service()
@@ -932,12 +932,12 @@ def test_stock_container_produces_one_object_graph_with_injected_fetcher() -> No
     assert container.calculation_input_resolver() is not None
     # ONE catalogue, ONE definition service, no second instance.
     assert (
-        container.product_library_service()._catalogue
-        is container.publication_catalogue()
+        (await container.product_library_service())._catalogue
+        is await container.publication_catalogue()
     )
     assert (
-        container.personal_conflict_product_service()._catalogue
-        is container.publication_catalogue()
+        (await container.personal_conflict_product_service())._catalogue
+        is await container.publication_catalogue()
     )
 
 
@@ -968,7 +968,7 @@ class _HttpContainer:
         return self.execution
 
 
-def _http_client(fetcher: Any) -> tuple[TestClient, str, CalculationSpec]:
+async def _http_client(fetcher: Any) -> tuple[TestClient, str, CalculationSpec]:
     container = _HttpContainer(fetcher)
     app = FastAPI()
     app.state.container = container
@@ -981,16 +981,16 @@ def _http_client(fetcher: Any) -> tuple[TestClient, str, CalculationSpec]:
 
     app.dependency_overrides[require_nl2sql_permission] = identity
     spec = _actual_to_target_spec()
-    draft = container.definitions.create_draft(
+    draft = await container.definitions.create_draft(
         owner_user_id="alice", title="Actual to target", calculation=spec
     )
-    container.definitions.mark_semantic_closed(
+    await container.definitions.mark_semantic_closed(
         owner_user_id="alice", definition_id=draft.definition_id
     )
-    container.definitions.confirm(
+    await container.definitions.confirm(
         owner_user_id="alice", definition_id=draft.definition_id
     )
-    container.definitions.save(
+    await container.definitions.save(
         owner_user_id="alice", definition_id=draft.definition_id
     )
     return TestClient(app), draft.definition_id, spec
@@ -1000,9 +1000,9 @@ def _binding_body(spec: CalculationSpec, target: int) -> dict[str, Any]:
     return _binding(spec, target).model_dump(mode="json")
 
 
-def test_http_execute_computes_from_server_resolved_input() -> None:
+async def test_http_execute_computes_from_server_resolved_input() -> None:
     fetcher = _GovernedFetcher(Decimal("45"))
-    client, definition_id, spec = _http_client(fetcher)
+    client, definition_id, spec = await _http_client(fetcher)
     path = f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute"
 
     a = client.post(path, json={"binding": _binding_body(spec, 90)})
@@ -1045,9 +1045,9 @@ def test_http_execute_computes_from_server_resolved_input() -> None:
         "definition_checksum",
     ],
 )
-def test_http_execute_rejects_every_server_owned_field(field: str) -> None:
+async def test_http_execute_rejects_every_server_owned_field(field: str) -> None:
     fetcher = _GovernedFetcher(Decimal("45"))
-    client, definition_id, spec = _http_client(fetcher)
+    client, definition_id, spec = await _http_client(fetcher)
     path = f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute"
     body = {"binding": _binding_body(spec, 90), field: "injected"}
     response = client.post(path, json=body)
@@ -1059,9 +1059,9 @@ def test_http_execute_rejects_every_server_owned_field(field: str) -> None:
     "field",
     ["value", "data_as_of", "source_id", "receipt_step_id", "fact_id", "unit"],
 )
-def test_nested_binding_cannot_smuggle_input_evidence(field: str) -> None:
+async def test_nested_binding_cannot_smuggle_input_evidence(field: str) -> None:
     fetcher = _GovernedFetcher(Decimal("45"))
-    client, definition_id, spec = _http_client(fetcher)
+    client, definition_id, spec = await _http_client(fetcher)
     path = f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute"
     binding = _binding_body(spec, 90)
     binding[field] = "injected"
@@ -1070,9 +1070,9 @@ def test_nested_binding_cannot_smuggle_input_evidence(field: str) -> None:
     assert fetcher.calls == []
 
 
-def test_http_execute_zero_target_is_undefined_not_no_data() -> None:
+async def test_http_execute_zero_target_is_undefined_not_no_data() -> None:
     fetcher = _GovernedFetcher(Decimal("45"))
-    client, definition_id, spec = _http_client(fetcher)
+    client, definition_id, spec = await _http_client(fetcher)
     response = client.post(
         f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute",
         json={"binding": _binding_body(spec, 0)},
@@ -1162,7 +1162,7 @@ def test_conflict_response_models_expose_no_winner_semantics() -> None:
         assert not overlap, (model.__name__, sorted(overlap))
 
 
-def _conflict_fixture() -> tuple[Any, str, str]:
+async def _conflict_fixture() -> tuple[Any, str, str]:
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
     from src.nl2sql.artifacts.personal_conflict_product_service import (
         PersonalConflictProductService,
@@ -1178,7 +1178,7 @@ def _conflict_fixture() -> tuple[Any, str, str]:
         definitions=definitions, catalogue=catalogue, library=library
     )
 
-    def _saved(multiplier: str, title: str) -> str:
+    async def _saved(multiplier: str, title: str) -> str:
         spec = CalculationSpec(
             calculation_id="custom.acceptance_conflict",
             expression=BinaryOperand(
@@ -1194,28 +1194,28 @@ def _conflict_fixture() -> tuple[Any, str, str]:
             unit="percent",
             precision=2,
         )
-        draft = definitions.create_draft(
+        draft = await definitions.create_draft(
             owner_user_id="alice", title=title, calculation=spec
         )
-        definitions.mark_semantic_closed(
+        await definitions.mark_semantic_closed(
             owner_user_id="alice", definition_id=draft.definition_id
         )
-        definitions.confirm(owner_user_id="alice", definition_id=draft.definition_id)
-        definitions.save(owner_user_id="alice", definition_id=draft.definition_id)
+        await definitions.confirm(owner_user_id="alice", definition_id=draft.definition_id)
+        await definitions.save(owner_user_id="alice", definition_id=draft.definition_id)
         return draft.definition_id
 
-    own = _saved("1", "Archive performance")
-    installed = _saved("2", "Archive performance")
-    publications.publish(owner_user_id="alice", definition_id=installed, version=1)
-    library.install(user_id="alice", identity_id=installed, version=1)
-    library.star(user_id="alice", identity_id=installed)
-    catalogue.certify_local_demo(installed, 1, certified_by="c")
+    own = await _saved("1", "Archive performance")
+    installed = await _saved("2", "Archive performance")
+    await publications.publish(owner_user_id="alice", definition_id=installed, version=1)
+    await library.install(user_id="alice", identity_id=installed, version=1)
+    await library.star(user_id="alice", identity_id=installed)
+    await catalogue.certify_local_demo(installed, 1, certified_by="c")
     return service, own, installed
 
 
-def test_serialized_conflict_body_carries_no_winner_semantics() -> None:
-    service, own, installed = _conflict_fixture()
-    projection = service.resolve(
+async def test_serialized_conflict_body_carries_no_winner_semantics() -> None:
+    service, own, installed = await _conflict_fixture()
+    projection = await service.resolve(
         user_id="alice", own_definition_id=own, installed_identity_id=installed
     )
     assert projection.resolution.outcome == "clarification_required"
@@ -1229,9 +1229,9 @@ def test_serialized_conflict_body_carries_no_winner_semantics() -> None:
     assert "certification_state" in blob
 
 
-def test_equivalent_exact_candidate_deduplicates_instead_of_conflicting() -> None:
-    service, _, installed = _conflict_fixture()
-    same = service.resolve(
+async def test_equivalent_exact_candidate_deduplicates_instead_of_conflicting() -> None:
+    service, _, installed = await _conflict_fixture()
+    same = await service.resolve(
         user_id="alice", own_definition_id=installed, installed_identity_id=installed
     )
     assert same.resolution.outcome == "resolved"
@@ -1251,15 +1251,15 @@ def test_persisted_selection_requires_an_explicit_user_request() -> None:
         )
 
 
-def test_run_scoped_selection_is_validated_against_the_resolved_conflict() -> None:
+async def test_run_scoped_selection_is_validated_against_the_resolved_conflict() -> None:
     from src.nl2sql.semantic.personal_conflict_contract import PersonalSelection
     from src.nl2sql.semantic.personal_conflict_service import (
         PersonalConflictServiceError,
         validate_personal_selection,
     )
 
-    service, own, installed = _conflict_fixture()
-    projection = service.resolve(
+    service, own, installed = await _conflict_fixture()
+    projection = await service.resolve(
         user_id="alice", own_definition_id=own, installed_identity_id=installed
     )
     assert projection.semantic_conflict is not None

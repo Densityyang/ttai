@@ -121,8 +121,13 @@ jobs:
           enable-cache: true
       - run: uv python install 3.13
       - run: uv sync --frozen --all-groups
-      - name: Verify PostgreSQL governance, QueryGateway, and metric execution
-        run: uv run pytest -vv -s tests/integration/test_postgres_governance.py tests/integration/test_query_gateway_postgres.py
+      - name: Verify PostgreSQL governance, QueryGateway, metric execution and product-store persistence
+        run: >
+          uv run pytest -vv -s
+          tests/integration/test_postgres_governance.py
+          tests/integration/test_query_gateway_postgres.py
+          tests/integration/test_publication_control_store.py
+          tests/integration/test_library_control_store.py
 
   compose-contract:
     runs-on: ubuntu-latest

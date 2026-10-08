@@ -33,6 +33,7 @@ def test_control_and_checkpoint_have_independent_alembic_chains() -> None:
         "002_semantic_registry",
         "003_audit_outbox",
         "004_semantic_registry_v3",
+        "005_product_artifacts",
     ]
     assert [path.stem for path in checkpoint_revisions] == ["001_checkpoint_schema"]
 

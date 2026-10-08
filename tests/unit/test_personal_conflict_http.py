@@ -80,29 +80,29 @@ class _Container:
 
         return _Engine()
 
-    def personal_conflict_product_service(self) -> PersonalConflictProductService:
+    async def personal_conflict_product_service(self) -> PersonalConflictProductService:
         return self.conflicts
 
 
-def _saved(container: _Container, multiplier: str, title: str) -> str:
-    version = container.definitions.create_draft(
+async def _saved(container: _Container, multiplier: str, title: str) -> str:
+    version = await container.definitions.create_draft(
         owner_user_id="alice",
         title=title,
         calculation=_spec(multiplier),
     )
-    container.definitions.mark_semantic_closed(
+    await container.definitions.mark_semantic_closed(
         owner_user_id="alice", definition_id=version.definition_id
     )
-    container.definitions.confirm(
+    await container.definitions.confirm(
         owner_user_id="alice", definition_id=version.definition_id
     )
-    container.definitions.save(
+    await container.definitions.save(
         owner_user_id="alice", definition_id=version.definition_id
     )
     return version.definition_id
 
 
-def _client() -> tuple[TestClient, _Container, str, str]:
+async def _client() -> tuple[TestClient, _Container, str, str]:
     app = FastAPI()
     container = _Container()
     app.state.container = container
@@ -114,16 +114,16 @@ def _client() -> tuple[TestClient, _Container, str, str]:
         )
 
     app.dependency_overrides[require_nl2sql_permission] = identity
-    own_id = _saved(container, "1", "Archive performance")
-    installed_id = _saved(container, "2", "Archive performance")
-    container.publications.publish(
+    own_id = await _saved(container, "1", "Archive performance")
+    installed_id = await _saved(container, "2", "Archive performance")
+    await container.publications.publish(
         owner_user_id="alice", definition_id=installed_id, version=1
     )
-    container.library.install(
+    await container.library.install(
         user_id="alice", identity_id=installed_id, version=1
     )
-    container.library.star(user_id="alice", identity_id=installed_id)
-    container.catalogue.certify_local_demo(
+    await container.library.star(user_id="alice", identity_id=installed_id)
+    await container.catalogue.certify_local_demo(
         installed_id, 1, certified_by="controlled-test"
     )
     return TestClient(app), container, own_id, installed_id
@@ -141,8 +141,8 @@ def _get_conflict(client: TestClient, own_id: str, installed_id: str):
     )
 
 
-def test_personal_conflict_http_resolves_server_owned_candidates() -> None:
-    client, _, own_id, installed_id = _client()
+async def test_personal_conflict_http_resolves_server_owned_candidates() -> None:
+    client, _, own_id, installed_id = await _client()
 
     response = _get_conflict(client, own_id, installed_id)
 
@@ -164,13 +164,13 @@ def test_personal_conflict_http_resolves_server_owned_candidates() -> None:
     assert "recommend" not in serialized
 
 
-def test_run_scoped_selection_re_resolves_and_never_persists_preference() -> None:
-    client, container, own_id, installed_id = _client()
+async def test_run_scoped_selection_re_resolves_and_never_persists_preference() -> None:
+    client, container, own_id, installed_id = await _client()
     conflict = _get_conflict(client, own_id, installed_id).json()
     block = conflict["conflict_comparison"]
     selected = block["candidates"][0]["candidate_id"]
-    installs_before = container.library.installs_of(user_id="alice")
-    stars_before = container.library.starred_of(user_id="alice")
+    installs_before = await container.library.installs_of(user_id="alice")
+    stars_before = await container.library.starred_of(user_id="alice")
 
     wrong_run = client.post(
         "/api/v2/nl2sql/conflicts/personal/select",
@@ -206,8 +206,8 @@ def test_run_scoped_selection_re_resolves_and_never_persists_preference() -> Non
 
     assert response.status_code == 200, response.text
     assert response.json()["selection"]["selection_scope"] == "run_scoped"
-    assert container.library.installs_of(user_id="alice") == installs_before
-    assert container.library.starred_of(user_id="alice") == stars_before
+    assert await container.library.installs_of(user_id="alice") == installs_before
+    assert await container.library.starred_of(user_id="alice") == stars_before
     resolved = _get_conflict(client, own_id, installed_id)
     assert resolved.status_code == 200
     assert resolved.json()["resolution"]["outcome"] == "resolved"
@@ -218,7 +218,7 @@ def test_run_scoped_selection_re_resolves_and_never_persists_preference() -> Non
     assert resolved.json()["selected_definition_id"] == selected_ref["definition_id"]
     assert resolved.json()["selected_version"] == selected_ref["version"]
     with pytest.raises(Exception, match="personal_selection_not_pending"):
-        container.conflicts.consume_selection(
+        await container.conflicts.consume_selection(
             user_id="alice",
             thread_id="11111111-1111-1111-1111-111111111111",
             run_id="run-personal-1",
@@ -242,14 +242,14 @@ def test_run_scoped_selection_re_resolves_and_never_persists_preference() -> Non
     assert wrong.status_code == 409
 
 
-def test_uninstalled_or_legacy_semantics_fail_closed() -> None:
-    client, container, own_id, installed_id = _client()
-    container.library.uninstall(user_id="alice", identity_id=installed_id)
+async def test_uninstalled_or_legacy_semantics_fail_closed() -> None:
+    client, container, own_id, installed_id = await _client()
+    await container.library.uninstall(user_id="alice", identity_id=installed_id)
     absent = _get_conflict(client, own_id, installed_id)
     assert absent.status_code == 404
 
     legacy_id = "legacy.display.only"
-    container.catalogue.seed(
+    await container.catalogue.seed(
         PublishedVersion(
             identity_id=legacy_id,
             version=1,
@@ -262,14 +262,14 @@ def test_uninstalled_or_legacy_semantics_fail_closed() -> None:
         ),
         current=True,
     )
-    container.library.install(user_id="alice", identity_id=legacy_id, version=1)
+    await container.library.install(user_id="alice", identity_id=legacy_id, version=1)
     legacy = _get_conflict(client, own_id, legacy_id)
     assert legacy.status_code == 409
     assert legacy.json()["detail"] == "personal_candidate_semantics_unavailable"
 
 
-def test_fabricated_run_cannot_mint_conflict_state() -> None:
-    client, _, own_id, installed_id = _client()
+async def test_fabricated_run_cannot_mint_conflict_state() -> None:
+    client, _, own_id, installed_id = await _client()
     response = client.get(
         "/api/v2/nl2sql/conflicts/personal",
         params={
@@ -283,8 +283,8 @@ def test_fabricated_run_cannot_mint_conflict_state() -> None:
     assert response.json()["detail"] == "personal_conflict_run_binding_invalid"
 
 
-def test_same_exact_identity_version_deduplicates_without_conflict() -> None:
-    client, container, _, installed_id = _client()
+async def test_same_exact_identity_version_deduplicates_without_conflict() -> None:
+    client, container, _, installed_id = await _client()
     response = _get_conflict(client, installed_id, installed_id)
     assert response.status_code == 200
     assert response.json()["resolution"]["outcome"] == "resolved"
@@ -292,9 +292,9 @@ def test_same_exact_identity_version_deduplicates_without_conflict() -> None:
     assert response.json()["conflict_comparison"] is None
 
 
-def test_historical_saved_candidate_survives_a_new_current_draft() -> None:
-    client, container, own_id, installed_id = _client()
-    container.definitions.create_revision(owner_user_id="alice", definition_id=own_id)
+async def test_historical_saved_candidate_survives_a_new_current_draft() -> None:
+    client, container, own_id, installed_id = await _client()
+    await container.definitions.create_revision(owner_user_id="alice", definition_id=own_id)
     response = _get_conflict(client, own_id, installed_id)
     assert response.status_code == 200, response.text
     own = next(

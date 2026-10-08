@@ -189,22 +189,22 @@ def test_frontend_contract_models_expose_frozen_server_owned_fields() -> None:
     } <= set(ProvenanceBlock.model_fields)
 
 
-def test_app_container_owns_one_shared_product_object_graph() -> None:
+async def test_app_container_owns_one_shared_product_object_graph() -> None:
     container = AppContainer()
     definitions = container.custom_definition_service()
-    catalogue = container.publication_catalogue()
-    publication = container.publication_service()
-    library = container.library_repository()
-    product_library = container.product_library_service()
-    personal_conflict = container.personal_conflict_product_service()
+    catalogue = await container.publication_catalogue()
+    publication = await container.publication_service()
+    library = await container.library_repository()
+    product_library = await container.product_library_service()
+    personal_conflict = await container.personal_conflict_product_service()
     execution = container.custom_definition_execution_service()
 
     assert definitions is container.custom_definition_service()
-    assert catalogue is container.publication_catalogue()
-    assert publication is container.publication_service()
-    assert library is container.library_repository()
-    assert product_library is container.product_library_service()
-    assert personal_conflict is container.personal_conflict_product_service()
+    assert catalogue is await container.publication_catalogue()
+    assert publication is await container.publication_service()
+    assert library is await container.library_repository()
+    assert product_library is await container.product_library_service()
+    assert personal_conflict is await container.personal_conflict_product_service()
     assert execution is container.custom_definition_execution_service()
     assert publication._definitions is definitions
     assert publication._catalogue is catalogue

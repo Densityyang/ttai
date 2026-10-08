@@ -14,20 +14,24 @@ Installing or starring content NEVER confers any authority over it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from src.nl2sql.artifacts.custom_definition import DefinitionVersion
 from src.nl2sql.artifacts.library import (
-    InMemoryLibraryRepository,
     LibraryIdentityNotFound,
 )
 from src.nl2sql.artifacts.publication import (
     LOCAL_DEMO_CERTIFICATION_PROVENANCE,
     NOT_CONNECTED,
-    PublicationCatalogue,
     PublishedVersion,
 )
 from src.nl2sql.artifacts.publication_service import PublicationService
 from src.nl2sql.artifacts.service import CustomDefinitionService
+
+if TYPE_CHECKING:
+    from src.nl2sql.artifacts.ports import CataloguePort, LibraryPort
+
+
 
 
 class CertificationForbidden(PermissionError):
@@ -129,8 +133,8 @@ class ProductLibraryService:
     def __init__(
         self,
         *,
-        catalogue: PublicationCatalogue,
-        library: InMemoryLibraryRepository,
+        catalogue: CataloguePort,
+        library: LibraryPort,
         definitions: CustomDefinitionService,
         publications: PublicationService,
         certification_authority: CertificationAuthority,
@@ -142,21 +146,21 @@ class ProductLibraryService:
         self._authority = certification_authority
 
     # --- catalogue / personal library assembly ---------------------------
-    def catalogue_entries(self) -> tuple[dict[str, object], ...]:
+    async def catalogue_entries(self) -> tuple[dict[str, object], ...]:
         """Discoverable identities.  NO private Draft content is exposed."""
 
         entries: list[dict[str, object]] = []
-        for identity_id in self._catalogue.identities():
-            versions = self._catalogue.versions(identity_id)
+        for identity_id in await self._catalogue.identities():
+            versions = await self._catalogue.versions(identity_id)
             if not versions:
                 continue
             try:
-                current = self._catalogue.current_version(identity_id)
+                current = await self._catalogue.current_version(identity_id)
             except LookupError:
                 # A missing/corrupt pointer is not a valid product projection.
                 continue
-            current_publication = self._catalogue.get(identity_id, current)
-            if current_publication is None or self._catalogue.is_withdrawn(
+            current_publication = await self._catalogue.get(identity_id, current)
+            if current_publication is None or await self._catalogue.is_withdrawn(
                 identity_id, current
             ):
                 # Do not fall back to an older non-withdrawn version.
@@ -164,19 +168,24 @@ class ProductLibraryService:
             entries.append(
                 {
                     "identity_id": identity_id,
-                    "title": self._catalogue.title(identity_id),
+                    "title": await self._catalogue.title(identity_id),
                     "owner_label": current_publication.owner_label,
                     "source_label": current_publication.source_label,
                     "current_version": current,
-                    "star_count": self._library.star_count(identity_id=identity_id),
+                    "star_count": await self._library.star_count(
+                        identity_id=identity_id
+                    ),
                     "versions": tuple(
-                        self._version_view(identity_id, item) for item in versions
+                        [
+                            await self._version_view(identity_id, item)
+                            for item in versions
+                        ]
                     ),
                 }
             )
         return tuple(entries)
 
-    def _version_view(
+    async def _version_view(
         self, identity_id: str, item: PublishedVersion
     ) -> dict[str, object]:
         return {
@@ -184,26 +193,28 @@ class ProductLibraryService:
             "title": item.title,
             "published_at": item.published_at,
             "unit": item.unit,
-            "certification_state": self._catalogue.certification_state(
+            "certification_state": await self._catalogue.certification_state(
                 identity_id, item.version
             ),
-            "withdrawn": self._catalogue.is_withdrawn(identity_id, item.version),
+            "withdrawn": await self._catalogue.is_withdrawn(
+                identity_id, item.version
+            ),
             "forkable": item.forkable,
             "derived_from_identity": item.derived_from_identity,
             "derived_from_version": item.derived_from_version,
         }
 
-    def library_entries(self, *, user_id: str) -> tuple[dict[str, object], ...]:
+    async def library_entries(self, *, user_id: str) -> tuple[dict[str, object], ...]:
         """The caller's PERSONAL state.  No winner, no ranking, no advice."""
 
         entries: list[dict[str, object]] = []
-        for binding in self._library.installs_of(user_id=user_id):
+        for binding in await self._library.installs_of(user_id=user_id):
             identity_id = binding.identity_id
-            published = self._catalogue.get(identity_id, binding.version)
+            published = await self._catalogue.get(identity_id, binding.version)
             if published is None:
                 continue
             try:
-                current = self._catalogue.current_version(identity_id)
+                current = await self._catalogue.current_version(identity_id)
             except LookupError:
                 # A personal install survives withdrawal, but not an invalid
                 # catalogue pointer.  Never fabricate a current version.
@@ -214,20 +225,22 @@ class ProductLibraryService:
                     "installed_version": binding.version,
                     "pinned": binding.pinned,
                     "current_version": current,
-                    "update_available": self._library.update_available(
+                    "update_available": await self._library.update_available(
                         user_id=user_id, identity_id=identity_id
                     ),
-                    "starred": self._library.is_starred(
+                    "starred": await self._library.is_starred(
                         user_id=user_id, identity_id=identity_id
                     ),
-                    "star_count": self._library.star_count(identity_id=identity_id),
-                    "certification_state": self._catalogue.certification_state(
+                    "star_count": await self._library.star_count(
+                        identity_id=identity_id
+                    ),
+                    "certification_state": await self._catalogue.certification_state(
                         identity_id, binding.version
                     ),
-                    "withdrawn": self._catalogue.is_withdrawn(
+                    "withdrawn": await self._catalogue.is_withdrawn(
                         identity_id, binding.version
                     ),
-                    "withdrawal_acknowledged": self._library.is_acknowledged(
+                    "withdrawal_acknowledged": await self._library.is_acknowledged(
                         user_id=user_id,
                         identity_id=identity_id,
                         version=binding.version,
@@ -242,45 +255,45 @@ class ProductLibraryService:
         return tuple(entries)
 
     # --- personal mutations ----------------------------------------------
-    def install(
+    async def install(
         self, *, user_id: str, identity_id: str, version: int
     ) -> InstallResult:
-        binding = self._library.install(
+        binding = await self._library.install(
             user_id=user_id, identity_id=identity_id, version=version
         )
         return InstallResult(identity_id=identity_id, installed_version=binding.version)
 
-    def uninstall(self, *, user_id: str, identity_id: str) -> dict[str, object]:
-        self._library.uninstall(user_id=user_id, identity_id=identity_id)
+    async def uninstall(self, *, user_id: str, identity_id: str) -> dict[str, object]:
+        await self._library.uninstall(user_id=user_id, identity_id=identity_id)
         return {"identity_id": identity_id, "installed": False}
 
-    def star(self, *, user_id: str, identity_id: str) -> int:
-        return self._library.star(user_id=user_id, identity_id=identity_id)
+    async def star(self, *, user_id: str, identity_id: str) -> int:
+        return await self._library.star(user_id=user_id, identity_id=identity_id)
 
-    def unstar(self, *, user_id: str, identity_id: str) -> int:
-        return self._library.unstar(user_id=user_id, identity_id=identity_id)
+    async def unstar(self, *, user_id: str, identity_id: str) -> int:
+        return await self._library.unstar(user_id=user_id, identity_id=identity_id)
 
-    def upgrade(
+    async def upgrade(
         self, *, user_id: str, identity_id: str, to_version: int
     ) -> InstallResult:
         """EXPLICIT only.  The target publication must exist; no auto-upgrade."""
 
-        if self._catalogue.get(identity_id, to_version) is None:
+        if await self._catalogue.get(identity_id, to_version) is None:
             raise LibraryVersionNotFound()
-        binding = self._library.upgrade(
+        binding = await self._library.upgrade(
             user_id=user_id, identity_id=identity_id, to_version=to_version
         )
         return InstallResult(identity_id=identity_id, installed_version=binding.version)
 
-    def acknowledge_withdrawal(
+    async def acknowledge_withdrawal(
         self, *, user_id: str, identity_id: str, version: int
     ) -> AcknowledgementResult:
         """Dismissal only; the catalogue withdrawal is NEVER cleared."""
 
-        if self._catalogue.get(identity_id, version) is None:
+        if await self._catalogue.get(identity_id, version) is None:
             raise LibraryVersionNotFound()
         try:
-            self._library.acknowledge_withdrawal(
+            await self._library.acknowledge_withdrawal(
                 user_id=user_id, identity_id=identity_id, version=version
             )
         except LibraryIdentityNotFound as exc:
@@ -290,12 +303,12 @@ class ProductLibraryService:
         return AcknowledgementResult(
             identity_id=identity_id,
             version=version,
-            withdrawn=self._catalogue.is_withdrawn(identity_id, version),
+            withdrawn=await self._catalogue.is_withdrawn(identity_id, version),
             withdrawal_acknowledged=True,
         )
 
     # --- fork -------------------------------------------------------------
-    def fork(
+    async def fork(
         self, *, user_id: str, identity_id: str, version: int, title: str
     ) -> DefinitionVersion:
         """Fork an INSTALLED exact version into a NEW private Definition.
@@ -305,15 +318,17 @@ class ProductLibraryService:
         Star nor certification and is not auto-advanced in any way.
         """
 
-        published = self._catalogue.get(identity_id, version)
+        published = await self._catalogue.get(identity_id, version)
         if published is None:
             raise LibraryVersionNotFound()
-        binding = self._library.get_install(user_id=user_id, identity_id=identity_id)
+        binding = await self._library.get_install(
+            user_id=user_id, identity_id=identity_id
+        )
         if binding is None or binding.version != version:
             raise LibraryVersionNotFound("library_install_required")
         if published.semantic is None:
             raise PublicationNotForkable()
-        return self._definitions.create_fork(
+        return await self._definitions.create_fork(
             owner_user_id=user_id,
             title=title,
             calculation=published.semantic.calculation,
@@ -322,29 +337,29 @@ class ProductLibraryService:
         )
 
     # --- local-demo certification ----------------------------------------
-    def certify(
+    async def certify(
         self, *, user_id: str, identity_id: str, version: int
     ) -> CertificationResult:
         """LOCAL-DEMO certification; never a production certification claim."""
 
         if not self._authority.allows(user_id=user_id):
             raise CertificationForbidden()
-        if self._catalogue.get(identity_id, version) is None:
+        if await self._catalogue.get(identity_id, version) is None:
             raise LibraryVersionNotFound()
-        self._library.certify_local_demo(
+        await self._library.certify_local_demo(
             identity_id=identity_id, version=version, certified_by=user_id
         )
         # Project ONLY onto the CURRENT definition axes: certifying a historical
         # version must never rewrite the current version's axes.
-        owner = self._catalogue.get(identity_id, version)
+        owner = await self._catalogue.get(identity_id, version)
         if owner is not None:
-            self._publications.project_certified(
+            await self._publications.project_certified(
                 identity_id=identity_id, version=version, owner_user_id=owner.owner_user_id
             )
         return CertificationResult(
             identity_id=identity_id,
             version=version,
-            certification_state=self._catalogue.certification_state(
+            certification_state=await self._catalogue.certification_state(
                 identity_id, version
             ),
             authority_provenance=LOCAL_DEMO_CERTIFICATION_PROVENANCE,
@@ -352,29 +367,29 @@ class ProductLibraryService:
         )
 
     # --- withdrawal -------------------------------------------------------
-    def withdraw(
+    async def withdraw(
         self, *, user_id: str, identity_id: str, version: int
     ) -> WithdrawalResult:
         """Source-owner withdrawal.  Nothing is deleted and nobody is evicted."""
 
-        published = self._catalogue.get(identity_id, version)
+        published = await self._catalogue.get(identity_id, version)
         if published is None:
             raise LibraryVersionNotFound()
         if published.owner_user_id != user_id:
             # Installing or starring content NEVER grants withdrawal authority.
             raise WithdrawalForbidden()
-        self._library.withdraw(identity_id=identity_id, version=version)
+        await self._library.withdraw(identity_id=identity_id, version=version)
         return WithdrawalResult(
             identity_id=identity_id,
             version=version,
-            withdrawn=self._catalogue.is_withdrawn(identity_id, version),
+            withdrawn=await self._catalogue.is_withdrawn(identity_id, version),
         )
 
 
 def build_product_library_service(
     *,
-    catalogue: PublicationCatalogue,
-    library: InMemoryLibraryRepository,
+    catalogue: CataloguePort,
+    library: LibraryPort,
     definitions: CustomDefinitionService,
     publications: PublicationService,
     certification_authority: CertificationAuthority,

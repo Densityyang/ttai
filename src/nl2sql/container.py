@@ -9,15 +9,20 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from src.nl2sql.artifacts.control_store import ControlArtifactRepository
     from src.nl2sql.artifacts.custom_definition_execution_service import (
         CustomDefinitionExecutionService,
     )
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
+    from src.nl2sql.artifacts.library_control_store import ControlLibraryRepository
     from src.nl2sql.artifacts.personal_conflict_product_service import (
         PersonalConflictProductService,
     )
     from src.nl2sql.artifacts.product_library_service import ProductLibraryService
     from src.nl2sql.artifacts.publication import PublicationCatalogue
+    from src.nl2sql.artifacts.publication_control_store import (
+        ControlPublicationCatalogue,
+    )
     from src.nl2sql.artifacts.publication_service import PublicationService
     from src.nl2sql.artifacts.repository import InMemoryArtifactRepository
     from src.nl2sql.artifacts.service import CustomDefinitionService
@@ -77,9 +82,16 @@ class AppContainer:
         self._local_real_source_watermark_checked_at: datetime | None = None
         self._local_real_count_column = "id"
         self._definition_service: CustomDefinitionService | None = None
-        self._artifact_repository: InMemoryArtifactRepository | None = None
-        self._library_repository: InMemoryLibraryRepository | None = None
-        self._publication_catalogue: PublicationCatalogue | None = None
+        self._artifact_repository: (
+            InMemoryArtifactRepository | ControlArtifactRepository | None
+        ) = None
+        self._library_repository: (
+            InMemoryLibraryRepository | ControlLibraryRepository | None
+        ) = None
+        self._publication_catalogue: (
+            PublicationCatalogue | ControlPublicationCatalogue | None
+        ) = None
+        self._product_store_ready = False
         self._publication_service: PublicationService | None = None
         self._product_library_service: ProductLibraryService | None = None
         self._personal_conflict_product_service: (
@@ -112,6 +124,28 @@ class AppContainer:
             except Exception as exc:
                 self._startup_failures.add("control_audit_initialization_failed")
                 logger.error("control audit initialization failed: %s", type(exc).__name__)
+
+        # The product stores are DURABLE only when they are control-backed.  A
+        # product deployment may not run the process-local stores, so the
+        # backend comes from immutable Settings and the control-backed stores
+        # are built and PINGED here, while this container owns the lifecycle.
+        # A store that cannot be reached is never reported as ready.
+        if self.product_store_backend == "control":
+            try:
+                for store in (
+                    await self.artifact_repository(),
+                    await self.publication_catalogue(),
+                    await self.library_repository(),
+                ):
+                    await store.ping()
+                self._product_store_ready = True
+            except Exception as exc:
+                self._startup_failures.add("product_store_initialization_failed")
+                logger.error(
+                    "product store initialization failed: %s", type(exc).__name__
+                )
+        else:
+            self._product_store_ready = True
 
     @property
     def audit_available(self) -> bool:
@@ -201,6 +235,12 @@ class AppContainer:
             "model": {
                 "status": "ready" if model_available else "unavailable",
                 "required": settings.model_required,
+            },
+            "product_store": {
+                "status": "ready" if self._product_store_ready else "unavailable",
+                # Only a control-backed store is REQUIRED to be reachable; the
+                # process-local backend is deliberately non-durable in infra-dev.
+                "required": self.product_store_backend == "control",
             },
         }
         if settings.local_real_data_demo_enabled:
@@ -319,17 +359,56 @@ class AppContainer:
             )
         return self._definition_service
 
-    def artifact_repository(self) -> InMemoryArtifactRepository:
-        """The application-scoped artifact repository (DEMO/local, non-durable)."""
+    @property
+    def product_store_backend(self) -> str:
+        """Which persistence backend the product stores use.
+
+        MASTER_PR_PLAN_V4.md 5.4.1 puts artifacts, their hashes and their
+        lifecycle in Control PostgreSQL.  Unset resolves to "control" in product
+        mode and "memory" otherwise, and Settings refuses an explicit "memory"
+        in product mode, so a product deployment cannot silently run the
+        process-local stores that lose state on restart.
+        """
+
+        from src.core.settings import get_settings
+
+        settings = get_settings()
+        return settings.product_store_backend or (
+            "control" if settings.service_mode == "product" else "memory"
+        )
+
+    @property
+    def product_store_available(self) -> bool:
+        return self._product_store_ready
+
+    async def artifact_repository(
+        self,
+    ) -> InMemoryArtifactRepository | ControlArtifactRepository:
+        """The application-scoped artifact repository.
+
+        Owner-scoped and fail-closed in BOTH backends; only durability differs.
+        """
 
         if self._artifact_repository is None:
-            from src.nl2sql.artifacts.repository import InMemoryArtifactRepository
+            if self.product_store_backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.control_store import (
+                    ControlArtifactRepository,
+                )
 
-            self._artifact_repository = InMemoryArtifactRepository()
+                self._artifact_repository = ControlArtifactRepository(
+                    get_settings().control_database_url or ""
+                )
+            else:
+                from src.nl2sql.artifacts.repository import InMemoryArtifactRepository
+
+                self._artifact_repository = InMemoryArtifactRepository()
         return self._artifact_repository
 
-    def publication_catalogue(self) -> PublicationCatalogue:
-        """The ONE application-scoped publication catalogue (DEMO/local).
+    async def publication_catalogue(
+        self,
+    ) -> PublicationCatalogue | ControlPublicationCatalogue:
+        """The ONE application-scoped publication catalogue.
 
         Publication and Library MUST share this single instance: a publication
         made through the Definition API is immediately visible to the Library
@@ -338,17 +417,31 @@ class AppContainer:
 
         if self._publication_catalogue is None:
             from src.nl2sql.artifacts.library import seed_catalogue_from_fixtures
-            from src.nl2sql.artifacts.publication import PublicationCatalogue
 
-            catalogue = PublicationCatalogue()
+            if self.product_store_backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.publication_control_store import (
+                    ControlPublicationCatalogue,
+                )
+
+                catalogue: PublicationCatalogue | ControlPublicationCatalogue = (
+                    ControlPublicationCatalogue(
+                        get_settings().control_database_url or ""
+                    )
+                )
+            else:
+                from src.nl2sql.artifacts.publication import PublicationCatalogue
+
+                catalogue = PublicationCatalogue()
             # Legacy demo fixtures are ADAPTED into the shared catalogue so the
             # existing demo catalogue stays discoverable; they carry no semantic
-            # package and are therefore not forkable.
-            seed_catalogue_from_fixtures(catalogue)
+            # package and are therefore not forkable.  Seeding is idempotent and
+            # fail-closed on an existing publication in BOTH backends.
+            await seed_catalogue_from_fixtures(catalogue)
             self._publication_catalogue = catalogue
         return self._publication_catalogue
 
-    def publication_service(self) -> PublicationService:
+    async def publication_service(self) -> PublicationService:
         """Application-scoped publication coordinator over the shared catalogue."""
 
         if self._publication_service is None:
@@ -356,11 +449,11 @@ class AppContainer:
 
             self._publication_service = PublicationService(
                 definitions=self.custom_definition_service(),
-                catalogue=self.publication_catalogue(),
+                catalogue=await self.publication_catalogue(),
             )
         return self._publication_service
 
-    def product_library_service(self) -> ProductLibraryService:
+    async def product_library_service(self) -> ProductLibraryService:
         """Application-scoped product library orchestration.
 
         It is bound to the SAME definition service, the SAME publication
@@ -377,10 +470,10 @@ class AppContainer:
 
             settings = get_settings()
             self._product_library_service = build_product_library_service(
-                catalogue=self.publication_catalogue(),
-                library=self.library_repository(),
+                catalogue=await self.publication_catalogue(),
+                library=await self.library_repository(),
                 definitions=self.custom_definition_service(),
-                publications=self.publication_service(),
+                publications=await self.publication_service(),
                 # The certification authority is read from immutable Settings at
                 # construction time and is NEVER inferred from a role, an
                 # organization or a publication ownership.
@@ -392,18 +485,37 @@ class AppContainer:
             )
         return self._product_library_service
 
-    def library_repository(self) -> InMemoryLibraryRepository:
-        """The application-scoped library repository over the SHARED catalogue."""
+    async def library_repository(
+        self,
+    ) -> InMemoryLibraryRepository | ControlLibraryRepository:
+        """The application-scoped library repository over the SHARED catalogue.
+
+        Personal state only (installs, Stars, withdrawal acknowledgements); the
+        catalogue stays the single authority for versions and the current
+        pointer in BOTH backends.
+        """
 
         if self._library_repository is None:
-            from src.nl2sql.artifacts.library import InMemoryLibraryRepository
+            catalogue = await self.publication_catalogue()
+            if self.product_store_backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.library_control_store import (
+                    ControlLibraryRepository,
+                )
 
-            self._library_repository = InMemoryLibraryRepository(
-                catalogue=self.publication_catalogue()
-            )
+                self._library_repository = ControlLibraryRepository(
+                    catalogue=catalogue,
+                    database_url=get_settings().control_database_url or "",
+                )
+            else:
+                from src.nl2sql.artifacts.library import InMemoryLibraryRepository
+
+                self._library_repository = InMemoryLibraryRepository(
+                    catalogue=catalogue
+                )
         return self._library_repository
 
-    def personal_conflict_product_service(self) -> PersonalConflictProductService:
+    async def personal_conflict_product_service(self) -> PersonalConflictProductService:
         """Application-scoped conflict service over the existing shared stores."""
 
         if self._personal_conflict_product_service is None:
@@ -413,8 +525,8 @@ class AppContainer:
 
             self._personal_conflict_product_service = PersonalConflictProductService(
                 definitions=self.custom_definition_service(),
-                catalogue=self.publication_catalogue(),
-                library=self.library_repository(),
+                catalogue=await self.publication_catalogue(),
+                library=await self.library_repository(),
             )
         return self._personal_conflict_product_service
 

@@ -54,7 +54,7 @@ class PersonalSelectionResponse(StrictContract):
     conflict_comparison: ConflictComparisonBlock
 
 
-def _service(request: Request) -> PersonalConflictProductService:
+async def _service(request: Request) -> PersonalConflictProductService:
     container = getattr(request.app.state, "container", None)
     accessor = getattr(container, "personal_conflict_product_service", None)
     if not callable(accessor):
@@ -62,7 +62,9 @@ def _service(request: Request) -> PersonalConflictProductService:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="runtime dependency unavailable",
         )
-    return cast(PersonalConflictProductService, accessor())
+    return cast(
+        PersonalConflictProductService, await cast(Awaitable[Any], accessor())
+    )
 
 
 def _owner(auth_user: AuthUser) -> str:
@@ -186,8 +188,9 @@ def register_conflict_routes(app: FastAPI) -> None:
         run_id: str = Query(min_length=1, max_length=64),
     ) -> PersonalConflictResponse:
         await _require_run(request, auth_user, thread_id, run_id)
+        service = await _service(request)
         try:
-            projection = _service(request).resolve(
+            projection = await service.resolve(
                 user_id=_owner(auth_user),
                 own_definition_id=own_definition_id,
                 installed_identity_id=installed_identity_id,
@@ -213,8 +216,9 @@ def register_conflict_routes(app: FastAPI) -> None:
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> PersonalSelectionResponse:
         await _require_run(request, auth_user, body.thread_id, body.run_id)
+        service = await _service(request)
         try:
-            projection, selection = _service(request).validate_selection(
+            projection, selection = await service.validate_selection(
                 user_id=_owner(auth_user),
                 own_definition_id=body.own_definition_id,
                 installed_identity_id=body.installed_identity_id,

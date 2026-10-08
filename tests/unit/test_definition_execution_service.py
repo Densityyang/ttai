@@ -133,7 +133,7 @@ class _Container:
         return self.execution
 
 
-def _client(
+async def _client(
     resolver: _ControlledResolver | None,
 ) -> tuple[TestClient, _Container, str, CalculationSpec]:
     app = FastAPI()
@@ -148,16 +148,16 @@ def _client(
 
     app.dependency_overrides[require_nl2sql_permission] = identity
     spec = _spec()
-    version = container.definitions.create_draft(
+    version = await container.definitions.create_draft(
         owner_user_id="alice", title="Actual target index", calculation=spec
     )
-    container.definitions.mark_semantic_closed(
+    await container.definitions.mark_semantic_closed(
         owner_user_id="alice", definition_id=version.definition_id
     )
-    container.definitions.confirm(
+    await container.definitions.confirm(
         owner_user_id="alice", definition_id=version.definition_id
     )
-    container.definitions.save(
+    await container.definitions.save(
         owner_user_id="alice", definition_id=version.definition_id
     )
     return TestClient(app), container, version.definition_id, spec
@@ -200,9 +200,9 @@ def test_definition_execution_context_is_strict_and_typed() -> None:
     assert request.execution_context.exact_date == date(2026, 9, 20)
 
 
-def test_controlled_http_execution_uses_server_resolved_input_only() -> None:
+async def test_controlled_http_execution_uses_server_resolved_input_only() -> None:
     resolver = _ControlledResolver(Decimal("45"))
-    client, _, definition_id, spec = _client(resolver)
+    client, _, definition_id, spec = await _client(resolver)
     path = f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute"
 
     first = client.post(path, json={"binding": _binding(spec, 90)})
@@ -227,8 +227,8 @@ def test_controlled_http_execution_uses_server_resolved_input_only() -> None:
     assert injected.status_code == 422
 
 
-def test_zero_target_is_governed_error_not_no_data() -> None:
-    client, _, definition_id, spec = _client(_ControlledResolver(Decimal("45")))
+async def test_zero_target_is_governed_error_not_no_data() -> None:
+    client, _, definition_id, spec = await _client(_ControlledResolver(Decimal("45")))
     response = client.post(
         f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute",
         json={"binding": _binding(spec, 0)},
@@ -238,8 +238,8 @@ def test_zero_target_is_governed_error_not_no_data() -> None:
     assert response.json()["detail"] != "NO_DATA"
 
 
-def test_unconfigured_resolver_returns_honest_503() -> None:
-    client, _, definition_id, spec = _client(None)
+async def test_unconfigured_resolver_returns_honest_503() -> None:
+    client, _, definition_id, spec = await _client(None)
     response = client.post(
         f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute",
         json={"binding": _binding(spec, 90)},
@@ -248,19 +248,19 @@ def test_unconfigured_resolver_returns_honest_503() -> None:
     assert response.json()["detail"] == "calculation_input_resolver_unavailable"
 
 
-def test_app_container_injected_fetcher_drives_controlled_http_vertical() -> None:
+async def test_app_container_injected_fetcher_drives_controlled_http_vertical() -> None:
     fetcher = _ControlledFetcher()
     container = AppContainer(governed_metric_input_fetcher=fetcher)
     definitions = container.custom_definition_service()
     spec = _spec()
-    version = definitions.create_draft(
+    version = await definitions.create_draft(
         owner_user_id="alice", title="Actual target index", calculation=spec
     )
-    definitions.mark_semantic_closed(
+    await definitions.mark_semantic_closed(
         owner_user_id="alice", definition_id=version.definition_id
     )
-    definitions.confirm(owner_user_id="alice", definition_id=version.definition_id)
-    definitions.save(owner_user_id="alice", definition_id=version.definition_id)
+    await definitions.confirm(owner_user_id="alice", definition_id=version.definition_id)
+    await definitions.save(owner_user_id="alice", definition_id=version.definition_id)
 
     app = FastAPI()
     app.state.container = container
@@ -296,16 +296,16 @@ def test_app_container_injected_fetcher_drives_controlled_http_vertical() -> Non
     )
 
 
-def test_app_container_definition_closure_uses_injected_applicable_authority() -> None:
+async def test_app_container_definition_closure_uses_injected_applicable_authority() -> None:
     def local_real_authority(metric_key: str) -> bool:
         return metric_key == "repair_service_archive_rate_overall_day"
 
     container = AppContainer(governed_metric_key_resolver=local_real_authority)
     definitions = container.custom_definition_service()
-    accepted = definitions.create_draft(
+    accepted = await definitions.create_draft(
         owner_user_id="local-real-demo", title="Rate", calculation=_spec()
     )
-    definitions.mark_semantic_closed(
+    await definitions.mark_semantic_closed(
         owner_user_id="local-real-demo", definition_id=accepted.definition_id
     )
 
@@ -320,11 +320,11 @@ def test_app_container_definition_closure_uses_injected_applicable_authority() -
             )
         }
     )
-    rejected = definitions.create_draft(
+    rejected = await definitions.create_draft(
         owner_user_id="local-real-demo", title="Synthetic", calculation=rejected_spec
     )
     with pytest.raises(ValueError, match="existing eligible published_gold metric"):
-        definitions.mark_semantic_closed(
+        await definitions.mark_semantic_closed(
             owner_user_id="local-real-demo", definition_id=rejected.definition_id
         )
 
@@ -341,7 +341,7 @@ async def test_generic_resolver_fails_closed_on_incomplete_evidence() -> None:
         governed_metric_keys={"repair_service_archive_rate_overall_day"}
     )
     spec = _spec()
-    version = definitions.create_draft(
+    version = await definitions.create_draft(
         owner_user_id="alice", title="Actual target index", calculation=spec
     )
     binding = CalculationExecutionBinding.model_validate(_binding(spec, 90))

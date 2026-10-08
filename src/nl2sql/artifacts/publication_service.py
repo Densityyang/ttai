@@ -7,6 +7,8 @@ projection of its CURRENT version.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from src.nl2sql.artifacts.custom_definition import utcnow
 from src.nl2sql.artifacts.publication import (
     PublicationCatalogue,
@@ -14,6 +16,11 @@ from src.nl2sql.artifacts.publication import (
     PublishedVersion,
 )
 from src.nl2sql.artifacts.service import CustomDefinitionService, DefinitionNotFound
+
+if TYPE_CHECKING:
+    from src.nl2sql.artifacts.ports import CataloguePort
+
+
 
 
 class PublicationNotEligible(ValueError):
@@ -39,12 +46,12 @@ class PublicationService:
         self,
         *,
         definitions: CustomDefinitionService,
-        catalogue: PublicationCatalogue,
+        catalogue: CataloguePort,
     ) -> None:
         self._definitions = definitions
         self._catalogue = catalogue
 
-    def publish(
+    async def publish(
         self,
         *,
         owner_user_id: str,
@@ -54,22 +61,22 @@ class PublicationService:
         # Owner + exact version: a foreign definition raises the SAME failure as
         # an absent one (no existence oracle).  Only PUBLIC service methods are
         # used across services.
-        self._definitions.get_owned_definition(
+        await self._definitions.get_owned_definition(
             owner_user_id=owner_user_id, definition_id=definition_id
         )
-        exact = self._definitions.get_exact_version(
+        exact = await self._definitions.get_exact_version(
             owner_user_id=owner_user_id,
             definition_id=definition_id,
             version=version,
         )
-        if self._catalogue.get(definition_id, version) is not None:
+        if await self._catalogue.get(definition_id, version) is not None:
             # A published version is IMMUTABLE; re-publishing is a conflict, not
             # a silent no-op or an overwrite.
             raise PublicationConflict("publication_already_exists")
         # Eligibility is proved by the EXACT version's OWN persisted lifecycle,
         # never by the current-axis projection: an explicitly selected historical
         # saved version stays publishable after a later Draft exists.
-        lifecycle = self._definitions.get_version_lifecycle(
+        lifecycle = await self._definitions.get_version_lifecycle(
             owner_user_id=owner_user_id,
             definition_id=definition_id,
             version=version,
@@ -101,14 +108,14 @@ class PublicationService:
             derived_from_version=exact.derived_from_version,
             semantic=package,
         )
-        self._catalogue.publish(published)
+        await self._catalogue.publish(published)
         # Project the CURRENT definition axes: published + still UNCERTIFIED.
-        self._definitions.project_published(
+        await self._definitions.project_published(
             owner_user_id=owner_user_id, definition_id=definition_id, version=version
         )
         return published
 
-    def project_certified(
+    async def project_certified(
         self, *, identity_id: str, version: int, owner_user_id: str
     ) -> None:
         """Project certification onto the CURRENT definition axes only.
@@ -118,7 +125,7 @@ class PublicationService:
         """
 
         try:
-            current = self._definitions.get_owned_definition(
+            current = await self._definitions.get_owned_definition(
                 owner_user_id=owner_user_id, definition_id=identity_id
             )
         except DefinitionNotFound:
@@ -126,7 +133,7 @@ class PublicationService:
         if current.current_version.version != version:
             # A historical version must never rewrite the CURRENT axes.
             return
-        self._definitions.project_certified(
+        await self._definitions.project_certified(
             owner_user_id=owner_user_id, definition_id=identity_id
         )
 

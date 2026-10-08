@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     database_url: str = Field(default="", description="????? URL?????????????")
     control_database_url: str | None = Field(default=None)
     checkpoint_database_url: str | None = Field(default=None)
+    # Which persistence backend the product stores (artifacts, the publication
+    # catalogue and the personal library) use.  Unset resolves to "control" in
+    # product mode and "memory" otherwise, so a product deployment can never
+    # silently run the process-local stores that lose state on restart.
+    product_store_backend: Literal["memory", "control"] | None = Field(default=None)
     backup_retention_days: int = Field(default=7, ge=1, le=365)
     database_pool_size: int = Field(default=3, ge=1, le=50)
     database_max_overflow: int = Field(default=2, ge=0, le=50)
@@ -195,6 +200,18 @@ class Settings(BaseSettings):
             raise ValueError("AUTH_ENABLED=false is not permitted in product mode")
         if self.auth_enabled and not self.tt_api_base_url.strip():
             raise ValueError("AUTH_ENABLED=true ????? TT_API_BASE_URL")
+        return self
+
+    @model_validator(mode="after")
+    def validate_product_store_backend(self) -> "Settings":
+        if self.service_mode == "product" and self.product_store_backend == "memory":
+            raise ValueError(
+                "PRODUCT_STORE_BACKEND=memory is not permitted when SERVICE_MODE=product"
+            )
+        if self.product_store_backend == "control" and not self.control_database_url:
+            raise ValueError(
+                "PRODUCT_STORE_BACKEND=control requires CONTROL_DATABASE_URL"
+            )
         return self
 
     @model_validator(mode="after")
