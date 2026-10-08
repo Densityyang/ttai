@@ -128,6 +128,7 @@ jobs:
           tests/integration/test_query_gateway_postgres.py
           tests/integration/test_publication_control_store.py
           tests/integration/test_library_control_store.py
+          tests/integration/test_product_store_persistence.py
 
   compose-contract:
     runs-on: ubuntu-latest

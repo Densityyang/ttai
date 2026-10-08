@@ -381,6 +381,11 @@ class AppContainer:
     def product_store_available(self) -> bool:
         return self._product_store_ready
 
+    # Accessor convention: an accessor is async exactly when building the object
+    # can await I/O (the catalogue, the library and the product services may open
+    # a database).  Pure constructors -- custom_definition_service() and
+    # custom_definition_execution_service() -- stay synchronous on purpose, so
+    # there is no coroutine a caller could forget to await.
     async def artifact_repository(
         self,
     ) -> InMemoryArtifactRepository | ControlArtifactRepository:

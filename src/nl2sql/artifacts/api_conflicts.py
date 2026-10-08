@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable
 from typing import Any, cast
 from uuid import UUID
@@ -62,9 +63,16 @@ async def _service(request: Request) -> PersonalConflictProductService:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="runtime dependency unavailable",
         )
-    return cast(
-        PersonalConflictProductService, await cast(Awaitable[Any], accessor())
-    )
+    resolved = accessor()
+    # The production container exposes an ASYNC accessor.  A synchronous one is a
+    # MISSING runtime dependency, so it must surface as 503 -- never as an
+    # unhandled 500 from awaiting a non-awaitable.
+    if not inspect.isawaitable(resolved):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="runtime dependency unavailable",
+        )
+    return cast(PersonalConflictProductService, await cast(Awaitable[Any], resolved))
 
 
 def _owner(auth_user: AuthUser) -> str:
