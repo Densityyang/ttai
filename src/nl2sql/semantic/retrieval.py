@@ -9,6 +9,7 @@ from langchain_openai import OpenAIEmbeddings
 from src.core.settings import get_settings
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.infra.store.graph_rag import expand_with_graph_rag, get_schema_relation_graph
+from src.nl2sql.observability.content_policy import contains_technical_secret
 from src.nl2sql.semantic.context_compiler import reciprocal_rank_fusion
 from src.nl2sql.semantic.registry import ControlSemanticReleasePublisher, SemanticDocument
 
@@ -35,18 +36,25 @@ async def retrieve_active_semantic(query: str, *, limit: int = 3) -> ActiveSeman
         lexical = await publisher.search_lexical(query, limit=limit)
         vector: list[SemanticDocument] = []
         degradation_reasons: list[str] = []
-        try:
-            config = get_agent_config()
-            embedder = OpenAIEmbeddings(
-                api_key=config.embedding_api_key,
-                base_url=config.embedding_base_url,
-                model=config.embedding_model,
-                check_embedding_ctx_length=False,
-            )
-            query_embedding = await embedder.aembed_query(query)
-            vector = await publisher.search_vector(query_embedding, limit=limit)
-        except Exception:
-            degradation_reasons.append("embedding_unavailable")
+        # Embedding egress applies the same technical-secret principle as model
+        # egress.  This is a legacy-only consumer, so no generic egress platform
+        # or destination registry is introduced here; lexical retrieval is
+        # unaffected and a secret-bearing query simply skips the vector leg.
+        if contains_technical_secret(query):
+            degradation_reasons.append("embedding_egress_denied")
+        else:
+            try:
+                config = get_agent_config()
+                embedder = OpenAIEmbeddings(
+                    api_key=config.embedding_api_key,
+                    base_url=config.embedding_base_url,
+                    model=config.embedding_model,
+                    check_embedding_ctx_length=False,
+                )
+                query_embedding = await embedder.aembed_query(query)
+                vector = await publisher.search_vector(query_embedding, limit=limit)
+            except Exception:
+                degradation_reasons.append("embedding_unavailable")
 
         documents = _fuse_documents(lexical, vector, limit=limit)
         graph_hints = _graph_hints(query)

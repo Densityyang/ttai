@@ -3,11 +3,11 @@
 import logging
 from collections.abc import Generator
 from typing import Any
-from uuid import uuid4
 
 from langchain_core.runnables import Runnable, RunnableConfig
 
 from src.nl2sql.infra.observer.langfuse import get_langfuse_handler
+from src.nl2sql.observability.sink_policy import LANGFUSE_SINK, build_sink_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -36,20 +36,28 @@ def create_monitored_config(
             "run_name": run_name,
         }
 
-    if metadata:
-        existing_metadata = config.get("metadata", {})
-        config = {
-            **config,
-            "metadata": {**(existing_metadata or {}), **metadata},
-        }
-
+    existing_metadata = config.get("metadata")
+    caller_metadata = {
+        **(existing_metadata if isinstance(existing_metadata, dict) else {}),
+        **dict(metadata or {}),
+    }
+    # Trusted run identity stays on the always-safe channel.  Langfuse links a
+    # trace to its session via the "langfuse_session_id" metadata key read at
+    # the root chain, so it is emitted here instead of on a handler attribute.
+    safe_metadata = {"langfuse_session_id": session_id} if session_id else {}
+    if caller_metadata or safe_metadata:
+        # R4: ALL caller-controlled metadata that can reach the Langfuse
+        # callback is routed through the SAME policy envelope -- INCLUDING
+        # metadata supplied through base_config.  Raw content is attached only
+        # under the explicit deployment-level raw-content observability policy,
+        # and the egress boundary scrubs technical secrets either way.
+        envelope = build_sink_envelope(
+            LANGFUSE_SINK, metadata=safe_metadata, content=caller_metadata
+        )
+        config = {**config, "metadata": envelope.as_record()}
 
     langfuse_handler = get_langfuse_handler()
     if langfuse_handler:
-        if session_id is None:
-            session_id = str(uuid4())
-        langfuse_handler.session_id = session_id  # type: ignore[attr-defined]
-
         existing_callbacks = config.get("callbacks")
         if existing_callbacks is None:
             callbacks = [langfuse_handler]

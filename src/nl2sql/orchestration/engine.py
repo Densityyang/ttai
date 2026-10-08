@@ -33,7 +33,13 @@ from src.nl2sql.contracts import (
     RoutePolicy,
     RoutingBudgetPolicy,
 )
-from src.nl2sql.infra.llm.gateway import ModelGateway, ModelGatewayError, ModelPolicyDenied
+from src.nl2sql.infra.llm.gateway import (
+    ModelGateway,
+    ModelGatewayError,
+    ModelInputPolicyDenied,
+    ModelPolicyDenied,
+)
+from src.nl2sql.observability.content_policy import scrub_text, scrub_value
 from src.nl2sql.observability.trace import TraceEnvelope, TraceEvent, fingerprint
 from src.nl2sql.orchestration.budget import (
     BudgetExceeded,
@@ -935,6 +941,7 @@ def create_v2_engine(
             data_classification="internal",
             prompt_version="v2-engine-v1",
             plan_reason="deep_or_shadow_route" if stage == "plan" else None,
+            authorization_revision=authorization_revision,
         )
         try:
             receipt = await model_gateway.invoke(request, budget)
@@ -948,6 +955,15 @@ def create_v2_engine(
                 )
             stop_reason = route_budget.stop_reason or route_budget.halt(error_code)
             trace = _trace(state)
+            policy_evidence: dict[str, object] = {}
+            if isinstance(exc, ModelInputPolicyDenied):
+                policy_evidence = {
+                    "model_input_policy_version": exc.decision.policy_version,
+                    "model_input_policy_checksum": exc.decision.policy_checksum,
+                    "matched_categories": list(exc.decision.matched_categories),
+                    "target_provider": exc.decision.target_provider,
+                    "target_model": exc.decision.target_model,
+                }
             trace.record(
                 "policy",
                 "model_stopped",
@@ -955,6 +971,7 @@ def create_v2_engine(
                 reason=stop_reason,
                 error_code=error_code,
                 model_calls=route_budget.model_calls,
+                **policy_evidence,
             )
             await _persist_new_events(trace_sink, trace.events[-1:])
             return {
@@ -982,7 +999,9 @@ def create_v2_engine(
                 "stop_reason": retry_stop_reason,
                 "trace_events": _events(trace),
             }
-        answer = f"{'Shadow plan (no business SQL executed): ' if is_shadow else ''}{receipt.content}"
+        answer = scrub_text(
+            f"{'Shadow plan (no business SQL executed): ' if is_shadow else ''}{receipt.content}"
+        )
         trace = _trace(state)
         trace.record(
             "answer",
@@ -1000,10 +1019,18 @@ def create_v2_engine(
             route=route,
             model_calls=route_budget.model_calls,
             budget_policy_version=resolved_budget_policy.version,
+            model_input_policy_version=receipt.model_input_policy_version,
+            model_input_policy_checksum=receipt.model_input_policy_checksum,
+            egress_outcome=receipt.egress_outcome,
+            content_sha256=receipt.content_sha256,
+            matched_categories=list(receipt.matched_categories),
         )
         await _persist_new_events(trace_sink, trace.events[-1:])
+        # Checkpoint scrubbing: the checkpointed receipt is a persisted payload,
+        # so configured secret values and secret shapes are removed before it is
+        # projected.  Ordinary business answer content is preserved verbatim.
         result: dict[str, object] = {
-            "model_receipt": receipt.model_dump(mode="json"),
+            "model_receipt": scrub_value(receipt.model_dump(mode="json")),
             "budget_record": route_budget.checkpoint_record().model_dump(mode="json"),
             "trace_events": _events(trace),
         }

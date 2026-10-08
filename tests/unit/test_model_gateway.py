@@ -13,6 +13,7 @@ from src.nl2sql.infra.llm import gateway as gateway_module
 from src.nl2sql.infra.llm.gateway import (
     FakeProvider,
     ModelGateway,
+    ModelInputPolicyDenied,
     ModelOutputInvalid,
     ModelPolicyDenied,
     ModelProfile,
@@ -22,6 +23,7 @@ from src.nl2sql.infra.llm.gateway import (
     ProviderUnavailable,
     StructuredOutputMode,
 )
+from src.nl2sql.infra.llm.model_input_policy import calibrated_model_input_policy
 from src.nl2sql.orchestration.budget import BudgetExceeded, CallBudget, should_stop
 from src.nl2sql.orchestration.routing import RiskSignals, choose_route
 from src.nl2sql.orchestration.shadow import is_shadow_sample
@@ -614,3 +616,226 @@ def test_shadow_sampling_is_deterministic_and_capped() -> None:
     assert is_shadow_sample(request_id, percentage=0) is False
     with pytest.raises(ValueError, match="between 0 and 5"):
         is_shadow_sample(request_id, percentage=6)
+
+class _CountingProvider:
+    """Provider that records call count so a deny can be proven zero-call."""
+
+    def __init__(
+        self, result: ProviderResponse | ProviderUnavailable, *, provider_name: str
+    ) -> None:
+        self._result = result
+        self.provider_name = provider_name
+        self.calls = 0
+
+    async def complete(self, **kwargs: object) -> ProviderResponse:
+        del kwargs
+        self.calls += 1
+        if isinstance(self._result, ProviderUnavailable):
+            raise self._result
+        return self._result
+
+    async def list_models(self) -> tuple[str, ...]:
+        return ("small",)
+
+
+def _answer(model: str = "small-resolved") -> ProviderResponse:
+    return ProviderResponse(
+        content="approved answer",
+        model=model,
+        usage={"input_tokens": 1, "output_tokens": 1},
+        finish_reason="stop",
+    )
+
+
+@pytest.mark.asyncio
+async def test_unapproved_primary_is_denied_before_any_provider_call() -> None:
+    provider = _CountingProvider(_answer(), provider_name="counting")
+    gateway = ModelGateway(
+        providers={"counting": provider},
+        profiles={
+            "fast.default": ModelProfile(
+                "fast.default",
+                "test-v1",
+                frozenset({"answer"}),
+                ModelTarget("counting", "unlisted-model", "small"),
+                None,
+            )
+        },
+        model_input_policy=calibrated_model_input_policy(
+            (ModelTarget("counting", "approved-model", "small"),)
+        ),
+    )
+    budget = CallBudget(deadline_ms=1_000, token_budget=100, cost_budget=1, max_attempts=1)
+
+    with pytest.raises(ModelInputPolicyDenied, match="model_target_not_approved") as raised:
+        await gateway.invoke(_request(alias="fast.default"), budget)
+
+    assert provider.calls == 0
+    assert budget.attempts == 0
+    assert raised.value.decision.target_provider == "counting"
+
+
+@pytest.mark.asyncio
+async def test_unapproved_fallback_is_denied_independently_after_primary_failure() -> None:
+    primary = _CountingProvider(
+        ProviderUnavailable("provider_timeout", provider="counting-primary", retryable=True),
+        provider_name="counting-primary",
+    )
+    fallback = _CountingProvider(_answer("small-fallback"), provider_name="counting-fallback")
+    gateway = ModelGateway(
+        providers={"counting-primary": primary, "counting-fallback": fallback},
+        profiles={
+            "fast.default": ModelProfile(
+                "fast.default",
+                "test-v1",
+                frozenset({"answer"}),
+                ModelTarget("counting-primary", "small-primary", "small"),
+                ModelTarget("counting-fallback", "small-fallback", "small"),
+            )
+        },
+        # ONLY the primary is approved; being the fallback grants nothing.
+        model_input_policy=calibrated_model_input_policy(
+            (ModelTarget("counting-primary", "small-primary", "small"),)
+        ),
+    )
+    budget = CallBudget(deadline_ms=1_000, token_budget=100, cost_budget=1, max_attempts=2)
+
+    with pytest.raises(ModelInputPolicyDenied, match="model_target_not_approved") as raised:
+        await gateway.invoke(_request(alias="fast.default"), budget)
+
+    assert primary.calls == 1
+    assert fallback.calls == 0
+    assert raised.value.decision.target_provider == "counting-fallback"
+
+
+@pytest.mark.asyncio
+async def test_configured_system_secret_is_denied_before_any_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R10-E: an approved target plus a bare bounded NON-model system credential
+    # in the prompt must deny BEFORE any provider/budget work.
+    monkeypatch.setenv("EMBEDDING_API_KEY", "emb-deploy-A1B2C3D4E5F6G7H8")
+    provider = _CountingProvider(_answer(), provider_name="counting")
+    gateway = ModelGateway(
+        providers={"counting": provider},
+        profiles={
+            "fast.default": ModelProfile(
+                "fast.default",
+                "test-v1",
+                frozenset({"answer"}),
+                ModelTarget("counting", "small", "small"),
+                None,
+            )
+        },
+        # No explicit secret values: the deployment source must still apply.
+        model_input_policy=calibrated_model_input_policy(
+            (ModelTarget("counting", "small", "small"),)
+        ),
+    )
+    budget = CallBudget(deadline_ms=1_000, token_budget=100, cost_budget=1, max_attempts=1)
+    request = _request(alias="fast.default").model_copy(
+        update={
+            "messages": [
+                {"role": "user", "content": "key emb-deploy-A1B2C3D4E5F6G7H8"}
+            ]
+        }
+    )
+
+    with pytest.raises(ModelInputPolicyDenied, match="model_input_secret_detected"):
+        await gateway.invoke(request, budget)
+
+    assert provider.calls == 0
+    assert budget.attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_configured_system_secret_never_reaches_a_fallback_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R10-F: with a configured system secret in the request, neither the primary
+    # nor the independently-gated fallback provider is called.
+    monkeypatch.setenv("EMBEDDING_API_KEY", "emb-deploy-A1B2C3D4E5F6G7H8")
+    primary = _CountingProvider(
+        ProviderUnavailable("provider_timeout", provider="counting-primary", retryable=True),
+        provider_name="counting-primary",
+    )
+    fallback = _CountingProvider(_answer("small-fallback"), provider_name="counting-fallback")
+    gateway = ModelGateway(
+        providers={"counting-primary": primary, "counting-fallback": fallback},
+        profiles={
+            "fast.default": ModelProfile(
+                "fast.default",
+                "test-v1",
+                frozenset({"answer"}),
+                ModelTarget("counting-primary", "small-primary", "small"),
+                ModelTarget("counting-fallback", "small-fallback", "small"),
+            )
+        },
+        model_input_policy=calibrated_model_input_policy(
+            (
+                ModelTarget("counting-primary", "small-primary", "small"),
+                ModelTarget("counting-fallback", "small-fallback", "small"),
+            )
+        ),
+    )
+    budget = CallBudget(deadline_ms=1_000, token_budget=100, cost_budget=1, max_attempts=2)
+    request = _request(alias="fast.default").model_copy(
+        update={
+            "messages": [
+                {"role": "user", "content": "key emb-deploy-A1B2C3D4E5F6G7H8"}
+            ]
+        }
+    )
+
+    with pytest.raises(ModelInputPolicyDenied, match="model_input_secret_detected"):
+        await gateway.invoke(request, budget)
+
+    assert primary.calls == 0
+    assert fallback.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_technical_secret_is_denied_before_the_provider_call() -> None:
+    provider = _CountingProvider(_answer(), provider_name="counting")
+    gateway = ModelGateway(
+        providers={"counting": provider},
+        profiles={
+            "fast.default": ModelProfile(
+                "fast.default",
+                "test-v1",
+                frozenset({"answer"}),
+                ModelTarget("counting", "small", "small"),
+                None,
+            )
+        },
+        model_input_policy=calibrated_model_input_policy(
+            (ModelTarget("counting", "small", "small"),)
+        ),
+    )
+    request = _request(alias="fast.default").model_copy(
+        update={"messages": [{"role": "user", "content": "password = 'hunter2'"}]}
+    )
+    budget = CallBudget(deadline_ms=1_000, token_budget=100, cost_budget=1, max_attempts=1)
+
+    with pytest.raises(ModelInputPolicyDenied, match="model_input_secret_detected") as raised:
+        await gateway.invoke(request, budget)
+
+    assert provider.calls == 0
+    assert budget.attempts == 0
+    assert "credential_assignment" in raised.value.decision.matched_categories
+
+
+@pytest.mark.asyncio
+async def test_successful_receipt_stamps_model_input_policy_evidence() -> None:
+    gateway = _gateway()
+
+    receipt = await gateway.invoke(
+        _request(alias="fast.default"),
+        CallBudget(deadline_ms=1_000, token_budget=100, cost_budget=1, max_attempts=2),
+    )
+
+    assert receipt.egress_outcome == "allow"
+    assert receipt.model_input_policy_version == "model-input.bootstrap.v1"
+    assert receipt.model_input_policy_checksum == gateway.model_input_policy.checksum
+    assert receipt.matched_categories == ()
+    assert len(receipt.content_sha256) == 64

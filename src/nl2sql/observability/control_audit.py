@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from src.core.database import DatabasePurpose, validate_application_database_url
 from src.core.settings import get_settings
+from src.nl2sql.observability.content_policy import scrub_value
 from src.nl2sql.observability.trace import TraceEvent, fingerprint
 
 
@@ -78,7 +79,11 @@ class ControlAuditStore:
 
     async def append(self, event: TraceEvent) -> None:
         event_id = str(uuid4())
-        payload = event.model_dump(mode="json")
+        # Defense in depth: scrub technical secrets from the persisted payload
+        # even when a caller constructed the TraceEvent without the envelope
+        # sanitizer.  Ordinary business attributes are preserved.
+        payload = scrub_value(event.model_dump(mode="json"))
+        attributes = payload["attributes"]
         try:
             await self._connection.execute(
                 """
@@ -90,7 +95,7 @@ class ControlAuditStore:
                 event.stage,
                 event.name,
                 event.at,
-                json.dumps(event.attributes, ensure_ascii=False, default=str),
+                json.dumps(attributes, ensure_ascii=False, default=str),
             )
             await self._connection.execute(
                 """

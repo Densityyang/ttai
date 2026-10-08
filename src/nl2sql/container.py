@@ -8,6 +8,7 @@ from typing import Any
 
 from src.core.settings import get_settings
 from src.nl2sql.infra.llm.gateway import ModelGateway, build_model_gateway
+from src.nl2sql.infra.llm.model_input_policy import ModelInputPolicyUncalibrated
 from src.nl2sql.infra.memory.checkpointer import CheckpointerManager
 from src.nl2sql.observability.control_audit import ControlAuditStore
 
@@ -120,7 +121,18 @@ class AppContainer:
 
                 try:
                     self._model_gateway = build_model_gateway()
-                except ValueError as exc:
+                    # P2-S2/R2: build_model_gateway injects an explicitly
+                    # deployment-approved model-input policy when one is
+                    # supplied; otherwise the gateway runs a BOOTSTRAP policy
+                    # derived from configured targets, which is never
+                    # production-ready.  A product deployment asserts readiness
+                    # here, so an unconfigured (or destination-empty) policy is
+                    # a startup failure rather than silently approved.  Outside
+                    # product mode this is a no-op and the path is unchanged.
+                    self._model_gateway.require_model_input_policy_ready(
+                        product_mode=get_settings().service_mode == "product"
+                    )
+                except (ValueError, ModelInputPolicyUncalibrated) as exc:
                     raise RuntimeDependencyUnavailable(
                         "model provider configuration is unavailable"
                     ) from exc
