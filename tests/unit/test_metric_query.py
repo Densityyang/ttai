@@ -56,7 +56,7 @@ def test_catalog_addition_requires_no_python_and_preserves_channels() -> None:
     seed = seed_contract()
     another = seed_contract(metric_key="complaint_other_approved_count", display_name="Synthetic other")
     catalog = load_metric_catalog(MetricCatalog(metrics=(seed, another)).model_dump_json())
-    ir = metric_catalog_ir(catalog, relations={"complaint_orders": "ai_views.complaint_orders"})
+    ir = metric_catalog_ir(catalog, relations={seed.source_ref: "ai_views.complaint_orders"})
     assert len(ir.metrics) == 2
     assert ir.metrics[1].execution_contract is not None
     assert ir.metrics[1].execution_contract["benchmark_eligible"] is False
@@ -68,7 +68,7 @@ def test_catalog_addition_requires_no_python_and_preserves_channels() -> None:
 
 
 @pytest.mark.parametrize("changes", [
-    {"operation": "ratio"}, {"owner": None}, {"approver": " "},
+    {"operation": "ratio"}, {"owner": None}, {"owner": " "},
     {"supported_grains": []}, {"supported_grains": ["day", "day"]},
     {"required_permissions": [""]}, {"daily_report_order": 1},
     {"filters": [{"field": "x", "value_type": "text"}] * 2},
@@ -692,9 +692,11 @@ async def test_no_authorization_signature_matches_the_pre_2b_payload() -> None:
         json.dumps(expected_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     assert query.semantic_signature == expected
-    # Literal pre-2B value pin (the fixture is deterministic).
+    # Literal pre-2B value pin (the fixture is deterministic).  The pinned
+    # value carries the config-aligned source_ref v_fault_reporting_order
+    # (P4-S1b section 4); no authorization key is involved either way.
     assert query.semantic_signature == (
-        "e753d3dcfcc0c0a039d1d28d2f87b75d804b94c91ddc43be3f0b91f65b0d1b0b"
+        "e429ab815b0918c007d90f5d3d29eb40d75e471f3776857a3fd8831ab54d242e"
     )
 
 

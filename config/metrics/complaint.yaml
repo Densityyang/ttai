@@ -5,7 +5,9 @@ metrics:
     # Formula confirmed in docs-enterprise-db-contract.md §8.2. Deployment
     # owner, approver and source are deliberately not invented here.
     release_status: pending_source
-    source_ref: complaint_orders
+    # V1 deployment vocabulary: source_ref is the PUBLISHED legacy AI-view name
+    # (configs/semantic/ai_views.yaml), resolving to ai_views.v_fault_reporting_order.
+    source_ref: v_fault_reporting_order
     formula_version: complaint_in_transit_count.v1
     eligibility_policy_id: work_order_metric_eligibility_v1
     operation: count
@@ -24,7 +26,7 @@ metrics:
     # Approved target: acceptance period, valid completed bandwidth orders.
     # Owner, approver, deployment source and freshness remain unapproved.
     release_status: pending_source
-    source_ref: complaint_orders
+    source_ref: v_fault_reporting_order
     formula_version: complaint_first_response_rate.v1
     eligibility_policy_id: work_order_metric_eligibility_v1
     operation: ratio

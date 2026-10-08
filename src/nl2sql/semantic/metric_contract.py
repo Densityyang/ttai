@@ -47,6 +47,9 @@ class MetricContract(FrozenContract):
     display_name: str = Field(min_length=1)
     domain: Literal["complaint"] = "complaint"
     owner: str | None = None
+    # Optional backwards-compatible metadata only.  It is NOT an Agent-side
+    # approval gate: per O3, Backend/data publication is the authority boundary,
+    # so no approval lookup, attestation, table or checksum exists here.
     approver: str | None = None
     release_status: Literal["active", "pending_source", "retired"] = "pending_source"
     daily_report_enabled: bool = False
@@ -78,10 +81,13 @@ class MetricContract(FrozenContract):
         if (not self.supported_dimensions
                 or len(set(self.supported_dimensions)) != len(self.supported_dimensions)):
             raise ValueError("supported dimensions must be nonempty and unique")
+        # O3 alignment: an ACTIVE metric requires owner but NOT approver.
+        # Activation needs no Agent-side approval record; ``approver`` (when
+        # present) stays inert metadata and is never consulted as a gate.
         if self.release_status == "active" and (
-            not self.owner or not self.owner.strip() or not self.approver or not self.approver.strip()
+            not self.owner or not self.owner.strip()
         ):
-            raise ValueError("active metric requires owner and approver")
+            raise ValueError("active metric requires owner")
         if not self.supported_grains or len(set(self.supported_grains)) != len(self.supported_grains):
             raise ValueError("supported grains must be nonempty and unique")
         if any(not item.strip() for item in self.required_permissions):
