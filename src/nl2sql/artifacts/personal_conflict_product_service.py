@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
-from src.nl2sql.artifacts.library import InMemoryLibraryRepository
-from src.nl2sql.artifacts.publication import PublicationCatalogue
 from src.nl2sql.artifacts.service import CustomDefinitionService
 from src.nl2sql.semantic.calculation_contract import SemanticResolution
 from src.nl2sql.semantic.personal_conflict_contract import (
@@ -20,6 +18,9 @@ from src.nl2sql.semantic.personal_conflict_service import (
     resolve_personal_candidate_conflict,
     validate_personal_selection,
 )
+
+if TYPE_CHECKING:
+    from src.nl2sql.artifacts.ports import CataloguePort, LibraryPort
 
 __all__ = [
     "PersonalConflictProductError",
@@ -40,8 +41,8 @@ class PersonalConflictProductService:
         self,
         *,
         definitions: CustomDefinitionService,
-        catalogue: PublicationCatalogue,
-        library: InMemoryLibraryRepository,
+        catalogue: CataloguePort,
+        library: LibraryPort,
     ) -> None:
         self._definitions = definitions
         self._catalogue = catalogue
@@ -63,7 +64,7 @@ class PersonalConflictProductService:
     ) -> tuple[str, str, str, str]:
         return (user_id, thread_id, run_id, conflict_id)
 
-    def resolve(
+    async def resolve(
         self,
         *,
         user_id: str,
@@ -73,11 +74,11 @@ class PersonalConflictProductService:
         run_id: str | None = None,
         own_version: int | None = None,
     ) -> PersonalConflictProjection:
-        self._definitions.get_owned_definition(
+        await self._definitions.get_owned_definition(
             owner_user_id=user_id,
             definition_id=own_definition_id,
         )
-        saved_versions = self._definitions.list_saved_versions(
+        saved_versions = await self._definitions.list_saved_versions(
             owner_user_id=user_id,
             definition_id=own_definition_id,
         )
@@ -87,26 +88,26 @@ class PersonalConflictProductService:
             own_version = saved_versions[-1].version
         if own_version not in {item.version for item in saved_versions}:
             raise PersonalConflictProductError("personal_candidate_version_unavailable")
-        own_version_record = self._definitions.get_exact_version(
+        own_version_record = await self._definitions.get_exact_version(
             owner_user_id=user_id,
             definition_id=own_definition_id,
             version=own_version,
         )
-        lifecycle = self._definitions.get_version_lifecycle(
+        lifecycle = await self._definitions.get_version_lifecycle(
             owner_user_id=user_id,
             definition_id=own_definition_id,
             version=own_version_record.version,
         )
-        install = self._library.get_install(
+        install = await self._library.get_install(
             user_id=user_id,
             identity_id=installed_identity_id,
         )
         if install is None:
             raise PersonalConflictProductError("personal_conflict_install_required")
-        published = self._catalogue.get(installed_identity_id, install.version)
+        published = await self._catalogue.get(installed_identity_id, install.version)
         if published is None:
             raise PersonalConflictProductError("personal_conflict_publication_not_found")
-        certification_raw = self._catalogue.certification_state(
+        certification_raw = await self._catalogue.certification_state(
             installed_identity_id,
             install.version,
         )
@@ -127,7 +128,7 @@ class PersonalConflictProductService:
                 certification_state=cast(
                     CandidateCertificationState, certification
                 ),
-                star_count=self._library.star_count(
+                star_count=await self._library.star_count(
                     identity_id=installed_identity_id
                 ),
             )
@@ -151,7 +152,7 @@ class PersonalConflictProductService:
                     )
                 )
                 if pending is not None:
-                    consumed = self.consume_selection(
+                    consumed = await self.consume_selection(
                         user_id=user_id,
                         thread_id=thread_id,
                         run_id=run_id,
@@ -176,7 +177,7 @@ class PersonalConflictProductService:
         except PersonalConflictServiceError as exc:
             raise PersonalConflictProductError(exc.code) from exc
 
-    def validate_selection(
+    async def validate_selection(
         self,
         *,
         user_id: str,
@@ -207,7 +208,7 @@ class PersonalConflictProductService:
         else:
             # Direct service callers from the pure contract tests may omit a
             # transport binding.  The HTTP product route never does so.
-            projection = self.resolve(
+            projection = await self.resolve(
                 user_id=user_id,
                 own_definition_id=own_definition_id,
                 installed_identity_id=installed_identity_id,
@@ -231,7 +232,7 @@ class PersonalConflictProductService:
             ] = validated
         return projection, validated
 
-    def consume_selection(
+    async def consume_selection(
         self,
         *,
         user_id: str,

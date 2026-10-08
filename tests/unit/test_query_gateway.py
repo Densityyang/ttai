@@ -581,6 +581,19 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
             "pool.fetchval",
             "connection.execute",
         },
+        # Reviewed product-artifact writer: the control-PG artifact repository
+        # reads and writes ONE owner-scoped row per call through the shared
+        # runtime engine, never through a business query session.
+        "src/nl2sql/artifacts/control_store.py": {"connection.execute"},
+        # Reviewed product-publication writer: the control-PG publication
+        # catalogue appends immutable versions and moves the explicit current
+        # pointer through the shared runtime engine, never through a business
+        # query session.
+        "src/nl2sql/artifacts/publication_control_store.py": {"connection.execute"},
+        # Reviewed personal-library writer: the control-PG library repository
+        # reads and writes installs/Stars/withdrawal acks through the shared
+        # runtime engine, never through a business query session.
+        "src/nl2sql/artifacts/library_control_store.py": {"connection.execute"},
         # Reviewed Mode3 orchestration call: the service resolves governed
         # scalar evidence and invokes the pure Calculation Runtime; it is not a
         # database session or QueryGateway bypass.
@@ -675,10 +688,13 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
                 continue
             receiver = ast.unparse(node.func.value)
             # Keep the reviewed call shape stable without embedding SQL text or
-            # parameter dictionaries in the allowlist identity.  The file,
-            # awaited session receiver and terminal method remain exact.
-            if receiver.startswith("await session.execute("):
-                receiver = "await session.execute(...)"
+            # parameter dictionaries in the allowlist identity.  The file, the
+            # awaited connection receiver and the terminal method stay exact.
+            # Any "await <receiver>.execute(<args>)" collapses to its receiver,
+            # so a reviewed entry never has to quote the statement text.
+            if receiver.startswith("await ") and ".execute(" in receiver:
+                head, _, _arguments = receiver.partition(".execute(")
+                receiver = f"{head}.execute(...)"
             call_name = f"{receiver}.{node.func.attr}"
             discovered.setdefault(relative, set()).add(call_name)
 

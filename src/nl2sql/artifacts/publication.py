@@ -1,5 +1,8 @@
 """Generic immutable PUBLICATION core (product path, not a fixture type).
 
+The bundled catalogue is a process-local implementation of the swappable port;
+a Control-PG implementation is selected by configuration.
+
 Invariants:
 
 * a published VERSION is IMMUTABLE and carries its OWN reusable SEMANTIC
@@ -86,10 +89,14 @@ class PublicationCatalogue:
     _certified_by: dict[tuple[str, int], str] = field(default_factory=dict)
     _withdrawn: dict[tuple[str, int], bool] = field(default_factory=dict)
 
-    def get(self, identity_id: str, version: int) -> PublishedVersion | None:
+    async def ping(self) -> None:
+        """Readiness probe.  A process-local store is trivially reachable."""
+
+
+    async def get(self, identity_id: str, version: int) -> PublishedVersion | None:
         return self._versions.get((identity_id, version))
 
-    def versions(self, identity_id: str) -> tuple[PublishedVersion, ...]:
+    async def versions(self, identity_id: str) -> tuple[PublishedVersion, ...]:
         return tuple(
             sorted(
                 (
@@ -101,33 +108,35 @@ class PublicationCatalogue:
             )
         )
 
-    def identities(self) -> tuple[str, ...]:
+    async def identities(self) -> tuple[str, ...]:
         return tuple(sorted({identity for identity, _ in self._versions}))
 
-    def current_version(self, identity_id: str) -> int:
+    async def current_version(self, identity_id: str) -> int:
         """The EXPLICIT pointer; never max(version)."""
-        if not self.versions(identity_id):
+        if not await self.versions(identity_id):
             raise LookupError("publication_identity_not_found")
         current = self._current.get(identity_id)
         if isinstance(current, bool) or not isinstance(current, int):
             raise LookupError("publication_current_version_unbound")
-        if self.get(identity_id, current) is None:
+        if await self.get(identity_id, current) is None:
             raise LookupError("publication_current_version_invalid")
         return current
 
-    def title(self, identity_id: str) -> str:
+    async def title(self, identity_id: str) -> str:
         return self._titles.get(identity_id, identity_id)
 
-    def certification_state(self, identity_id: str, version: int) -> str:
+    async def certification_state(self, identity_id: str, version: int) -> str:
         return self._certification.get((identity_id, version), "uncertified")
 
-    def certified_by(self, identity_id: str, version: int) -> str | None:
+    async def certified_by(self, identity_id: str, version: int) -> str | None:
         return self._certified_by.get((identity_id, version))
 
-    def is_withdrawn(self, identity_id: str, version: int) -> bool:
+    async def is_withdrawn(self, identity_id: str, version: int) -> bool:
         return bool(self._withdrawn.get((identity_id, version), False))
 
-    def seed(self, item: PublishedVersion, *, current: bool = False) -> PublishedVersion:
+    async def seed(
+        self, item: PublishedVersion, *, current: bool = False
+    ) -> PublishedVersion:
         """Fixture/bootstrap ONLY, with fail-closed overwrite protection.
 
         Absent            -> seed allowed.
@@ -146,13 +155,13 @@ class PublicationCatalogue:
         # product publication.  In particular, an existing identity with a
         # missing/corrupt pointer must not be repaired by guessing a maximum.
         if current:
-            existing_versions = self.versions(item.identity_id)
+            existing_versions = await self.versions(item.identity_id)
             if not existing_versions:
                 if item.identity_id in self._current:
                     raise ValueError("publication_current_version_invalid")
                 self._current[item.identity_id] = item.version
             else:
-                current_version = self.current_version(item.identity_id)
+                current_version = await self.current_version(item.identity_id)
                 if item.version < current_version:
                     raise ValueError("publication_current_version_regression")
                 if item.version > current_version:
@@ -161,7 +170,7 @@ class PublicationCatalogue:
         self._titles.setdefault(item.identity_id, item.title)
         return item
 
-    def publish(self, item: PublishedVersion) -> PublishedVersion:
+    async def publish(self, item: PublishedVersion) -> PublishedVersion:
         """Append ONE immutable semantic version and monotonically advance.
 
         Publishing a historical version preserves the already established
@@ -174,9 +183,9 @@ class PublicationCatalogue:
         if item.semantic is None:
             raise ValueError("publication requires a semantic package")
 
-        existing_versions = self.versions(item.identity_id)
+        existing_versions = await self.versions(item.identity_id)
         if existing_versions:
-            current = self.current_version(item.identity_id)
+            current = await self.current_version(item.identity_id)
         else:
             current = None
 
@@ -192,18 +201,18 @@ class PublicationCatalogue:
         self._withdrawn.pop(key, None)
         return item
 
-    def certify_local_demo(
+    async def certify_local_demo(
         self, identity_id: str, version: int, *, certified_by: str
     ) -> None:
         """LOCAL-DEMO certification; the semantic package is NOT touched."""
-        if self.get(identity_id, version) is None:
+        if await self.get(identity_id, version) is None:
             raise LookupError("publication_version_not_found")
         self._certification[(identity_id, version)] = "certified"
         self._certified_by[(identity_id, version)] = certified_by
 
-    def withdraw(self, identity_id: str, version: int) -> None:
+    async def withdraw(self, identity_id: str, version: int) -> None:
         """Source withdrawal; the semantic package is NOT touched."""
-        if self.get(identity_id, version) is None:
+        if await self.get(identity_id, version) is None:
             raise LookupError("publication_version_not_found")
         self._withdrawn[(identity_id, version)] = True
 

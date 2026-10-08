@@ -78,7 +78,7 @@ class CustomDefinitionExecutionService:
         binding: CalculationExecutionBinding,
         execution_context: DefinitionExecutionContext | None = None,
     ) -> CustomDefinitionExecutionOutcome:
-        exact = self._definitions.get_exact_version(
+        exact = await self._definitions.get_exact_version(
             owner_user_id=owner_user_id,
             definition_id=definition_id,
             version=version,
@@ -89,7 +89,7 @@ class CustomDefinitionExecutionService:
             definition_checksum=exact.checksum,
             binding=binding,
         )
-        exact = self._definitions.execute_version(
+        exact = await self._definitions.execute_version(
             owner_user_id=owner_user_id,
             definition_id=definition_id,
             version=version,

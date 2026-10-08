@@ -756,16 +756,16 @@ def test_published_version_state_is_never_taken_from_the_client(
 # --- app-scoped shared state ----------------------------------------------------
 
 
-def test_services_share_one_catalogue_and_one_definition_service(
+async def test_services_share_one_catalogue_and_one_definition_service(
     journey: TestClient,
 ) -> None:
     container = cast(Any, journey.app).state.container
     assert container.custom_definition_service() is container.custom_definition_service()
-    assert container.publication_catalogue() is container.publication_catalogue()
-    assert container.publication_service()._definitions is container.custom_definition_service()
-    assert container.publication_service()._catalogue is container.publication_catalogue()
-    library_service = container.product_library_service()
-    assert library_service is container.product_library_service()
-    assert library_service._catalogue is container.publication_catalogue()
-    assert library_service._library is container.library_repository()
+    assert await container.publication_catalogue() is await container.publication_catalogue()
+    assert (await container.publication_service())._definitions is container.custom_definition_service()
+    assert (await container.publication_service())._catalogue is await container.publication_catalogue()
+    library_service = await container.product_library_service()
+    assert library_service is await container.product_library_service()
+    assert library_service._catalogue is await container.publication_catalogue()
+    assert library_service._library is await container.library_repository()
     assert library_service._definitions is container.custom_definition_service()

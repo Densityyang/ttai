@@ -65,14 +65,16 @@ class CustomDefinitionService:
         )
 
     # --- helpers ---------------------------------------------------------
-    def _owned(self, *, owner_user_id: str, definition_id: str) -> CustomDefinition:
+    async def _owned(
+        self, *, owner_user_id: str, definition_id: str
+    ) -> CustomDefinition:
         definition = self._definitions.get(definition_id)
         if definition is None or definition.owner_user_id != owner_user_id:
             raise DefinitionNotFound()
         return definition
 
     # --- bounded PUBLIC owner-scoped API ---------------------------------
-    def get_owned_definition(
+    async def get_owned_definition(
         self, *, owner_user_id: str, definition_id: str
     ) -> CustomDefinition:
         """Own public accessor.  Foreign == absent, both raise DefinitionNotFound.
@@ -81,9 +83,11 @@ class CustomDefinitionService:
         another public method rather than the private owner-check helper.
         """
 
-        return self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+        return await self._owned(
+            owner_user_id=owner_user_id, definition_id=definition_id
+        )
 
-    def get_version_lifecycle(
+    async def get_version_lifecycle(
         self, *, owner_user_id: str, definition_id: str, version: int
     ) -> DefinitionVersionLifecycle:
         """The EXACT private lifecycle of one version, never the current axes.
@@ -94,7 +98,7 @@ class CustomDefinitionService:
 
         # Reuse the SAME resolution as get_exact_version, so a DRAFT version and
         # a confirmed version are treated consistently by both readers.
-        exact = self.get_exact_version(
+        exact = await self.get_exact_version(
             owner_user_id=owner_user_id,
             definition_id=definition_id,
             version=version,
@@ -112,7 +116,7 @@ class CustomDefinitionService:
         return DefinitionVersionLifecycle()
 
     # --- lifecycle -------------------------------------------------------
-    def create_draft(
+    async def create_draft(
         self,
         *,
         owner_user_id: str,
@@ -148,7 +152,7 @@ class CustomDefinitionService:
         )
         return draft
 
-    def update_draft(
+    async def update_draft(
         self,
         *,
         owner_user_id: str,
@@ -157,7 +161,9 @@ class CustomDefinitionService:
         parameter_contract: ParameterContract | None = None,
         title: str | None = None,
     ) -> DefinitionVersion:
-        current = self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+        current = await self._owned(
+            owner_user_id=owner_user_id, definition_id=definition_id
+        )
         if current.axes.confirmation == "CONFIRMED":
             # A confirmed/saved version is immutable.  A material semantic edit
             # requires a NEW immutable DefinitionVersion; the positive revision
@@ -202,10 +208,12 @@ class CustomDefinitionService:
         )
         return updated
 
-    def confirm(
+    async def confirm(
         self, *, owner_user_id: str, definition_id: str
     ) -> CustomDefinition:
-        current = self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+        current = await self._owned(
+            owner_user_id=owner_user_id, definition_id=definition_id
+        )
         draft = self._drafts[definition_id]
         # Confirming an UNCLOSED draft would create an immutable version that can
         # never become SAVED (closure refuses confirmed definitions), i.e. a
@@ -228,8 +236,12 @@ class CustomDefinitionService:
         self._definitions[definition_id] = confirmed
         return confirmed
 
-    def save(self, *, owner_user_id: str, definition_id: str) -> CustomDefinition:
-        current = self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+    async def save(
+        self, *, owner_user_id: str, definition_id: str
+    ) -> CustomDefinition:
+        current = await self._owned(
+            owner_user_id=owner_user_id, definition_id=definition_id
+        )
         if current.axes.confirmation != "CONFIRMED":
             raise ValueError("SAVED requires CONFIRMED")
         if not current.current_version.semantic_closed:
@@ -243,7 +255,7 @@ class CustomDefinitionService:
         )
         return saved
 
-    def mark_semantic_closed(
+    async def mark_semantic_closed(
         self, *, owner_user_id: str, definition_id: str
     ) -> DefinitionVersion:
         """Explicit semantic-closure transition for a mutable DRAFT.
@@ -253,7 +265,9 @@ class CustomDefinitionService:
         slot).  There is deliberately no client-trusted boolean on the wire.
         """
 
-        current = self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+        current = await self._owned(
+            owner_user_id=owner_user_id, definition_id=definition_id
+        )
         if current.axes.confirmation == "CONFIRMED":
             raise ValueError("a confirmed version is immutable")
         draft = self._drafts[definition_id]
@@ -302,7 +316,7 @@ class CustomDefinitionService:
         )
 
 
-    def project_published(
+    async def project_published(
         self, *, owner_user_id: str, definition_id: str, version: int
     ) -> None:
         """Project PUBLISHED onto the CURRENT axes (certification unchanged).
@@ -311,7 +325,9 @@ class CustomDefinitionService:
         lives in the catalogue and is never inferred from these axes.
         """
 
-        current = self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+        current = await self._owned(
+            owner_user_id=owner_user_id, definition_id=definition_id
+        )
         if current.current_version.version != version:
             return
         axes = current.axes
@@ -325,12 +341,14 @@ class CustomDefinitionService:
             }
         )
 
-    def project_certified(
+    async def project_certified(
         self, *, owner_user_id: str, definition_id: str
     ) -> None:
         """Project CERTIFIED onto the CURRENT axes of a PUBLISHED version."""
 
-        current = self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+        current = await self._owned(
+            owner_user_id=owner_user_id, definition_id=definition_id
+        )
         if current.axes.publication != "PUBLISHED":
             raise ValueError("certification projection requires PUBLISHED")
         self._definitions[definition_id] = current.model_copy(
@@ -342,7 +360,7 @@ class CustomDefinitionService:
         )
 
 
-    def create_revision(
+    async def create_revision(
         self, *, owner_user_id: str, definition_id: str
     ) -> DefinitionVersion:
         """Open a NEW mutable Draft revision of a confirmed definition.
@@ -354,7 +372,9 @@ class CustomDefinitionService:
         authority, and lineage to vN is explicit.
         """
 
-        current = self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+        current = await self._owned(
+            owner_user_id=owner_user_id, definition_id=definition_id
+        )
         if current.axes.confirmation != "CONFIRMED":
             raise ValueError("revision requires a confirmed definition")
         prior = current.current_version
@@ -385,7 +405,7 @@ class CustomDefinitionService:
         return revision
 
 
-    def create_fork(
+    async def create_fork(
         self,
         *,
         owner_user_id: str,
@@ -423,19 +443,21 @@ class CustomDefinitionService:
         )
         return fork
 
-    def list_owned(self, *, owner_user_id: str) -> tuple[CustomDefinition, ...]:
+    async def list_owned(
+        self, *, owner_user_id: str
+    ) -> tuple[CustomDefinition, ...]:
         return tuple(
             definition
             for definition in self._definitions.values()
             if definition.owner_user_id == owner_user_id
         )
 
-    def list_saved_versions(
+    async def list_saved_versions(
         self, *, owner_user_id: str, definition_id: str
     ) -> tuple[DefinitionVersion, ...]:
         """Return exact immutable SAVED versions, including historical ones."""
 
-        self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+        await self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
         versions: dict[int, DefinitionVersion] = {}
         for (candidate_id, version), exact in self._versions.items():
             if candidate_id != definition_id:
@@ -449,7 +471,7 @@ class CustomDefinitionService:
             versions[current.version] = current
         return tuple(versions[key] for key in sorted(versions))
 
-    def get_exact_version(
+    async def get_exact_version(
         self, *, owner_user_id: str, definition_id: str, version: int
     ) -> DefinitionVersion:
         """The exact version, whether it is still a DRAFT or already confirmed.
@@ -459,7 +481,9 @@ class CustomDefinitionService:
         that is neither the current draft nor a confirmed version does not exist.
         """
 
-        current = self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+        current = await self._owned(
+            owner_user_id=owner_user_id, definition_id=definition_id
+        )
         exact = self._versions.get((definition_id, version))
         if exact is None:
             draft = self._drafts.get(definition_id)
@@ -470,7 +494,7 @@ class CustomDefinitionService:
             raise DefinitionNotFound()
         return exact
 
-    def execute_version(
+    async def execute_version(
         self,
         *,
         owner_user_id: str,
@@ -484,7 +508,7 @@ class CustomDefinitionService:
         values never creates a new definition version.
         """
 
-        exact = self.get_exact_version(
+        exact = await self.get_exact_version(
             owner_user_id=owner_user_id, definition_id=definition_id, version=version
         )
         # The WHOLE binding must correspond to this exact immutable version.

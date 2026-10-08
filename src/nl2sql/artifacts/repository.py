@@ -1,4 +1,7 @@
-"""Artifact repository: owner-scoped, fail-closed, DEMO/local and non-durable.
+"""Artifact repository port: owner-scoped and fail-closed.
+
+The bundled implementation is a process-local implementation of the swappable
+port; a Control-PG implementation is selected by configuration.
 
 Every read/mutation resolves the owner from the AUTHENTICATED identity passed in
 by the caller (the request context), never from a request field.  A cross-user
@@ -44,7 +47,7 @@ def new_artifact_id() -> str:
 
 @runtime_checkable
 class ArtifactRepository(Protocol):
-    def create(
+    async def create(
         self,
         *,
         owner_user_id: str,
@@ -53,11 +56,15 @@ class ArtifactRepository(Protocol):
         run_id: str | None = None,
     ) -> ArtifactEnvelope: ...
 
-    def get(self, *, owner_user_id: str, artifact_id: str) -> ArtifactEnvelope: ...
+    async def get(
+        self, *, owner_user_id: str, artifact_id: str
+    ) -> ArtifactEnvelope: ...
 
-    def list_for_owner(self, *, owner_user_id: str) -> tuple[ArtifactEnvelope, ...]: ...
+    async def list_for_owner(
+        self, *, owner_user_id: str
+    ) -> tuple[ArtifactEnvelope, ...]: ...
 
-    def replace_payload(
+    async def replace_payload(
         self,
         *,
         owner_user_id: str,
@@ -67,7 +74,7 @@ class ArtifactRepository(Protocol):
 
 
 class InMemoryArtifactRepository:
-    """DEMO/local, process-lifetime, NON-DURABLE artifact store.
+    """Process-local, in-memory implementation of the artifact port.
 
     Per-instance state only (no module/class-level dict), so tests cannot share
     state and a foreign caller can never observe another user's artifacts.
@@ -76,7 +83,11 @@ class InMemoryArtifactRepository:
     def __init__(self) -> None:
         self._records: dict[str, ArtifactEnvelope] = {}
 
-    def create(
+    async def ping(self) -> None:
+        """Readiness probe.  A process-local store is trivially reachable."""
+
+
+    async def create(
         self,
         *,
         owner_user_id: str,
@@ -105,28 +116,34 @@ class InMemoryArtifactRepository:
         self._records[record.artifact_id] = record
         return record
 
-    def get(self, *, owner_user_id: str, artifact_id: str) -> ArtifactEnvelope:
+    async def get(
+        self, *, owner_user_id: str, artifact_id: str
+    ) -> ArtifactEnvelope:
         record = self._records.get(artifact_id)
         if record is None or record.owner_user_id != owner_user_id:
             # Identical failure for "absent" and "not yours".
             raise ArtifactNotFound()
         return record
 
-    def list_for_owner(self, *, owner_user_id: str) -> tuple[ArtifactEnvelope, ...]:
+    async def list_for_owner(
+        self, *, owner_user_id: str
+    ) -> tuple[ArtifactEnvelope, ...]:
         return tuple(
             record
             for record in self._records.values()
             if record.owner_user_id == owner_user_id
         )
 
-    def replace_payload(
+    async def replace_payload(
         self,
         *,
         owner_user_id: str,
         artifact_id: str,
         payload: AnalysisArtifact | CustomDefinitionArtifact,
     ) -> ArtifactEnvelope:
-        current = self.get(owner_user_id=owner_user_id, artifact_id=artifact_id)
+        current = await self.get(
+            owner_user_id=owner_user_id, artifact_id=artifact_id
+        )
         # The artifact TYPE is immutable: replacing an analysis payload with a
         # custom-definition payload (or vice versa) would leave an envelope whose
         # declared type contradicts its payload.

@@ -947,80 +947,80 @@ def test_no_public_rollback_mutator_exists() -> None:
         assert "set_current" not in name.lower()
 
 
-def test_first_valid_current_is_established_then_advances() -> None:
+async def test_first_valid_current_is_established_then_advances() -> None:
     from src.nl2sql.artifacts.publication import PublicationCatalogue
 
     catalogue = PublicationCatalogue()
-    catalogue.publish(_published_version("id.one", 1))
-    assert catalogue.current_version("id.one") == 1
-    catalogue.publish(_published_version("id.one", 2))
-    assert catalogue.current_version("id.one") == 2
+    await catalogue.publish(_published_version("id.one", 1))
+    assert await catalogue.current_version("id.one") == 1
+    await catalogue.publish(_published_version("id.one", 2))
+    assert await catalogue.current_version("id.one") == 2
 
 
-def test_historical_publication_never_moves_current_backward() -> None:
+async def test_historical_publication_never_moves_current_backward() -> None:
     from src.nl2sql.artifacts.publication import PublicationCatalogue
 
     catalogue = PublicationCatalogue()
-    catalogue.publish(_published_version("id.two", 3))
-    assert catalogue.current_version("id.two") == 3
-    catalogue.publish(_published_version("id.two", 1))
-    assert catalogue.current_version("id.two") == 3, "current regressed"
-    catalogue.publish(_published_version("id.two", 2))
-    assert catalogue.current_version("id.two") == 3
+    await catalogue.publish(_published_version("id.two", 3))
+    assert await catalogue.current_version("id.two") == 3
+    await catalogue.publish(_published_version("id.two", 1))
+    assert await catalogue.current_version("id.two") == 3, "current regressed"
+    await catalogue.publish(_published_version("id.two", 2))
+    assert await catalogue.current_version("id.two") == 3
 
 
-def test_seed_current_false_never_changes_current() -> None:
+async def test_seed_current_false_never_changes_current() -> None:
     from src.nl2sql.artifacts.publication import PublicationCatalogue
 
     catalogue = PublicationCatalogue()
-    catalogue.seed(_published_version("id.three", 5, semantic=False), current=True)
-    assert catalogue.current_version("id.three") == 5
-    catalogue.seed(_published_version("id.three", 1, semantic=False))
-    assert catalogue.current_version("id.three") == 5
+    await catalogue.seed(_published_version("id.three", 5, semantic=False), current=True)
+    assert await catalogue.current_version("id.three") == 5
+    await catalogue.seed(_published_version("id.three", 1, semantic=False))
+    assert await catalogue.current_version("id.three") == 5
 
 
-def test_seed_current_true_cannot_regress_current() -> None:
+async def test_seed_current_true_cannot_regress_current() -> None:
     from src.nl2sql.artifacts.publication import PublicationCatalogue
 
     catalogue = PublicationCatalogue()
-    catalogue.seed(_published_version("id.four", 5, semantic=False), current=True)
+    await catalogue.seed(_published_version("id.four", 5, semantic=False), current=True)
     with pytest.raises(ValueError, match="regression"):
-        catalogue.seed(_published_version("id.four", 2, semantic=False), current=True)
-    assert catalogue.current_version("id.four") == 5
+        await catalogue.seed(_published_version("id.four", 2, semantic=False), current=True)
+    assert await catalogue.current_version("id.four") == 5
 
 
-def test_missing_and_corrupt_current_fail_closed() -> None:
+async def test_missing_and_corrupt_current_fail_closed() -> None:
     from src.nl2sql.artifacts.publication import PublicationCatalogue
 
     catalogue = PublicationCatalogue()
-    catalogue.publish(_published_version("id.five", 1))
+    await catalogue.publish(_published_version("id.five", 1))
     catalogue._current.pop("id.five")
     with pytest.raises(LookupError, match="unbound"):
-        catalogue.current_version("id.five")
+        await catalogue.current_version("id.five")
     catalogue._current["id.five"] = 99
     with pytest.raises(LookupError, match="invalid"):
-        catalogue.current_version("id.five")
+        await catalogue.current_version("id.five")
     catalogue._current["id.five"] = True
     with pytest.raises(LookupError, match="unbound"):
-        catalogue.current_version("id.five")
+        await catalogue.current_version("id.five")
 
 
-def test_withdrawn_current_disappears_from_discovery_without_fallback() -> None:
+async def test_withdrawn_current_disappears_from_discovery_without_fallback() -> None:
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
     from src.nl2sql.artifacts.publication import PublicationCatalogue
 
     catalogue = PublicationCatalogue()
     library = InMemoryLibraryRepository(catalogue=catalogue)
     service = _library_service(catalogue, library)
-    catalogue.publish(_published_version("id.six", 1))
-    catalogue.publish(_published_version("id.six", 2))
-    assert [e["identity_id"] for e in service.catalogue_entries()] == ["id.six"]
-    catalogue.withdraw("id.six", 2)
+    await catalogue.publish(_published_version("id.six", 1))
+    await catalogue.publish(_published_version("id.six", 2))
+    assert [e["identity_id"] for e in await service.catalogue_entries()] == ["id.six"]
+    await catalogue.withdraw("id.six", 2)
     # The withdrawn CURRENT disappears; NO fallback to the older v1.
-    assert service.catalogue_entries() == ()
+    assert await service.catalogue_entries() == ()
 
 
-def test_install_and_upgrade_into_a_withdrawn_version_fail() -> None:
+async def test_install_and_upgrade_into_a_withdrawn_version_fail() -> None:
     from src.nl2sql.artifacts.library import (
         InMemoryLibraryRepository,
         LibraryIdentityNotFound,
@@ -1029,54 +1029,54 @@ def test_install_and_upgrade_into_a_withdrawn_version_fail() -> None:
 
     catalogue = PublicationCatalogue()
     library = InMemoryLibraryRepository(catalogue=catalogue)
-    catalogue.publish(_published_version("id.seven", 1))
-    catalogue.publish(_published_version("id.seven", 2))
-    library.install(user_id="alice", identity_id="id.seven", version=1)
-    catalogue.withdraw("id.seven", 2)
+    await catalogue.publish(_published_version("id.seven", 1))
+    await catalogue.publish(_published_version("id.seven", 2))
+    await library.install(user_id="alice", identity_id="id.seven", version=1)
+    await catalogue.withdraw("id.seven", 2)
     with pytest.raises(LibraryIdentityNotFound, match="withdrawn"):
-        library.install(user_id="bob", identity_id="id.seven", version=2)
+        await library.install(user_id="bob", identity_id="id.seven", version=2)
     with pytest.raises(LibraryIdentityNotFound, match="withdrawn"):
-        library.upgrade(user_id="alice", identity_id="id.seven", to_version=2)
-    install = library.get_install(user_id="alice", identity_id="id.seven")
+        await library.upgrade(user_id="alice", identity_id="id.seven", to_version=2)
+    install = await library.get_install(user_id="alice", identity_id="id.seven")
     assert install is not None and install.version == 1
 
 
-def test_acknowledgement_never_clears_withdrawal() -> None:
+async def test_acknowledgement_never_clears_withdrawal() -> None:
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
     from src.nl2sql.artifacts.publication import PublicationCatalogue
 
     catalogue = PublicationCatalogue()
     library = InMemoryLibraryRepository(catalogue=catalogue)
-    catalogue.publish(_published_version("id.eight", 1))
-    library.install(user_id="alice", identity_id="id.eight", version=1)
-    catalogue.withdraw("id.eight", 1)
-    library.acknowledge_withdrawal(user_id="alice", identity_id="id.eight", version=1)
-    assert library.is_acknowledged(user_id="alice", identity_id="id.eight", version=1)
-    assert catalogue.is_withdrawn("id.eight", 1) is True, "ack cleared withdrawal"
+    await catalogue.publish(_published_version("id.eight", 1))
+    await library.install(user_id="alice", identity_id="id.eight", version=1)
+    await catalogue.withdraw("id.eight", 1)
+    await library.acknowledge_withdrawal(user_id="alice", identity_id="id.eight", version=1)
+    assert await library.is_acknowledged(user_id="alice", identity_id="id.eight", version=1)
+    assert await catalogue.is_withdrawn("id.eight", 1) is True, "ack cleared withdrawal"
 
 
-def test_a_later_higher_published_current_restores_discovery() -> None:
+async def test_a_later_higher_published_current_restores_discovery() -> None:
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
     from src.nl2sql.artifacts.publication import PublicationCatalogue
 
     catalogue = PublicationCatalogue()
     library = InMemoryLibraryRepository(catalogue=catalogue)
     service = _library_service(catalogue, library)
-    catalogue.publish(_published_version("id.nine", 1))
-    catalogue.withdraw("id.nine", 1)
-    assert service.catalogue_entries() == ()
-    catalogue.publish(_published_version("id.nine", 2))
-    entries = service.catalogue_entries()
+    await catalogue.publish(_published_version("id.nine", 1))
+    await catalogue.withdraw("id.nine", 1)
+    assert await service.catalogue_entries() == ()
+    await catalogue.publish(_published_version("id.nine", 2))
+    entries = await service.catalogue_entries()
     assert len(entries) == 1
     assert entries[0]["current_version"] == 2
-    assert catalogue.is_withdrawn("id.nine", 2) is False
+    assert await catalogue.is_withdrawn("id.nine", 2) is False
 
 
 @pytest.mark.parametrize(
     ("installed", "current", "expected"),
     [(1, 1, False), (2, 1, False), (1, 2, True)],
 )
-def test_update_available_matrix(installed: int, current: int, expected: bool) -> None:
+async def test_update_available_matrix(installed: int, current: int, expected: bool) -> None:
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
     from src.nl2sql.artifacts.publication import PublicationCatalogue
 
@@ -1084,31 +1084,31 @@ def test_update_available_matrix(installed: int, current: int, expected: bool) -
     library = InMemoryLibraryRepository(catalogue=catalogue)
     top = max(installed, current)
     for version in range(1, top + 1):
-        catalogue.publish(_published_version("id.ten", version))
-    library.install(user_id="alice", identity_id="id.ten", version=installed)
+        await catalogue.publish(_published_version("id.ten", version))
+    await library.install(user_id="alice", identity_id="id.ten", version=installed)
     if current != top:
         catalogue._current["id.ten"] = current
-    result = library.update_available(user_id="alice", identity_id="id.ten")
+    result = await library.update_available(user_id="alice", identity_id="id.ten")
     assert result is expected
 
 
-def test_withdrawn_or_missing_current_reports_no_update() -> None:
+async def test_withdrawn_or_missing_current_reports_no_update() -> None:
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
     from src.nl2sql.artifacts.publication import PublicationCatalogue
 
     catalogue = PublicationCatalogue()
     library = InMemoryLibraryRepository(catalogue=catalogue)
-    catalogue.publish(_published_version("id.eleven", 1))
-    catalogue.publish(_published_version("id.eleven", 2))
-    library.install(user_id="alice", identity_id="id.eleven", version=1)
-    assert library.update_available(user_id="alice", identity_id="id.eleven") is True
-    catalogue.withdraw("id.eleven", 2)
-    assert library.update_available(user_id="alice", identity_id="id.eleven") is False
+    await catalogue.publish(_published_version("id.eleven", 1))
+    await catalogue.publish(_published_version("id.eleven", 2))
+    await library.install(user_id="alice", identity_id="id.eleven", version=1)
+    assert await library.update_available(user_id="alice", identity_id="id.eleven") is True
+    await catalogue.withdraw("id.eleven", 2)
+    assert await library.update_available(user_id="alice", identity_id="id.eleven") is False
     catalogue._current.pop("id.eleven")
-    assert library.update_available(user_id="alice", identity_id="id.eleven") is False
+    assert await library.update_available(user_id="alice", identity_id="id.eleven") is False
 
 
-def test_upgrade_must_move_strictly_upward() -> None:
+async def test_upgrade_must_move_strictly_upward() -> None:
     from src.nl2sql.artifacts.library import (
         InMemoryLibraryRepository,
         LibraryIdentityNotFound,
@@ -1118,16 +1118,16 @@ def test_upgrade_must_move_strictly_upward() -> None:
     catalogue = PublicationCatalogue()
     library = InMemoryLibraryRepository(catalogue=catalogue)
     for version in (1, 2, 3):
-        catalogue.publish(_published_version("id.twelve", version))
-    library.install(user_id="alice", identity_id="id.twelve", version=2)
+        await catalogue.publish(_published_version("id.twelve", version))
+    await library.install(user_id="alice", identity_id="id.twelve", version=2)
     with pytest.raises(LibraryIdentityNotFound, match="newer"):
-        library.upgrade(user_id="alice", identity_id="id.twelve", to_version=1)
+        await library.upgrade(user_id="alice", identity_id="id.twelve", to_version=1)
     with pytest.raises(LibraryIdentityNotFound, match="newer"):
-        library.upgrade(user_id="alice", identity_id="id.twelve", to_version=2)
-    held = library.get_install(user_id="alice", identity_id="id.twelve")
+        await library.upgrade(user_id="alice", identity_id="id.twelve", to_version=2)
+    held = await library.get_install(user_id="alice", identity_id="id.twelve")
     assert held is not None and held.version == 2, "rejected upgrade moved it"
-    library.upgrade(user_id="alice", identity_id="id.twelve", to_version=3)
-    moved = library.get_install(user_id="alice", identity_id="id.twelve")
+    await library.upgrade(user_id="alice", identity_id="id.twelve", to_version=3)
+    moved = await library.get_install(user_id="alice", identity_id="id.twelve")
     assert moved is not None and moved.version == 3
 
 
@@ -1194,7 +1194,7 @@ def _execute_spec() -> Any:
     )
 
 
-def _execute_app(fetcher: Any) -> tuple[TestClient, str]:
+async def _execute_app(fetcher: Any) -> tuple[TestClient, str]:
     from src.nl2sql.artifacts.api_definitions import register_definition_routes
     from src.nl2sql.artifacts.service import CustomDefinitionService
     from src.nl2sql.orchestration.governed_calculation_inputs import (
@@ -1205,14 +1205,14 @@ def _execute_app(fetcher: Any) -> tuple[TestClient, str]:
         governed_metric_keys={"repair_service_archive_rate_overall_day"}
     )
     spec = _execute_spec()
-    draft = definitions.create_draft(
+    draft = await definitions.create_draft(
         owner_user_id="alice", title="T", calculation=spec
     )
-    definitions.mark_semantic_closed(
+    await definitions.mark_semantic_closed(
         owner_user_id="alice", definition_id=draft.definition_id
     )
-    definitions.confirm(owner_user_id="alice", definition_id=draft.definition_id)
-    definitions.save(owner_user_id="alice", definition_id=draft.definition_id)
+    await definitions.confirm(owner_user_id="alice", definition_id=draft.definition_id)
+    await definitions.save(owner_user_id="alice", definition_id=draft.definition_id)
 
     class _Container:
         def custom_definition_service(self) -> Any:
@@ -1252,9 +1252,9 @@ def _execute_path(definition_id: str) -> str:
     return f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute"
 
 
-def test_omitted_date_context_defaults_to_latest_authoritative() -> None:
+async def test_omitted_date_context_defaults_to_latest_authoritative() -> None:
     fetcher = _RecordingFetcher()
-    client, definition_id = _execute_app(fetcher)
+    client, definition_id = await _execute_app(fetcher)
     spec = _execute_spec()
     response = client.post(
         _execute_path(definition_id), json={"binding": _binding_body(spec, 90)}
@@ -1266,9 +1266,9 @@ def test_omitted_date_context_defaults_to_latest_authoritative() -> None:
     assert context.exact_date is None
 
 
-def test_explicit_latest_authoritative_is_unchanged() -> None:
+async def test_explicit_latest_authoritative_is_unchanged() -> None:
     fetcher = _RecordingFetcher()
-    client, definition_id = _execute_app(fetcher)
+    client, definition_id = await _execute_app(fetcher)
     spec = _execute_spec()
     response = client.post(
         _execute_path(definition_id),
@@ -1283,9 +1283,9 @@ def test_explicit_latest_authoritative_is_unchanged() -> None:
     assert context.exact_date is None
 
 
-def test_exact_date_propagates_unchanged_to_the_fetcher() -> None:
+async def test_exact_date_propagates_unchanged_to_the_fetcher() -> None:
     fetcher = _RecordingFetcher()
-    client, definition_id = _execute_app(fetcher)
+    client, definition_id = await _execute_app(fetcher)
     spec = _execute_spec()
     response = client.post(
         _execute_path(definition_id),
@@ -1300,9 +1300,9 @@ def test_exact_date_propagates_unchanged_to_the_fetcher() -> None:
     assert context.exact_date == date(2026, 8, 15)
 
 
-def test_compact_top_level_exact_date_spelling_also_propagates() -> None:
+async def test_compact_top_level_exact_date_spelling_also_propagates() -> None:
     fetcher = _RecordingFetcher()
-    client, definition_id = _execute_app(fetcher)
+    client, definition_id = await _execute_app(fetcher)
     spec = _execute_spec()
     response = client.post(
         _execute_path(definition_id),
@@ -1335,9 +1335,9 @@ def test_compact_top_level_exact_date_spelling_also_propagates() -> None:
         ),
     ],
 )
-def test_date_context_rejections(body: dict[str, Any], label: str) -> None:
+async def test_date_context_rejections(body: dict[str, Any], label: str) -> None:
     fetcher = _RecordingFetcher()
-    client, definition_id = _execute_app(fetcher)
+    client, definition_id = await _execute_app(fetcher)
     spec = _execute_spec()
     payload = {"binding": _binding_body(spec, 90), **body}
     response = client.post(_execute_path(definition_id), json=payload)
@@ -1422,7 +1422,7 @@ def test_illustrative_axes_cannot_be_encoded_as_one_status_literal() -> None:
     assert first.model_dump() != second.model_dump()
 
 
-def test_historical_publication_never_rewrites_a_newer_current_revision() -> None:
+async def test_historical_publication_never_rewrites_a_newer_current_revision() -> None:
     from src.nl2sql.artifacts.publication import PublicationCatalogue
     from src.nl2sql.artifacts.publication_service import PublicationService
 
@@ -1434,23 +1434,23 @@ def test_historical_publication_never_rewrites_a_newer_current_revision() -> Non
         definitions=definitions, catalogue=catalogue
     )
     spec = _execute_spec()
-    draft = definitions.create_draft(
+    draft = await definitions.create_draft(
         owner_user_id="alice", title="T", calculation=spec
     )
     definition_id = draft.definition_id
-    definitions.mark_semantic_closed(
+    await definitions.mark_semantic_closed(
         owner_user_id="alice", definition_id=definition_id
     )
-    definitions.confirm(owner_user_id="alice", definition_id=definition_id)
-    definitions.save(owner_user_id="alice", definition_id=definition_id)
+    await definitions.confirm(owner_user_id="alice", definition_id=definition_id)
+    await definitions.save(owner_user_id="alice", definition_id=definition_id)
     # open v2 BEFORE publishing v1
-    definitions.create_revision(
+    await definitions.create_revision(
         owner_user_id="alice", definition_id=definition_id
     )
-    publications.publish(
+    await publications.publish(
         owner_user_id="alice", definition_id=definition_id, version=1
     )
-    current = definitions.get_owned_definition(
+    current = await definitions.get_owned_definition(
         owner_user_id="alice", definition_id=definition_id
     )
     assert current.current_version.version == 2
@@ -1459,11 +1459,11 @@ def test_historical_publication_never_rewrites_a_newer_current_revision() -> Non
     assert current.axes.confirmation == "DRAFT"
     assert current.axes.retention == "SESSION"
     # ...and v1 keeps its OWN exact axes in the catalogue
-    assert catalogue.get(definition_id, 1) is not None
-    assert catalogue.current_version(definition_id) == 1
+    assert await catalogue.get(definition_id, 1) is not None
+    assert await catalogue.current_version(definition_id) == 1
 
 
-def test_certifying_a_historical_version_never_rewrites_current_axes() -> None:
+async def test_certifying_a_historical_version_never_rewrites_current_axes() -> None:
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
     from src.nl2sql.artifacts.product_library_service import (
         CertificationAuthority,
@@ -1489,29 +1489,29 @@ def test_certifying_a_historical_version_never_rewrites_current_axes() -> None:
         ),
     )
     spec = _execute_spec()
-    draft = definitions.create_draft(
+    draft = await definitions.create_draft(
         owner_user_id="alice", title="T", calculation=spec
     )
     definition_id = draft.definition_id
     for step in ("mark_semantic_closed", "confirm", "save"):
-        getattr(definitions, step)(
+        await getattr(definitions, step)(
             owner_user_id="alice", definition_id=definition_id
         )
-    service._publications.publish(
+    await service._publications.publish(
         owner_user_id="alice", definition_id=definition_id, version=1
     )
-    definitions.create_revision(
+    await definitions.create_revision(
         owner_user_id="alice", definition_id=definition_id
     )
     # certify the HISTORICAL v1
-    service.certify(user_id="admin", identity_id=definition_id, version=1)
-    current = definitions.get_owned_definition(
+    await service.certify(user_id="admin", identity_id=definition_id, version=1)
+    current = await definitions.get_owned_definition(
         owner_user_id="alice", definition_id=definition_id
     )
     assert current.current_version.version == 2
     assert current.axes.certification == "UNCERTIFIED", "v2 axes were rewritten"
     assert current.axes.publication == "UNPUBLISHED"
-    assert catalogue.certification_state(definition_id, 1) == "certified"
+    assert await catalogue.certification_state(definition_id, 1) == "certified"
 
 
 @pytest.mark.parametrize(
@@ -1533,11 +1533,11 @@ def test_certifying_a_historical_version_never_rewrites_current_axes() -> None:
         "data_as_of",
     ],
 )
-def test_execution_context_cannot_carry_input_selection_authority(
+async def test_execution_context_cannot_carry_input_selection_authority(
     override_field: str,
 ) -> None:
     fetcher = _RecordingFetcher()
-    client, definition_id = _execute_app(fetcher)
+    client, definition_id = await _execute_app(fetcher)
     spec = _execute_spec()
     payload = {
         "binding": _binding_body(spec, 90),
@@ -1552,7 +1552,7 @@ def test_execution_context_cannot_carry_input_selection_authority(
     assert fetcher.contexts == [], f"{override_field} reached the fetcher"
 
 
-def test_parameter_values_remain_calculation_parameters_only() -> None:
+async def test_parameter_values_remain_calculation_parameters_only() -> None:
     """A parameter VALUE can never select the governed business input."""
 
     from src.nl2sql.orchestration.custom_calculation_execution import (
@@ -1582,7 +1582,7 @@ def test_parameter_values_remain_calculation_parameters_only() -> None:
             )
 
     fetcher = _SelectingFetcher()
-    client, definition_id = _execute_app(fetcher)
+    client, definition_id = await _execute_app(fetcher)
     spec = _execute_spec()
     for target in (10, 90, 100):
         response = client.post(

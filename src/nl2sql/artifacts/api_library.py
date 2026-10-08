@@ -132,14 +132,14 @@ def owner_identity(auth_user: AuthUser) -> str:
     return str(auth_user.user_id)
 
 
-def library_service(request: Request) -> ProductLibraryService:
+async def library_service(request: Request) -> ProductLibraryService:
     container = getattr(request.app.state, "container", None)
     if container is None or not hasattr(container, "product_library_service"):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="runtime dependency unavailable",
         )
-    service: ProductLibraryService = container.product_library_service()
+    service: ProductLibraryService = await container.product_library_service()
     return service
 
 
@@ -241,7 +241,8 @@ def register_library_routes(app: Any) -> None:
         request: Request,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> LibraryResponse:
-        entries = library_service(request).library_entries(user_id=owner_identity(auth_user))
+        service = await library_service(request)
+        entries = await service.library_entries(user_id=owner_identity(auth_user))
         return LibraryResponse(entries=tuple(_library_entry(entry) for entry in entries))
 
     @router.get("/catalogue", response_model=CatalogueResponse)
@@ -250,7 +251,8 @@ def register_library_routes(app: Any) -> None:
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> CatalogueResponse:
         del auth_user
-        entries = library_service(request).catalogue_entries()
+        service = await library_service(request)
+        entries = await service.catalogue_entries()
         return CatalogueResponse(entries=tuple(_catalogue_entry(e) for e in entries))
 
     @router.post("/install", response_model=MutationResponse)
@@ -259,8 +261,9 @@ def register_library_routes(app: Any) -> None:
         body: ExactVersionRequest,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> MutationResponse:
+        service = await library_service(request)
         try:
-            result = library_service(request).install(
+            result = await service.install(
                 user_id=owner_identity(auth_user),
                 identity_id=body.identity_id,
                 version=body.version,
@@ -286,7 +289,8 @@ def register_library_routes(app: Any) -> None:
     ) -> MutationResponse:
         """Idempotent: an absent install is not an error."""
 
-        library_service(request).uninstall(
+        service = await library_service(request)
+        await service.uninstall(
             user_id=owner_identity(auth_user), identity_id=body.identity_id
         )
         return MutationResponse(identity_id=body.identity_id, installed=False)
@@ -297,8 +301,9 @@ def register_library_routes(app: Any) -> None:
         body: IdentityRequest,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> MutationResponse:
+        service = await library_service(request)
         try:
-            count = library_service(request).star(
+            count = await service.star(
                 user_id=owner_identity(auth_user), identity_id=body.identity_id
             )
         except LibraryIdentityNotFound as exc:
@@ -315,7 +320,8 @@ def register_library_routes(app: Any) -> None:
     ) -> MutationResponse:
         """Idempotent: unstar of an unstarred identity is not an error."""
 
-        count = library_service(request).unstar(
+        service = await library_service(request)
+        count = await service.unstar(
             user_id=owner_identity(auth_user), identity_id=body.identity_id
         )
         return MutationResponse(
@@ -328,8 +334,9 @@ def register_library_routes(app: Any) -> None:
         body: UpgradeRequest,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> MutationResponse:
+        service = await library_service(request)
         try:
-            result = library_service(request).upgrade(
+            result = await service.upgrade(
                 user_id=owner_identity(auth_user),
                 identity_id=body.identity_id,
                 to_version=body.to_version,
@@ -349,8 +356,9 @@ def register_library_routes(app: Any) -> None:
         body: ExactVersionRequest,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> MutationResponse:
+        service = await library_service(request)
         try:
-            result = library_service(request).acknowledge_withdrawal(
+            result = await service.acknowledge_withdrawal(
                 user_id=owner_identity(auth_user),
                 identity_id=body.identity_id,
                 version=body.version,
@@ -371,8 +379,9 @@ def register_library_routes(app: Any) -> None:
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> MutationResponse:
         await require_build_run(request, auth_user)
+        service = await library_service(request)
         try:
-            fork_version = library_service(request).fork(
+            fork_version = await service.fork(
                 user_id=owner_identity(auth_user),
                 identity_id=body.identity_id,
                 version=body.version,
@@ -397,8 +406,9 @@ def register_library_routes(app: Any) -> None:
         body: ExactVersionRequest,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> MutationResponse:
+        service = await library_service(request)
         try:
-            result = library_service(request).certify(
+            result = await service.certify(
                 user_id=owner_identity(auth_user),
                 identity_id=body.identity_id,
                 version=body.version,
@@ -422,8 +432,9 @@ def register_library_routes(app: Any) -> None:
         body: ExactVersionRequest,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> MutationResponse:
+        service = await library_service(request)
         try:
-            result = library_service(request).withdraw(
+            result = await service.withdraw(
                 user_id=owner_identity(auth_user),
                 identity_id=body.identity_id,
                 version=body.version,
