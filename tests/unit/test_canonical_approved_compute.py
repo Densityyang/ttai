@@ -264,11 +264,12 @@ def test_registry_is_versioned_and_checksum_deterministic() -> None:
 
 def test_binding_checksum_is_stable_and_duplicate_keys_rejected() -> None:
     assert _binding().checksum == _binding().checksum
-    # Frozen serialization lock: the reject-only rounding/precision rule must not
-    # change how any accepted binding serializes or checksums.
+    # Frozen serialization lock, re-pinned for approved-calculation schema 1.1:
+    # the inert global null/zero policy fields were removed and schema_version
+    # moved to "1.1", so the accepted payload intentionally changes.
     assert (
         _binding().checksum
-        == "d7c938cc4cfd6ff62d58d952a9ec09bf28aee193c9bcf922bcdfe2356e4c1e12"
+        == "b0b0b1485ce9b4e10730ad41d4c7c5524082b3b50b08d413e496b23f6bf97df6"
     )
     with pytest.raises(ApprovedComputeError):
         ApprovedCalculationCatalog([_binding(), _binding()])
@@ -698,7 +699,9 @@ def test_single_unbound_metric_still_compiles_an_ordinary_fetch() -> None:
         plan=plan, context=context, validation=_allow(plan, context)
     )
     assert [step.kind for step in execution_plan.steps] == ["fetch_metric", "verify"]
-    assert execution_plan.steps[0].metric_keys == ("metric.stores",)
+    first = execution_plan.steps[0]
+    assert isinstance(first, FetchMetricStep)
+    assert first.metric_keys == ("metric.stores",)
 
 
 def test_single_bound_metric_compiles_the_canonical_dag() -> None:

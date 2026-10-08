@@ -74,7 +74,7 @@ class ApprovedCalculationInput(_FrozenModel):
 class ApprovedCalculationBinding(_FrozenModel):
     """Immutable evidence binding a canonical metric to a governed calculation."""
 
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["1.1"] = "1.1"
     canonical_metric_key: str = Field(min_length=1, max_length=256)
     template_id: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
     template_version: str = Field(min_length=1, max_length=64)
@@ -86,8 +86,6 @@ class ApprovedCalculationBinding(_FrozenModel):
     unit: str | None = Field(default=None, min_length=1, max_length=32)
     precision: int | None = Field(default=None, ge=0, le=12)
     rounding: Literal["half_up", "half_even", "half_down", "floor", "ceil"] | None = None
-    null_policy: Literal["preserve", "zero", "no_data"] | None = None
-    zero_policy: Literal["preserve", "no_data"] | None = None
 
     @field_validator("inputs")
     @classmethod

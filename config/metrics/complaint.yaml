@@ -42,7 +42,8 @@ metrics:
       unit: percent
       value_scale: '0_100'
       decimal_places: 2
-      zero_denominator_policy: no_data
+      # Division by zero is an UNDEFINED calculation, never absent data.
+      zero_denominator_policy: calculation_error
     required_permissions: [nl2sql:invoke]
     assistant_enabled: true
     daily_report_enabled: true

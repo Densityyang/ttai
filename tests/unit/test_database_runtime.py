@@ -97,7 +97,8 @@ def test_runtime_database_urls_reject_privileged_roles(database_url: str) -> Non
 def test_product_settings_accept_only_separated_application_roles() -> None:
     settings = Settings(
         _env_file=None,
-        auth_enabled=False,
+        auth_enabled=True,
+        tt_api_base_url="http://auth.invalid",
         service_mode="product",
         memory_backend="postgresql",
         database_url="postgresql+asyncpg://business_reader:secret@db/business",
@@ -109,8 +110,8 @@ def test_product_settings_accept_only_separated_application_roles() -> None:
     assert settings.database_max_overflow == 2
 
 
-def test_product_settings_fail_closed_for_owner_credentials() -> None:
-    with pytest.raises(ValidationError, match="privileged role"):
+def test_product_settings_auth_disabled_fails_closed_before_database_roles() -> None:
+    with pytest.raises(ValidationError, match="AUTH_ENABLED=false"):
         Settings(
             _env_file=None,
             auth_enabled=False,

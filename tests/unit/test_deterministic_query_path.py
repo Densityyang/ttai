@@ -25,6 +25,8 @@ from src.nl2sql.contracts import (
     QueryPlan,
     RequestContext,
     RequestIdentity,
+    RoutePolicy,
+    RoutingBudgetPolicy,
     TimeRange,
 )
 from src.nl2sql.infra.governance.query_gateway import QueryGateway, QueryReceipt
@@ -39,10 +41,12 @@ from src.nl2sql.orchestration.deterministic_query_plan import (
     DeterministicQueryPlanProvider,
     QueryPlanProposalError,
     UnresolvedTime,
+    normalize_frozen_real_question,
     resolve_time_expression,
 )
 from src.nl2sql.orchestration.engine import create_v2_engine
 from src.nl2sql.orchestration.metric_query import metric_plan_executor
+from src.nl2sql.orchestration.mode_contract import RunEnvelope
 from src.nl2sql.orchestration.planning import (
     PlanCompiler,
     PlanValidationError,
@@ -183,6 +187,12 @@ class _LiveEngine:
 async def _engine(
     authority: MetricAuthority,
     rows: list[dict[str, Any]] | None = None,
+    route_policy: RoutePolicy | None = None,
+    budget_policy: RoutingBudgetPolicy | None = None,
+    *,
+    query_plan_provider: Any | None = None,
+    context_resolver: Any | None = None,
+    fingerprint_plan: QueryPlan | None = None,
 ) -> _LiveEngine:
     """Compose the real collaborators over a real QueryGateway (mocked execute)."""
 
@@ -193,7 +203,9 @@ async def _engine(
     # (permission denial) never reaches the runner, so a parser-valid stub
     # fingerprint is enough there.
     try:
-        compiled = await authority.compiler().compile(authority.plan(), authority.context)
+        compiled = await authority.compiler().compile(
+            fingerprint_plan or authority.plan(), authority.context
+        )
         fingerprint = gateway.prepare(compiled.sql).fingerprint
     except Exception:
         fingerprint = gateway.prepare("SELECT 1 AS value").fingerprint
@@ -214,9 +226,13 @@ async def _engine(
     engine = create_v2_engine(
         checkpointer=MemorySaver(),
         model_gateway=_model_gateway(provider),
-        context_resolver=resolver,
-        query_plan_provider=DeterministicQueryPlanProvider(registry, clock),
+        context_resolver=context_resolver or resolver,
+        query_plan_provider=(
+            query_plan_provider or DeterministicQueryPlanProvider(registry, clock)
+        ),
         plan_executor=metric_plan_executor(authority.compiler(), gateway),
+        route_policy=route_policy,
+        budget_policy=budget_policy,
     )
     return _LiveEngine(engine, execute, provider, clock, authority)
 
@@ -265,6 +281,7 @@ async def _run(
     question: str,
     deadline_ms: int = 4_000,
     trace_id: str = "trace-deterministic-query",
+    requested_mode: str | None = None,
 ) -> dict[str, Any]:
     context = RequestContext(
         identity=_identity(),
@@ -272,10 +289,16 @@ async def _run(
         trace_id=trace_id,
         deadline_ms=deadline_ms,
     )
-    result = await live.engine.ainvoke(
-        {"messages": [{"role": "user", "content": question}]},
-        runtime_config(context),
-    )
+    payload: dict[str, object] = {
+        "messages": [{"role": "user", "content": question}]
+    }
+    if requested_mode is not None:
+        payload["run_envelope"] = RunEnvelope(
+            run_id="run-deterministic-query",
+            requested_mode=requested_mode,  # type: ignore[arg-type]
+            effective_mode=requested_mode,  # type: ignore[arg-type]
+        ).model_dump(mode="json")
+    result = await live.engine.ainvoke(payload, runtime_config(context))
     return dict(result)
 
 
@@ -288,6 +311,131 @@ def _trace_names(result: dict[str, Any]) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Grammar / provider unit tests
 # --------------------------------------------------------------------------- #
+
+
+def test_frozen_real_presenter_phrase_normalizes_to_canonical_metric() -> None:
+    latest = normalize_frozen_real_question(
+        "查询最新可用日期的报修服务归档及时率"
+    )
+    recent = normalize_frozen_real_question(
+        "分析报修服务归档及时率最近7个可用业务日的趋势"
+    )
+    latest_display = normalize_frozen_real_question(
+        "查询最新可用日期的报修服务归档及时率（全局-日）"
+    )
+    recent_display = normalize_frozen_real_question(
+        "分析报修服务归档及时率（全局-日）最近7个可用业务日的趋势"
+    )
+    latest_ascii_parentheses = normalize_frozen_real_question(
+        "查询最新可用日期的报修服务归档及时率(全局-日)"
+    )
+    with_team = normalize_frozen_real_question(
+        "查询最新可用日期的报修服务归档及时率 team=5"
+    )
+    with_filter = normalize_frozen_real_question(
+        "查询最新可用日期的报修服务归档及时率 filter.foo=x"
+    )
+    recent_extra_dimension = normalize_frozen_real_question(
+        "分析报修服务归档及时率最近7个可用业务日的趋势 dim=team"
+    )
+    recent_extra_intent = normalize_frozen_real_question(
+        "分析报修服务归档及时率最近7个可用业务日的趋势 intent=comparison"
+    )
+    unrelated = normalize_frozen_real_question("说明最新可用日期但不是报修指标")
+    assert latest == (
+        "metric=repair_service_archive_rate_overall_day "
+        "time=latest_authoritative"
+    )
+    assert recent == (
+        "metric=repair_service_archive_rate_overall_day "
+        "time=recent_7_available intent=trend"
+    )
+    assert latest_display == latest
+    assert recent_display == recent
+    assert latest_ascii_parentheses == latest
+    assert with_team.endswith("team=5")
+    assert with_filter.endswith("filter.foo=x")
+    assert recent_extra_dimension.endswith("dim=team")
+    assert recent_extra_intent.endswith("intent=comparison")
+    assert unrelated == "说明最新可用日期但不是报修指标"
+
+
+@pytest.mark.asyncio
+async def test_recent_available_window_is_server_owned_and_bounded() -> None:
+    authority = MetricAuthority()
+    resolver, registry = _live_resolver(authority)
+    context = await resolver.resolve(
+        question=f"{DISPLAY_NAME} time=2024-02-29",
+        identity=_identity(),
+        route_hint="standard",
+    )
+    available_dates = (date(2026, 9, 10), date(2026, 9, 18))
+    window = TimeRange(
+        start=available_dates[0], end=available_dates[-1], timezone="Asia/Shanghai"
+    )
+    provider = DeterministicQueryPlanProvider(
+        registry, _FixedClock(), availability_window=lambda: available_dates
+    )
+    plan = await provider.propose(
+        question=f"metric={METRIC_ASSET} time=recent_7_available intent=trend",
+        context=context,
+        identity=_identity(),
+    )
+    assert plan.time_range == window
+    assert plan.metric_keys == (METRIC_ASSET,)
+    assert plan.available_dates == (
+        date(2026, 9, 10),
+        date(2026, 9, 18),
+    )
+
+
+@pytest.mark.asyncio
+async def test_engine_uses_one_normalizer_for_context_and_plan(monkeypatch) -> None:
+    from src.nl2sql.orchestration import engine as engine_module
+
+    live = await _engine(MetricAuthority())
+    original = engine_module.normalize_frozen_real_question
+    seen: list[str] = []
+
+    def _record(question: str) -> str:
+        seen.append(question)
+        return original(question)
+
+    monkeypatch.setattr(engine_module, "normalize_frozen_real_question", _record)
+    result = await _run(
+        live,
+        f"{DISPLAY_NAME} time=2024-02-29",
+        requested_mode="QUERY",
+    )
+    assert result["run_envelope"]["effective_mode"] == "QUERY"
+    assert len(seen) >= 2
+
+
+def test_latest_authoritative_is_not_wall_clock_today() -> None:
+    from src.nl2sql.orchestration.deterministic_query_plan import (
+        UNRESOLVED_TIME,
+        resolve_time_expression,
+    )
+
+    def request_clock() -> datetime:
+        return datetime(2026, 9, 23, 2, 0, tzinfo=UTC)
+    assert resolve_time_expression("today", clock=request_clock).start == date(2026, 9, 23)
+    provider = DeterministicQueryPlanProvider(
+        ActiveReleaseRegistry(),
+        request_clock,
+        authoritative_date=lambda: date(2026, 9, 18),
+    )
+    resolved = provider._resolve_time(
+        type("Proposal", (), {"time_text": "latest_authoritative", "time_conflict": False})()
+    )
+    assert resolved.start == resolved.end == date(2026, 9, 18)
+    unavailable = DeterministicQueryPlanProvider(ActiveReleaseRegistry(), request_clock)
+    unresolved = unavailable._resolve_time(
+        type("Proposal", (), {"time_text": "latest_authoritative", "time_conflict": False})()
+    )
+    assert unresolved == UNRESOLVED_TIME or getattr(unresolved, "reason", "") == (
+        "authoritative_date_unavailable"
+    )
 
 
 def test_time_resolver_is_a_pure_deterministic_component() -> None:
@@ -924,13 +1072,17 @@ async def test_engine_exit_ea1_zero_model_fast_path_through_gateway_runner() -> 
 @pytest.mark.asyncio
 async def test_engine_exit_ea2_unknown_metric_fails_closed() -> None:
     live = await _engine(MetricAuthority())
-    result = await _run(live, "metric=metric.unknown time=2024-02-29")
+    result = await _run(
+        live, "metric=metric.unknown time=2024-02-29", requested_mode="QUERY"
+    )
 
-    assert result["stop_reason"] == "query_plan_proposal_failed"
+    assert result["stop_reason"] == "mode_cannot_resolve"
+    assert result["mode_capability_outcome"]["outcome"] == "cannot_resolve"
+    assert result["mode_capability_outcome"]["suggested_mode"] == "ANALYZE"
     assert _trace_names(result) == [
         "received",
         "context_compiled",
-        "query_plan_proposal_failed",
+        "query_plan_deterministic_unsupported",
     ]
     assert result["budget_record"] is None
     live.gateway_execute.assert_not_awaited()
@@ -941,13 +1093,16 @@ async def test_engine_exit_ea2_unknown_metric_fails_closed() -> None:
 async def test_engine_exit_ea3_ambiguous_metric_fails_closed() -> None:
     authority = _authority_with_metric_document(MetricAuthority(), _second_metric_document())
     live = await _engine(authority)
-    result = await _run(live, f"{DISPLAY_NAME} time=2024-02-29")
+    result = await _run(
+        live, f"{DISPLAY_NAME} time=2024-02-29", requested_mode="QUERY"
+    )
 
-    assert result["stop_reason"] == "query_plan_proposal_failed"
+    assert result["stop_reason"] == "mode_cannot_resolve"
+    assert result["mode_capability_outcome"]["outcome"] == "cannot_resolve"
     assert _trace_names(result) == [
         "received",
         "context_compiled",
-        "query_plan_proposal_failed",
+        "query_plan_deterministic_unsupported",
     ]
     live.gateway_execute.assert_not_awaited()
     assert live.provider.calls == 0
@@ -958,8 +1113,18 @@ async def test_engine_exit_ea4_missing_time_clarifies() -> None:
     live = await _engine(MetricAuthority())
     result = await _run(live, "metric=complaint_in_transit_count")
 
-    assert result["stop_reason"] == "query_plan_clarification_required"
+    # Typed suspension: clarification is no longer terminal, but it does not
+    # execute either.  The server-owned typed request is checkpointed.
+    assert result["stop_reason"] is None
+    assert result["decision_status"] == "awaiting_decision"
+    assert result["decision_version"] == 1
+    pending = result["pending_decision"]
+    assert isinstance(pending, dict)
+    assert pending["decision_kind"] == "clarification"
+    assert pending["unresolved_slots"] == ["time"]
+    assert pending["plan_sha256"] == result["query_plan_validation"]["query_plan_sha256"]
     assert "time" in result["query_plan"]["unresolved_slots"]
+    assert "__interrupt__" in result
     assert "query_plan_validated" in _trace_names(result)
     assert "typed_plan_executed" not in _trace_names(result)
     live.gateway_execute.assert_not_awaited()
@@ -1214,7 +1379,9 @@ async def test_boundary_p_unresolved_time_yields_zero_sql_and_zero_model() -> No
     live = await _engine(MetricAuthority())
     result = await _run(live, "metric=complaint_in_transit_count time=2025-02-29")
 
-    assert result["stop_reason"] == "query_plan_clarification_required"
+    assert result["stop_reason"] is None
+    assert result["decision_status"] == "awaiting_decision"
+    assert result["pending_decision"]["unresolved_slots"] == ["time"]
     assert "typed_plan_executed" not in _trace_names(result)
     live.gateway_execute.assert_not_awaited()
     assert live.provider.calls == 0
@@ -1228,8 +1395,10 @@ async def test_boundary_p_repeated_time_yields_zero_sql_and_zero_model() -> None
         "metric=complaint_in_transit_count time=today time=this_week",
     )
 
-    assert result["stop_reason"] == "query_plan_clarification_required"
+    assert result["stop_reason"] is None
+    assert result["decision_status"] == "awaiting_decision"
     assert "time" in result["query_plan"]["unresolved_slots"]
+    assert result["pending_decision"]["unresolved_slots"] == ["time"]
     live.gateway_execute.assert_not_awaited()
     assert live.provider.calls == 0
 
@@ -1242,7 +1411,9 @@ async def test_boundary_p_vague_time_yields_zero_sql_and_zero_model() -> None:
         "metric=complaint_in_transit_count time=\u524d\u4e0d\u4e45",
     )
 
-    assert result["stop_reason"] == "query_plan_clarification_required"
+    assert result["stop_reason"] is None
+    assert result["decision_status"] == "awaiting_decision"
+    assert result["pending_decision"]["unresolved_slots"] == ["time"]
     live.gateway_execute.assert_not_awaited()
     assert live.provider.calls == 0
 
@@ -1323,9 +1494,12 @@ async def test_unmatched_question_surfaces_the_explicit_flag() -> None:
 @pytest.mark.asyncio
 async def test_engine_unmatched_selector_flags_the_context_breadth() -> None:
     live = await _engine(MetricAuthority())
-    result = await _run(live, "metric=metric.unknown time=2024-02-29")
+    result = await _run(
+        live, "metric=metric.unknown time=2024-02-29", requested_mode="QUERY"
+    )
 
-    assert result["stop_reason"] == "query_plan_proposal_failed"
+    assert result["stop_reason"] == "mode_cannot_resolve"
+    assert result["mode_capability_outcome"]["suggested_mode"] == "ANALYZE"
     assert QUESTION_METRIC_UNMATCHED_FLAG in result["context_bundle"]["degradation_flags"]
     live.gateway_execute.assert_not_awaited()
     assert live.provider.calls == 0

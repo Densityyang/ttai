@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from time import monotonic
 
@@ -14,6 +15,24 @@ from src.nl2sql.contracts import (
 )
 
 
+def _route_deadline_ms(env_name: str, default: int) -> int:
+    """Deployment-overridable route deadline, defaulting to the frozen limit.
+
+    A real provider needs longer than the frozen microseconds-scale budgets, but
+    the DEFAULT must stay byte-identical for the contract tests.  Only a
+    deployment that exports the override changes its own budget envelope.
+    """
+
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 1 else default
+
+
 def bootstrap_routing_budget_policy() -> RoutingBudgetPolicy:
     """Return the versioned bootstrap limits from MASTER_PR_PLAN_V3."""
 
@@ -22,15 +41,17 @@ def bootstrap_routing_budget_policy() -> RoutingBudgetPolicy:
         state="bootstrap",
         routes={
             "fast": RouteBudget(
-                deadline_ms=4_000,
-                max_model_calls=0,
+                deadline_ms=_route_deadline_ms("V2_ROUTE_DEADLINE_FAST_MS", 4_000),
+                # ProductMode is independent of RouteName: QUERY is graph-level
+                # zero-model, while governed ANALYZE admits one interpretation.
+                max_model_calls=1,
                 max_sql_candidates=1,
                 max_sql_executions=1,
                 max_join_hops=0,
                 max_repairs=0,
             ),
             "standard": RouteBudget(
-                deadline_ms=10_000,
+                deadline_ms=_route_deadline_ms("V2_ROUTE_DEADLINE_STANDARD_MS", 10_000),
                 max_model_calls=3,
                 max_sql_candidates=2,
                 max_sql_executions=2,
@@ -38,7 +59,7 @@ def bootstrap_routing_budget_policy() -> RoutingBudgetPolicy:
                 max_repairs=1,
             ),
             "deep": RouteBudget(
-                deadline_ms=30_000,
+                deadline_ms=_route_deadline_ms("V2_ROUTE_DEADLINE_DEEP_MS", 30_000),
                 max_model_calls=5,
                 max_sql_candidates=2,
                 max_sql_executions=2,

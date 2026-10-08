@@ -19,6 +19,7 @@ from src.nl2sql.contracts import (
     ExecutionReceipt,
     FetchMetricStep,
     PlanExecutionRecord,
+    PlanStep,
     PlanStepReceipt,
     QueryPlan,
     RequestIdentity,
@@ -726,6 +727,145 @@ async def test_executor_rejects_non_scalar_ad_hoc_inputs_before_the_runner() -> 
         assert runner.calls == 0
 
 
+def _grounded(answer: object):
+    return answer
+
+
+def test_canonical_provenance_mismatch_is_reported_as_a_grounding_mismatch() -> None:
+    from src.nl2sql.orchestration.grounding import ground_execution_answer
+
+    query_plan, context, plan = _trusted_plan()
+    record = _record(plan, _trusted_receipt(template_version="9.9"))
+    answer = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=plan,
+        record=record,
+        outputs={"calculate_ratio": 2.5},
+    )
+    # still fail-closed: no fact
+    assert answer.facts == ()
+    # but the refusal is operator-visible through the existing evidence channel
+    assert "grounding_execution_mismatch" in answer.artifact.degradation_flags
+    # and the execution record is NOT reclassified
+    assert record.status == "succeeded"
+
+
+def test_matching_canonical_receipt_has_no_mismatch_flag() -> None:
+    from src.nl2sql.orchestration.grounding import ground_execution_answer
+
+    query_plan, context, plan = _trusted_plan()
+    record = _record(plan, _trusted_receipt())
+    answer = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=plan,
+        record=record,
+        outputs={"calculate_ratio": 2.5},
+    )
+    assert len(answer.facts) == 1
+    assert "grounding_execution_mismatch" not in answer.artifact.degradation_flags
+
+
+def test_ad_hoc_provenance_mismatch_is_reported_as_a_grounding_mismatch() -> None:
+    from src.nl2sql.orchestration.grounding import ground_execution_answer
+
+    spec = _spec()
+    binding = _binding(spec)
+    query_plan = _query_plan()
+    context = _context()
+    plan = _execution_plan(query_plan, context, spec, binding)
+    bad = _adhoc_receipt(spec, binding, derived_output_id="adhoc_" + "0" * 32)
+    answer = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=plan,
+        record=_record(plan, bad),
+        outputs={"calculate_adhoc": 2.5},
+    )
+    assert answer.facts == ()
+    assert "grounding_execution_mismatch" in answer.artifact.degradation_flags
+
+
+def test_matching_ad_hoc_receipt_has_no_mismatch_flag() -> None:
+    from src.nl2sql.orchestration.grounding import ground_execution_answer
+
+    spec = _spec()
+    binding = _binding(spec)
+    query_plan = _query_plan()
+    context = _context()
+    plan = _execution_plan(query_plan, context, spec, binding)
+    good = _adhoc_receipt(spec, binding)
+    answer = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=plan,
+        record=_record(plan, good),
+        outputs={"calculate_adhoc": 2.5},
+    )
+    assert len(answer.facts) == 1
+    assert "grounding_execution_mismatch" not in answer.artifact.degradation_flags
+
+
+def test_missing_or_wrong_kind_calculation_step_is_also_a_mismatch() -> None:
+    """R4 found these two were silent: the isinstance guard fired before the
+    provenance comparison.  A calculation receipt whose step is absent from the
+    plan, or is a different step kind, is the same re-binding mismatch class."""
+    from src.nl2sql.orchestration.grounding import ground_execution_answer
+
+    query_plan, context, plan = _trusted_plan()
+    # (a) missing step: the receipt names a step_id that is not in the plan
+    orphan = _trusted_receipt(step_id="ghost_calc")
+    answer = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=plan,
+        record=_record(plan, orphan),
+        outputs={"ghost_calc": 2.5},
+    )
+    assert answer.facts == ()
+    assert "grounding_execution_mismatch" in answer.artifact.degradation_flags
+    # (b) wrong step kind: a calculation receipt matched to a fetch step id
+    wrong_kind = _trusted_receipt(step_id="fetch_numerator")
+    answer2 = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=plan,
+        record=_record(plan, wrong_kind),
+        outputs={"fetch_numerator": 2.5},
+    )
+    assert "grounding_execution_mismatch" in answer2.artifact.degradation_flags
+
+
+def test_internal_dependency_fetch_and_nodata_are_not_mismatches() -> None:
+    from src.nl2sql.orchestration.grounding import ground_execution_answer
+
+    spec = _spec()
+    binding = _binding(spec)
+    query_plan = _query_plan()
+    context = _context()
+    plan = _execution_plan(query_plan, context, spec, binding)
+    # an internal dependency fetch is a normal FILTER, never a mismatch
+    dep = PlanStepReceipt(
+        step_id="fetch_numerator",
+        kind="fetch_metric",
+        status="succeeded",
+        elapsed_ms=1,
+        output_digest="a" * 64,
+    )
+    flagged = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=plan,
+        record=_record(plan, dep),
+        outputs={"fetch_numerator": 5},
+    )
+    assert "grounding_execution_mismatch" not in flagged.artifact.degradation_flags
+    # a legitimate unavailable/no-data result is NOT a mismatch either
+    good = _adhoc_receipt(spec, binding)
+    nodata = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=plan,
+        record=_record(plan, good),
+        outputs={"calculate_adhoc": None},
+    )
+    assert len(nodata.facts) == 1
+    assert "grounding_execution_mismatch" not in nodata.artifact.degradation_flags
+
+
 def test_grounding_requires_a_successful_execution_record() -> None:
     query_plan, _context_bundle, plan = _trusted_plan()
     failed = PlanExecutionRecord(
@@ -807,7 +947,7 @@ def test_canonical_metric_grounding_is_unchanged() -> None:
 # --- Iteration 3: exact V1 DAG closure ---------------------------------------
 def _valid_steps(
     spec: CalculationSpec, binding: CalculationExecutionBinding
-) -> tuple[object, ...]:
+) -> tuple[PlanStep, ...]:
     derived = derived_output_id(spec, binding)
     return (
         FetchMetricStep(

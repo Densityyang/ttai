@@ -247,7 +247,9 @@ class PlanExecutor:
         deadline_ms: int,
     ) -> PlanExecutionResult:
         # Deep snapshots close mutation windows in nested JSON filter/ref values.
-        query_plan = QueryPlan.model_validate_json(query_plan.model_dump_json())
+        from src.nl2sql.contracts import query_plan_payload
+
+        query_plan = QueryPlan.model_validate(query_plan_payload(query_plan))
         context = ContextBundle.model_validate_json(context.model_dump_json())
         execution_plan = ExecutionPlan.model_validate_json(
             execution_plan.model_dump_json()

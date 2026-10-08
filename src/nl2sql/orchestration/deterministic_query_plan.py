@@ -25,12 +25,21 @@ import calendar
 import re
 import unicodedata
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 from zoneinfo import ZoneInfo
 
-from src.nl2sql.contracts import BoundFilter, ContextBundle, QueryPlan, RequestIdentity, TimeRange
+from src.nl2sql.contracts import (
+    BoundFilter,
+    ContextBundle,
+    QueryPlan,
+    RequestIdentity,
+    TimeRange,
+    query_plan_payload,
+)
+from src.nl2sql.orchestration.decision_contract import SlotBinding
+from src.nl2sql.orchestration.planning import DeterministicQueryUnsupported
 from src.nl2sql.semantic.metric_contract import MetricContract
 from src.nl2sql.semantic.metric_match import MetricCandidate, detect_metric_candidates
 from src.nl2sql.semantic.policy_evidence import (
@@ -74,6 +83,19 @@ _RELATIVE_ALIASES = {
     "\u4eca\u5e74": "this year",
     "\u53bb\u5e74": "last year",
 }
+_FROZEN_REAL_METRIC_KEY = "repair_service_archive_rate_overall_day"
+_FROZEN_REAL_LATEST_PHRASES = frozenset(
+    {
+        "查询最新可用日期的报修服务归档及时率",
+        "查询最新可用日期的报修服务归档及时率（全局-日）",
+    }
+)
+_FROZEN_REAL_RECENT_PHRASES = frozenset(
+    {
+        "分析报修服务归档及时率最近7个可用业务日的趋势",
+        "分析报修服务归档及时率（全局-日）最近7个可用业务日的趋势",
+    }
+)
 _IN_CLAUSE = re.compile(r"^(?P<name>[a-z_]+)\s+in\s+\[(?P<values>[^\]]*)\]$")
 
 
@@ -89,6 +111,21 @@ class QueryPlanProposalError(ValueError):
     for conflicting or unresolved TIME, which is clarification-possible and
     becomes a plan slot.
     """
+
+
+class DeterministicQueryCapabilityUnavailable(
+    QueryPlanProposalError, DeterministicQueryUnsupported
+):
+    """A deterministic QUERY cannot identify a safely executable metric.
+
+    This is narrower than generic grammar/infrastructure failure: the request
+    is valid user intent, but the deterministic provider cannot serve it.  The
+    engine may therefore expose a typed ANALYZE suggestion without invoking a
+    model or silently switching modes.
+    """
+
+    def __init__(self, code: str) -> None:
+        DeterministicQueryUnsupported.__init__(self, code)
 
 
 @dataclass(frozen=True)
@@ -310,6 +347,7 @@ class ProposalIntent:
     intent: Literal["metric", "trend", "comparison", "ranking"]
     result_limit: int | None
     filters: tuple[BoundFilter, ...]
+    available_dates: tuple[date, ...] = ()
 
 
 class DeterministicQueryPlanProvider:
@@ -334,9 +372,13 @@ class DeterministicQueryPlanProvider:
         self,
         registry: ActiveReleaseRegistry,
         clock: Callable[[], datetime],
+        availability_window: Callable[[], tuple[date, ...]] | None = None,
+        authoritative_date: Callable[[], date] | None = None,
     ) -> None:
         self._registry = registry
         self._clock = clock
+        self._availability_window = availability_window
+        self._authoritative_date = authoritative_date
 
     async def propose(
         self,
@@ -346,6 +388,72 @@ class DeterministicQueryPlanProvider:
         identity: RequestIdentity,
     ) -> QueryPlan:
         del identity
+        proposal, candidate = self._parse_question(question, context)
+        proposal = self._bind_available_dates(proposal)
+        plan, _ = build_plan(
+            proposal, self._resolve_time(proposal), context, candidate.contract
+        )
+        return plan
+
+    async def propose_with_slot_bindings(
+        self,
+        *,
+        question: str,
+        context: ContextBundle,
+        identity: RequestIdentity,
+        slot_bindings: tuple[SlotBinding, ...],
+    ) -> QueryPlan:
+        """Deterministic slot-bound replan over the V1 supported slot set.
+
+        ONLY plan-level ``time`` and ``grain`` bindings from a ``user`` source
+        are applied; every other slot name, source or value fails closed.  The
+        normal ``propose`` path is unchanged.
+        """
+
+        del identity
+        proposal, candidate = self._parse_question(question, context)
+        proposal = self._bind_available_dates(proposal)
+        proposal = _apply_slot_bindings(proposal, slot_bindings)
+        resolved = self._resolve_time(proposal)
+        if (
+            proposal.time_text is not None
+            and not proposal.time_conflict
+            and resolved == _carrier_range()
+        ):
+            # A user time binding must never resurrect the inert 1970 carrier as
+            # a resolved business window.
+            raise QueryPlanProposalError("slot_binding_time_carrier_rejected")
+        plan, _ = build_plan(proposal, resolved, context, candidate.contract)
+        return plan
+
+    async def replan_with_slot_bindings(
+        self,
+        *,
+        question: str,
+        context: ContextBundle,
+        identity: RequestIdentity,
+        base_plan: QueryPlan,
+        slot_bindings: tuple[SlotBinding, ...],
+    ) -> QueryPlan:
+        """Cumulative slot-bound replan from the CURRENT ACTIVE plan.
+
+        Unlike propose_with_slot_bindings this refines the server-restored
+        active plan instead of reparsing the original question, so semantics
+        resolved in an earlier round (for example a fixed TimeRange) are
+        preserved rather than lost.
+        """
+
+        del identity
+        _proposal, candidate = self._parse_question(question, context)
+        if tuple(base_plan.metric_keys) != (candidate.asset_id,):
+            raise QueryPlanProposalError("replan_base_plan_metric_mismatch")
+        return _apply_slot_bindings_to_plan(
+            base_plan, slot_bindings, candidate.contract, self._clock
+        )
+
+    def _parse_question(
+        self, question: str, context: ContextBundle
+    ) -> tuple[ProposalIntent, MetricCandidate]:
         try:
             release = self._registry.active_release()
         except ActiveReleaseBoundError as exc:
@@ -356,24 +464,87 @@ class DeterministicQueryPlanProvider:
             # The plan may only be parsed from the release the context was
             # compiled against; a rotated pointer fails closed.
             raise QueryPlanProposalError("context_release_mismatch")
-        candidates = detect_metric_candidates(question, release, frozenset(context.asset_ids))
+        normalized_question = normalize_frozen_real_question(question)
+        candidates = detect_metric_candidates(
+            normalized_question, release, frozenset(context.asset_ids)
+        )
         match candidates:
             case ():
-                raise QueryPlanProposalError("unknown_metric_selector")
+                raise DeterministicQueryCapabilityUnavailable("unknown_metric_selector")
             case (candidate,):
                 pass
             case _:
-                raise QueryPlanProposalError("ambiguous_metric_selector")
-        proposal = parse_proposal(question, candidate)
+                raise DeterministicQueryCapabilityUnavailable(
+                    "ambiguous_metric_selector"
+                )
+        return parse_proposal(normalized_question, candidate), candidate
+
+    def _resolve_time(self, proposal: ProposalIntent) -> TimeRange | UnresolvedTime:
         # Zero clock samples when no time clause is present (or when repeated
         # clauses already conflict); otherwise EXACTLY ONE sample for the whole
         # proposal, so every relative expression in it shares one now.
         if proposal.time_text is None or proposal.time_conflict:
-            resolved: TimeRange | UnresolvedTime = UNRESOLVED_TIME
-        else:
-            resolved = resolve_time_expression(proposal.time_text, clock=self._clock)
-        plan, _ = build_plan(proposal, resolved, context, candidate.contract)
-        return plan
+            return UNRESOLVED_TIME
+        time_text = _normalize(proposal.time_text).replace("_", " ")
+        if time_text == "latest authoritative":
+            if self._authoritative_date is None:
+                return UnresolvedTime("authoritative_date_unavailable")
+            try:
+                authoritative = self._authoritative_date()
+            except Exception:
+                return UnresolvedTime("authoritative_date_unavailable")
+            return TimeRange(
+                start=authoritative,
+                end=authoritative,
+                timezone="Asia/Shanghai",
+            )
+        if time_text == "recent 7 available":
+            dates = proposal.available_dates or self._available_dates()
+            if not dates:
+                return UnresolvedTime("authoritative_window_unavailable")
+            return TimeRange(
+                start=dates[0], end=dates[-1], timezone="Asia/Shanghai"
+            )
+        return resolve_time_expression(proposal.time_text, clock=self._clock)
+
+    def _available_dates(self) -> tuple[date, ...]:
+        if self._availability_window is None:
+            return ()
+        try:
+            dates = tuple(self._availability_window())
+        except Exception:
+            return ()
+        if not dates or tuple(sorted(set(dates))) != dates:
+            return ()
+        return dates
+
+    def _bind_available_dates(self, proposal: ProposalIntent) -> ProposalIntent:
+        if (
+            proposal.time_text is not None
+            and not proposal.time_conflict
+            and _normalize(proposal.time_text).replace("_", " ")
+            == "recent 7 available"
+        ):
+            return replace(proposal, available_dates=self._available_dates())
+        return proposal
+
+
+def normalize_frozen_real_question(question: str) -> str:
+    """Map the bounded presenter phrases to the canonical typed grammar."""
+
+    normalized = _normalize(question)
+    if normalized in {
+        _normalize(phrase) for phrase in _FROZEN_REAL_LATEST_PHRASES
+    }:
+        return f"metric={_FROZEN_REAL_METRIC_KEY} time=latest_authoritative"
+    if normalized in {
+        _normalize(phrase) for phrase in _FROZEN_REAL_RECENT_PHRASES
+    }:
+        return (
+            f"metric={_FROZEN_REAL_METRIC_KEY} "
+            "time=recent_7_available intent=trend"
+        )
+    return question
 
 
 def parse_proposal(question: str, candidate: MetricCandidate) -> ProposalIntent:
@@ -500,6 +671,7 @@ def parse_proposal(question: str, candidate: MetricCandidate) -> ProposalIntent:
         intent=intent,
         result_limit=result_limit,
         filters=tuple(filters),
+        available_dates=(),
     )
 
 
@@ -606,6 +778,96 @@ def _filter_clause(field: str, value: str, contract: MetricContract) -> BoundFil
     return BoundFilter(field_ref=field, operator="eq", value=typed, source="user")
 
 
+_SUPPORTED_SLOT_BINDINGS: Final[frozenset[str]] = frozenset({"time", "grain"})
+
+
+def _apply_slot_bindings(
+    proposal: ProposalIntent,
+    slot_bindings: tuple[SlotBinding, ...],
+) -> ProposalIntent:
+    """Apply ONLY user-sourced time/grain bindings to the frozen proposal.
+
+    Any unsupported slot name, non-user source, duplicate binding or malformed
+    value fails closed.  A valid user time binding clears time_conflict and
+    replaces time_text so the EXISTING closed grammar resolves it; the inert
+    1970 carrier is therefore never reused once the slot is resolved.
+    """
+
+    seen: set[str] = set()
+    for binding in slot_bindings:
+        if binding.slot in seen:
+            raise QueryPlanProposalError("duplicate_slot_binding")
+        seen.add(binding.slot)
+        if binding.slot not in _SUPPORTED_SLOT_BINDINGS:
+            raise QueryPlanProposalError("unsupported_slot_binding")
+        if binding.source != "user":
+            raise QueryPlanProposalError("slot_binding_source_not_executable")
+        if not isinstance(binding.value, str):
+            raise QueryPlanProposalError("slot_binding_value_invalid")
+        if binding.slot == "time":
+            proposal = replace(proposal, time_text=binding.value, time_conflict=False)
+        else:
+            if binding.value not in _GRAINS:
+                raise QueryPlanProposalError("slot_binding_grain_invalid")
+            proposal = replace(proposal, grain=binding.value)
+    return proposal
+
+
+def _apply_slot_bindings_to_plan(
+    base_plan: QueryPlan,
+    slot_bindings: tuple[SlotBinding, ...],
+    contract: MetricContract,
+    clock: Callable[[], datetime],
+) -> QueryPlan:
+    """Apply user time/grain bindings to the ACTIVE plan, preserving the rest.
+
+    A resolved field is never re-derived from the original question, so a fixed
+    TimeRange from an earlier round survives a later unrelated round and the
+    wall clock is never re-sampled for an already-resolved slot.
+    """
+
+    seen: set[str] = set()
+    time_range = base_plan.time_range
+    grain = base_plan.grain
+    unresolved = list(base_plan.unresolved_slots)
+    for binding in slot_bindings:
+        if binding.slot in seen:
+            raise QueryPlanProposalError("duplicate_slot_binding")
+        seen.add(binding.slot)
+        if binding.slot not in _SUPPORTED_SLOT_BINDINGS:
+            raise QueryPlanProposalError("unsupported_slot_binding")
+        if binding.source != "user":
+            raise QueryPlanProposalError("slot_binding_source_not_executable")
+        if not isinstance(binding.value, str):
+            raise QueryPlanProposalError("slot_binding_value_invalid")
+        if binding.slot == "time":
+            resolved = resolve_time_expression(binding.value, clock=clock)
+            if isinstance(resolved, UnresolvedTime):
+                if "time" not in unresolved:
+                    unresolved.append("time")
+                continue
+            if resolved == _carrier_range():
+                raise QueryPlanProposalError("slot_binding_time_carrier_rejected")
+            time_range = resolved
+            unresolved = [slot for slot in unresolved if slot != "time"]
+        else:
+            if binding.value not in _GRAINS:
+                raise QueryPlanProposalError("slot_binding_grain_invalid")
+            grain = binding.value
+            if grain in contract.supported_grains:
+                unresolved = [slot for slot in unresolved if slot != "grain"]
+            elif "grain" not in unresolved:
+                unresolved.append("grain")
+    return QueryPlan.model_validate(
+        {
+            **query_plan_payload(base_plan),
+            "time_range": time_range.model_dump(mode="json"),
+            "grain": grain,
+            "unresolved_slots": list(dict.fromkeys(unresolved)),
+        }
+    )
+
+
 def build_plan(
     proposal: ProposalIntent,
     resolved: TimeRange | UnresolvedTime,
@@ -685,6 +947,7 @@ def build_plan(
             dimensions=dimensions,
             filters=proposal.filters,
             time_range=carrier,
+            available_dates=proposal.available_dates,
             grain=proposal.grain,
             source_strategy="aggregate_first",
             result_limit=proposal.result_limit,
@@ -704,6 +967,7 @@ def _carrier_range() -> TimeRange:
 
 
 __all__ = [
+    "DeterministicQueryCapabilityUnavailable",
     "DeterministicQueryPlanProvider",
     "ProposalIntent",
     "QueryPlanProposalError",
@@ -711,5 +975,6 @@ __all__ = [
     "UnresolvedTime",
     "build_plan",
     "parse_proposal",
+    "normalize_frozen_real_question",
     "resolve_time_expression",
 ]

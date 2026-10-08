@@ -579,6 +579,18 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
             "pool.fetchval",
             "self._connection.execute",
         },
+        # Reviewed Mode3 orchestration call: the service resolves governed
+        # scalar evidence and invokes the pure Calculation Runtime; it is not a
+        # database session or QueryGateway bypass.
+        "src/nl2sql/artifacts/api_definitions.py": {
+            "definition_execution_service(request).execute"
+        },
+        # Frozen local-real probe: explicit read-only transaction controls and
+        # bounded probe statements, owned by Coding A and reviewed separately.
+        "src/nl2sql/local_real/live_probe.py": {
+            "await session.execute(...).scalars",
+            "session.execute",
+        },
             "src/nl2sql/semantic/registry.py": {"connection.execute"},
             "src/nl2sql/semantic/schema_snapshot.py": {"connection.execute"},
             "src/nl2sql/agents/codeact_engine/graph.py": {"sandbox.execute"},
@@ -587,7 +599,10 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
             "trusted_template_registry.execute",
         },
         "src/nl2sql/orchestration/engine.py": {"plan_executor.execute"},
-        "src/nl2sql/orchestration/metric_query.py": {"self._gateway.execute"},
+            "src/nl2sql/orchestration/metric_query.py": {"self._gateway.execute"},
+            "src/nl2sql/local_real/governed_inputs.py": {
+                "runtime.plan_executor.execute",
+            },
         "src/nl2sql/orchestration/execution.py": {
             "self._metric_runner.execute",
             "self._registry.execute",
@@ -657,6 +672,11 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
             if node.func.attr not in database_methods:
                 continue
             receiver = ast.unparse(node.func.value)
+            # Keep the reviewed call shape stable without embedding SQL text or
+            # parameter dictionaries in the allowlist identity.  The file,
+            # awaited session receiver and terminal method remain exact.
+            if receiver.startswith("await session.execute("):
+                receiver = "await session.execute(...)"
             call_name = f"{receiver}.{node.func.attr}"
             discovered.setdefault(relative, set()).add(call_name)
 

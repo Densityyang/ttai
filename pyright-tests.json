@@ -1,0 +1,7 @@
+{
+  "include": ["tests/unit"],
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+  "reportArgumentType": "none",
+  "reportCallIssue": "none"
+}

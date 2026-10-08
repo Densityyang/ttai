@@ -45,6 +45,19 @@ def _span(attributes: dict[str, Any]) -> tuple[OtelSpanIdentifier, OtelSpanData]
     )
 
 
+def _config_metadata(config: dict[str, Any]) -> dict[str, Any]:
+    metadata = config.get("metadata")
+    assert isinstance(metadata, dict)
+    return metadata
+
+
+def _span_patch(result: Any, identifier: OtelSpanIdentifier) -> Any:
+    assert result is not None
+    patch = result.span_patches[identifier]
+    assert patch is not None
+    return patch
+
+
 # --------------------------------------------------------------------------- #
 # R4: base_config metadata must not bypass the observability envelope
 # --------------------------------------------------------------------------- #
@@ -64,7 +77,7 @@ def test_base_config_metadata_is_dropped_when_raw_content_is_off(
 
     config = observer.create_monitored_config(session_id="session-1", base_config=base)
 
-    metadata = config["metadata"]
+    metadata = _config_metadata(config)
     assert metadata == {"langfuse_session_id": "session-1"}
     assert "note" not in metadata
     assert "credential" not in metadata
@@ -88,7 +101,7 @@ def test_base_config_metadata_is_raw_gated_but_secret_scrubbed_when_raw_is_on(
 
     config = observer.create_monitored_config(session_id="session-1", base_config=base)
 
-    metadata = config["metadata"]
+    metadata = _config_metadata(config)
     assert metadata["note"] == "team A revenue 1200"
     assert metadata["langfuse_session_id"] == "session-1"
     assert CONFIGURED_SECRET not in str(metadata)
@@ -107,7 +120,7 @@ def test_base_and_call_time_metadata_are_merged_through_the_envelope(
         metadata={"call_note": "raw call"},
     )
 
-    assert config["metadata"] == {"langfuse_session_id": "session-1"}
+    assert _config_metadata(config) == {"langfuse_session_id": "session-1"}
 
 
 # --------------------------------------------------------------------------- #
@@ -202,7 +215,7 @@ def test_mask_removes_raw_prompt_and_answer_attributes_when_raw_is_off() -> None
     )
 
     assert result is not None
-    patch = result.span_patches[identifier]
+    patch = _span_patch(result, identifier)
     assert set(patch.delete_attributes) == {
         "langfuse.observation.input",
         "langfuse.observation.output",
@@ -228,7 +241,7 @@ def test_mask_keeps_safe_operational_telemetry_while_deleting_raw_content() -> N
     )
 
     assert result is not None
-    patch = result.span_patches[identifier]
+    patch = _span_patch(result, identifier)
     assert set(patch.delete_attributes) == {
         "langfuse.observation.input",
         "langfuse.observation.output",
@@ -270,7 +283,7 @@ def test_mask_never_exports_technical_secrets_under_either_toggle(
     )
 
     assert result is not None
-    patch = result.span_patches[identifier]
+    patch = _span_patch(result, identifier)
     assert CONFIGURED_SECRET not in str(patch.set_attributes)
     assert "hunter2" not in str(patch.set_attributes)
     assert patch.set_attributes["langfuse.observation.metadata.note"] == "uses [REDACTED]"
@@ -292,7 +305,7 @@ def test_mask_scrubs_configured_secret_from_sequence_attributes(
     )
 
     assert result is not None
-    patch = result.span_patches[identifier]
+    patch = _span_patch(result, identifier)
     assert CONFIGURED_SECRET not in str(patch.set_attributes)
 
 
@@ -437,7 +450,7 @@ def test_span_mask_default_source_scrubs_a_bare_embedding_api_key(
 
     assert result is not None
     assert EMBEDDING_SECRET not in str(
-        result.span_patches[identifier].set_attributes
+        _span_patch(result, identifier).set_attributes
     )
 
 
@@ -679,7 +692,7 @@ def test_base_config_metadata_key_position_is_governed(
         session_id="s1", base_config={"metadata": {EMBEDDING_SECRET: "note"}}
     )
 
-    assert EMBEDDING_SECRET not in str(config["metadata"])
+    assert EMBEDDING_SECRET not in str(_config_metadata(config))
 
 
 def test_mask_recurses_into_nested_structured_attributes() -> None:
@@ -695,5 +708,5 @@ def test_mask_recurses_into_nested_structured_attributes() -> None:
 
     assert result is not None
     assert EMBEDDING_SECRET not in str(
-        result.span_patches[identifier].set_attributes
+        _span_patch(result, identifier).set_attributes
     )

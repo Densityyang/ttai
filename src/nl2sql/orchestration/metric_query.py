@@ -27,6 +27,7 @@ from src.nl2sql.contracts import (
     QueryPlan,
     RequestIdentity,
     evaluate_authorization,
+    query_plan_payload,
 )
 from src.nl2sql.infra.governance.query_gateway import QueryGateway
 from src.nl2sql.orchestration.approved_compute import (
@@ -176,6 +177,10 @@ class RelationBinding(FrozenContract):
     required_permissions: tuple[str, ...] = ()
     approved: Literal[True]
     timestamp_kind: Literal["timestamp", "timestamptz"]
+    # Optional deployment-proven canonical count identity.  When present,
+    # COUNT(column) is compiled instead of COUNT(*); absence preserves the
+    # existing non-local compatibility binding.
+    count_column: Identifier | None = None
     max_days: int = Field(default=366, ge=1, le=3660)
     source_id: ContractId | None = None
     aggregate: AggregateContract | None = None
@@ -296,7 +301,7 @@ class MetricQueryCompiler:
         )
 
     async def compile(self, plan: QueryPlan, context: ContextBundle) -> CompiledMetricQuery:
-        plan = QueryPlan.model_validate_json(plan.model_dump_json())
+        plan = QueryPlan.model_validate(query_plan_payload(plan))
         context = ContextBundle.model_validate_json(context.model_dump_json())
         # FIRST, the frozen admission semantics: a disabled agent, an empty
         # effective scope, or a malformed/unusable injected context denies
@@ -398,6 +403,8 @@ class MetricQueryCompiler:
         if binding.aggregate is not None and metric.metric_key not in relation.aggregate_coverage:
             raise PlanStepError("metric_aggregate_coverage_unapproved")
         columns = {column.name: column.data_type.lower() for column in relation.columns}
+        if binding.count_column is not None and binding.count_column not in columns:
+            raise PlanStepError("metric_count_column_unapproved")
         authorized_coverage = (
             _authorization_coverage(coverage, authorization.scope_level)
             if authorization is not None
@@ -417,6 +424,8 @@ class MetricQueryCompiler:
             )
         used = {business_time_column, *(item.field for item in formula_predicates),
                 *(item.field for item in metric.filters)}
+        if binding.count_column is not None:
+            used.add(binding.count_column)
         if aggregate:
             used = {*aggregate.columns.model_dump().values(), *(item.field for item in metric.filters)}
         used.update(item.field for item in filter_dimensions.values() if item.field is not None)
@@ -468,6 +477,12 @@ class MetricQueryCompiler:
         days = (plan.time_range.end - plan.time_range.start).days + 1
         if days > binding.max_days:
             raise PlanStepError("metric_time_range_too_large")
+        if plan.available_dates and (
+            plan.intent != "trend"
+            or plan.grain != "day"
+            or plan.dimensions
+        ):
+            raise PlanStepError("metric_available_period_shape_invalid")
         try:
             # Existing TimeRange is a pair of inclusive dates (same-day allowed).
             # Convert once to a half-open interval; month/day grain only groups.
@@ -481,6 +496,22 @@ class MetricQueryCompiler:
         params: dict[str, Any] = {"start_at": start, "end_at": end}
         business_time = _quote(business_time_column)
         where = [f"{business_time} >= :start_at", f"{business_time} < :end_at"]
+        if plan.available_dates:
+            local_business_date = (
+                f"DATE({business_time} AT TIME ZONE 'Asia/Shanghai')"
+                if binding.timestamp_kind == "timestamptz"
+                else f"DATE({business_time})"
+            )
+            available_keys = [
+                f"available_date_{position}"
+                for position in range(len(plan.available_dates))
+            ]
+            where.append(
+                f"{local_business_date} IN ({', '.join(':' + key for key in available_keys)})"
+            )
+            params.update(
+                dict(zip(available_keys, plan.available_dates, strict=True))
+            )
         # SYSTEM-AUTHORED authorization predicate, independent of QueryPlan and
         # of user filters.  It is built ONLY from the trusted context ids and the
         # relation's approved coverage, and ids are always bound parameters.
@@ -571,7 +602,10 @@ class MetricQueryCompiler:
         group = ""
         order = ""
         prefix = ""
-        select = "COUNT(*) AS value"
+        count_expression = (
+            _quote(binding.count_column) if binding.count_column is not None else "*"
+        )
+        select = f"COUNT({count_expression}) AS value"
         if aggregate:
             select = f"CAST(COALESCE(SUM({_quote(aggregate.columns.value)}), 0) AS bigint) AS value"
         if plan.intent == "trend":
@@ -597,8 +631,10 @@ class MetricQueryCompiler:
         if metric.ratio is not None:
             denominator = " AND ".join(_predicate_sql(item) for item in metric.ratio.denominator_predicates)
             numerator = " AND ".join(_predicate_sql(item) for item in metric.ratio.numerator_predicates)
-            select = (f"COUNT(*) FILTER (WHERE {denominator} AND {numerator}) AS numerator, "
-                      f"COUNT(*) FILTER (WHERE {denominator}) AS denominator")
+            select = (
+                f"COUNT({count_expression}) FILTER (WHERE {denominator} AND {numerator}) AS numerator, "
+                f"COUNT({count_expression}) FILTER (WHERE {denominator}) AS denominator"
+            )
             if aggregate:
                 select = (f"CAST(COALESCE(SUM({_quote(aggregate.columns.numerator)}), 0) AS bigint) AS numerator, "
                           f"CAST(COALESCE(SUM({_quote(aggregate.columns.denominator)}), 0) AS bigint) AS denominator")
@@ -606,18 +642,37 @@ class MetricQueryCompiler:
                f" WHERE {' AND '.join(where)}{group}")
         if metric.ratio is not None:
             output_prefix = "period, " if plan.intent == "trend" else "dimension_id, " if dimension else ""
+            # ZERO-DENOMINATOR SEMANTICS.  NULLIF would erase the distinction
+            # between an UNDEFINED calculation and genuinely absent data, so the
+            # division is guarded explicitly and the two outcomes stay separate:
+            #   denominator = 0 -> status "calculation_error" (undefined), value NULL;
+            #   denominator > 0 -> status "success", including a VALID 0.00 ratio
+            #                      when the numerator is zero.
             sql = (f"SELECT {output_prefix}numerator, denominator, "
-                   "ROUND(100 * CAST(numerator AS numeric) / NULLIF(denominator, 0), 2) AS value, "
-                   "CASE WHEN denominator = 0 THEN 'no_data' ELSE 'success' END AS status "
+                   "CASE WHEN denominator = 0 THEN NULL "
+                   "ELSE ROUND(100 * CAST(numerator AS numeric) / denominator, 2) END AS value, "
+                   "CASE WHEN denominator = 0 THEN 'calculation_error' ELSE 'success' END AS status "
                    f"FROM ({sql}) AS metric_counts")
         sql += order
-        signature_plan = plan.model_dump(mode="json", exclude={"source_strategy"})
+        signature_exclusions = {"source_strategy"}
+        if not plan.available_dates:
+            # Preserve the pre-sparse-window semantic signature for ordinary
+            # contiguous plans; the server-owned sparse set participates only
+            # when it is actually present.
+            signature_exclusions.add("available_dates")
+        signature_plan = plan.model_dump(mode="json", exclude=signature_exclusions)
         signature_payload: dict[str, Any] = {
             "plan": signature_plan, "metric": metric.model_dump(mode="json"),
             "policy": policy.model_dump(mode="json"), "release": release.release_id,
             "snapshot": snapshot.snapshot_id, "checksum": snapshot.checksum,
             "checkpoint": freshness.checkpoint if freshness else None,
         }
+        if plan.available_dates:
+            signature_payload["available_dates"] = [
+                item.isoformat() for item in plan.available_dates
+            ]
+        if binding.count_column is not None:
+            signature_payload["count_column"] = binding.count_column
         if authorization is not None:
             # Deterministic replay identity for the injected trusted authority.
             # A changed authorization revision or effective scope level MUST
@@ -876,6 +931,10 @@ class GatewayMetricStepRunner:
             raise PlanStepError("metric_result_may_be_truncated")
         if result.row_count != len(result.rows):
             raise PlanStepError("metric_result_shape_invalid")
+        # An UNDEFINED ratio calculation is rejected BEFORE shape validation and
+        # before any grounding, so it can never be mistaken for absent data, for a
+        # legitimate zero, or for a database failure.
+        _reject_calculation_error_rows(query, result.rows)
         _validate_rows(result.rows, query)
         digest = rowset_sha256(result.rows)
         # Decimal is an exact two-place JSON string; hash the typed database
@@ -913,6 +972,8 @@ class GatewayMetricStepRunner:
         decision = self._compiler.authorization_decision()
         if decision is not None and decision.outcome == "allow":
             receipt = bind_execution_receipt_authorization(receipt, decision)
+        # Only genuine absence may produce no_data; an undefined calculation was
+        # already rejected above.
         no_data = not rows or (
             query.operation == "ratio"
             and all(row["status"] == "no_data" for row in result.rows)
@@ -928,7 +989,27 @@ class GatewayMetricStepRunner:
         return MetricStepResult(value=output, receipt=receipt)
 
 
+# Row statuses a dependency fetch may legitimately carry.  "calculation_error" is
+# deliberately ABSENT: an undefined calculation is not a scalar a dependent step
+# may consume, so it must fail as undefined rather than be coerced or dropped.
 _DEPENDENCY_ROW_STATUSES = frozenset({"success", "no_data"})
+
+# The stable, exact reason for an undefined ratio calculation (division by zero).
+METRIC_CALCULATION_UNDEFINED = "metric_calculation_undefined_division_by_zero"
+
+
+def _reject_calculation_error_rows(query: Any, rows: Sequence[Any]) -> None:
+    """Fail closed when a row carries an UNDEFINED calculation.
+
+    A zero denominator is an undefined calculation.  Reporting it as "no data"
+    would let an undefined result reach grounding as a legitimate absence, so it
+    is raised with its own stable reason instead.
+    """
+
+    del query
+    for row in rows:
+        if isinstance(row, Mapping) and row.get("status") == "calculation_error":
+            raise PlanStepError(METRIC_CALCULATION_UNDEFINED)
 
 
 def project_dependency_scalar(rows: Sequence[Any], *, no_data: bool) -> JsonValue:
@@ -947,12 +1028,17 @@ def project_dependency_scalar(rows: Sequence[Any], *, no_data: bool) -> JsonValu
     if not isinstance(row, Mapping) or "value" not in row:
         raise PlanStepError("metric_dependency_value_missing")
     status = row.get("status")
+    if status == "calculation_error":
+        # An undefined dependency is a CALCULATION failure, never absent data.
+        raise PlanStepError(METRIC_CALCULATION_UNDEFINED)
     if status is not None and status not in _DEPENDENCY_ROW_STATUSES:
         raise PlanStepError("metric_dependency_status_invalid")
     if status == "no_data":
         raise PlanStepError("metric_dependency_no_data")
     value = row["value"]
     if value is None:
+        # A NULL value is only legitimate no-data when the row says so; an
+        # undefined calculation was already rejected above.
         raise PlanStepError("metric_dependency_no_data")
     if isinstance(value, (dict, list)):
         raise PlanStepError("metric_dependency_scalar_required")
@@ -1224,6 +1310,10 @@ def _validate_rows(rows: list[dict[str, Any]], query: CompiledMetricQuery) -> No
             keys.append(identifier)
     if len(set(keys)) != len(keys):
         raise PlanStepError("metric_result_shape_invalid")
+    if plan.available_dates:
+        returned_periods = tuple(period.date() for period in keys)
+        if returned_periods != plan.available_dates:
+            raise PlanStepError("metric_available_period_set_invalid")
     if plan.intent == "ranking":
         # Stable passes preserve ascending ID ties without Decimal arithmetic
         # (unary minus would round under the caller's ambient context).
@@ -1243,7 +1333,9 @@ def _validate_ratio_row(row: dict[str, Any]) -> None:
             or not 0 <= numerator <= denominator <= 2 ** 63 - 1):
         raise PlanStepError("metric_result_shape_invalid")
     if denominator == 0:
-        valid = value is None and row["status"] == "no_data"
+        # UNDEFINED CALCULATION, not absent data: a zero denominator carries no
+        # value and its own status, never the genuine no_data outcome.
+        valid = value is None and row["status"] == "calculation_error"
     else:
         # PostgreSQL COUNT is int8; this precision is ample for exact rounding
         # of its ratio. Never use the ambient Decimal context or binary float.

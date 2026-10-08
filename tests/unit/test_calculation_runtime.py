@@ -228,7 +228,10 @@ def test_pinned_spec_checksum_is_stable_for_a_fixed_spec() -> None:
     future serialization or schema change cannot pass silently.
     """
     spec = _ratio_spec()
-    assert spec.checksum == "29aa54e32bc6b67e5298362c4b0f829dbf4367f1a029c2be08b9465d1411f696"
+    # Re-pinned for calculation schema 1.1 (the inert global null/zero policy
+    # fields were removed and schema_version moved to "1.1", so every spec
+    # checksum intentionally changes).
+    assert spec.checksum == "691b6d9e842d1a796ced053a03cadf3979c51fa0b2f8cb5b4e32cf1ec00e6993"
 
 
 # 1. LiteralOperand -------------------------------------------------------------

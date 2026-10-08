@@ -36,6 +36,14 @@ SourceDegradation = Literal[
 ConfidenceBand = Literal["low", "medium", "high"]
 # Final Agent-facing scope vocabulary owned by Backend/DB; tt-ai only consumes it.
 ScopeLevel = Literal["city_company", "area", "team", "employee"]
+# Shared product-mode vocabulary.  MODE is decided by THIS RUN's user intent and
+# is independent of definition lifecycle and metric authority: arithmetic,
+# comparison, ranking, trend, execution count, Save and SAVED identity never
+# determine it.  It is deliberately NOT the same axis as QueryPlan.intent
+# (metric/trend/comparison/ranking/detail), which only describes execution
+# shape.  P4-Q's observed-mode vocabulary reuses this type rather than keeping a
+# second duplicate mode literal.
+ProductMode = Literal["QUERY", "ANALYZE", "BUILD"]
 
 
 class StrictContract(BaseModel):
@@ -379,6 +387,12 @@ class QueryPlan(StrictContract):
     dimensions: tuple[str, ...] = Field(default=(), max_length=16)
     filters: tuple[BoundFilter, ...] = Field(default=(), max_length=32)
     time_range: TimeRange
+    # Server-owned sparse business-day availability for bounded recent windows.
+    # Empty means an ordinary contiguous time range; non-empty values are an
+    # exact typed execution set and are never client authority.
+    available_dates: tuple[date, ...] = Field(
+        default=(), max_length=31, exclude=True
+    )
     grain: Literal["hour", "day", "week", "month", "quarter", "year"]
     source_strategy: Literal["aggregate_first", "detail_required"]
     # Ranking defaults to ten; other intents must leave this unset.
@@ -390,6 +404,21 @@ class QueryPlan(StrictContract):
     def validate_result_limit(self) -> QueryPlan:
         if self.intent != "ranking" and self.result_limit is not None:
             raise ValueError("result_limit is only supported for ranking")
+        return self
+
+    @model_validator(mode="after")
+    def validate_available_dates(self) -> QueryPlan:
+        if self.available_dates:
+            if self.intent != "trend":
+                raise ValueError("available_dates is only supported for trends")
+            if len(set(self.available_dates)) != len(self.available_dates):
+                raise ValueError("available_dates must be unique")
+            if tuple(sorted(self.available_dates)) != self.available_dates:
+                raise ValueError("available_dates must be ordered")
+            if self.available_dates[0] < self.time_range.start:
+                raise ValueError("available_dates start is outside time_range")
+            if self.available_dates[-1] > self.time_range.end:
+                raise ValueError("available_dates end is outside time_range")
         return self
 
     @property
@@ -412,7 +441,26 @@ class QueryPlan(StrictContract):
 
     @property
     def checksum(self) -> str:
-        return _contract_checksum(self)
+        payload = self.model_dump(mode="json")
+        if self.available_dates:
+            payload["available_dates"] = [item.isoformat() for item in self.available_dates]
+        canonical = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def query_plan_payload(plan: QueryPlan) -> dict[str, JsonValue]:
+    """Serialize a plan while retaining the server-owned sparse date set."""
+
+    payload = plan.model_dump(mode="json")
+    if plan.available_dates:
+        payload["available_dates"] = [item.isoformat() for item in plan.available_dates]
+    return payload
 
 
 PlanStepId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]

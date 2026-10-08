@@ -1,4 +1,4 @@
-"""Shared calculation semantic contract (contract-only slice).
+"""Shared calculation semantic contract + shared ProductMode (contract-only slice).
 
 MODE_SEMANTIC_SHARED_CALC_CONTRACT_V1.
 
@@ -16,10 +16,12 @@ import pytest
 from pydantic import ValidationError
 
 from src.nl2sql.agents.dynamic_calc.trusted_templates import trusted_template_registry
+from src.nl2sql.contracts import ProductMode, QueryPlan
 from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationBinding,
     ApprovedCalculationInput,
 )
+from src.nl2sql.orchestration.p4q_acceptance import P4QObservedMode
 from src.nl2sql.semantic import calculation_contract as contract
 from src.nl2sql.semantic.calculation_contract import (
     FORBIDDEN_AUTHORITY_FIELDS,
@@ -41,6 +43,9 @@ from src.nl2sql.semantic.calculation_contract import (
     referenced_input_roles,
     referenced_parameter_names,
 )
+
+_EXPECTED_MODES = {"QUERY", "ANALYZE", "BUILD"}
+_EXPECTED_INTENTS = {"metric", "trend", "comparison", "ranking", "detail"}
 
 
 def _inputs() -> tuple[CalculationInputSpec, ...]:
@@ -77,12 +82,27 @@ def _spec(**overrides: object) -> CalculationSpec:
 
 
 # 1 ---------------------------------------------------------------------------
+def test_product_mode_has_exactly_query_analyze_build() -> None:
+    assert set(get_args(ProductMode)) == _EXPECTED_MODES
+    assert len(get_args(ProductMode)) == 3
 
 
 # 2 ---------------------------------------------------------------------------
+def test_query_plan_intent_is_separate_from_product_mode() -> None:
+    intent = set(get_args(QueryPlan.model_fields["intent"].annotation))
+    assert intent == _EXPECTED_INTENTS
+    assert intent.isdisjoint(set(get_args(ProductMode)))
 
 
 # 3 ---------------------------------------------------------------------------
+def test_comparison_ranking_trend_are_not_encoded_as_analyze() -> None:
+    modes = set(get_args(ProductMode))
+    for intent in ("comparison", "ranking", "trend"):
+        assert intent not in modes
+    assert "ANALYZE" in modes
+    # The shared contract has no execution-shape field that could derive a mode.
+    assert "mode" not in CalculationSpec.model_fields
+    assert "intent" not in CalculationSpec.model_fields
 
 
 # 4 ---------------------------------------------------------------------------
@@ -154,20 +174,37 @@ def test_parameter_names_are_non_empty_and_unique() -> None:
 
 
 # 9 ---------------------------------------------------------------------------
-def test_null_zero_unit_precision_policy_validates_strictly() -> None:
+def test_unit_precision_policy_validates_strictly() -> None:
     with pytest.raises(ValidationError):
         _spec(unit="bogus")
-    with pytest.raises(ValidationError):
-        _spec(null_policy="maybe")
-    with pytest.raises(ValidationError):
-        _spec(zero_policy="zero")
     with pytest.raises(ValidationError):
         _spec(precision=13)
     with pytest.raises(ValidationError):
         _spec(rounding="half_up", precision=None)
-    ok = _spec(null_policy="no_data", zero_policy="no_data")
-    assert ok.null_policy == "no_data"
-    assert ok.zero_policy == "no_data"
+    ok = _spec(rounding="half_up", precision=2)
+    assert ok.rounding == "half_up"
+    assert ok.precision == 2
+
+
+# 9b --------------------------------------------------------------------------
+def test_removed_global_null_zero_policy_fields_fail_closed() -> None:
+    """Schema 1.1: null/zero behaviour is explicit in the typed expression.
+
+    The global policy fields were inert (the runtime never read them) and they
+    conflicted with the frozen rules (0 is a real value; NULL != 0; NULL !=
+    NO_DATA; divide-by-zero != NO_DATA).  They are REMOVED, not defaulted: a
+    payload that still carries them must fail strict validation.
+    """
+
+    assert "null_policy" not in CalculationSpec.model_fields
+    assert "zero_policy" not in CalculationSpec.model_fields
+    with pytest.raises(ValidationError):
+        _spec(null_policy="preserve")
+    with pytest.raises(ValidationError):
+        _spec(zero_policy="no_data")
+    assert contract.SCHEMA_VERSION == "1.1"
+    assert _spec().schema_version == "1.1"
+    assert CalculationExecutionBinding.model_fields["schema_version"].default == "1.1"
 
 
 # 10 --------------------------------------------------------------------------
@@ -235,6 +272,9 @@ def test_calculation_spec_rejects_lifecycle_fields(field: str, value: object) ->
 
 
 # 13 --------------------------------------------------------------------------
+def test_p4q_reuses_shared_product_mode_vocabulary() -> None:
+    assert P4QObservedMode is ProductMode
+    assert set(get_args(P4QObservedMode)) == _EXPECTED_MODES
 
 
 # 14 --------------------------------------------------------------------------

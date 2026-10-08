@@ -245,9 +245,9 @@ def test_stream_route_resolves_fresh_authorization_once(
     captured: dict[str, Any] = {}
 
     async def _fake_stream(
-        engine_arg: Any, messages: Any, config: Any, thread_id: Any
+        engine_arg: Any, messages: Any, config: Any, thread_id: Any, extra: Any = None
     ):
-        del engine_arg, messages, thread_id
+        del engine_arg, messages, thread_id, extra
         captured["config"] = config
         yield "data: {}\n\n"
 
@@ -265,17 +265,20 @@ def test_stream_route_resolves_fresh_authorization_once(
     assert authorization["authorization_revision"] == "rev-stream"
 
 
-def test_existing_run_routes_never_fetch_authorization() -> None:
+def test_read_only_routes_never_fetch_authorization() -> None:
+    """Read-only thread/history/feedback must NOT trigger an auth refresh.
+
+    The /actions route is deliberately EXCLUDED here: an action can continue
+    business execution, so it MUST re-fetch the CURRENT trusted authorization
+    (see test_resume_authorization_refresh.py).
+    """
+
     provider = _StubProvider(_context())
     engine = _CapturingEngine()
 
     with TestClient(_app(engine, provider)) as client:
         client.get(f"/api/v2/nl2sql/threads/{THREAD_ID}")
         client.get(f"/api/v2/nl2sql/threads/{THREAD_ID}/history")
-        client.post(
-            f"/api/v2/nl2sql/threads/{THREAD_ID}/actions",
-            json={"action": "approve", "idempotency_key": "k1", "expected_version": 1},
-        )
         client.post(
             "/api/v2/nl2sql/feedback",
             json={"thread_id": str(THREAD_ID), "rating": "up"},

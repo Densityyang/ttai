@@ -43,7 +43,7 @@ from typing import Annotated, Final, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-SCHEMA_VERSION: Final[Literal["1.0"]] = "1.0"
+SCHEMA_VERSION: Final[Literal["1.1"]] = "1.1"
 
 RoleName = Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")]
 ParameterName = Annotated[str, Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")]
@@ -59,8 +59,6 @@ UnitPolicy = Literal["count", "percent", "ratio", "currency_cny", "seconds", "cu
 # separators, and (see CalculationSpec) it must not shadow a built-in literal.
 CustomUnitId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]*(?:[.-][a-z0-9_]+)*$")]
 BUILTIN_UNIT_LITERALS: Final[frozenset[str]] = frozenset((*get_args(UnitPolicy), "custom"))
-NullPolicy = Literal["preserve", "zero", "no_data"]
-ZeroPolicy = Literal["preserve", "no_data"]
 RoundingPolicy = Literal["half_up", "half_even", "half_down", "floor", "ceil"]
 Precision = Annotated[int, Field(ge=0, le=12)]
 
@@ -419,7 +417,7 @@ class CalculationSpec(_StrictFrozenModel):
     Canonical authority, definition identity and lifecycle live outside.
     """
 
-    schema_version: Literal["1.0"] = SCHEMA_VERSION
+    schema_version: Literal["1.1"] = SCHEMA_VERSION
     calculation_id: CalculationId
     expression: Expression
     inputs: tuple[CalculationInputSpec, ...] = Field(min_length=1, max_length=32)
@@ -430,8 +428,6 @@ class CalculationSpec(_StrictFrozenModel):
     custom_unit_id: CustomUnitId | None = None
     precision: Precision | None = None
     rounding: RoundingPolicy | None = None
-    null_policy: NullPolicy = "preserve"
-    zero_policy: ZeroPolicy = "preserve"
 
     @model_validator(mode="before")
     @classmethod
@@ -559,7 +555,7 @@ class CalculationExecutionBinding(_StrictFrozenModel):
     never a new spec identity/checksum.
     """
 
-    schema_version: Literal["1.0"] = SCHEMA_VERSION
+    schema_version: Literal["1.1"] = SCHEMA_VERSION
     calculation_id: CalculationId
     spec_checksum: Checksum
     parameters: tuple[ParameterBinding, ...] = Field(default=(), max_length=32)
@@ -698,7 +694,6 @@ __all__ = [
     "MAX_EXPRESSION_DEPTH",
     "MAX_EXPRESSION_NODES",
     "NullLiteralOperand",
-    "NullPolicy",
     "ParameterBinding",
     "ParameterName",
     "ParameterRefOperand",
@@ -712,7 +707,6 @@ __all__ = [
     "SemanticResolution",
     "SemanticResolutionOutcome",
     "UnitPolicy",
-    "ZeroPolicy",
     "derived_output_id",
     "expression_depth",
     "expression_node_count",

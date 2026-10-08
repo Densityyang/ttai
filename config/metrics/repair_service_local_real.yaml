@@ -1,0 +1,81 @@
+schema_version: 1
+# Frozen real-data case deployment binding: repair_service_archive_rate_overall_day
+# (报修服务归档及时率（全局-日）).
+#
+# This file is a DEPLOYMENT BINDING, not a semantic re-authoring.  The business
+# semantics (eligibility predicates, business time, grain, unit) are transcribed
+# from the canonical Gold definition in
+# configs/semantic/gold/metrics/repair_service.yaml, whose SHA-256 is verified
+# before any release is built.  No formula is written in Python.
+#
+# release_status stays pending_source here on purpose: the deployment activates
+# it explicitly (owner + release_status) once the frozen case is approved.  The
+# canonical source remains the sole semantic authority.
+metrics:
+  # Numerator: 归档及时工单数, business time report_time,
+  # filters is_archive_on_time = true AND completion_receipt_time IS NOT NULL.
+  - metric_key: repair_service_archive_on_time_count_overall_day
+    display_name: 报修服务归档及时工单数（全局-日）
+    release_status: pending_source
+    source_ref: v_repair_service
+    formula_version: repair_service_archive_on_time_count_overall_day.v1
+    eligibility_policy_id: work_order_metric_eligibility_v1
+    operation: count
+    business_time_column: report_time
+    supported_grains: [day]
+    supported_dimensions: [city_company]
+    predicates:
+      - {field: is_archive_on_time, operator: is_true}
+      - {field: completion_receipt_time, operator: is_not_null}
+    required_permissions: [nl2sql:invoke]
+    assistant_enabled: true
+    daily_report_enabled: false
+    benchmark_eligible: false
+
+  # Denominator: 报修计算分母（全局-日）, business time report_time,
+  # filter completion_receipt_time IS NOT NULL.
+  - metric_key: repair_service_calc_total_count_overall_day
+    display_name: 报修计算分母（全局-日）
+    release_status: pending_source
+    source_ref: v_repair_service
+    formula_version: repair_service_calc_total_count_overall_day.v1
+    eligibility_policy_id: work_order_metric_eligibility_v1
+    operation: count
+    business_time_column: report_time
+    supported_grains: [day]
+    supported_dimensions: [city_company]
+    predicates:
+      - {field: completion_receipt_time, operator: is_not_null}
+    required_permissions: [nl2sql:invoke]
+    assistant_enabled: true
+    daily_report_enabled: false
+    benchmark_eligible: false
+
+  # KPI: the ratio {on_time} / {total} * 100, undefined when total = 0.
+  # The numerator is an explicit SUBSET of the denominator, matching the
+  # canonical CASE expression rather than restating it as a formula string.
+  - metric_key: repair_service_archive_rate_overall_day
+    display_name: 报修服务归档及时率（全局-日）
+    release_status: pending_source
+    source_ref: v_repair_service
+    formula_version: repair_service_archive_rate_overall_day.v1
+    eligibility_policy_id: work_order_metric_eligibility_v1
+    operation: ratio
+    business_time_column: report_time
+    supported_grains: [day]
+    supported_dimensions: [city_company]
+    ratio:
+      denominator_predicates:
+        - {field: completion_receipt_time, operator: is_not_null}
+      numerator_predicates:
+        - {field: is_archive_on_time, operator: is_true}
+        - {field: completion_receipt_time, operator: is_not_null}
+      unit: percent
+      value_scale: "0_100"
+      decimal_places: 2
+      # Division by zero is an UNDEFINED calculation, never absent data.
+      zero_denominator_policy: calculation_error
+    required_permissions: [nl2sql:invoke]
+    assistant_enabled: true
+    daily_report_enabled: false
+    benchmark_eligible: false

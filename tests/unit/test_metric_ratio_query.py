@@ -171,7 +171,13 @@ async def test_ratio_sql_target_and_partial_month_boundaries(timestamptz: bool) 
     assert '"is_valid_for_metrics" IS TRUE' in query.sql
     assert '"completion_time" IS NOT NULL' in query.sql
     assert '"is_first_response_on_time" IS TRUE' in query.sql
-    assert "CAST(numerator AS numeric) / NULLIF(denominator, 0)" in query.sql
+    # ZERO-DENOMINATOR SEMANTICS: the division is guarded explicitly rather than
+    # hidden behind NULLIF, and an undefined calculation is NOT labelled no_data.
+    assert "NULLIF(denominator, 0)" not in query.sql
+    assert "CASE WHEN denominator = 0 THEN NULL" in query.sql
+    assert "CAST(numerator AS numeric) / denominator" in query.sql
+    assert "'calculation_error'" in query.sql
+    assert "'no_data'" not in query.sql
     assert "area_id" not in query.sql and "team_id" not in query.sql
     assert "first_arrival_time" not in query.sql and "archive_time" not in query.sql
     trend = await authority.compiler().compile(authority.plan(
@@ -316,7 +322,7 @@ async def run_rows(rows: list[dict[str, Any]], *, max_rows: int = 200, **changes
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("numerator", "denominator", "value", "status"), [
     (2, 3, Decimal("66.67"), "success"), (0, 5, Decimal("0.00"), "success"),
-    (0, 0, None, "no_data"), (1, 32, Decimal("3.13"), "success"),
+    (1, 32, Decimal("3.13"), "success"),
 ])
 async def test_decimal_result_hash_null_and_freshness(numerator: int, denominator: int, value: Decimal | None, status: str) -> None:
     rows = [dict(numerator=numerator, denominator=denominator, value=value, status=status)]
@@ -332,12 +338,43 @@ async def test_decimal_result_hash_null_and_freshness(numerator: int, denominato
 
 
 @pytest.mark.asyncio
+async def test_sparse_available_periods_are_an_exact_post_execution_set() -> None:
+    dates = (date(2026, 9, 1), date(2026, 9, 3), date(2026, 9, 5))
+    rows = [
+        {
+            "period": datetime.combine(item, datetime.min.time()),
+            "numerator": 1,
+            "denominator": 2,
+            "value": Decimal("50.00"),
+            "status": "success",
+        }
+        for item in dates
+    ]
+    changes = {
+        "intent": "trend",
+        "grain": "day",
+        "time_range": TimeRange(start=dates[0], end=dates[-1]),
+        "available_dates": dates,
+    }
+    result = await run_rows(rows, **changes)
+    assert len(result.value["rows"]) == len(dates)
+
+    for invalid_rows in (
+        [*rows[:2], {**rows[2], "period": datetime(2026, 9, 4)}],
+        rows[:2],
+        [rows[0], rows[2], rows[1]],
+    ):
+        with pytest.raises(PlanStepError):
+            await run_rows(invalid_rows, **changes)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("updates", [
     {"value": 50.0}, {"value": "50.00"}, {"value": Decimal("NaN")}, {"value": Decimal("Infinity")},
     {"value": Decimal("50.001")}, {"value": None}, {"status": "no_data"},
     {"value": Decimal("50")}, {"value": Decimal("50.000")},
     {"numerator": True}, {"denominator": None}, {"numerator": -1}, {"numerator": 3},
-    {"denominator": 2 ** 63}, {"denominator": 0}, {"extra": "detail"},
+    {"denominator": 2 ** 63}, {"extra": "detail"},
 ])
 async def test_ratio_result_shape_rejects_invalid_values(updates: dict[str, Any]) -> None:
     row = {"numerator": 1, "denominator": 2, "value": Decimal("50.00"), "status": "success", **updates}
@@ -379,14 +416,20 @@ async def test_ranking_precision_nulls_and_integer_ids() -> None:
     rows = [
         dict(dimension_id=2, numerator=6667, denominator=10000, value=Decimal("66.67"), status="success"),
         dict(dimension_id=1, numerator=6666, denominator=10000, value=Decimal("66.66"), status="success"),
-        dict(dimension_id=3, numerator=0, denominator=0, value=None, status="no_data"),
+        # A VALID NUMERIC ZERO: denominator > 0 with an empty numerator.
+        dict(dimension_id=3, numerator=0, denominator=10000, value=Decimal("0.00"), status="success"),
     ]
     with localcontext() as context:
         context.prec = 2
         assert not (await run_rows(rows, intent="ranking", dimensions=("team",))).value["no_data"]
     with pytest.raises(PlanStepError, match="shape_invalid"):
         await run_rows([rows[2], *rows[:2]], intent="ranking", dimensions=("team",))
-    assert (await run_rows([rows[2]], intent="ranking", dimensions=("team",))).value["no_data"]
+    # A zero-denominator row is an UNDEFINED calculation and is never grounded as
+    # a legitimate no_data row, even as the only row of the ranking.
+    undefined = dict(dimension_id=3, numerator=0, denominator=0, value=None, status="calculation_error")
+    with pytest.raises(PlanStepError) as raised:
+        await run_rows([undefined], intent="ranking", dimensions=("team",))
+    assert raised.value.code == "metric_calculation_undefined_division_by_zero"
     with pytest.raises(PlanStepError, match="shape_invalid"):
         await run_rows([rows[0], dict(rows[1], dimension_id="1")], intent="ranking", dimensions=("team",))
 
@@ -426,3 +469,113 @@ async def test_ratio_checkpoint_isolation_and_authority_reread() -> None:
     with pytest.raises(PlanStepError, match="active_release"):
         await runner.execute(prepared, timeout_ms=1000)
     gateway.execute.assert_not_called()
+
+
+# --- D4 frozen numeric constitution -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_zero_numerator_over_positive_denominator_is_a_valid_numeric_zero() -> None:
+    """0 / 10 is a legitimate 0.00, NOT an absence of data."""
+
+    rows = [dict(numerator=0, denominator=10, value=Decimal('0.00'), status='success')]
+    result = await run_rows(rows)
+    assert result.value == {
+        'rows': [{**rows[0], 'value': '0.00'}],
+        'no_data': False,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('numerator', 'denominator'), [(10, 0), (0, 0)])
+async def test_zero_denominator_is_undefined_not_no_data(
+    numerator: int, denominator: int
+) -> None:
+    """Division by zero is an UNDEFINED calculation, never a no_data outcome."""
+
+    rows = [
+        dict(
+            numerator=numerator,
+            denominator=denominator,
+            value=None,
+            status='calculation_error',
+        )
+    ]
+    with pytest.raises(PlanStepError) as raised:
+        await run_rows(rows)
+    assert raised.value.code == 'metric_calculation_undefined_division_by_zero'
+    assert 'no_data' not in raised.value.code
+
+
+@pytest.mark.asyncio
+async def test_zero_denominator_never_reaches_grounding_as_a_success_path() -> None:
+    """An undefined calculation must not surface as a normal grounded result."""
+
+    rows = [dict(numerator=1, denominator=0, value=None, status='calculation_error')]
+    with pytest.raises(PlanStepError):
+        await run_rows(rows)
+
+
+@pytest.mark.asyncio
+async def test_genuine_empty_result_remains_no_data() -> None:
+    """Genuine absence keeps its existing contract; only division by zero changed.
+
+    A single-row metric read requires exactly one row, so genuine absence is
+    expressed through a GROUPED read that legitimately returns no rows.
+    """
+
+    result = await run_rows([], intent="comparison", dimensions=("area",))
+    assert result.value == {'rows': [], 'no_data': True}
+
+
+@pytest.mark.asyncio
+async def test_undefined_dependency_is_not_reported_as_no_data() -> None:
+    """A dependency whose calculation is undefined fails as undefined."""
+
+    authority = MetricAuthority(ratio_contract())
+    gateway = QueryGateway(async_sessionmaker(), schema='ai_views')
+    plan = authority.plan()
+    runner = GatewayMetricStepRunner(authority.compiler(), gateway)
+    prepared = await runner.prepare(
+        step=FetchMetricStep(step_id='fetch', metric_keys=plan.metric_keys),
+        query_plan=plan,
+        context=authority.context,
+    )
+    object.__setattr__(prepared, 'dependency_fetch', True)
+    gateway.execute = AsyncMock(
+        return_value=QueryReceipt(
+            accepted=True,
+            sql='',
+            sql_fingerprint=prepared.sql_fingerprint,
+            rows=[dict(numerator=1, denominator=0, value=None, status='calculation_error')],
+            row_count=1,
+            max_rows=200,
+            policy_outcome='allow',
+        )
+    )
+    with pytest.raises(PlanStepError) as raised:
+        await runner.execute(prepared, timeout_ms=1000)
+    assert raised.value.code == 'metric_calculation_undefined_division_by_zero'
+    assert 'metric_dependency_no_data' not in raised.value.code
+
+
+def test_ratio_contract_policy_vocabulary_is_calculation_error() -> None:
+    """The frozen vocabulary has exactly one admissible zero-denominator value."""
+
+    contract = ratio_contract()
+    assert contract.ratio is not None
+    assert contract.ratio.zero_denominator_policy == 'calculation_error'
+    payload = contract.ratio.model_dump(mode='json')
+    payload['zero_denominator_policy'] = 'no_data'
+    with pytest.raises(ValidationError):
+        type(contract.ratio).model_validate(payload)
+
+
+def test_repository_ratio_bindings_use_the_corrected_policy() -> None:
+    """No tracked ratio binding may keep the forbidden no_data policy."""
+
+    root = Path(__file__).resolve().parents[2]
+    for name in ('complaint.yaml', 'repair_service_local_real.yaml'):
+        text = (root / 'config' / 'metrics' / name).read_text(encoding='utf-8')
+        assert 'zero_denominator_policy: calculation_error' in text, name
+        assert 'zero_denominator_policy: no_data' not in text, name

@@ -33,6 +33,8 @@ def test_infra_dev_is_ready_without_a_model(monkeypatch) -> None:
 
 def test_product_requires_a_model_for_readiness(monkeypatch) -> None:
     monkeypatch.setenv("SERVICE_MODE", "product")
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("TT_API_BASE_URL", "http://auth.invalid")
     monkeypatch.setenv("MODEL_REQUIRED", "true")
     monkeypatch.setenv(
         "DATABASE_URL",
@@ -55,7 +57,8 @@ def test_product_rejects_process_local_checkpoint_backend(monkeypatch) -> None:
     monkeypatch.setenv("SERVICE_MODE", "product")
     monkeypatch.setenv("MODEL_REQUIRED", "true")
     monkeypatch.setenv("MEMORY_BACKEND", "memory")
-    monkeypatch.setenv("AUTH_ENABLED", "false")
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("TT_API_BASE_URL", "http://auth.invalid")
     monkeypatch.setenv(
         "DATABASE_URL",
         "postgresql+asyncpg://business_reader:test@business.invalid/business",

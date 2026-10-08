@@ -21,6 +21,7 @@ from src.nl2sql.contracts import (
     RouteName,
     TrustedCalculationStep,
     VerifyStep,
+    query_plan_payload,
 )
 from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationBinding,
@@ -67,6 +68,20 @@ class QueryPlanProvider(Protocol):
         context: ContextBundle,
         identity: RequestIdentity,
     ) -> QueryPlan: ...
+
+
+class DeterministicQueryUnsupported(ValueError):
+    """A DETERMINISTIC planner cannot serve this request without a model.
+
+    Generic and provider-agnostic: it lives at the shared planning seam so the
+    engine never depends on any concrete (e.g. demo) provider.  Any future
+    deterministic provider may raise it.  It carries only a stable machine code,
+    never business meaning.
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 class PlanValidationError(ValueError):
@@ -125,7 +140,7 @@ class PlanValidator:
         context: ContextBundle,
         identity: RequestIdentity,
     ) -> PlanValidationRecord:
-        plan = QueryPlan.model_validate_json(plan.model_dump_json())
+        plan = QueryPlan.model_validate(query_plan_payload(plan))
         context = ContextBundle.model_validate_json(context.model_dump_json())
         identity = RequestIdentity.model_validate_json(identity.model_dump_json())
         deny: list[PlanValidationIssue] = []
@@ -231,7 +246,7 @@ class PlanValidator:
         execution_plan = ExecutionPlan.model_validate_json(
             execution_plan.model_dump_json()
         )
-        query_plan = QueryPlan.model_validate_json(query_plan.model_dump_json())
+        query_plan = QueryPlan.model_validate(query_plan_payload(query_plan))
         context = ContextBundle.model_validate_json(context.model_dump_json())
         deny: list[PlanValidationIssue] = []
         approval: list[PlanValidationIssue] = []
@@ -468,7 +483,7 @@ class PlanCompiler:
         context: ContextBundle,
         validation: PlanValidationRecord,
     ) -> ExecutionPlan:
-        plan = QueryPlan.model_validate_json(plan.model_dump_json())
+        plan = QueryPlan.model_validate(query_plan_payload(plan))
         context = ContextBundle.model_validate_json(context.model_dump_json())
         validation = PlanValidationRecord.model_validate_json(validation.model_dump_json())
         if validation.outcome != "allow":
@@ -532,7 +547,7 @@ class PlanCompiler:
         is never inferred from the mere presence of arithmetic.
         """
 
-        plan = QueryPlan.model_validate_json(plan.model_dump_json())
+        plan = QueryPlan.model_validate(query_plan_payload(plan))
         context = ContextBundle.model_validate_json(context.model_dump_json())
         validation = PlanValidationRecord.model_validate_json(
             validation.model_dump_json()

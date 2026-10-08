@@ -9,6 +9,7 @@ from uuid import UUID
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 from pydantic import JsonValue, ValidationError
 
 from src.nl2sql.contracts import (
@@ -1150,13 +1151,31 @@ async def test_engine_resets_request_state_after_a_terminal_clarification() -> N
         {"messages": [{"role": "user", "content": "show revenue"}]},
         config,
     )
+    # Typed suspension: the clarify run pauses with a server-owned request and
+    # does not execute.  It is no longer a terminal stop_reason.
+    assert first["stop_reason"] is None
+    assert first["decision_status"] == "awaiting_decision"
+    assert first["pending_decision"]["unresolved_slots"] == ["metric"]
+    assert "__interrupt__" in first
+    assert metric_runner.execute_calls == 0
+
+    # A typed decision closes the suspension without executing business work.
+    resumed = await engine.ainvoke(
+        Command(resume={"action": "reject", "idempotency_key": "reset-1"}),
+        config,
+    )
+    assert resumed["decision_status"] == "rejected"
+    assert resumed["stop_reason"] is None
+    assert metric_runner.execute_calls == 0
+
+    # A fresh run on the SAME thread starts clean (no stale suspension state).
     second = await engine.ainvoke(
         {"messages": [{"role": "user", "content": "show revenue"}]},
         config,
     )
-
-    assert first["stop_reason"] == "query_plan_clarification_required"
     assert second["stop_reason"] is None
+    assert second["decision_status"] is None
+    assert second["pending_decision"] is None
     assert second["route_record"]["route"] == "fast"
     assert second["execution_record"]["status"] == "succeeded"
     assert second["trace_events"][0]["name"] == "received"
@@ -1423,6 +1442,22 @@ def test_grounded_renderer_keeps_raw_rows_out_and_marks_stale_freshness() -> Non
         "aggregate_stale",
         "GroundedAnswerStale",
     )
+
+
+def test_grounded_trend_renderer_preserves_business_period_mapping() -> None:
+    fact = AnswerFact(
+        fact_id="e" * 64,
+        step_id="fetch_metrics",
+        metric_key="metric.revenue",
+        value=75,
+        time_range=TimeRange(
+            start=date(2026, 9, 12), end=date(2026, 9, 12)
+        ),
+    )
+    rendered = render_grounded_answer(query_plan=_query_plan(), facts=(fact,))
+    assert rendered == "metric.revenue [2026-09-12]: 75"
+    assert "rows" not in rendered
+    assert "SELECT" not in rendered
 
 
 @pytest.mark.asyncio

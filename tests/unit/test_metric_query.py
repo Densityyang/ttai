@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -16,6 +17,7 @@ from src.nl2sql.contracts import (
     AuthorizationContext,
     AuthorizationDecision,
     BoundFilter,
+    ExecutionReceipt,
     FetchMetricStep,
     TimeRange,
     evaluate_authorization,
@@ -102,6 +104,149 @@ async def test_eligibility_half_open_leap_day_and_month(timestamptz: bool) -> No
     trend = await authority.compiler().compile(authority.plan(intent="trend", grain="month"), authority.context)
     assert "DATE_TRUNC('month'" in trend.sql
     assert ("AT TIME ZONE" in trend.sql) == timestamptz
+
+
+@pytest.mark.asyncio
+async def test_trusted_count_column_compiles_count_id_not_count_star() -> None:
+    authority = MetricAuthority()
+    assert authority.snapshot is not None and authority.release is not None
+    relation = authority.snapshot.candidate.relations[0]
+    authority.change_snapshot_relation(
+        columns=(*relation.columns, ColumnSnapshot("id", "uuid", False, 99))
+    )
+    authority.release = replace(
+        authority.release,
+        schema_snapshot_checksum=authority.snapshot.checksum,
+    )
+    binding = authority.binding.model_copy(
+        update={
+            "count_column": "id",
+            "allowed_columns": (*authority.binding.allowed_columns, "id"),
+        }
+    )
+    query = await authority.compiler(bindings=(binding,)).compile(
+        authority.plan(), authority.context
+    )
+    assert 'COUNT("id") AS value' in query.sql
+    assert "COUNT(*)" not in query.sql
+    ratio_authority = MetricAuthority(ratio_contract())
+    assert ratio_authority.snapshot is not None and ratio_authority.release is not None
+    ratio_relation = ratio_authority.snapshot.candidate.relations[0]
+    ratio_authority.change_snapshot_relation(
+        columns=(*ratio_relation.columns, ColumnSnapshot("id", "uuid", False, 99))
+    )
+    ratio_authority.release = replace(
+        ratio_authority.release,
+        schema_snapshot_checksum=ratio_authority.snapshot.checksum,
+    )
+    ratio_binding = ratio_authority.binding.model_copy(
+        update={
+            "count_column": "id",
+            "allowed_columns": (*ratio_authority.binding.allowed_columns, "id"),
+        }
+    )
+    ratio_query = await ratio_authority.compiler(
+        bindings=(ratio_binding,)
+    ).compile(ratio_authority.plan(), ratio_authority.context)
+    assert 'COUNT("id") FILTER' in ratio_query.sql or "COUNT(*)" not in ratio_query.sql
+
+
+def test_count_id_excludes_a_nullable_identity_from_denominator() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute("CREATE TABLE frozen (id INTEGER, eligible INTEGER)")
+        connection.executemany(
+            "INSERT INTO frozen (id, eligible) VALUES (?, ?)",
+            [(None, 1), (7, 1), (8, 0)],
+        )
+        counted = connection.execute(
+            "SELECT COUNT(id) FROM frozen WHERE eligible = 1"
+        ).fetchone()
+        assert counted == (1,)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("binding_update", "snapshot_update", "error"),
+    [
+        ({"count_column": "id"}, {}, "metric_column_unapproved"),
+        (
+            {
+                "count_column": "id",
+                "allowed_columns": (*MetricAuthority().binding.allowed_columns, "id"),
+            },
+            {"sensitive_columns": ("id",)},
+            "metric_column_unapproved",
+        ),
+        ({"count_column": "id"}, {}, "metric_count_column_unapproved"),
+    ],
+)
+async def test_count_column_uses_normal_column_authority_checks(
+    binding_update: dict[str, object],
+    snapshot_update: dict[str, object],
+    error: str,
+) -> None:
+    authority = MetricAuthority()
+    assert authority.snapshot is not None
+    relation = authority.snapshot.candidate.relations[0]
+    if error == "metric_count_column_unapproved":
+        authority.change_snapshot_relation(
+            columns=tuple(column for column in relation.columns if column.name != "id")
+        )
+    else:
+        authority.change_snapshot_relation(
+            columns=(*relation.columns, ColumnSnapshot("id", "uuid", False, 99)),
+            **snapshot_update,
+        )
+    binding = authority.binding.model_copy(update=binding_update)
+    with pytest.raises(PlanStepError, match=error):
+        await authority.compiler(bindings=(binding,)).compile(
+            authority.plan(), authority.context
+        )
+
+
+@pytest.mark.asyncio
+async def test_sparse_recent_authoritative_dates_are_an_execution_set() -> None:
+    authority = MetricAuthority(ratio_contract())
+    dates = (date(2026, 9, 1), date(2026, 9, 3), date(2026, 9, 8))
+    plan = authority.plan(
+        intent="trend",
+        time_range=TimeRange(start=dates[0], end=dates[-1]),
+        available_dates=dates,
+    )
+    query = await authority.compiler().compile(plan, authority.context)
+    assert ":available_date_0" in query.sql
+    assert 'DATE("acceptance_time"' in query.sql
+    assert query.params["available_date_0"] == dates[0]
+    assert query.params["available_date_1"] == dates[1]
+    assert query.params["available_date_2"] == dates[2]
+
+
+@pytest.mark.asyncio
+async def test_count_column_is_bound_to_semantic_signature() -> None:
+    authority = MetricAuthority()
+    assert authority.snapshot is not None and authority.release is not None
+    relation = authority.snapshot.candidate.relations[0]
+    authority.change_snapshot_relation(
+        columns=(*relation.columns, ColumnSnapshot("id", "uuid", False, 99))
+    )
+    authority.release = replace(
+        authority.release,
+        schema_snapshot_checksum=authority.snapshot.checksum,
+    )
+    no_count = authority.binding.model_copy(
+        update={"allowed_columns": (*authority.binding.allowed_columns, "id")}
+    )
+    with_count = no_count.model_copy(update={"count_column": "id"})
+    first = await authority.compiler(bindings=(no_count,)).compile(
+        authority.plan(), authority.context
+    )
+    second = await authority.compiler(bindings=(with_count,)).compile(
+        authority.plan(), authority.context
+    )
+    assert first.semantic_signature != second.semantic_signature
 
 
 @pytest.mark.asyncio
@@ -719,7 +864,7 @@ async def test_authorized_receipt_is_stamped_from_the_allow_decision() -> None:
 
     authority = _area_team_authority()
 
-    async def _run(compiler) -> tuple[CompiledMetricQuery, object]:
+    async def _run(compiler) -> tuple[CompiledMetricQuery, ExecutionReceipt]:
         gateway = QueryGateway(async_sessionmaker(), schema="ai_views")
         runner = GatewayMetricStepRunner(compiler, gateway)
         plan = authority.plan()

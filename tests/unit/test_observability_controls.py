@@ -129,8 +129,8 @@ async def test_control_audit_scrubs_technical_secrets_before_persisting() -> Non
 
     await store.append(event)
 
-    audit_payload = connection.calls[0][1][5]
-    outbox_payload = connection.calls[1][1][4]
+    audit_payload = cast(str, connection.calls[0][1][5])
+    outbox_payload = cast(str, connection.calls[1][1][4])
     assert "hunter2" not in audit_payload
     assert "hunter2" not in outbox_payload
     assert "revenue 100" in audit_payload

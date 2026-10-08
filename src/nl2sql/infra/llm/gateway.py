@@ -709,6 +709,18 @@ def _completion_payload(
         return payload
     if structured_output_mode == "json_object":
         payload["response_format"] = {"type": "json_object"}
+        if not _messages_mention_json(messages):
+            # OpenAI-compatible providers (notably DeepSeek) reject
+            # response_format=json_object unless the prompt mentions JSON.
+            # The gateway owns provider compatibility, so the hint is added
+            # HERE rather than leaking a provider quirk into every prompt.
+            payload["messages"] = [
+                {
+                    "role": "system",
+                    "content": "Respond with a single valid JSON object.",
+                },
+                *messages,
+            ]
         return payload
     payload["response_format"] = {
         "type": "json_schema",
@@ -719,6 +731,14 @@ def _completion_payload(
         },
     }
     return payload
+
+
+def _messages_mention_json(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(message.get("content"), str)
+        and "json" in message["content"].lower()
+        for message in messages
+    )
 
 
 def _schema_name(schema: dict[str, Any]) -> str:
