@@ -86,3 +86,8 @@ docs/
 _build_slide2.py
 .demo_tokens.json
 周例会ppt_928_yhx.pptx
+
+# Tool workspaces and shell artifacts (never product deliverables)
+.opencode/
+.mobilework-workspace
+%SystemDrive%/
