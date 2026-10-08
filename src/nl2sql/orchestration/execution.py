@@ -54,6 +54,9 @@ class PreparedMetricStep:
     sql_fingerprint: str
     join_hops: int
     payload: object = field(repr=False, compare=False)
+    # Request-local mode: True when this fetch serves one trusted calculation
+    # input role and must project a typed scalar instead of a rowset.
+    dependency_fetch: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -272,6 +275,16 @@ class PlanExecutor:
                         )
                     outputs[current_step.step_id] = output
                     gateway_receipt = gateway_receipts.get(current_step.step_id)
+                    calculation = (
+                        {
+                            "template_id": current_step.template_id,
+                            "template_version": current_step.template_version,
+                            "binding_checksum": current_step.binding_checksum,
+                            "output_metric_key": current_step.output_metric_key,
+                        }
+                        if isinstance(current_step, TrustedCalculationStep)
+                        else {}
+                    )
                     receipts.append(
                         PlanStepReceipt(
                             step_id=current_step.step_id,
@@ -279,6 +292,7 @@ class PlanExecutor:
                             status="succeeded",
                             elapsed_ms=_elapsed_ms(current_started),
                             output_digest=_json_digest(output),
+                            **calculation,
                             rowset_sha256=gateway_receipt.rowset_sha256 if gateway_receipt else None,
                             data_as_of=gateway_receipt.data_as_of if gateway_receipt else None,
                             freshness_status=gateway_receipt.freshness_status if gateway_receipt else "unknown",

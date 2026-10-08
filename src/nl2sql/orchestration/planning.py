@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Protocol
 
 from src.nl2sql.contracts import (
     ContextBundle,
     ExecutionPlan,
     FetchMetricStep,
+    PlanStep,
     PlanValidationIssue,
     PlanValidationRecord,
     QueryPlan,
@@ -19,9 +21,18 @@ from src.nl2sql.contracts import (
     TrustedCalculationStep,
     VerifyStep,
 )
+from src.nl2sql.orchestration.approved_compute import (
+    ApprovedCalculationBinding,
+    ApprovedCalculationCatalog,
+    declares_canonical_binding,
+)
 
 PLAN_VALIDATION_POLICY_VERSION = "plan-validation.bootstrap.v1"
 PLAN_COMPILER_POLICY_VERSION = "plan-compiler.v1"
+
+# A binding input role is only compilable when it maps to a PlanStepId-safe,
+# lowercase dependency step id.  Anything else fails closed at compile time.
+_DEPENDENCY_ROLE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 
 
 class ContextResolver(Protocol):
@@ -70,12 +81,16 @@ class PlanValidator:
         policy_version: str = PLAN_VALIDATION_POLICY_VERSION,
         approved_template_ids: frozenset[str] = frozenset(),
         approved_invariant_ids: frozenset[str] = frozenset({"typed_result_present"}),
+        calculation_catalog: ApprovedCalculationCatalog | None = None,
     ) -> None:
         if not policy_version.strip():
             raise ValueError("plan validation policy version must be non-empty")
         self.policy_version = policy_version
         self.approved_template_ids = approved_template_ids
         self.approved_invariant_ids = approved_invariant_ids
+        # Already-resolved trusted bindings; None keeps the bounded legacy
+        # approved-template-id behaviour and never invents authority.
+        self._calculation_catalog = calculation_catalog
         policy_payload = json.dumps(
             {
                 "policy_version": policy_version,
@@ -258,9 +273,77 @@ class PlanValidator:
                 )
             )
 
+        if self._calculation_catalog is None:
+            # Calculation provenance is trusted-binding authority evidence.  A
+            # plan carrying ANY canonical provenance -- a canonical calculation
+            # or a dependency fetch -- is a hard DENY without a catalog, and a
+            # template-id allowlist can never stand in for it.
+            if any(
+                isinstance(step, TrustedCalculationStep)
+                and declares_canonical_binding(step)
+                for step in execution_plan.steps
+            ) or any(
+                isinstance(step, FetchMetricStep)
+                and step.calculation_input_role is not None
+                for step in execution_plan.steps
+            ):
+                deny.append(
+                    _issue(
+                        "trusted_calculation_binding_authority_missing",
+                        "execution_plan.steps",
+                        "Canonical calculation provenance is present but no trusted "
+                        "binding catalog is available.",
+                    )
+                )
+        else:
+            # Plan-level canonical authority: a catalog-bound requested output
+            # must be claimed by exactly one canonical calculation, and every
+            # provenance-carrying dependency fetch must have exactly one owner,
+            # whether or not the plan happens to contain a calculation step.
+            for code in self._calculation_catalog.validate_bound_outputs(
+                query_plan=query_plan,
+                execution_plan=execution_plan,
+            ):
+                deny.append(
+                    _issue(
+                        code,
+                        "execution_plan.steps",
+                        "A catalog-bound requested metric is not satisfied by exactly "
+                        "one trusted calculation.",
+                    )
+                )
+            for code in self._calculation_catalog.validate_dependency_provenance(
+                execution_plan=execution_plan,
+            ):
+                deny.append(
+                    _issue(
+                        code,
+                        "execution_plan.steps",
+                        "A calculation dependency fetch is not owned by exactly one "
+                        "canonical calculation.",
+                    )
+                )
+
         for step in execution_plan.steps:
             if isinstance(step, TrustedCalculationStep):
-                if step.template_id not in self.approved_template_ids:
+                if declares_canonical_binding(step):
+                    # Canonical metric authority is the already-resolved trusted
+                    # binding, NEVER a template-id allowlist.  Without a catalog
+                    # the plan was already denied above.
+                    if self._calculation_catalog is not None:
+                        for code in self._calculation_catalog.validate_calculation(
+                            step=step,
+                            execution_plan=execution_plan,
+                            context=context,
+                        ):
+                            deny.append(
+                                _issue(
+                                    code,
+                                    f"execution_plan.steps.{step.step_id}",
+                                    "The calculation step does not match its trusted binding.",
+                                )
+                            )
+                elif step.template_id not in self.approved_template_ids:
                     approval.append(
                         _issue(
                             "trusted_calculation_approval_required",
@@ -294,10 +377,16 @@ class PlanValidator:
 class PlanCompiler:
     """Compile one validated proposal into the registered SQL-plus-verify DAG."""
 
-    def __init__(self, *, policy_version: str = PLAN_COMPILER_POLICY_VERSION) -> None:
+    def __init__(
+        self,
+        *,
+        policy_version: str = PLAN_COMPILER_POLICY_VERSION,
+        calculation_catalog: ApprovedCalculationCatalog | None = None,
+    ) -> None:
         if not policy_version.strip():
             raise ValueError("plan compiler policy version must be non-empty")
         self.policy_version = policy_version
+        self._calculation_catalog = calculation_catalog
 
     def compile(
         self,
@@ -316,23 +405,106 @@ class PlanCompiler:
         if validation.context_checksum != context.checksum:
             raise PlanCompilationError("context_validation_hash_mismatch")
 
-        fetch = FetchMetricStep(
-            step_id="fetch_metrics",
-            metric_keys=plan.metric_keys,
+        catalog = self._calculation_catalog
+        bound_requested = (
+            tuple(
+                key for key in plan.metric_keys if catalog.binding_for(key) is not None
+            )
+            if catalog is not None
+            else ()
         )
-        verify = VerifyStep(
-            step_id="verify_result",
-            input_refs=(fetch.step_id,),
-            invariant_ids=("typed_result_present",),
-            depends_on=(fetch.step_id,),
-        )
+        if bound_requested:
+            # V1 supports exactly ONE catalog-bound canonical output per plan.
+            # Any other shape that requests a bound metric fails closed: falling
+            # back to a direct fetch would create an untrusted second authority
+            # for a canonical value.
+            if len(plan.metric_keys) != 1 or len(bound_requested) != 1:
+                raise PlanCompilationError("approved_calculation_plan_shape_unsupported")
+            binding = catalog.binding_for(plan.metric_keys[0]) if catalog is not None else None
+            if binding is None:
+                raise PlanCompilationError("approved_calculation_plan_shape_unsupported")
+            steps = _compile_bound_calculation(plan=plan, binding=binding)
+        else:
+            fetch = FetchMetricStep(
+                step_id="fetch_metrics",
+                metric_keys=plan.metric_keys,
+            )
+            verify = VerifyStep(
+                step_id="verify_result",
+                input_refs=(fetch.step_id,),
+                invariant_ids=("typed_result_present",),
+                depends_on=(fetch.step_id,),
+            )
+            steps: tuple[PlanStep, ...] = (fetch, verify)
         return ExecutionPlan(
             query_plan_sha256=plan.checksum,
             semantic_release_id=context.semantic_release_id,
             schema_snapshot_id=context.schema_snapshot_id,
             policy_version=self.policy_version,
-            steps=(fetch, verify),
+            steps=steps,
         )
+
+
+def _dependency_fetch_step_id(role: str) -> str:
+    """Deterministic PlanStepId for one trusted binding input role."""
+
+    normalized = role.lower()
+    if not _DEPENDENCY_ROLE.fullmatch(normalized):
+        raise PlanCompilationError("approved_calculation_role_unsupported")
+    return f"fetch_{normalized}"
+
+
+def _compile_bound_calculation(
+    *,
+    plan: QueryPlan,
+    binding: ApprovedCalculationBinding,
+) -> tuple[PlanStep, ...]:
+    """Emit internal dependency fetches feeding one trusted calculation.
+
+    The requested metric is NEVER itself fetched: fetching the derived output
+    would create a second, untrusted authority for the same value alongside the
+    bound calculation.  Each binding input becomes exactly one dependency fetch
+    whose declared provenance is the binding checksum, the input role and the
+    canonical output key; the calculation consumes only the projected scalar
+    ("<fetch>.value") of those fetches.
+    """
+
+    if plan.intent != "metric":
+        raise PlanCompilationError("approved_calculation_intent_unsupported")
+    if plan.metric_keys != (binding.canonical_metric_key,):
+        raise PlanCompilationError("approved_calculation_output_not_requested")
+    fetch_steps = [
+        FetchMetricStep(
+            step_id=_dependency_fetch_step_id(item.role),
+            metric_keys=(item.metric_key,),
+            calculation_input_role=item.role,
+            calculation_binding_checksum=binding.checksum,
+            calculation_output_metric_key=binding.canonical_metric_key,
+        )
+        for item in binding.inputs
+    ]
+    if len({step.step_id for step in fetch_steps}) != len(fetch_steps):
+        raise PlanCompilationError("approved_calculation_role_unsupported")
+    calculation = TrustedCalculationStep(
+        step_id="calculate_metric",
+        template_id=binding.template_id,
+        template_version=binding.template_version,
+        template_checksum=binding.template_checksum,
+        binding_checksum=binding.checksum,
+        output_metric_key=binding.canonical_metric_key,
+        input_refs={
+            item.role: f"{_dependency_fetch_step_id(item.role)}.value"
+            for item in binding.inputs
+        },
+        depends_on=tuple(step.step_id for step in fetch_steps),
+    )
+    verify = VerifyStep(
+        step_id="verify_result",
+        input_refs=(calculation.step_id,),
+        invariant_ids=("typed_result_present",),
+        depends_on=(calculation.step_id,),
+    )
+    return (*fetch_steps, calculation, verify)
 
 
 def _issue(code: str, path: str, safe_message: str) -> PlanValidationIssue:

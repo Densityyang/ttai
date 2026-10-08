@@ -10,11 +10,11 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 from pydantic import Field, JsonValue, model_validator
@@ -29,12 +29,18 @@ from src.nl2sql.contracts import (
     evaluate_authorization,
 )
 from src.nl2sql.infra.governance.query_gateway import QueryGateway
+from src.nl2sql.orchestration.approved_compute import (
+    ApprovedCalculationBinding,
+    ApprovedCalculationCatalog,
+)
 from src.nl2sql.orchestration.candidates import rowset_sha256
 from src.nl2sql.orchestration.execution import (
     MetricStepResult,
     PlanExecutor,
     PlanStepError,
     PreparedMetricStep,
+    RegistryTrustedCalculationRunner,
+    TrustedCalculationRunner,
 )
 from src.nl2sql.orchestration.planning import PlanValidator
 from src.nl2sql.ownership import bind_execution_receipt_authorization
@@ -715,17 +721,85 @@ class MetricQueryCompiler:
 
 
 class GatewayMetricStepRunner:
-    def __init__(self, compiler: MetricQueryCompiler, gateway: QueryGateway) -> None:
+    def __init__(
+        self,
+        compiler: MetricQueryCompiler,
+        gateway: QueryGateway,
+        *,
+        calculation_catalog: ApprovedCalculationCatalog | None = None,
+    ) -> None:
         self._compiler = compiler
         self._gateway = gateway
+        # Dependency fetches are authorized ONLY by an injected, already-resolved
+        # trusted binding catalog; without one they fail closed.
+        self._calculation_catalog = calculation_catalog
 
     async def prepare(self, *, step: FetchMetricStep, query_plan: QueryPlan,
                       context: ContextBundle) -> PreparedMetricStep:
-        if step.metric_keys != query_plan.metric_keys:
-            raise PlanStepError("metric_step_mismatch")
-        query = await self._compiler.compile(query_plan, context)
+        if step.calculation_input_role is None:
+            if step.metric_keys != query_plan.metric_keys:
+                raise PlanStepError("metric_step_mismatch")
+            query = await self._compiler.compile(query_plan, context)
+            prepared = self._gateway.prepare(query.sql)
+            return PreparedMetricStep(prepared.fingerprint, 0, query)
+        dependency_plan = self._dependency_plan(
+            step=step, query_plan=query_plan, context=context
+        )
+        query = await self._compiler.compile(dependency_plan, context)
         prepared = self._gateway.prepare(query.sql)
-        return PreparedMetricStep(prepared.fingerprint, 0, query)
+        return PreparedMetricStep(prepared.fingerprint, 0, query, dependency_fetch=True)
+
+    def _dependency_plan(
+        self,
+        *,
+        step: FetchMetricStep,
+        query_plan: QueryPlan,
+        context: ContextBundle,
+    ) -> QueryPlan:
+        """Derive the ephemeral child plan fetching ONE trusted binding input.
+
+        A dependency fetch names a single metric key that is deliberately NOT the
+        requested plan's metric key, so the direct equality invariant cannot
+        apply.  The trusted binding is instead re-proved here from the injected
+        catalog: the binding owning the compiled output key must exist, its
+        checksum must match the step's declared checksum, the declared role must
+        be one of its inputs, that input must be exactly the fetched metric, and
+        the metric must be resolved in this request's context.  Everything else
+        fails closed before any SQL is compiled.
+        """
+
+        catalog = self._calculation_catalog
+        output_metric_key = step.calculation_output_metric_key
+        binding: ApprovedCalculationBinding | None = (
+            catalog.binding_for(output_metric_key)
+            if catalog is not None and output_metric_key is not None
+            else None
+        )
+        if binding is None:
+            raise PlanStepError("metric_dependency_binding_missing")
+        if step.calculation_binding_checksum != binding.checksum:
+            raise PlanStepError("metric_dependency_binding_mismatch")
+        role = step.calculation_input_role
+        inputs = [item for item in binding.inputs if item.role == role]
+        if len(inputs) != 1:
+            raise PlanStepError("metric_dependency_role_mismatch")
+        if step.metric_keys != (inputs[0].metric_key,):
+            raise PlanStepError("metric_dependency_metric_mismatch")
+        if catalog is not None and catalog.binding_for(inputs[0].metric_key) is not None:
+            # V1 has no recursive canonical DAG: a catalog-bound dependency
+            # would itself require a governed calculation, so this seam refuses
+            # it even for a caller that bypassed PlanValidator.
+            raise PlanStepError("metric_dependency_nested_calculation_unsupported")
+        if query_plan.intent != "metric":
+            raise PlanStepError("metric_dependency_intent_unsupported")
+        if query_plan.metric_keys != (binding.canonical_metric_key,):
+            raise PlanStepError("metric_dependency_output_mismatch")
+        if inputs[0].metric_key not in context.asset_ids:
+            raise PlanStepError("metric_dependency_metric_unresolved")
+        # Only the requested metric identity changes: domain, filters, time
+        # range, grain, source strategy and permission requirements stay exactly
+        # as the validated plan declared them, and compile() re-validates.
+        return query_plan.model_copy(update={"metric_keys": step.metric_keys})
 
     async def execute(self, prepared: PreparedMetricStep, *, timeout_ms: int) -> MetricStepResult:
         query = prepared.payload
@@ -799,17 +873,78 @@ class GatewayMetricStepRunner:
         decision = self._compiler.authorization_decision()
         if decision is not None and decision.outcome == "allow":
             receipt = bind_execution_receipt_authorization(receipt, decision)
-        output: dict[str, JsonValue] = {
-            "rows": rows,
-            "no_data": not rows or (query.operation == "ratio"
-                                    and all(row["status"] == "no_data" for row in result.rows)),
-        }
+        no_data = not rows or (
+            query.operation == "ratio"
+            and all(row["status"] == "no_data" for row in result.rows)
+        )
+        if prepared.dependency_fetch:
+            # A calculation input is the typed scalar only: the rowset wrapper
+            # never reaches the trusted calculation runner.
+            output: dict[str, JsonValue] = {
+                "value": project_dependency_scalar(rows, no_data=no_data)
+            }
+        else:
+            output = {"rows": rows, "no_data": no_data}
         return MetricStepResult(value=output, receipt=receipt)
 
 
-def metric_plan_executor(compiler: MetricQueryCompiler, gateway: QueryGateway) -> PlanExecutor:
-    """Explicit request-scoped wiring; default AppContainer remains fail closed."""
-    return PlanExecutor(metric_runner=GatewayMetricStepRunner(compiler, gateway))
+_DEPENDENCY_ROW_STATUSES = frozenset({"success", "no_data"})
+
+
+def project_dependency_scalar(rows: Sequence[Any], *, no_data: bool) -> JsonValue:
+    """Project one dependency fetch's rows to the single typed scalar input.
+
+    V1 admits exactly ONE business row/value per dependency.  Multi-row results,
+    alignment, trend and ranking shapes fail closed with a stable reason instead
+    of being reduced, and no missing or no-data value is ever coerced to zero.
+    """
+
+    if no_data:
+        raise PlanStepError("metric_dependency_no_data")
+    if len(rows) != 1:
+        raise PlanStepError("metric_dependency_scalar_required")
+    row = rows[0]
+    if not isinstance(row, Mapping) or "value" not in row:
+        raise PlanStepError("metric_dependency_value_missing")
+    status = row.get("status")
+    if status is not None and status not in _DEPENDENCY_ROW_STATUSES:
+        raise PlanStepError("metric_dependency_status_invalid")
+    if status == "no_data":
+        raise PlanStepError("metric_dependency_no_data")
+    value = row["value"]
+    if value is None:
+        raise PlanStepError("metric_dependency_no_data")
+    if isinstance(value, (dict, list)):
+        raise PlanStepError("metric_dependency_scalar_required")
+    return cast(JsonValue, value)
+
+
+def metric_plan_executor(
+    compiler: MetricQueryCompiler,
+    gateway: QueryGateway,
+    *,
+    trusted_calculation_runner: TrustedCalculationRunner | None = None,
+    calculation_catalog: ApprovedCalculationCatalog | None = None,
+) -> PlanExecutor:
+    """Explicit request-scoped wiring; default AppContainer remains fail closed.
+
+    A calculation step can only be emitted/validated when an explicit trusted
+    binding catalog is supplied elsewhere, so injecting the registered runner
+    here does not make any unbound production metric executable.  The same holds
+    for calculation_catalog: without it no dependency fetch is ever admitted, so
+    the AppContainer default remains fail closed.
+    """
+
+    return PlanExecutor(
+        metric_runner=GatewayMetricStepRunner(
+            compiler, gateway, calculation_catalog=calculation_catalog
+        ),
+        trusted_calculation_runner=(
+            trusted_calculation_runner
+            if trusted_calculation_runner is not None
+            else RegistryTrustedCalculationRunner()
+        ),
+    )
 
 
 def _quote(identifier: str) -> str:
