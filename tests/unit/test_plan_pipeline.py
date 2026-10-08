@@ -12,11 +12,15 @@ from langgraph.checkpoint.memory import MemorySaver
 from pydantic import JsonValue, ValidationError
 
 from src.nl2sql.contracts import (
+    AnswerArtifact,
+    AnswerFact,
     BoundFilter,
     ContextBundle,
     ExecutionPlan,
     ExecutionReceipt,
     FetchMetricStep,
+    PlanExecutionRecord,
+    PlanStepReceipt,
     QueryPlan,
     RequestContext,
     RequestIdentity,
@@ -38,6 +42,11 @@ from src.nl2sql.orchestration.execution import (
     PlanExecutor,
     PreparedMetricStep,
     RegistryTrustedCalculationRunner,
+)
+from src.nl2sql.orchestration.grounding import (
+    build_answer_facts,
+    receipt_degradation_flags,
+    render_grounded_answer,
 )
 from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
 from src.nl2sql.ownership import runtime_config
@@ -773,11 +782,22 @@ async def test_engine_uses_zero_model_fast_path_for_a_validated_typed_plan() -> 
     assert context_resolver.calls == 1
     assert plan_provider.calls == 1
     assert metric_runner.execute_calls == 1
-    assert result["messages"][-1].content == (
-        "Typed execution completed. Grounded answer rendering is pending."
-    )
-    assert "GroundedAnswerPending" in result["degradation_flags"]
+    answer_text = result["messages"][-1].content
+    assert answer_text == "metric.revenue: 4242"
+    degradation_flags = result["degradation_flags"]
+    assert "GroundedAnswerPending" not in degradation_flags
+    assert "GroundedAnswerFreshnessUnknown" in degradation_flags
+    # S1d explicit guard: the paired-key guard below does not catch a bare number,
+    # so assert directly that the persisted message carries neither raw rows nor
+    # SQL.  The grounded scalar itself is allowed to appear.
+    assert "4242" in answer_text
+    assert "rows" not in answer_text
+    assert "SELECT" not in answer_text
+    assert "{" not in answer_text
+    assert "}" not in answer_text
     execution_checkpoint = json.dumps(result["execution_record"], sort_keys=True)
+    assert "outputs" not in execution_checkpoint
+    assert "revenue" not in execution_checkpoint
     _assert_business_payload_absent(execution_checkpoint)
     serialized_checkpoint = json.dumps(checkpoint_values, default=str, sort_keys=True)
     assert "SELECT synthetic_revenue" not in serialized_checkpoint
@@ -942,3 +962,239 @@ async def test_semantic_context_adapter_binds_policy_evidence_to_release_snapsho
         "synthetic_fixture",
         "embedding_unavailable",
     )
+
+def _succeeded_fetch_record(
+    *,
+    execution_plan: ExecutionPlan,
+    step_id: str,
+    **receipt_overrides: object,
+) -> PlanExecutionRecord:
+    fields: dict[str, object] = {
+        "step_id": step_id,
+        "kind": "fetch_metric",
+        "status": "succeeded",
+        "elapsed_ms": 1,
+        "output_digest": "b" * 64,
+    }
+    fields.update(receipt_overrides)
+    return PlanExecutionRecord(
+        execution_plan_checksum=execution_plan.checksum,
+        status="succeeded",
+        step_receipts=(PlanStepReceipt(**fields),),
+        output_step_ids=(step_id,),
+    )
+
+
+def _compiled_execution_plan() -> ExecutionPlan:
+    context = _context()
+    plan = _query_plan()
+    validation = PlanValidator().validate_query_plan(
+        plan=plan,
+        context=context,
+        identity=_identity(),
+    )
+    return PlanCompiler().compile(plan=plan, context=context, validation=validation)
+
+
+def test_answer_fact_defaults_every_descriptive_field_to_absent() -> None:
+    fact = AnswerFact(
+        fact_id="a" * 64,
+        step_id="fetch_metrics",
+        metric_key="metric.revenue",
+        value="87.30",
+    )
+
+    assert fact.status == "grounded"
+    assert fact.value == "87.30"
+    assert fact.unit is None
+    assert fact.time_range is None
+    assert fact.dimension is None
+    assert fact.quality is None
+    assert fact.freshness_explanation is None
+    assert fact.confidence_band is None
+    assert fact.source_id is None
+    assert fact.rowset_sha256 is None
+    assert fact.freshness_status == "unknown"
+
+
+def test_answer_artifact_is_constructible_without_a_confidence_producer() -> None:
+    artifact = AnswerArtifact()
+
+    assert artifact.confidence_band is None
+    assert artifact.facts == ()
+    assert artifact.degradation_flags == ()
+
+
+def test_answer_fact_is_frozen_and_rejects_an_unavailable_value() -> None:
+    with pytest.raises(ValidationError):
+        AnswerFact(
+            fact_id="a" * 64,
+            step_id="fetch_metrics",
+            metric_key="metric.revenue",
+            status="unavailable",
+            value=1,
+        )
+
+    fact = AnswerFact(
+        fact_id="a" * 64,
+        step_id="fetch_metrics",
+        metric_key="metric.revenue",
+        value=1,
+    )
+    with pytest.raises(ValidationError):
+        fact.value = 2  # type: ignore[misc]
+
+
+def test_grounding_marks_no_data_unavailable_without_inventing_fields() -> None:
+    plan = _query_plan()
+    execution_plan = _compiled_execution_plan()
+    record = _succeeded_fetch_record(
+        execution_plan=execution_plan,
+        step_id="fetch_metrics",
+        rowset_sha256="c" * 64,
+        source_id="warehouse.revenue",
+        semantic_signature="d" * 64,
+        freshness_status="fresh",
+    )
+    outputs = {"fetch_metrics": {"rows": [], "no_data": True}}
+
+    facts = build_answer_facts(
+        query_plan=plan,
+        execution_plan=execution_plan,
+        record=record,
+        outputs=outputs,
+    )
+
+    assert len(facts) == 1
+    fact = facts[0]
+    assert fact.status == "unavailable"
+    assert fact.value is None
+    assert fact.rowset_sha256 == "c" * 64
+    assert fact.output_digest == "b" * 64
+    assert fact.source_id == "warehouse.revenue"
+    assert fact.semantic_signature == "d" * 64
+    assert fact.freshness_status == "fresh"
+    assert fact.unit is None
+    assert fact.confidence_band is None
+    assert receipt_degradation_flags(record) == ()
+
+    rebuilt = build_answer_facts(
+        query_plan=plan,
+        execution_plan=execution_plan,
+        record=record,
+        outputs=outputs,
+    )
+    assert rebuilt[0].fact_id == fact.fact_id
+
+
+def test_grounded_renderer_keeps_raw_rows_out_and_marks_stale_freshness() -> None:
+    plan = _query_plan()
+    execution_plan = _compiled_execution_plan()
+    record = _succeeded_fetch_record(
+        execution_plan=execution_plan,
+        step_id="fetch_metrics",
+        freshness_status="stale",
+        source_degradation=("aggregate_stale",),
+    )
+    outputs = {
+        "fetch_metrics": {
+            "rows": [{"value": "87.30", "region_code": "east"}],
+            "no_data": False,
+        }
+    }
+
+    facts = build_answer_facts(
+        query_plan=plan,
+        execution_plan=execution_plan,
+        record=record,
+        outputs=outputs,
+    )
+    text = render_grounded_answer(query_plan=plan, facts=facts)
+
+    assert len(facts) == 1
+    assert facts[0].status == "grounded"
+    assert facts[0].value == "87.30"
+    assert text == 'metric.revenue: "87.30"'
+    assert "region_code" not in text
+    assert "rows" not in text
+    assert receipt_degradation_flags(record) == (
+        "aggregate_stale",
+        "GroundedAnswerStale",
+    )
+
+
+@pytest.mark.asyncio
+async def test_engine_renders_a_grounded_scalar_without_raw_rows_or_sql() -> None:
+    context = _context()
+    plan = _query_plan()
+    runner = _MetricRunner(
+        {"rows": [{"value": 4242, "region_code": "east"}], "no_data": False}
+    )
+    engine = create_v2_engine(
+        checkpointer=MemorySaver(),
+        model_gateway=_model_gateway(_CountingProvider()),
+        context_resolver=_StaticContextResolver(context),
+        query_plan_provider=_StaticQueryPlanProvider(plan),
+        plan_executor=PlanExecutor(metric_runner=runner),
+    )
+    config = runtime_config(
+        RequestContext(
+            identity=_identity(),
+            thread_id=THREAD_ID,
+            trace_id="trace-grounded-rows",
+            deadline_ms=4_000,
+        )
+    )
+
+    result = await engine.ainvoke(
+        {"messages": [{"role": "user", "content": "show revenue"}]},
+        config,
+    )
+    answer_text = result["messages"][-1].content
+
+    assert answer_text == "metric.revenue: 4242"
+    assert "region_code" not in answer_text
+    assert "rows" not in answer_text
+    assert "SELECT" not in answer_text
+    assert "GroundedAnswerPending" not in result["degradation_flags"]
+    execution_checkpoint = json.dumps(result["execution_record"], sort_keys=True)
+    assert "outputs" not in execution_checkpoint
+    _assert_business_payload_absent(execution_checkpoint)
+    snapshot = await engine.aget_state(config)
+    serialized = json.dumps(
+        cast(dict[str, object], snapshot.values), default=str, sort_keys=True
+    )
+    assert "region_code" not in serialized
+    assert "SELECT synthetic_revenue" not in serialized
+    _assert_business_payload_absent(serialized)
+
+
+@pytest.mark.asyncio
+async def test_engine_renders_structured_unavailable_for_no_data() -> None:
+    context = _context()
+    plan = _query_plan()
+    runner = _MetricRunner({"rows": [], "no_data": True})
+    engine = create_v2_engine(
+        checkpointer=MemorySaver(),
+        model_gateway=_model_gateway(_CountingProvider()),
+        context_resolver=_StaticContextResolver(context),
+        query_plan_provider=_StaticQueryPlanProvider(plan),
+        plan_executor=PlanExecutor(metric_runner=runner),
+    )
+    config = runtime_config(
+        RequestContext(
+            identity=_identity(),
+            thread_id=THREAD_ID,
+            trace_id="trace-grounded-no-data",
+            deadline_ms=4_000,
+        )
+    )
+
+    result = await engine.ainvoke(
+        {"messages": [{"role": "user", "content": "show revenue"}]},
+        config,
+    )
+
+    assert result["messages"][-1].content == "metric.revenue: no data returned"
+    assert "GroundedAnswerPending" not in result["degradation_flags"]
+    assert result["execution_record"]["status"] == "succeeded"
