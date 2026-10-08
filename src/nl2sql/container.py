@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Any
 
+from src.core.auth.provider import BackendAuthorizationProvider
 from src.core.settings import get_settings
 from src.nl2sql.infra.llm.gateway import ModelGateway, build_model_gateway
 from src.nl2sql.infra.llm.model_input_policy import ModelInputPolicyUncalibrated
@@ -64,6 +65,18 @@ class AppContainer:
     @property
     def checkpoint_available(self) -> bool:
         return self._checkpoint_available
+
+    def get_backend_authorization_provider(self) -> BackendAuthorizationProvider | None:
+        """Return this deployment's Backend authorization provider, or None.
+
+        Iteration 1 is the trusted-carrier SEAM only: the concrete Backend
+        endpoint/payload/revision contract does not exist yet, so this returns
+        None and an activated typed runtime fails closed rather than
+        synthesizing an authorization context.  The accessor is
+        application-scoped and holds no request identity or per-user cache.
+        """
+
+        return None
 
     def readiness_report(self, *, model_available: bool) -> dict[str, object]:
         """Return profile-aware status without leaking endpoints, DSNs, or exception text."""
