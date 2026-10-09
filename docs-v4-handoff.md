@@ -15,15 +15,15 @@
 | 仓库（本地） | `E:\平台开发\ttai-pr07a-next` |
 | 工作目录 | 同上（= session cwd） |
 | 分支 | `agent/v4-p7-typed-continuation` |
-| 已提交 HEAD | `4b3f6db`（"feat(v4): close the algorithm-layer gaps…"） |
-| 已推送 | 是（`origin/agent/v4-p7-typed-continuation` = 4b3f6db） |
-| 工作区 | **有大量未提交改动**（见第 5 节），全部为"P7 之后"的一批切片 |
+| 已提交 HEAD | **`924bae1`**（"feat(v4): make the P7B guarantees reachable, provable and persistent"） |
+| 已推送 | 是（`origin/agent/v4-p7-typed-continuation` = `924bae1`） |
+| 工作区 | **干净**（所有工作已提交并推送） |
 | 目标仓库（后端/agent） | GitHub `Densityyang/ttai` |
 | 目标仓库（前端） | Gitee `huang7899135/tt-intelligent` |
 | 主干 main | `41af2c470e25d632ebb753e4024419dc323aabc6` |
-| 已开的 PR | **#45**（open, mergeable=true, 67 files, +20708/-429） https://github.com/Densityyang/ttai/pull/45 |
-| PR #45 的 CI | **`quality` 作业失败**（Whitespace gate）——**前任已在工作区修复，但尚未提交/推送**（见 §9.1） |
-| 其它 CI 作业 | container ✅ / compose-contract ✅ / postgres-contract ✅ / secrets ✅ |
+| 已开的 PR | **#45**（open, mergeable=true） https://github.com/Densityyang/ttai/pull/45 |
+| PR #45 的 CI | `4b3f6db` 那次 **`quality` 失败**（Whitespace gate：`tests/integration/test_definition_control_store.py:999` EOF 空行）；**已在 `924bae1` 修复并推送**，新一次 CI 结果**请在新窗口确认** |
+| 其它 CI 作业（4b3f6db 时） | container ✅ / compose-contract ✅ / postgres-contract ✅ / secrets ✅ |
 
 ### 1.1 技术栈
 Python 3.13 · FastAPI · Pydantic v2 · LangGraph · PostgreSQL · SQLGlot · uv（Windows 虚拟环境在 `.venv`）
@@ -225,7 +225,7 @@ docs amendment → owner review → docs accepted（文档控制；不自动授�
 | **结果 artifact 保存面** | 4 条路由；**保存结果不创建定义**（定义数/版本数/checksum 全不变）；owner 隔离 foreign==absent；BUILD 对照 | ✅ 19 测试 |
 | **探索确认接线 + BUILD 门禁** | 3 条路由 + 权限映射 + 容器**只读**接入（`ReadOnlyDefinitionReader`）；**发现并修复真缺口：`POST /library/certify` 改 certification 轴却无 BUILD 门禁**；产出**门禁覆盖矩阵**（9 个生命周期入口全覆盖 + 故意不 gate 的入口及理由） | ✅ 33 测试 |
 | **H19i 整链集成证据** | 真实 Docker PG + 真实 SQL、**零 mock**，证明注入 catalog 时**整链可达**；**并证明默认生产接线不可达**（`metric_contract_missing`/`metric_dependency_binding_missing`） | ✅ 2 测试 |
-| **审计记录持久化** | 迁移 007 + `confirmation_control_store.py` | 🔄 **进行中**（见第 7 节） |
+| **审计记录持久化** | 迁移 007 + `confirmation_control_store.py`：**两类审计记录落 Control PG**；审计表 **append-only（DB 层拒绝 UPDATE/DELETE）**、**复合外键使悬空引用不可能**、actor/time 不可空；探索表 `replaces_never` CHECK + `(run_id, exploration_id)` 唯一；**每条拒绝都有 PostgreSQL 报错原文**；迁移幂等 | ✅ 11 单元 + 14 集成 |
 
 ---
 
@@ -278,8 +278,10 @@ docs amendment → owner review → docs accepted（文档控制；不自动授�
 ## 7. 进行中 / 未完成 / 阻塞
 
 ### 7.1 进行中
-- **审计记录持久化**（迁移 007 + `confirmation_control_store.py`）：把**定义确认审计**与**探索确认**从内存改为 Control PG。
-  **起因**：前任核实两个 store **都只有内存实现**，控制库无对应表 → **product 模式下"谁在何时确认了这条定义"重启即丢失**，而 §8.16 P7B 必测要求**可审计**。
+**无。** 所有已授权的切片均已完成并提交（`924bae1`）。
+
+> 持久化切片的起因：两个 store **都只有内存实现**，控制库无对应表 → **product 模式下"谁在何时确认了这条定义"重启即丢失**，而 §8.16 P7B 必测要求**可审计**。已修复。
+> 实证：**全新容器**能逐字段读回；**内存实现在同一场景下会丢**（对照证明持久化是真的）。
 
 ### 7.2 待办（**需要 owner 授权**）
 | 项 | 内容 | 前任判断 |
@@ -344,7 +346,14 @@ docs amendment → owner review → docs accepted（文档控制；不自动授�
 - openapi「每条路由都显式授权」的唯一性守卫：新路由**必须**在 `src/core/auth/dependencies.py` 的 `_required_nl2sql_permission` 登记。
 - owner 隔离一律 **foreign == absent**（404，不泄露存在性）。
 
-### 9.5 环境
+### 9.5 数据库 / 迁移
+- **007 是 control 库第一批带 `BIGSERIAL` 的表**。生产 bootstrap（`docker/initdb/roles.sh` readwrite）已 `GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES` + DEFAULT PRIVILEGES，**生产无问题**；但**既有集成 fixture 只授表权限**——若有人复用旧 fixture 插这两张表会 `permission denied for sequence`。新 fixture 已补序列授权。
+- **`exploration_confirmations.definition_reference` 绝不能加复合外键**：它指向 **DRAFT**，draft 从不进 `custom_definition_versions`；加 FK 会让**所有"已语义闭合但未确认的草稿"的探索记录无法写入**，并打破既有 P7B 验收。FK **只**加在 `definition_confirmation_audit`。
+- 新增 DB 执行调用点**必须**在 `tests/unit/test_query_gateway.py` 的 allowlist 显式登记（本次登记了 `confirmation_control_store.py`）。
+- 新增迁移**必须**更新 `tests/unit/test_postgres_operations.py` 的精确 revision 列表（本次加 `"007_confirmation_audit"`）。
+- 新增集成测试**必须**同时加进 `.github/workflows/ci.yml` 的 `postgres-contract` 作业。
+
+### 9.6 环境
 - `run_code` 里 `process.env` 为空 → `os.tmpdir()` 是 undefined。
 - `tools.edit` **要求先用 `tools.read` 读过该文件**（fs-observation policy）。
 - `uv sync --all-groups` 曾**弄坏虚拟环境**——慎用。
@@ -358,12 +367,12 @@ docs amendment → owner review → docs accepted（文档控制；不自动授�
 |---|---|
 | `ruff check src tests benchmarks` | All checks passed |
 | `pyright -p pyrightconfig.json` | 0 errors, 0 warnings, 0 informations |
-| `pytest tests/unit -q` | **2414 passed, 2 skipped** |
+| `pytest tests/unit -q` | **2425 passed, 2 skipped** |
 | `pytest tests/acceptance -q` | **281 passed** |
 | `pytest benchmarks/tests -q` | **49 passed** |
 | `pytest tests/integration/...` | 需 `TTAI_RUN_POSTGRES_INTEGRATION=1` |
 
-> ⚠️ **acceptance 基线是 281，不是 248**（多个代理纠正过前任）。基线会随在途切片增长——**先跑一遍再判断"失败"**。
+> ⚠️ **unit 基线现在是 2425**（持久化切片 +11）；**acceptance 基线是 281，不是 248**（多个代理纠正过前任）。基线会随在途切片增长——**先跑一遍再判断"失败"**。
 > ⚠️ CI 的 `postgres-contract` 作业已纳入全部集成测试文件；新增集成测试要**同时**加进 `.github/workflows/ci.yml`。
 
 ---
@@ -397,8 +406,8 @@ docs amendment → owner review → docs accepted（文档控制；不自动授�
 [ ] 读本文件全文
 [ ] 读 NEW_WINDOW_PROMPT.md
 [ ] 跑一次全量门禁确认基线（ruff / pyright / unit / acceptance / benchmarks）
-[ ] git status 看未提交改动，确认没有正在运行的代理
-[ ] 确认 PR #45 的 CI 状态（前任已修空白问题但未推送）
+[ ] git status 应为**干净**（HEAD = 924bae1）；确认没有正在运行的代理
+[ ] 确认 PR #45 在 `924bae1` 上的 CI 结果（空白问题已修并推送）
 [ ] 检查仓库里有没有代理残留的 scratch 文件
 [ ] 再决定下一步（H19a/H19b 需 owner 授权；持久化切片可能已完成）
 ```

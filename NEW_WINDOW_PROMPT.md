@@ -7,7 +7,7 @@
 ## 一、项目一句话
 
 **TT-AI：可治理的 NL2SQL agent**（Python 3.13 / FastAPI / Pydantic v2 / LangGraph / PostgreSQL / SQLGlot / uv）。
-仓库 `E:\平台开发\ttai-pr07a-next`，分支 `agent/v4-p7-typed-continuation`，已提交 HEAD `4b3f6db`，PR **#45** 已开（https://github.com/Densityyang/ttai/pull/45）。
+仓库 `E:\平台开发\ttai-pr07a-next`，分支 `agent/v4-p7-typed-continuation`，**HEAD = `924bae1`（工作区干净）**，PR **#45** 已开（https://github.com/Densityyang/ttai/pull/45）。
 产品核心是**三模式（QUERY / ANALYZE / BUILD）+ 可追溯 + 可复用 + 分权威 + 人在环**。
 
 ## 二、我的目标（**长期有效，逐字**）
@@ -60,20 +60,20 @@ $env:TTAI_RUN_POSTGRES_INTEGRATION = "0"   # 集成测试默认关；需要时�
    ```
    ruff check src tests benchmarks     → 期望 All checks passed
    pyright -p pyrightconfig.json       → 期望 0 errors
-   pytest tests/unit -q                → 期望 2414 passed, 2 skipped
+   pytest tests/unit -q                → 期望 2425 passed, 2 skipped
    pytest tests/acceptance -q          → 期望 281 passed
    pytest benchmarks/tests -q          → 期望 49 passed
    ```
-3. `git status` 看未提交改动；确认**没有代理在运行**；检查有没有代理残留的 scratch 文件。
-4. 确认 **PR #45 的 CI 状态**。**已知**：上一窗口发现 `quality` 作业的 **Whitespace gate** 失败（`tests/integration/test_definition_control_store.py:999` 文件末尾多空行），**已在工作区修复但尚未提交/推送**。
+3. `git status` **应为干净**（HEAD = `924bae1`）；确认**没有代理在运行**；检查有没有代理残留的 scratch 文件。
+4. 确认 **PR #45 在 `924bae1` 上的 CI 状态**。**已知**：`4b3f6db` 那次 `quality` 作业的 **Whitespace gate** 失败（文件末尾多空行），**已在 `924bae1` 修复并推送**——请确认新一次 CI 是否转绿。
 5. 把当前真实状态告诉我（**包括与我预期不符的地方**），然后按下面的"待办"推进。
 
 ## 六、待办与阻塞（详见交接文档第 7 节）
 
-### 进行中（上一窗口最后开的刀）
-- **审计记录持久化**：迁移 007 + `confirmation_control_store.py`，把**定义确认审计**与**探索确认**从内存改为 Control PG。
-  **起因**：两个 store 都只有内存实现，控制库无表 → product 模式下"谁在何时确认了这条定义"**重启即丢失**，而 §8.16 P7B 必测要求**可审计**。
-  **先检查它是否已完成**（上一窗口未能等到它的报告）。
+### 进行中
+**无。** 所有已授权的切片均已完成并提交（`924bae1`）。
+
+> 上一窗口最后完成的是**审计记录持久化**（迁移 007）：两类审计记录落 Control PG，审计表 **append-only（DB 层拒绝 UPDATE/DELETE）**、**复合外键使悬空引用不可能**、actor/time 不可空；**全新容器能逐字段读回，而内存实现在同一场景下会丢**（对照证明持久化是真的）。
 
 ### 待你授权（**H19 需要逐项授权**）
 主计划 §8.20 明文："本表只登记证据和处置门禁，**不实施修复、不访问 DB、不授权下一代码 slice**。"
@@ -88,6 +88,9 @@ $env:TTAI_RUN_POSTGRES_INTEGRATION = "0"   # 集成测试默认关；需要时�
 | H19i | canonical 整链集成证据 | ✅ **已完成** |
 
 **→ 请先问我要 H19a/H19b 的授权**，再开工。
+
+### 已完成（上一窗口，全部在 `924bae1` 中）
+HITL typed continuation 真正可达 · §4.3 人工等待不吃 deadline · QUERY AD_HOC 端到端（含公式确认做法 B） · 定义持久化（迁移 006）· A4 两轴 · **A6 语义轴驱动版本边界** · SAVED 重跑五分支重验 · ANALYZE 证据门禁 · P9A 评测（EX 虚高消除）· **P7 原地修正（Mode 1）** · 定义确认审计 · 探索确认（+接线）· 执行就绪门禁 · 结果 artifact 保存面 · **BUILD 门禁覆盖矩阵（修复 certify 缺口）** · **H19i 整链集成证据** · **审计记录持久化（迁移 007）**
 
 ### 阻塞（**不要碰**）
 - §8.19 全部 11 项（需要真实生产环境/数据）。
