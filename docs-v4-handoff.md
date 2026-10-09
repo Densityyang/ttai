@@ -22,8 +22,8 @@
 | 目标仓库（前端） | Gitee `huang7899135/tt-intelligent` |
 | 主干 main | `41af2c470e25d632ebb753e4024419dc323aabc6` |
 | 已开的 PR | **#45**（open, mergeable=true） https://github.com/Densityyang/ttai/pull/45 |
-| PR #45 的 CI | `4b3f6db` 那次 **`quality` 失败**（Whitespace gate：`tests/integration/test_definition_control_store.py:999` EOF 空行）；**已在 `924bae1` 修复并推送**，新一次 CI 结果**请在新窗口确认** |
-| 其它 CI 作业（4b3f6db 时） | container ✅ / compose-contract ✅ / postgres-contract ✅ / secrets ✅ |
+| PR #45 的 CI | `4b3f6db` 那次红；**三个失败已在 `e30314a` 修复并推送**（见 §9.0）。**新窗口请确认最新一次是否转绿** |
+| CI 作业 | secrets / container / compose-contract / quality / postgres-contract |
 
 ### 1.1 技术栈
 Python 3.13 · FastAPI · Pydantic v2 · LangGraph · PostgreSQL · SQLGlot · uv（Windows 虚拟环境在 `.venv`）
@@ -325,6 +325,19 @@ docs amendment → owner review → docs accepted（文档控制；不自动授�
 ---
 
 ## 9. 已知陷阱与坑（**具体的、会咬人的**）
+
+### 9.0 ⚠️ **本地通过 ≠ CI 通过**（本会话踩了三次）
+
+**CI 用的命令与本地不同**，三个失败本地全都看不见：
+
+| # | CI 失败 | 本地为何看不见 | 修法 |
+|---|---|---|---|
+| 1 | `quality` → Whitespace gate | 本地不跑 `git diff --check` | 删文件末尾多余空行 |
+| 2 | `quality` → `pytest benchmarks/tests` 报 **`ModuleNotFoundError: No module named 'benchmarks'`** | 本地用 **`python -m pytest`**（会把 CWD 加进 `sys.path`）；**CI 用 `uv run pytest`**（不会） | 建 **`benchmarks/tests/__init__.py`**——pytest 会把测试文件之上**第一个非包目录**加进 sys.path；`benchmarks/` 是包而 `benchmarks/tests/` 不是，于是走到 `benchmarks/tests/` 就停了。加标记后才会继续走到**仓库根**（与 `tests/` 一致） |
+| 3 | `postgres-contract` → `relation "definition_confirmation_audit" does not exist` | 本地集成测试默认关闭 | ① 集成 fixture 的**硬编码迁移清单补 `007`**；② 补 **`GRANT ... ON ALL SEQUENCES`**（见 §9.5） |
+
+**→ 验证必须用 CI 的调用方式**：`.venv\Scripts\pytest.exe ...`（**不是** `python -m pytest`）。
+**→ 新增控制库迁移后，必须同步更新所有相关集成 fixture 的迁移清单与授权。**
 
 ### 9.1 CI 空白门禁
 - `quality` 作业跑 `git diff --check`，排除 `tests/fixtures/v4_p1/authoritative/**` 与 `MASTER_PR_PLAN_V4.md`。
