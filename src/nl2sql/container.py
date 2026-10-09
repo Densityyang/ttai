@@ -13,12 +13,19 @@ if TYPE_CHECKING:
     from src.nl2sql.artifacts.custom_definition_execution_service import (
         CustomDefinitionExecutionService,
     )
+    from src.nl2sql.artifacts.exploration_confirmation import (
+        ExplorationConfirmationService,
+    )
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
     from src.nl2sql.artifacts.library_control_store import ControlLibraryRepository
     from src.nl2sql.artifacts.personal_conflict_product_service import (
         PersonalConflictProductService,
     )
-    from src.nl2sql.artifacts.ports import DefinitionStorePort
+    from src.nl2sql.artifacts.ports import (
+        ConfirmationAuditPort,
+        DefinitionStorePort,
+        ExplorationConfirmationPort,
+    )
     from src.nl2sql.artifacts.product_library_service import ProductLibraryService
     from src.nl2sql.artifacts.publication import PublicationCatalogue
     from src.nl2sql.artifacts.publication_control_store import (
@@ -84,8 +91,19 @@ class AppContainer:
         self._local_real_count_column = "id"
         self._definition_store: DefinitionStorePort | None = None
         self._definition_service: CustomDefinitionService | None = None
+        # The two server-owned confirmation records are SEPARATE stores: an
+        # audit record is never a field of a definition, so it can never move a
+        # definition checksum.  They are backend-selected exactly like the
+        # definition store.
+        self._confirmation_audit_store: ConfirmationAuditPort | None = None
+        self._exploration_confirmation_store: (
+            ExplorationConfirmationPort | None
+        ) = None
         self._artifact_repository: (
             InMemoryArtifactRepository | ControlArtifactRepository | None
+        ) = None
+        self._exploration_confirmation_service: (
+            ExplorationConfirmationService | None
         ) = None
         self._library_repository: (
             InMemoryLibraryRepository | ControlLibraryRepository | None
@@ -143,6 +161,12 @@ class AppContainer:
                     # store.  A definition store that cannot be reached is never
                     # reported as ready.
                     self._definition_store_instance(),
+                    # The two confirmation records are part of the SAME
+                    # readiness gate: a control-backed deployment that cannot
+                    # reach its audit trail is NOT ready, because "who confirmed
+                    # this definition" would silently stop being durable.
+                    self._confirmation_audit_store_instance(),
+                    self._exploration_confirmation_store_instance(),
                 ):
                     await store.ping()
                 self._product_store_ready = True
@@ -343,6 +367,74 @@ class AppContainer:
                 self._definition_store = InMemoryDefinitionStore()
         return self._definition_store
 
+    def _confirmation_audit_store_instance(self) -> ConfirmationAuditPort:
+        """The backend-selected confirmation audit store, built ONCE.
+
+        It is chosen by the SAME immutable setting as the definition store and is
+        PINGED by start(), so a control-backed deployment whose audit trail is
+        unreachable is never reported ready.  The process-local implementation
+        remains the infra-dev/test default.
+        """
+
+        if self._confirmation_audit_store is None:
+            try:
+                backend = self.product_store_backend
+            except Exception:
+                # Direct unit tests may build a container without bootstrapping
+                # Settings; the process-local store is the safe default there.
+                backend = "memory"
+            if backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.confirmation_control_store import (
+                    ControlConfirmationAuditStore,
+                )
+
+                self._confirmation_audit_store = ControlConfirmationAuditStore(
+                    get_settings().control_database_url or ""
+                )
+            else:
+                from src.nl2sql.artifacts.definition_confirmation_audit import (
+                    InMemoryConfirmationAuditStore,
+                )
+
+                self._confirmation_audit_store = InMemoryConfirmationAuditStore()
+        return self._confirmation_audit_store
+
+    def _exploration_confirmation_store_instance(
+        self,
+    ) -> ExplorationConfirmationPort:
+        """The backend-selected exploration confirmation store, built ONCE.
+
+        Same immutable setting and same readiness gate as the other product
+        stores.  It is a pure constructor, so the accessor stays synchronous.
+        """
+
+        if self._exploration_confirmation_store is None:
+            try:
+                backend = self.product_store_backend
+            except Exception:
+                backend = "memory"
+            if backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.confirmation_control_store import (
+                    ControlExplorationConfirmationStore,
+                )
+
+                self._exploration_confirmation_store = (
+                    ControlExplorationConfirmationStore(
+                        get_settings().control_database_url or ""
+                    )
+                )
+            else:
+                from src.nl2sql.artifacts.exploration_confirmation import (
+                    InMemoryExplorationConfirmationStore,
+                )
+
+                self._exploration_confirmation_store = (
+                    InMemoryExplorationConfirmationStore()
+                )
+        return self._exploration_confirmation_store
+
     def custom_definition_service(self) -> CustomDefinitionService:
         """The application-scoped definition service over the selected store."""
 
@@ -397,6 +489,10 @@ class AppContainer:
             self._definition_service = CustomDefinitionService(
                 store=self._definition_store_instance(),
                 governed_metric_key_resolver=resolver,
+                # The audit trail is a SEPARATE, server-owned store: in a
+                # control-backed deployment "who confirmed this exact version"
+                # survives a restart, and it is never part of the definition.
+                confirmation_audit=self._confirmation_audit_store_instance(),
             )
         return self._definition_service
 
@@ -450,6 +546,31 @@ class AppContainer:
 
                 self._artifact_repository = InMemoryArtifactRepository()
         return self._artifact_repository
+
+    def exploration_confirmation_service(self) -> ExplorationConfirmationService:
+        """The application-scoped run-scoped EXPLORATION confirmation service.
+
+        The definition dependency is injected READ-ONLY.  The service is typed
+        against the narrow ``DefinitionExactVersionReader`` protocol (one
+        owner-scoped ``get_exact_version``), so it cannot name - and therefore
+        cannot reach - any definition mutation.  It is a PURE constructor, so the
+        accessor is synchronous exactly like ``custom_definition_service()``.
+        """
+
+        if self._exploration_confirmation_service is None:
+            from src.nl2sql.artifacts.exploration_confirmation import (
+                ExplorationConfirmationService,
+            )
+
+            self._exploration_confirmation_service = ExplorationConfirmationService(
+                # READ-ONLY definition injection is preserved: the service wraps
+                # whatever it is given in ReadOnlyDefinitionReader, so it cannot
+                # name a definition mutation.  Only the run-scoped STORE changes
+                # with the backend.
+                definitions=self.custom_definition_service(),
+                store=self._exploration_confirmation_store_instance(),
+            )
+        return self._exploration_confirmation_service
 
     async def publication_catalogue(
         self,
@@ -1144,6 +1265,23 @@ class AppContainer:
                 logger.error("definition store close failed")
             self._definition_store = None
             self._definition_service = None
+        if self._confirmation_audit_store is not None:
+            # Same engine-ownership rule as the definition store: a
+            # control-backed audit store owns its engine, and the definition
+            # service holds it, so both are dropped together.
+            try:
+                await self._confirmation_audit_store.close()
+            except Exception:
+                logger.error("confirmation audit store close failed")
+            self._confirmation_audit_store = None
+            self._definition_service = None
+        if self._exploration_confirmation_store is not None:
+            try:
+                await self._exploration_confirmation_store.close()
+            except Exception:
+                logger.error("exploration confirmation store close failed")
+            self._exploration_confirmation_store = None
+            self._exploration_confirmation_service = None
         if self._audit_store is not None:
             await self._audit_store.close()
             self._audit_store = None

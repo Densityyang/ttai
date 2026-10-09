@@ -4,9 +4,10 @@ These tests drive the REAL compiled LangGraph engine (not a node in isolation)
 and prove, with execution-level evidence, that:
 
 * an EXPLICIT formula carrier ALWAYS suspends as ONE typed
-  business_confirmation (issue code custom_metric_plan_confirmation) whose
+  metric_plan_confirmation (issue code custom_metric_plan_confirmation) whose
   safe_summary names BOTH the formula-declared inputs and the
-  question-resolved inputs;
+  question-resolved inputs, and which is the ONLY kind that can carry an
+  in-place correction (resolve) - never "modify";
 * confirm continues into the governed AD_HOC compile/execute path EXACTLY
   ONCE, reject/cancel execute ZERO times, and a repeated idempotency key does
   not execute twice;
@@ -639,10 +640,14 @@ async def test_explicit_formula_suspends_as_one_typed_confirmation() -> None:
     assert paused["decision_version"] == 1
     assert paused["ad_hoc_confirmation_satisfied"] is False
     request = revalidate_request(paused["pending_decision"])
-    assert request.decision_kind == "business_confirmation"
+    # P7: the suspension is the ONE correction kind.  Its action set is the
+    # FROZEN correction vocabulary - "modify" is deliberately absent, so there is
+    # exactly ONE way to correct (resolve) and no payload-less second "change".
+    assert request.decision_kind == "metric_plan_confirmation"
     assert request.issue_codes == ("custom_metric_plan_confirmation",)
-    assert set(request.allowed_actions) == {"confirm", "modify", "reject", "cancel"}
+    assert request.allowed_actions == ("confirm", "resolve", "reject", "cancel")
     assert request.unresolved_slots == ()
+    assert request.resolution_options
     summary = request.safe_summary
     assert isinstance(summary, str) and len(summary) <= 512
     # BOTH sides are named: formula-declared (role=metric) and question-resolved.
@@ -1098,10 +1103,16 @@ async def test_clarified_question_is_confirmed_against_the_formula_before_execut
     assert "40.0000" in third["grounded_answer_text"]
 
 @pytest.mark.asyncio
-async def test_modify_on_a_formula_confirmation_never_executes() -> None:
-    """modify is the allowed "correct" action, but V1 records it WITHOUT a
-    correction payload (business confirmations carry no unresolved slots), so it
-    must terminate with ZERO execution rather than silently running the formula.
+async def test_modify_is_no_longer_offered_on_a_formula_confirmation() -> None:
+    """P7: `modify` is REMOVED from the formula-plan confirmation.
+
+    The pre-P7 finding was that `modify` could not carry a correction payload at
+    all: the frozen business_confirmation action set rejects slot bindings on a
+    non-resolve action and the request had no unresolved slots, so `modify` could
+    only "record a note and stop".  A correction is now expressed by `resolve`
+    ONLY.  This test proves, through the REAL compiled engine, that the payload-
+    less "change" action is REFUSED with zero execution and the request stays
+    suspended so the user can still confirm/resolve/reject it.
     """
 
     metric_runner = _CountingMetricRunner()
@@ -1114,19 +1125,33 @@ async def test_modify_on_a_formula_confirmation_never_executes() -> None:
         route_policy=_standard_route_policy(),
     )
     config = _config()
-    await engine.ainvoke(_graph_input(_carrier()), config)
+    paused = await engine.ainvoke(_graph_input(_carrier()), config)
+    request = revalidate_request(paused["pending_decision"])
+    assert "modify" not in request.allowed_actions
 
-    resumed = await engine.ainvoke(
+    refused = await engine.ainvoke(
         Command(resume={"action": "modify", "idempotency_key": "k-modify"}),
         config,
     )
 
-    assert resumed["decision_status"] == "recorded_no_continuation"
-    assert resumed.get("continuation_ready") is not True
-    assert resumed["execution_record"] is None
+    # The decision is refused BEFORE it is recorded: the run stays suspended on
+    # the SAME request and NOTHING was compiled or executed.
+    assert refused["decision_status"] == "awaiting_decision"
+    assert refused["pending_decision"]["request_id"] == request.request_id
+    assert "__interrupt__" in refused
+    assert refused.get("continuation_ready") is not True
+    assert refused["execution_record"] is None
+    assert "decision_action_not_allowed" in str(
+        refused["__interrupt__"][0].value.get("previous_failure")
+    )
     assert ad_hoc_runner.calls == 0
     assert metric_runner.prepare_calls == 0
     assert metric_runner.execute_calls == 0
+
+    # ...and the request is still usable: a real confirm still executes once.
+    confirmed = await engine.ainvoke(Command(resume=_confirm_payload()), config)
+    assert confirmed["execution_record"]["status"] == "succeeded"
+    assert ad_hoc_runner.calls == 1
 
 
 @pytest.mark.asyncio
@@ -1228,7 +1253,7 @@ async def test_http_confirm_of_a_formula_confirmation_executes_once_and_is_idemp
     config = _config()
     paused = await engine.ainvoke(_graph_input(_carrier()), config)
     pending = revalidate_request(paused["pending_decision"])
-    assert pending.decision_kind == "business_confirmation"
+    assert pending.decision_kind == "metric_plan_confirmation"
     assert pending.issue_codes == ("custom_metric_plan_confirmation",)
 
     decision = HITLDecision(

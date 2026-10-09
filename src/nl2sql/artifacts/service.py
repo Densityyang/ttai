@@ -15,8 +15,9 @@ context.  A cross-user access raises the same not-found as an absent definition.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from src.nl2sql.artifacts.custom_definition import (
     CustomDefinition,
@@ -28,6 +29,16 @@ from src.nl2sql.artifacts.custom_definition import (
     derive_parameter_contract,
     new_definition_id,
     utcnow,
+)
+from src.nl2sql.artifacts.definition_confirmation_audit import (
+    ConfirmationAuditStore,
+    ConfirmationRecord,
+    ConfirmationRecordNotFound,
+    InMemoryConfirmationAuditStore,
+    parse_confirm_definition_request,
+)
+from src.nl2sql.artifacts.definition_execution_readiness import (
+    require_executable_semantics,
 )
 from src.nl2sql.artifacts.definition_semantics import (
     DefinitionSemantics,
@@ -120,6 +131,7 @@ class CustomDefinitionService:
         store: DefinitionStore | None = None,
         governed_metric_key_resolver: Callable[[str], bool] | None = None,
         governed_metric_keys: Collection[str] | None = None,
+        confirmation_audit: ConfirmationAuditStore | None = None,
     ) -> None:
         # Storage only.  The service never keeps a second copy of definition
         # state, so the durable and process-local backends cannot diverge.
@@ -134,6 +146,20 @@ class CustomDefinitionService:
             if governed_metric_keys is not None
             else _default_governed_metric_keys()
         )
+        # The confirmation audit is a SEPARATE, server-owned record store.  It is
+        # deliberately NOT part of the definition store or of the version: that
+        # is what keeps an audit record out of every definition checksum.
+        self._confirmation_audit: ConfirmationAuditStore = (
+            confirmation_audit
+            if confirmation_audit is not None
+            else InMemoryConfirmationAuditStore()
+        )
+
+    @property
+    def confirmation_audit(self) -> ConfirmationAuditStore:
+        """The queryable confirmation-audit port owned by this service."""
+
+        return self._confirmation_audit
 
     # --- helpers ---------------------------------------------------------
     async def _owned(
@@ -416,8 +442,25 @@ class CustomDefinitionService:
         return outcome.version
 
     async def confirm(
-        self, *, owner_user_id: str, definition_id: str
+        self,
+        *,
+        owner_user_id: str,
+        definition_id: str,
+        decision_reference: str | None = None,
     ) -> CustomDefinition:
+        """Business confirmation of an exact version, with a server-owned record.
+
+        ``owner_user_id`` is the AUTHENTICATED server identity supplied by the
+        request context, never a client field, and it is recorded as the
+        confirmation ACTOR.  ``decision_reference`` is an optional bounded
+        server-side decision/validation id (for example a HITL request id) that
+        binds the confirmation to the decision that authorised it.
+
+        The audit record is stored in its OWN port and is never a field of the
+        version, so the version checksum is bit-for-bit identical with or without
+        a record.
+        """
+
         current = await self._owned(
             owner_user_id=owner_user_id, definition_id=definition_id
         )
@@ -445,7 +488,74 @@ class CustomDefinitionService:
             }
         )
         await self._store.put_definition(definition=confirmed)
+        # SERVER-OWNED audit: the actor is the authenticated owner identity and
+        # the timestamp is the service clock.  The record is bound to the EXACT
+        # confirmed checksum, so a later revision cannot rewrite this history.
+        await self._confirmation_audit.put(
+            record=ConfirmationRecord(
+                definition_id=definition_id,
+                version=published_version.version,
+                definition_checksum=published_version.checksum,
+                confirmed_by=owner_user_id,
+                confirmed_at=utcnow(),
+                decision_reference=decision_reference,
+            )
+        )
         return confirmed
+
+    async def confirm_from_client_payload(
+        self,
+        *,
+        owner_user_id: str,
+        definition_id: str,
+        payload: Mapping[str, Any],
+    ) -> CustomDefinition:
+        """The STRICT seam a route uses to confirm from a client body.
+
+        The payload is parsed by the closed confirmation contract BEFORE any
+        lifecycle transition, so a client that tries to inject
+        ``confirmed_by`` / ``confirmed_at`` (or any other identity/time spelling)
+        is refused with the stable typed code and leaves ZERO state change.
+        ``owner_user_id`` is still the server identity, never a payload field.
+        """
+
+        request = parse_confirm_definition_request(payload)
+        return await self.confirm(
+            owner_user_id=owner_user_id,
+            definition_id=definition_id,
+            decision_reference=request.decision_reference,
+        )
+
+    async def get_confirmation_record(
+        self, *, owner_user_id: str, definition_id: str, version: int
+    ) -> ConfirmationRecord:
+        """WHO confirmed this EXACT version, WHEN and against WHICH reference.
+
+        The owner check runs FIRST (through the same exact-version reader every
+        other public method uses), so a foreign caller cannot probe the record.
+        """
+
+        await self.get_exact_version(
+            owner_user_id=owner_user_id,
+            definition_id=definition_id,
+            version=version,
+        )
+        record = await self._confirmation_audit.get(
+            definition_id=definition_id, version=version
+        )
+        if record is None:
+            raise ConfirmationRecordNotFound()
+        return record
+
+    async def list_confirmation_records(
+        self, *, owner_user_id: str, definition_id: str
+    ) -> tuple[ConfirmationRecord, ...]:
+        """Every confirmation audit record of this owned definition, in order."""
+
+        await self._owned(owner_user_id=owner_user_id, definition_id=definition_id)
+        return await self._confirmation_audit.list_for_definition(
+            definition_id=definition_id
+        )
 
     async def save(
         self, *, owner_user_id: str, definition_id: str
@@ -741,10 +851,13 @@ class CustomDefinitionService:
         version: int,
         binding: DefinitionExecutionBinding,
     ) -> DefinitionVersion:
-        """Resolve the exact version and verify the run binding matches it.
+        """Resolve the exact version, verify the binding and prove readiness.
 
         The concrete parameter VALUES live in the binding, so executing with new
-        values never creates a new definition version.
+        values never creates a new definition version.  A version that DECLARES
+        business semantics but is missing denominator / business-time / join
+        semantics is NOT executable (§8.16 P7B); a semantics-free version keeps
+        its A6 legacy identity and stays executable.
         """
 
         exact = await self.get_exact_version(
@@ -764,6 +877,11 @@ class CustomDefinitionService:
             raise ValueError(
                 "execution binding parameter failures: " + ",".join(sorted(failures))
             )
+        # §8.16 P7B: a DECLARED semantic surface must be complete enough to
+        # execute.  The refusal carries the stable code
+        # definition_semantics_incomplete_for_execution and is raised BEFORE any
+        # governed input is fetched.
+        require_executable_semantics(exact)
         return exact
 
 

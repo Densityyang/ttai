@@ -474,6 +474,9 @@ _TYPED_CONTINUATION_STATUSES: Final[frozenset[str]] = frozenset(
         "rejected",
         "cancelled",
         "invalid",
+        # The typed, fail-closed outcome of a rejected in-place correction: a
+        # stable product-visible status instead of a misleading fallback.
+        "metric_plan_correction_rejected",
     }
 )
 
@@ -932,13 +935,27 @@ def register_v2_routes(app: FastAPI) -> None:
     # Bounded product routers: the Definition/Publication and Library product
     # surfaces are registered separately so this module does not become a
     # monolith.  Both use the SAME server-side permission dependency.
+    from src.nl2sql.artifacts.api_artifacts import register_artifact_routes
     from src.nl2sql.artifacts.api_conflicts import register_conflict_routes
     from src.nl2sql.artifacts.api_definitions import register_definition_routes
+    from src.nl2sql.artifacts.api_exploration_confirmations import (
+        register_exploration_confirmation_routes,
+    )
     from src.nl2sql.artifacts.api_library import register_library_routes
 
     register_definition_routes(app)
     register_library_routes(app)
     register_conflict_routes(app)
+    # The result-artifact surface is its OWN product router, mounted next to the
+    # others rather than inside the Definition router: saving a result artifact
+    # is an artifact operation (A3) and must never be reachable through the
+    # definition lifecycle.
+    register_artifact_routes(app)
+    # The run-scoped EXPLORATION confirmation surface is likewise its OWN product
+    # router: it is mounted here so the §8.16 P7B "an exploration confirmation
+    # never stands in for a definition confirmation" invariant is reachable by a
+    # real caller instead of being true only inside a unit test.
+    register_exploration_confirmation_routes(app)
 
 
 def register_v1_gone_routes(app: FastAPI) -> None:

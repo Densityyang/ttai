@@ -68,6 +68,26 @@ _THREAD_INVOKE_ROUTES = (
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/fork$")),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/certify$")),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/withdraw$")),
+    # Result artifacts.  Saving a RESULT artifact is an ARTIFACT operation: it
+    # creates no definition, selects no BUILD and changes no mode.  It is
+    # nevertheless listed EXPLICITLY by name, exactly like every other product
+    # route, so an unmapped route still fails closed with
+    # AUTH_PERMISSION_POLICY_MISSING instead of silently inheriting a grant.
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/artifacts$")),
+    ("GET", re.compile(rf"^{_V2_NL2SQL_PREFIX}/artifacts$")),
+    ("GET", re.compile(rf"^{_V2_NL2SQL_PREFIX}/artifacts/[^/]+$")),
+    ("PUT", re.compile(rf"^{_V2_NL2SQL_PREFIX}/artifacts/[^/]+$")),
+    # Run-scoped EXPLORATION confirmations.  Recording one is a NON-authoritative
+    # result action: it never selects BUILD, never confirms a definition and
+    # never changes a mode.  Every method is nevertheless listed EXPLICITLY by
+    # name, so an unmapped route still fails closed with
+    # AUTH_PERMISSION_POLICY_MISSING instead of silently inheriting a grant.
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/exploration-confirmations$")),
+    ("GET", re.compile(rf"^{_V2_NL2SQL_PREFIX}/exploration-confirmations$")),
+    (
+        "GET",
+        re.compile(rf"^{_V2_NL2SQL_PREFIX}/exploration-confirmations/[^/]+$"),
+    ),
 )
 
 

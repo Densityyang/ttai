@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Mapping
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -71,11 +72,13 @@ from src.nl2sql.orchestration.budget import (
 )
 from src.nl2sql.orchestration.decision_contract import (
     FORBIDDEN_DECISION_FIELDS,
+    RESERVED_SLOT_NAMES,
     HITLDecision,
     HITLRequest,
+    ResolutionOption,
     ResumeToken,
-    business_confirmation_request,
     clarification_request,
+    metric_plan_confirmation_request,
     revalidate_decision,
     revalidate_request,
     revalidate_resume_token,
@@ -109,6 +112,10 @@ from src.nl2sql.orchestration.typed_runtime import (
 from src.nl2sql.ownership import (
     authorization_context_from_config,
     evaluate_authorization,
+)
+from src.nl2sql.semantic.calculation_contract import (
+    CalculationExecutionBinding,
+    CalculationSpec,
 )
 from src.nl2sql.supervisor.schemas import (
     ProvenanceAuthorityBlock,
@@ -212,7 +219,7 @@ class V2EngineState(TypedDict):
     # canonical authority.  Declared here so the key survives graph state.
     ad_hoc_calculation: NotRequired[dict[str, object] | None]
     # Set once the EXPLICIT formula carrier has been confirmed BY THE USER for
-    # this run (decision_kind="business_confirmation").  The confirmation is
+    # this run (decision_kind="metric_plan_confirmation").  The confirmation is
     # required even when the formula and the question-resolved plan AGREE, so it
     # is requested exactly once and a confirmed run never re-suspends.
     ad_hoc_confirmation_satisfied: NotRequired[bool]
@@ -2179,6 +2186,14 @@ def create_v2_engine(
                 "allowed_actions": list(stored.allowed_actions),
                 "unresolved_slots": list(stored.unresolved_slots),
                 "issue_codes": list(stored.issue_codes),
+                # The correction surface, when this request has one: each
+                # bindable formula role plus the ALREADY-AUTHORIZED candidates it
+                # may be re-bound to.  Display + machine-readable, never
+                # authority: every choice is re-validated at continuation.
+                "resolution_options": [
+                    option.model_dump(mode="json")
+                    for option in stored.resolution_options
+                ],
                 "safe_summary": stored.safe_summary,
             }
             if failure is not None:
@@ -2243,6 +2258,44 @@ def create_v2_engine(
         except Exception:
             return _continuation_stopped(state, "typed_continuation_state_invalid")
         trace = _trace(state)
+        if decision.action == "resolve":
+            # P7 IN-PLACE CORRECTION.  The user re-points formula roles at
+            # server-derived, already-authorized candidate metrics.  The
+            # candidate set is RE-DERIVED here from the restored plan/context
+            # (never trusted from the checkpoint request) and EVERY choice is
+            # checked against it; anything else fails closed with ZERO
+            # execution.  The corrected carrier then goes through the SAME
+            # governed resolver below, which re-checks authorization for every
+            # input, so no new fetch path is opened and no authority is granted.
+            corrected, correction_failure = _apply_metric_plan_correction(
+                carrier=carrier,
+                decision=decision,
+                plan=active_plan,
+                context=context,
+            )
+            if correction_failure is not None or corrected is None:
+                code = correction_failure or _METRIC_PLAN_CORRECTION_REJECTED
+                trace.record(
+                    "policy",
+                    "metric_plan_correction_rejected",
+                    code=code,
+                )
+                await _persist_new_events(trace_sink, trace.events[-1:])
+                return _metric_plan_correction_rejected(state, code)
+            trace.record(
+                "policy",
+                "metric_plan_corrected",
+                role_count=len(decision.slot_bindings),
+                roles=sorted(item.slot for item in decision.slot_bindings),
+            )
+            carrier = corrected
+        # From here on the run's carrier IS the corrected one: it is what the
+        # governed resolver accepted and what this run actually derives.
+        carrier_update: dict[str, object] = (
+            {"ad_hoc_calculation": carrier.model_dump(mode="json")}
+            if decision.action == "resolve"
+            else {}
+        )
         try:
             resolved_ad_hoc = resolve_ad_hoc_request(
                 request=carrier,
@@ -2276,6 +2329,7 @@ def create_v2_engine(
                 "decision_status": "resolved_pending_current_authorization",
                 "ad_hoc_confirmation_satisfied": True,
                 "needs_hitl": False,
+                **carrier_update,
             }
             return base
         (
@@ -2295,6 +2349,7 @@ def create_v2_engine(
         base = {
             "ad_hoc_confirmation_satisfied": True,
             "trace_events": _events(trace),
+            **carrier_update,
         }
         route_state: V2EngineState = cast(V2EngineState, {**state, **base})
         routed = await route_node(route_state)
@@ -3563,12 +3618,17 @@ def _continuation_eligibility(
     policy_version: str,
     policy_checksum: str,
 ) -> tuple[str, ...]:
-    """V1 continuation eligibility: resolve/confirm, user-source, time/grain slots.
+    """Continuation eligibility: resolve/confirm, user-source, plan-slot scoping.
 
     The suspended request is re-verified against the RESTORED plan/context, so a
     tampered or stale checkpoint request cannot drive the replan.  A Confirm
     carries no slot bindings and may only continue a plan that is already
     complete; a Resolve applies user-source time/grain bindings.
+
+    A metric_plan_confirmation is the ONE kind whose bindings are scoped to the
+    formula's declared roles instead of the V1 plan slots, so it takes its own
+    (strictly narrower) eligibility branch above; every other kind keeps the
+    exact V1 rules byte for byte.
     """
 
     failures: list[str] = []
@@ -3587,6 +3647,16 @@ def _continuation_eligibility(
         failures.append("continuation_decision_mismatch")
     if token.validate_against(stored, decision):
         failures.append("continuation_token_mismatch")
+    if stored.decision_kind == _AD_HOC_PLAN_CONFIRMATION_KIND:
+        # The formula-plan correction binds the FORMULA's declared roles, not the
+        # V1 plan slots, so the V1 slot-scope rules below deliberately do NOT
+        # apply.  The chosen VALUES were validated by the contract against the
+        # request's candidates and are RE-validated against the re-derived
+        # candidate set inside the continuation itself, which is also where the
+        # governed resolver re-checks authorization for every input.
+        if any(binding.source != "user" for binding in decision.slot_bindings):
+            failures.append("continuation_slot_source_not_user")
+        return tuple(dict.fromkeys(failures))
     if decision.action == "resolve":
         if any(binding.source != "user" for binding in decision.slot_bindings):
             failures.append("continuation_slot_source_not_user")
@@ -3665,6 +3735,37 @@ def _ad_hoc_confirmation_rejected(state: V2EngineState, code: str) -> dict[str, 
         "decision_status": "ad_hoc_confirmation_rejected",
         "stop_reason": code,
         "degradation_flags": _degradation_flags(state, "AdHocConfirmationRejected"),
+        "needs_hitl": False,
+    }
+
+
+def _metric_plan_correction_rejected(
+    state: V2EngineState, code: str
+) -> dict[str, object]:
+    """Fail closed AFTER a rejected in-place correction, executing NOTHING.
+
+    The code names the RULE that was broken (a role outside the request, a
+    value outside the role's authorized candidate set, a non-identity payload,
+    a duplicate metric, an unusable payload).  It NEVER echoes the attempted
+    value and never distinguishes "does not exist" from "not authorized", so
+    the refusal leaks nothing about the attempted metric.
+    """
+
+    return {
+        "messages": [
+            AIMessage(
+                content=(
+                    "The in-place correction was not accepted, so the "
+                    "calculation was not executed. Nothing was executed."
+                )
+            )
+        ],
+        "pending_decision": None,
+        "decision_status": "metric_plan_correction_rejected",
+        "stop_reason": code,
+        "degradation_flags": _degradation_flags(
+            state, "MetricPlanCorrectionRejected"
+        ),
         "needs_hitl": False,
     }
 
@@ -3864,18 +3965,31 @@ def _record_ad_hoc_budget_allowance(
     )
 
 
-# --- P6-B: explicit-formula plan confirmation --------------------------------
+# --- P6-B/P7: explicit-formula plan confirmation + in-place correction -------
 #
 # Owner decision B: when the user supplies an EXPLICIT formula carrier the
 # question is STILL parsed normally, but the parsed result MUST be shown to the
 # user and confirmed once - even when the formula and the question-resolved plan
 # agree.  The frozen reason vocabulary already names this: the reasons list entry
-# CUSTOM_METRIC_PLAN_CONFIRMATION, carried here as an issue code on a
-# decision_kind="business_confirmation" typed request.  A confirmation RECORDS a
-# decision: it grants no authority, carries no unresolved slot, is not a
-# definition confirmation and never overrides a request-entry refusal.
+# CUSTOM_METRIC_PLAN_CONFIRMATION, carried here as an issue code.
+#
+# P7: the suspension is a decision_kind="metric_plan_confirmation" typed request,
+# the ONE kind that may carry an IN-PLACE CORRECTION of this run's own
+# derived-calculation inputs.  Its action set is
+# ("confirm", "resolve", "reject", "cancel"): modify is deliberately ABSENT so
+# there is exactly ONE way to correct, and resolve binds a FORMULA ROLE to one of
+# the server-derived, ALREADY-AUTHORIZED candidate metrics.  A confirmation
+# RECORDS a decision: it grants no authority, creates no definition, carries no
+# unresolved slot, is not a definition confirmation and never overrides a
+# request-entry refusal.
 _AD_HOC_PLAN_CONFIRMATION_ISSUE: Final[str] = "custom_metric_plan_confirmation"
 _AD_HOC_PLAN_CONFIRMATION_EVENT = "ad_hoc_calculation_confirmation_required"
+_AD_HOC_PLAN_CONFIRMATION_KIND: Final[str] = "metric_plan_confirmation"
+# The pre-P7 suspension was a business_confirmation carrying the SAME issue code.
+# A checkpoint written before the upgrade still resumes through the SAME
+# continuation (it can be confirmed/rejected); it simply cannot carry a
+# correction, because that frozen kind has no resolution options.
+_LEGACY_AD_HOC_PLAN_CONFIRMATION_KIND: Final[str] = "business_confirmation"
 # The ONE request-entry code that is an ALIGNMENT discrepancy between two
 # well-formed parses (the formula's declared inputs vs the question-resolved
 # plan), so it is CONFIRMABLE instead of a pre-confirmation hard stop.  Every
@@ -3884,6 +3998,14 @@ _AD_HOC_PLAN_CONFIRMATION_EVENT = "ad_hoc_calculation_confirmation_required"
 _AD_HOC_SOURCE_PLAN_MISMATCH: Final[str] = "ad_hoc_request_source_plan_mismatch"
 _SAFE_SUMMARY_TOKEN_LIMIT: Final[int] = 64
 _SAFE_SUMMARY_MAX_LENGTH: Final[int] = 512
+# The role-name shape a SlotBinding can express.  A formula role outside it is
+# simply NOT bindable: it is never renamed, coerced or approximated.
+_SLOT_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# ONE stable, typed, non-leaking code for every rejected correction.  The engine
+# reports the RULE that was broken (see _apply_metric_plan_correction); it never
+# echoes the attempted value and never distinguishes "does not exist" from "not
+# authorized", so a refusal leaks nothing about the attempted metric.
+_METRIC_PLAN_CORRECTION_REJECTED: Final[str] = "metric_plan_correction_rejected"
 
 
 def _safe_summary_token(value: object, *, limit: int = _SAFE_SUMMARY_TOKEN_LIMIT) -> str:
@@ -3899,16 +4021,81 @@ def _safe_summary_token(value: object, *, limit: int = _SAFE_SUMMARY_TOKEN_LIMIT
     )[:limit]
 
 
+def _is_expressible_correction_candidate(metric_key: str) -> bool:
+    """Whether a metric identity can be expressed as a correction candidate.
+
+    A candidate the contract cannot express (empty, over-long, carrying control
+    characters or statement delimiters) is NOT offered: the role simply keeps
+    fewer choices and a correction that cannot reach the governed resolver
+    fails closed.
+    """
+
+    try:
+        ResolutionOption(slot="candidate", candidates=(metric_key,))
+    except Exception:
+        return False
+    return True
+
+
+def _metric_plan_resolution_options(
+    *,
+    carrier: AdHocCalculationRequest,
+    plan: QueryPlan,
+    context: ContextBundle,
+) -> tuple[ResolutionOption, ...]:
+    """The server-derived, ALREADY-AUTHORIZED candidate set of ONE correction.
+
+    A correction may only pick, for a formula role, one of the metrics this run
+    OWN question-resolved plan produced AND this run's authorized context
+    already admits.  That intersection is exactly the set the governed AD_HOC
+    resolver accepts for this run, so:
+
+    * a correction can never widen the accessible metric range - it can only
+      re-point a role at a metric that was ALREADY parsed and ALREADY
+      authorized for this run;
+    * naming the candidates leaks nothing unauthorized;
+    * the governed resolver keeps its OWN authorization check, so even a forged
+      candidate set cannot get an unauthorized metric fetched.
+
+    A role whose name a SlotBinding cannot express (uppercase / leading
+    underscore) or whose name is reserved control-plane vocabulary is NOT
+    bindable: it is never renamed or coerced, it is simply not offered.
+    """
+
+    authorized = set(context.asset_ids)
+    candidates = tuple(
+        metric_key
+        for metric_key in dict.fromkeys(plan.metric_keys)
+        if metric_key in authorized
+        and _is_expressible_correction_candidate(metric_key)
+    )
+    if not candidates:
+        return ()
+    options: list[ResolutionOption] = []
+    for item in carrier.calculation_spec.inputs:
+        if _SLOT_NAME_PATTERN.fullmatch(item.role) is None:
+            continue
+        if item.role in RESERVED_SLOT_NAMES:
+            continue
+        options.append(ResolutionOption(slot=item.role, candidates=candidates))
+    return tuple(options)
+
+
 def _ad_hoc_plan_confirmation_summary(
     *,
     declared_inputs: tuple[tuple[str, str | None], ...],
     plan_metric_keys: tuple[str, ...],
     aligned: bool,
+    resolution_options: tuple[ResolutionOption, ...] = (),
 ) -> str:
     """Name BOTH sides so a human can see at a glance whether they align.
 
     Left  = the inputs the EXPLICIT formula declares (role -> metric).
     Right = the inputs the QUESTION was parsed into (the query plan metrics).
+    When a correction is possible the bindable roles and their candidates are
+    named too - they are server-derived, already-authorized metrics, so this
+    leaks nothing the caller may not see.  The verdict is the LAST token and is
+    never truncated away.
     """
 
     declared = (
@@ -3923,10 +4110,26 @@ def _ad_hoc_plan_confirmation_summary(
         ", ".join(_safe_summary_token(key) for key in plan_metric_keys) or "(none)"
     )
     verdict = "aligned" if aligned else "MISMATCH"
-    return (
+    body = (
         f"Formula-declared inputs (role=metric): {declared} | "
-        f"Question-resolved inputs: {question} | {verdict}"
-    )[: _SAFE_SUMMARY_MAX_LENGTH]
+        f"Question-resolved inputs: {question}"
+    )
+    if resolution_options:
+        correctable = ", ".join(
+            f"{_safe_summary_token(option.slot)} in "
+            + "{"
+            + ",".join(
+                _safe_summary_token(candidate) for candidate in option.candidates
+            )
+            + "}"
+            for option in resolution_options
+        )
+        body += (
+            " | Correctable roles (resolve: role -> one of these parsed, "
+            f"authorized metrics): {correctable}"
+        )
+    room = _SAFE_SUMMARY_MAX_LENGTH - len(verdict) - len(" | ")
+    return (body[:room] + " | " + verdict)[:_SAFE_SUMMARY_MAX_LENGTH]
 
 
 def _ad_hoc_plan_confirmation_request(
@@ -3937,22 +4140,103 @@ def _ad_hoc_plan_confirmation_request(
     declared_inputs: tuple[tuple[str, str | None], ...],
     aligned: bool,
     version: int,
+    resolution_options: tuple[ResolutionOption, ...],
 ) -> HITLRequest:
-    """The FROZEN producer for "confirm this calculation's取数 plan"."""
+    """The FROZEN producer for "confirm or correct this calculation's plan".
 
-    return business_confirmation_request(
+    It reuses the shared HITLRequest validation instead of a second decision
+    interface, and it is the ONLY caller of the metric_plan_confirmation kind.
+    """
+
+    return metric_plan_confirmation_request(
         plan=plan,
         context=context,
         policy_version=validation.policy_version,
         policy_checksum=validation.policy_checksum,
         issue_codes=(_AD_HOC_PLAN_CONFIRMATION_ISSUE,),
+        resolution_options=resolution_options,
         version=version,
         safe_summary=_ad_hoc_plan_confirmation_summary(
             declared_inputs=declared_inputs,
             plan_metric_keys=tuple(plan.metric_keys),
             aligned=aligned,
+            resolution_options=resolution_options,
         ),
     )
+
+
+def _apply_metric_plan_correction(
+    *,
+    carrier: AdHocCalculationRequest,
+    decision: HITLDecision,
+    plan: QueryPlan,
+    context: ContextBundle,
+) -> tuple[AdHocCalculationRequest | None, str | None]:
+    """Rebuild this run's carrier with the user's AUTHORIZED role choices.
+
+    The candidate set is RE-DERIVED here from the RESTORED plan/context - never
+    trusted from the (possibly tampered) checkpoint request - and every binding
+    is checked against it BEFORE anything is rebuilt.  The rebuilt carrier then
+    crosses the NORMAL Pydantic boundary again (model_copy would bypass
+    extra="forbid" and every field pattern, so it is never used), and the
+    governed resolve_ad_hoc_request re-checks authorization for EVERY input, so
+    no new fetch path is opened and no authority is granted.
+
+    A breach returns ONE typed, non-leaking code: the rule that was broken,
+    never the attempted value and never whether the metric exists.
+    """
+
+    options = {
+        option.slot: set(option.candidates)
+        for option in _metric_plan_resolution_options(
+            carrier=carrier, plan=plan, context=context
+        )
+    }
+    if not options:
+        return None, "metric_plan_correction_not_bindable"
+    choices: dict[str, str] = {}
+    for item in decision.slot_bindings:
+        if item.source != "user":
+            return None, "metric_plan_correction_source_not_user"
+        if not isinstance(item.value, str):
+            # Free text, a number, a list: never a candidate identity.
+            return None, "metric_plan_correction_value_invalid"
+        allowed = options.get(item.slot)
+        if allowed is None:
+            return None, "metric_plan_correction_unknown_role"
+        if item.value not in allowed:
+            # IDENTICAL code whether the metric does not exist, is not
+            # authorized, or is merely not a candidate for this role.
+            return None, "metric_plan_correction_value_not_a_candidate"
+        choices[item.slot] = item.value
+    if len(set(choices.values())) != len(choices):
+        return None, "metric_plan_correction_duplicate_metric"
+    spec_payload = carrier.calculation_spec.model_dump(mode="json")
+    spec_payload["inputs"] = [
+        {
+            **item.model_dump(mode="json"),
+            "metric_key": choices.get(item.role, item.metric_key),
+        }
+        for item in carrier.calculation_spec.inputs
+    ]
+    try:
+        spec = CalculationSpec.model_validate(spec_payload)
+        binding = CalculationExecutionBinding.model_validate(
+            {
+                **carrier.execution_binding.model_dump(mode="json"),
+                "spec_checksum": spec.checksum,
+            }
+        )
+        corrected = AdHocCalculationRequest.model_validate(
+            {
+                "schema_version": carrier.schema_version,
+                "calculation_spec": spec.model_dump(mode="json"),
+                "execution_binding": binding.model_dump(mode="json"),
+            }
+        )
+    except Exception:
+        return None, "metric_plan_correction_payload_invalid"
+    return corrected, None
 
 
 def _is_ad_hoc_plan_confirmation(
@@ -3962,12 +4246,16 @@ def _is_ad_hoc_plan_confirmation(
 
     The issue code ALONE is not a sufficient discriminator:
     custom_metric_plan_confirmation is the frozen reason for confirming a custom
-    metric's取数 plan, and an ordinary business confirmation may carry it too.
-    THIS run's formula confirmation is identified by that reason AND the presence
-    of the run's EXPLICIT carrier.
+    metric's plan, and an ordinary business confirmation may carry it too.
+    THIS run's formula confirmation is identified by that reason AND the
+    presence of the run's EXPLICIT carrier.  The pre-P7 business_confirmation
+    form stays recognised so an in-flight checkpoint still resumes.
     """
 
-    if request.decision_kind != "business_confirmation":
+    if request.decision_kind not in (
+        _AD_HOC_PLAN_CONFIRMATION_KIND,
+        _LEGACY_AD_HOC_PLAN_CONFIRMATION_KIND,
+    ):
         return False
     if _AD_HOC_PLAN_CONFIRMATION_ISSUE not in request.issue_codes:
         return False
@@ -4027,6 +4315,14 @@ def _ad_hoc_confirmation_suspended(
     declared = tuple(
         (item.role, item.metric_key) for item in carrier.calculation_spec.inputs
     )
+    # The correction surface is derived HERE, server-side, from the SAME restored
+    # plan/context the resolver uses.  It is re-derived again at continuation, so
+    # a tampered checkpoint can never widen it.
+    resolution_options = _metric_plan_resolution_options(
+        carrier=carrier,
+        plan=plan,
+        context=context,
+    )
     request = _ad_hoc_plan_confirmation_request(
         plan=plan,
         context=context,
@@ -4034,14 +4330,17 @@ def _ad_hoc_confirmation_suspended(
         declared_inputs=declared,
         aligned=resolved is not None,
         version=version,
+        resolution_options=resolution_options,
     )
     trace.record(
         "policy",
         _AD_HOC_PLAN_CONFIRMATION_EVENT,
         issue_code=_AD_HOC_PLAN_CONFIRMATION_ISSUE,
+        decision_kind=request.decision_kind,
         aligned=resolved is not None,
         declared_input_count=len(declared),
         plan_metric_count=len(plan.metric_keys),
+        correctable_role_count=len(resolution_options),
     )
     return {
         "messages": [

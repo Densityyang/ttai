@@ -996,5 +996,3 @@ def test_control_store_round_trips_through_the_port(
             await store.close()
 
     _run_async(scenario())
-
-

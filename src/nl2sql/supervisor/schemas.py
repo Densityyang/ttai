@@ -87,7 +87,10 @@ class ClarificationBlock(_PublicBlock):
     type: Literal["clarification"] = "clarification"
     request_id: str = Field(min_length=1, max_length=128)
     decision_kind: Literal[
-        "clarification", "business_confirmation", "risk_policy_decision"
+        "clarification",
+        "business_confirmation",
+        "risk_policy_decision",
+        "metric_plan_confirmation",
     ]
     version: int = Field(ge=1, le=1_000_000)
     allowed_actions: tuple[

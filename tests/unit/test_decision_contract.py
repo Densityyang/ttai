@@ -127,10 +127,14 @@ def _decision(**overrides: object) -> HITLDecision:
 
 # 1, 2 ------------------------------------------------------------------------
 def test_decision_kind_vocabulary_is_exact() -> None:
+    # The FROZEN three reason kinds plus the ONE correction kind added for the
+    # run-scoped formula-plan confirmation.  The set is exact: no kind may appear
+    # without a deliberate contract change.
     assert set(get_args(DecisionKind)) == {
         "clarification",
         "business_confirmation",
         "risk_policy_decision",
+        "metric_plan_confirmation",
     }
 
 
