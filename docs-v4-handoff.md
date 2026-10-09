@@ -15,9 +15,9 @@
 | 仓库（本地） | `E:\平台开发\ttai-pr07a-next` |
 | 工作目录 | 同上（= session cwd） |
 | 分支 | `agent/v4-p7-typed-continuation` |
-| 已提交 HEAD | **`924bae1`**（"feat(v4): make the P7B guarantees reachable, provable and persistent"） |
-| 已推送 | 是（`origin/agent/v4-p7-typed-continuation` = `924bae1`） |
-| 工作区 | **干净**（所有工作已提交并推送） |
+| HEAD | 见 `git log -1`（**工作区应为干净**）。关键提交：`4b3f6db` 算法层主体 → `924bae1` P7B 可达/可证/持久化 → `c5ed50f` 本交接文档 |
+| 已推送 | 是（`origin/agent/v4-p7-typed-continuation` 与本地同步） |
+| 工作区 | **应为干净**（所有工作已提交并推送） |
 | 目标仓库（后端/agent） | GitHub `Densityyang/ttai` |
 | 目标仓库（前端） | Gitee `huang7899135/tt-intelligent` |
 | 主干 main | `41af2c470e25d632ebb753e4024419dc323aabc6` |
