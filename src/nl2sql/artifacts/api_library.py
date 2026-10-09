@@ -406,6 +406,12 @@ def register_library_routes(app: Any) -> None:
         body: ExactVersionRequest,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> MutationResponse:
+        # Certification is a DEFINITION lifecycle change: the product service
+        # projects CERTIFIED onto the CURRENT definition axes through
+        # project_certified().  It therefore requires the SAME current
+        # server-persisted BUILD run as create / confirm / save / publish /
+        # revision / fork, so no definition axis can move outside BUILD.
+        await require_build_run(request, auth_user)
         service = await library_service(request)
         try:
             result = await service.certify(

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from time import monotonic
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.nl2sql.contracts import (
     RouteBudget,
@@ -142,10 +146,45 @@ class RouteBudgetLedger:
     sql_fingerprint_counts: dict[str, int] = field(default_factory=dict)
     error_counts: dict[str, int] = field(default_factory=dict)
     stop_reason: str | None = None
+    # Run-scoped SQL allowance granted by a parsed, NONCANONICAL AD_HOC carrier
+    # that declares N dependency inputs.  It raises THIS ledger only: the effective
+    # SQL candidate/execution limits become max(policy_limit, N).  The versioned
+    # policy table itself is never mutated and a plain query keeps an allowance of 0.
+    sql_allowance: int = 0
 
     @property
     def limits(self) -> RouteBudget:
-        return self.policy.routes[self.route]
+        base = self.policy.routes[self.route]
+        if self.sql_allowance <= 0:
+            return base
+        candidates = max(base.max_sql_candidates, self.sql_allowance)
+        executions = max(base.max_sql_executions, self.sql_allowance)
+        if (
+            candidates == base.max_sql_candidates
+            and executions == base.max_sql_executions
+        ):
+            return base
+        return base.model_copy(
+            update={
+                "max_sql_candidates": candidates,
+                "max_sql_executions": executions,
+            }
+        )
+
+    def grant_sql_allowance(self, count: int) -> int:
+        """Raise this ledger SQL candidate/execution limits to at least count.
+
+        The allowance is run-scoped, recomputed from the run own AD_HOC carrier on
+        every derivation, and deliberately NOT persisted into the checkpoint record
+        (see checkpoint_record): the record keeps the versioned policy limits so a
+        resumed run re-derives the identical allowance from the same carrier instead
+        of trusting a serialized number.
+        """
+
+        if count < 0:
+            raise ValueError("SQL allowance cannot be negative")
+        self.sql_allowance = max(self.sql_allowance, count)
+        return self.sql_allowance
 
     @classmethod
     def from_record(
@@ -255,7 +294,11 @@ class RouteBudgetLedger:
             policy_state=self.policy.state,
             policy_checksum=self.policy.checksum,
             route=self.route,
-            limits=self.limits,
+            # The checkpoint carries the VERSIONED policy limits, never the
+            # run-scoped AD_HOC allowance: from_record revalidates these against
+            # the active policy, and the allowance is re-derived deterministically
+            # from the run own carrier on resume.
+            limits=self.policy.routes[self.route],
             usage=RouteBudgetUsage(
                 model_calls=self.model_calls,
                 sql_candidates=self.sql_candidates,
@@ -308,3 +351,200 @@ def should_stop(
     if same_error_seen >= resolved_policy.max_same_error:
         return "repeated_error"
     return None
+
+
+# --- cross-round drilldown budget --------------------------------------------
+#
+# This is the DRILLDOWN-MULTI-ROUND axis, deliberately separate from the engine's
+# per-request RouteBudgetLedger resume carry-forward axis.  The engine rebuilds a
+# route ledger for each run; a drilldown series instead passes ONE ledger (or its
+# checkpoint) between rounds so already-consumed quota is inherited and never
+# silently reset.  Reaching a limit stops the series with a stable reason.
+
+
+class _BudgetModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class DrilldownBudgetPolicy(_BudgetModel):
+    """Versioned cross-round limits for one diagnostic drilldown series."""
+
+    version: str = Field(
+        default="drilldown-budget.bootstrap.v1", min_length=1, max_length=128
+    )
+    max_rounds: int = Field(default=3, ge=1)
+    max_drilldowns: int = Field(default=6, ge=1)
+    max_model_calls: int = Field(default=6, ge=1)
+    max_sql_executions: int = Field(default=6, ge=1)
+    max_wall_ms: int = Field(default=60_000, ge=1)
+    reserve_ms: int = Field(default=500, ge=0)
+
+    @model_validator(mode="after")
+    def validate_reserve(self) -> DrilldownBudgetPolicy:
+        if self.reserve_ms >= self.max_wall_ms:
+            raise ValueError("drilldown reserve must be lower than the wall limit")
+        return self
+
+    @property
+    def checksum(self) -> str:
+        payload = self.model_dump(mode="json")
+        return hashlib.sha256(
+            json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        ).hexdigest()
+
+
+class DrilldownBudgetUsage(_BudgetModel):
+    rounds: int = Field(default=0, ge=0)
+    drilldowns: int = Field(default=0, ge=0)
+    model_calls: int = Field(default=0, ge=0)
+    sql_executions: int = Field(default=0, ge=0)
+    elapsed_ms: int = Field(default=0, ge=0)
+
+
+class DrilldownBudgetRecord(_BudgetModel):
+    """Secret-free cross-round checkpoint; carries accumulated usage."""
+
+    policy_version: str = Field(min_length=1, max_length=128)
+    policy_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    usage: DrilldownBudgetUsage = Field(default_factory=DrilldownBudgetUsage)
+    stop_reason: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class DrilldownBudgetLedger:
+    """Accumulating drilldown accounting that never resets between rounds."""
+
+    def __init__(
+        self,
+        policy: DrilldownBudgetPolicy | None = None,
+        *,
+        usage: DrilldownBudgetUsage | None = None,
+        stop_reason: str | None = None,
+        elapsed_base_ms: int = 0,
+        started_at: float | None = None,
+    ) -> None:
+        if elapsed_base_ms < 0:
+            raise ValueError("drilldown elapsed base cannot be negative")
+        self.policy = policy or DrilldownBudgetPolicy()
+        resolved = usage or DrilldownBudgetUsage()
+        self.rounds = resolved.rounds
+        self.drilldowns = resolved.drilldowns
+        self.model_calls = resolved.model_calls
+        self.sql_executions = resolved.sql_executions
+        self.stop_reason = stop_reason
+        self._elapsed_base_ms = elapsed_base_ms
+        self._started_at = started_at if started_at is not None else monotonic()
+
+    @property
+    def usage(self) -> DrilldownBudgetUsage:
+        return DrilldownBudgetUsage(
+            rounds=self.rounds,
+            drilldowns=self.drilldowns,
+            model_calls=self.model_calls,
+            sql_executions=self.sql_executions,
+            elapsed_ms=self.elapsed_ms(),
+        )
+
+    def elapsed_ms(self, *, now: float | None = None) -> int:
+        reference = now if now is not None else monotonic()
+        return self._elapsed_base_ms + int((reference - self._started_at) * 1000)
+
+    def remaining_ms(self, *, now: float | None = None) -> int:
+        return max(0, self.policy.max_wall_ms - self.elapsed_ms(now=now))
+
+    def begin_round(self, *, now: float | None = None) -> None:
+        """Open one round while INHERITING every already-consumed unit."""
+
+        self._ensure_active()
+        self._check_deadline(now=now)
+        self._increment(
+            "rounds", self.policy.max_rounds, "drilldown_round_budget_exhausted"
+        )
+
+    def record_drilldown(self, count: int = 1, *, now: float | None = None) -> None:
+        if count < 1:
+            raise ValueError("drilldown count must be positive")
+        self._ensure_active()
+        self._check_deadline(now=now)
+        for _ in range(count):
+            self._increment(
+                "drilldowns",
+                self.policy.max_drilldowns,
+                "drilldown_step_budget_exhausted",
+            )
+
+    def begin_model_call(self, *, now: float | None = None) -> None:
+        self._ensure_active()
+        self._check_deadline(now=now)
+        self._increment(
+            "model_calls", self.policy.max_model_calls, "drilldown_model_budget_exhausted"
+        )
+
+    def begin_sql_execution(self, *, now: float | None = None) -> None:
+        self._ensure_active()
+        self._check_deadline(now=now)
+        self._increment(
+            "sql_executions",
+            self.policy.max_sql_executions,
+            "drilldown_sql_budget_exhausted",
+        )
+
+    def halt(self, reason: str) -> str:
+        normalized = reason.strip()
+        if not normalized:
+            raise ValueError("stop reason must be non-empty")
+        if self.stop_reason is None:
+            self.stop_reason = normalized
+        return self.stop_reason
+
+    def checkpoint(self) -> DrilldownBudgetRecord:
+        return DrilldownBudgetRecord(
+            policy_version=self.policy.version,
+            policy_checksum=self.policy.checksum,
+            usage=self.usage,
+            stop_reason=self.stop_reason,
+        )
+
+    @classmethod
+    def resume(
+        cls,
+        *,
+        policy: DrilldownBudgetPolicy,
+        record: DrilldownBudgetRecord | dict[str, object],
+    ) -> DrilldownBudgetLedger:
+        parsed = (
+            record
+            if isinstance(record, DrilldownBudgetRecord)
+            else DrilldownBudgetRecord.model_validate(record)
+        )
+        if (
+            parsed.policy_version != policy.version
+            or parsed.policy_checksum != policy.checksum
+        ):
+            raise ValueError(
+                "drilldown checkpoint policy does not match the active policy"
+            )
+        return cls(
+            policy,
+            usage=parsed.usage,
+            stop_reason=parsed.stop_reason,
+            elapsed_base_ms=parsed.usage.elapsed_ms,
+        )
+
+    def _check_deadline(self, *, now: float | None = None) -> None:
+        if self.remaining_ms(now=now) <= self.policy.reserve_ms:
+            reason = self.halt("drilldown_deadline_reserve")
+            raise BudgetExceeded(reason)
+
+    def _ensure_active(self) -> None:
+        if self.stop_reason is not None:
+            raise BudgetExceeded(self.stop_reason)
+
+    def _increment(self, attribute: str, limit: int, reason: str) -> None:
+        self._ensure_active()
+        current = int(getattr(self, attribute))
+        if current >= limit:
+            self.halt(reason)
+            raise BudgetExceeded(reason)
+        setattr(self, attribute, current + 1)

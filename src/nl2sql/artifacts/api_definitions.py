@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import Field, model_validator
@@ -23,7 +23,22 @@ from src.core.auth.types import AuthUser
 from src.nl2sql.artifacts.build_run import require_build_run
 from src.nl2sql.artifacts.custom_definition_execution_service import (
     CalculationInputResolverUnavailable,
+    CustomDefinitionExecutionRefused,
     CustomDefinitionExecutionService,
+    DefinitionExecutionRefused,
+)
+from src.nl2sql.artifacts.definition_revalidation import (
+    DefinitionRevalidationResult,
+)
+from src.nl2sql.artifacts.definition_run_record import (
+    DefinitionRunPlan,
+    DefinitionRunReceipt,
+    DefinitionRunRecord,
+    DefinitionRunValidation,
+)
+from src.nl2sql.artifacts.definition_semantics import (
+    DefinitionSemantics,
+    SemanticAxis,
 )
 from src.nl2sql.artifacts.publication_service import (
     PublicationConflict,
@@ -42,6 +57,7 @@ from src.nl2sql.orchestration.governed_calculation_inputs import (
 from src.nl2sql.semantic.calculation_contract import (
     CalculationExecutionBinding,
     CalculationSpec,
+    ParameterBinding,
 )
 
 
@@ -53,10 +69,24 @@ class CreateDefinitionRequest(StrictContract):
 
 
 class UpdateDraftRequest(StrictContract):
-    """A DRAFT edit.  There is deliberately NO client-editable contract field."""
+    """A DRAFT edit.  There is deliberately NO client-editable contract field.
+
+    semantics is the caller's DECLARATION of the definition's business meaning
+    (A6).  It is deliberately the SHARED DefinitionSemantics model rather than a
+    second wire-only copy, so the HTTP surface and the version boundary can
+    never disagree about the axis vocabulary.  A declaration carries NO
+    authority: DefinitionSemantics forbids every extra field, so an authority /
+    lifecycle / canonical / axes / confirmation claim inside it is a 422 before
+    any service call can run.
+
+    None (the default, and the shape every pre-existing client sends) means "do
+    not touch the declaration", which keeps those requests byte-identical to
+    their pre-A6 behaviour.
+    """
 
     title: str | None = Field(default=None, min_length=1, max_length=256)
     calculation: CalculationSpec | None = None
+    semantics: DefinitionSemantics | None = None
 
 
 class ExecuteDefinitionRequest(StrictContract):
@@ -110,6 +140,18 @@ class DefinitionVersionView(StrictContract):
     publication: str = "UNPUBLISHED"
     certification: str = "UNCERTIFIED"
     withdrawn: bool = False
+    # A6: the definition-level semantics THIS EXACT version DECLARES, read-only
+    # and display-only.  "semantics" is the declaration itself; "declared_axes"
+    # is the axis vocabulary it actually populates, in the frozen AXIS_ORDER, so
+    # a caller can read what this version declares without re-deriving it.
+    # The name is deliberately NOT "semantic_axes": the PATCH response uses that
+    # name for the DIFF an edit caused, and one name for two different questions
+    # is exactly the kind of overload a client gets wrong.
+    # Both are EMPTY when the version declares nothing, and neither carries any
+    # authority: they describe business meaning, never a permission, lifecycle
+    # or canonicality claim.
+    semantics: DefinitionSemantics | None = None
+    declared_axes: tuple[SemanticAxis, ...] = ()
 
 
 class DefinitionView(StrictContract):
@@ -125,8 +167,34 @@ class DefinitionView(StrictContract):
     retention: str
     publication: str
     certification: str
+    # The OBJECT-LEVEL governance/authority axes (A4).  They are deliberately
+    # NOT on DefinitionVersionView: a version's lifecycle does not own them, and
+    # duplicating them there would misattribute object state to a version.
+    governance: str
+    authority: str
     derived_from_definition_id: str | None = None
     derived_from_version: int | None = None
+
+
+class DraftUpdateResponse(DefinitionView):
+    """The DRAFT-edit wire shape, extended with the A6 semantic-axis OUTCOME.
+
+    A SUBCLASS is used deliberately, exactly like ExecutedDefinitionResponse:
+    DefinitionView.model_fields stays byte-for-byte frozen (the backend freeze
+    contract compares it), while the PATCH wire gains the A6 decision input.
+    Existing clients that do not know these fields simply ignore them.
+
+    semantic_axes is the A6 diff THIS edit caused, in the frozen AXIS_ORDER.  A
+    NON-EMPTY tuple always comes with version_created and
+    requires_business_decision True, so a caller can never miss that the change
+    is substantive and that a NEW business decision is required before the new
+    draft can be confirmed.  No approval action is performed here: this route
+    only SURFACES the requirement.
+    """
+
+    semantic_axes: tuple[SemanticAxis, ...] = ()
+    version_created: bool = False
+    requires_business_decision: bool = False
 
 
 class DefinitionListResponse(StrictContract):
@@ -149,6 +217,169 @@ class ExecuteDefinitionResponse(StrictContract):
     data_as_of: datetime | None = None
     time_range: TimeRange | None = None
     calculation_scope: Literal["reusable_custom_definition"]
+
+
+class ExecutedDefinitionResponse(ExecuteDefinitionResponse):
+    """The EXECUTE wire shape, extended with the rerun's degradation flags.
+
+    A SUBCLASS is used deliberately: ``ExecuteDefinitionResponse.model_fields``
+    stays byte-for-byte frozen (the backend freeze contract compares it with
+    ``==``), while the wire gains ONE additive field so the caller can see that
+    this deployment skipped an unconfigured authority check.  Clients that do not
+    know the field simply ignore it.
+    """
+
+    degradations: tuple[str, ...] = ()
+
+
+class CalculationExecutionBindingView(StrictContract):
+    """The per-run parameter binding AS STORED, plus its CONTENT checksum.
+
+    The domain model exposes its checksum as a COMPUTED PROPERTY, so a plain
+    model_dump() silently DROPS it; that hash is exactly what makes two reruns
+    of the same version distinguishable in the audit trail, so it is
+    materialised here explicitly instead of being lost on the wire.  Nothing is
+    re-derived: every field below is copied verbatim from the stored record.
+    """
+
+    schema_version: Literal["1.1"] = "1.1"
+    calculation_id: str
+    spec_checksum: str
+    parameters: tuple[ParameterBinding, ...] = ()
+    checksum: str
+
+
+class DefinitionExecutionBindingView(StrictContract):
+    """The exact-version binding of ONE rerun, checksum included."""
+
+    definition_id: str
+    version: int
+    definition_checksum: str
+    binding: CalculationExecutionBindingView
+
+
+class DefinitionRunRecordView(StrictContract):
+    """ONE per-run audit record as exposed on the wire.
+
+    It mirrors the immutable DefinitionRunRecord field-for-field WITHOUT
+    re-deriving anything: the caller sees the exact binding, plan, validation
+    (BOTH revalidation phases, before_resolution and resolved_inputs) and
+    receipt that THIS rerun actually produced, plus the explicit degradation
+    codes of a deployment that SKIPPED an unconfigured CURRENT-authority check.
+    A degraded run is therefore auditable over HTTP and never only inside the
+    process.
+    """
+
+    run_id: str
+    definition_id: str
+    version: int
+    definition_checksum: str
+    binding: DefinitionExecutionBindingView
+    plan: DefinitionRunPlan
+    validation: DefinitionRunValidation
+    degradations: tuple[str, ...] = ()
+    receipt: DefinitionRunReceipt | None = None
+    created_at: datetime
+
+
+class DefinitionRunRecordListResponse(StrictContract):
+    """Every per-run record of ONE exact version, in insertion order."""
+
+    definition_id: str
+    version: int
+    runs: tuple[DefinitionRunRecordView, ...]
+
+
+class ClarificationRequiredResponse(StrictContract):
+    """A typed business outcome: the rerun needs a minimal clarification."""
+
+    status: Literal["clarification_required"] = "clarification_required"
+    definition_id: str
+    version: int
+    definition_checksum: str
+    reasons: tuple[str, ...]
+    unresolved_slots: tuple[str, ...] = ()
+
+
+class DecisionRequiredResponse(StrictContract):
+    """A typed business outcome: a named business-risk decision is required."""
+
+    status: Literal["decision_required"] = "decision_required"
+    definition_id: str
+    version: int
+    definition_checksum: str
+    reasons: tuple[str, ...]
+    required_decision: str
+
+
+class ResultUnavailableResponse(StrictContract):
+    """A typed business outcome: required CURRENT evidence is unavailable."""
+
+    status: Literal["result_unavailable"] = "result_unavailable"
+    definition_id: str
+    version: int
+    definition_checksum: str
+    reasons: tuple[str, ...]
+    retryable: bool = False
+
+
+# The five revalidation branches map onto FOUR response shapes plus the hard 403
+# DENY below.  The discriminator keeps them distinguishable on the wire instead
+# of collapsing every refusal into one generic 409/503 error code.
+ExecuteDefinitionOutcomeResponse = Annotated[
+    ExecutedDefinitionResponse
+    | ClarificationRequiredResponse
+    | DecisionRequiredResponse
+    | ResultUnavailableResponse,
+    Field(discriminator="status"),
+]
+
+
+def _revalidation_refusal_response(
+    refusal: CustomDefinitionExecutionRefused,
+) -> (
+    ClarificationRequiredResponse
+    | DecisionRequiredResponse
+    | ResultUnavailableResponse
+):
+    """Project one typed revalidation refusal onto its OWN wire outcome.
+
+    DENY is a hard 403 policy denial: human confirmation can never repair a
+    missing authorization.  CLARIFICATION / BUSINESS-RISK DECISION / UNAVAILABLE
+    stay business outcomes and are never collapsed into a generic 409/503.
+    """
+
+    result: DefinitionRevalidationResult = refusal.revalidation
+    if result.branch == "DENY":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "definition_revalidation_denied",
+                "reasons": list(result.reasons),
+            },
+        )
+    if result.branch == "CLARIFICATION":
+        return ClarificationRequiredResponse(
+            definition_id=refusal.definition_id,
+            version=refusal.version,
+            definition_checksum=refusal.definition_checksum,
+            reasons=result.reasons,
+            unresolved_slots=result.unresolved_slots,
+        )
+    if result.branch == "BUSINESS_RISK_DECISION":
+        return DecisionRequiredResponse(
+            definition_id=refusal.definition_id,
+            version=refusal.version,
+            definition_checksum=refusal.definition_checksum,
+            reasons=result.reasons,
+            required_decision=result.required_decision or "business_risk_decision",
+        )
+    return ResultUnavailableResponse(
+        definition_id=refusal.definition_id,
+        version=refusal.version,
+        definition_checksum=refusal.definition_checksum,
+        reasons=result.reasons,
+    )
 
 
 def owner_identity(auth_user: AuthUser) -> str:
@@ -202,29 +433,78 @@ def _not_found() -> HTTPException:
     )
 
 
+def _run_not_found() -> HTTPException:
+    """ONE stable response for a foreign, absent OR unknown run id."""
+
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND, detail="definition_run_not_found"
+    )
+
+
 def _conflict(code: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=code)
 
 
-def _definition_view(definition: Any) -> DefinitionView:
+def _definition_view_fields(definition: Any) -> dict[str, Any]:
+    """The ONE projection of a Definition onto its object-level wire fields.
+
+    Returned as a mapping so the DRAFT-edit response can ADD the A6 outcome to
+    the EXACT same fields instead of keeping a second, drifting copy of them.
+    """
+
     axes = definition.axes
     current = definition.current_version
-    return DefinitionView(
-        definition_id=definition.definition_id,
-        current_version=current.version,
-        title=current.title,
-        calculation=current.calculation,
-        parameter_contract_parameters=tuple(
+    return {
+        "definition_id": definition.definition_id,
+        "current_version": current.version,
+        "title": current.title,
+        "calculation": current.calculation,
+        "parameter_contract_parameters": tuple(
             parameter.name for parameter in current.parameter_contract.parameters
         ),
-        semantic_closed=current.semantic_closed,
-        checksum=current.checksum,
-        confirmation=axes.confirmation,
-        retention=axes.retention,
-        publication=axes.publication,
-        certification=axes.certification,
-        derived_from_definition_id=current.derived_from_definition_id,
-        derived_from_version=current.derived_from_version,
+        "semantic_closed": current.semantic_closed,
+        "checksum": current.checksum,
+        "confirmation": axes.confirmation,
+        "retention": axes.retention,
+        "publication": axes.publication,
+        "certification": axes.certification,
+        "governance": axes.governance,
+        "authority": axes.authority,
+        "derived_from_definition_id": current.derived_from_definition_id,
+        "derived_from_version": current.derived_from_version,
+    }
+
+
+def _definition_view(definition: Any) -> DefinitionView:
+    return DefinitionView(**_definition_view_fields(definition))
+
+
+def _run_record_view(record: DefinitionRunRecord) -> DefinitionRunRecordView:
+    """Project ONE stored record onto the wire WITHOUT losing any audit field."""
+
+    return DefinitionRunRecordView(
+        run_id=record.run_id,
+        definition_id=record.definition_id,
+        version=record.version,
+        definition_checksum=record.definition_checksum,
+        binding=DefinitionExecutionBindingView(
+            definition_id=record.binding.definition_id,
+            version=record.binding.version,
+            definition_checksum=record.binding.definition_checksum,
+            binding=CalculationExecutionBindingView(
+                schema_version=record.binding.binding.schema_version,
+                calculation_id=record.binding.binding.calculation_id,
+                spec_checksum=record.binding.binding.spec_checksum,
+                parameters=record.binding.binding.parameters,
+                # The domain checksum is a computed property: materialise it.
+                checksum=record.binding.binding.checksum,
+            ),
+        ),
+        plan=record.plan,
+        validation=record.validation,
+        degradations=record.degradations,
+        receipt=record.receipt,
+        created_at=record.created_at,
     )
 
 
@@ -323,23 +603,42 @@ def register_definition_routes(app: Any) -> None:
             publication=publication,
             certification=certification,
             withdrawn=withdrawn,
+            # A6: the declaration of THIS EXACT version, read-only.  A version
+            # that declares nothing yields None and an empty axis tuple - it is
+            # never an error.
+            semantics=exact.semantics,
+            declared_axes=exact.semantics.axes() if exact.semantics else (),
         )
 
-    @router.patch("/definitions/{definition_id}/draft", response_model=DefinitionView)
+    @router.patch(
+        "/definitions/{definition_id}/draft",
+        response_model=DraftUpdateResponse,
+    )
     async def update_definition_draft(
         definition_id: str,
         request: Request,
         body: UpdateDraftRequest,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
-    ) -> DefinitionView:
+    ) -> DraftUpdateResponse:
+        """Apply a DRAFT edit and report the A6 axes it changed.
+
+        The response is a SUPERSET of the pre-A6 DefinitionView shape, so an
+        existing client keeps working unchanged, while a caller that needs the
+        business decision can read semantic_axes / version_created /
+        requires_business_decision.  A substantive change opens a NEW draft
+        version and requires a NEW business decision; a title-only edit stays on
+        the same version and PRESERVES closure.  Nothing is approved here.
+        """
+
         await require_build_run(request, auth_user)
         service = definition_service(request)
         try:
-            await service.update_draft(
+            outcome = await service.update_draft_with_semantics(
                 owner_user_id=owner_identity(auth_user),
                 definition_id=definition_id,
                 calculation=body.calculation,
                 title=body.title,
+                semantics=body.semantics,
             )
             definition = await service.get_owned_definition(
                 owner_user_id=owner_identity(auth_user), definition_id=definition_id
@@ -348,7 +647,12 @@ def register_definition_routes(app: Any) -> None:
             raise _not_found() from exc
         except ValueError as exc:
             raise _conflict("definition_not_mutable") from exc
-        return _definition_view(definition)
+        return DraftUpdateResponse(
+            **_definition_view_fields(definition),
+            semantic_axes=outcome.semantic_axes,
+            version_created=outcome.version_created,
+            requires_business_decision=outcome.requires_business_decision,
+        )
 
     @router.post(
         "/definitions/{definition_id}/semantic-close",
@@ -487,11 +791,16 @@ def register_definition_routes(app: Any) -> None:
             publication=publication,
             certification=certification,
             withdrawn=withdrawn,
+            # A6: the declaration of THIS EXACT version, read-only.  A version
+            # that declares nothing yields None and an empty axis tuple - it is
+            # never an error.
+            semantics=exact.semantics,
+            declared_axes=exact.semantics.axes() if exact.semantics else (),
         )
 
     @router.post(
         "/definitions/{definition_id}/versions/{version}/execute",
-        response_model=ExecuteDefinitionResponse,
+        response_model=ExecuteDefinitionOutcomeResponse,
     )
     async def execute_definition_version(
         definition_id: str,
@@ -499,7 +808,7 @@ def register_definition_routes(app: Any) -> None:
         request: Request,
         body: ExecuteDefinitionRequest,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
-    ) -> ExecuteDefinitionResponse:
+    ) -> ExecuteDefinitionOutcomeResponse:
         try:
             outcome = await definition_execution_service(request).execute(
                 owner_user_id=owner_identity(auth_user),
@@ -508,6 +817,8 @@ def register_definition_routes(app: Any) -> None:
                 binding=body.binding,
                 execution_context=body.execution_context,
             )
+        except DefinitionExecutionRefused as exc:
+            return _revalidation_refusal_response(exc.refusal)
         except DefinitionNotFound as exc:
             raise _not_found() from exc
         except CalculationInputResolverUnavailable as exc:
@@ -520,7 +831,7 @@ def register_definition_routes(app: Any) -> None:
         except ValueError as exc:
             raise _conflict("execution_binding_invalid") from exc
         result = outcome.result
-        return ExecuteDefinitionResponse(
+        return ExecutedDefinitionResponse(
             definition_id=outcome.definition_id,
             version=outcome.version,
             definition_checksum=outcome.definition_checksum,
@@ -533,18 +844,93 @@ def register_definition_routes(app: Any) -> None:
             data_as_of=result.data_as_of,
             time_range=result.time_range,
             calculation_scope=result.calculation_scope,
+            degradations=outcome.degradations,
         )
+
+    @router.get(
+        "/definitions/{definition_id}/versions/{version}/runs",
+        response_model=DefinitionRunRecordListResponse,
+    )
+    async def list_definition_version_runs(
+        definition_id: str,
+        version: int,
+        request: Request,
+        auth_user: AuthUser = Depends(require_nl2sql_permission),
+    ) -> DefinitionRunRecordListResponse:
+        """Every per-run audit record of THIS exact version, owner-scoped.
+
+        The owner check runs FIRST through the SAME resolution as every other
+        definition reader, so a foreign identity is indistinguishable from an
+        absent definition (404, never 403) and cannot use this route as an
+        existence oracle.
+        """
+
+        service = definition_service(request)
+        try:
+            await service.get_exact_version(
+                owner_user_id=owner_identity(auth_user),
+                definition_id=definition_id,
+                version=version,
+            )
+        except DefinitionNotFound as exc:
+            raise _not_found() from exc
+        records = await definition_execution_service(
+            request
+        ).run_records.list_for_version(definition_id=definition_id, version=version)
+        return DefinitionRunRecordListResponse(
+            definition_id=definition_id,
+            version=version,
+            runs=tuple(_run_record_view(record) for record in records),
+        )
+
+    @router.get(
+        "/definitions/{definition_id}/versions/{version}/runs/{run_id}",
+        response_model=DefinitionRunRecordView,
+    )
+    async def get_definition_version_run(
+        definition_id: str,
+        version: int,
+        run_id: str,
+        request: Request,
+        auth_user: AuthUser = Depends(require_nl2sql_permission),
+    ) -> DefinitionRunRecordView:
+        """ONE per-run audit record, owner-scoped by the SAME first check."""
+
+        service = definition_service(request)
+        try:
+            await service.get_exact_version(
+                owner_user_id=owner_identity(auth_user),
+                definition_id=definition_id,
+                version=version,
+            )
+        except DefinitionNotFound as exc:
+            raise _not_found() from exc
+        record = await definition_execution_service(request).run_records.get(
+            definition_id=definition_id, version=version, run_id=run_id
+        )
+        if record is None:
+            raise _run_not_found()
+        return _run_record_view(record)
 
     app.include_router(router)
 
 
+
 __all__ = [
+    "ClarificationRequiredResponse",
     "CreateDefinitionRequest",
+    "DecisionRequiredResponse",
     "DefinitionListResponse",
+    "DefinitionRunRecordListResponse",
+    "DefinitionRunRecordView",
     "DefinitionVersionView",
     "DefinitionView",
+    "DraftUpdateResponse",
+    "ExecuteDefinitionOutcomeResponse",
     "ExecuteDefinitionRequest",
     "ExecuteDefinitionResponse",
+    "ExecutedDefinitionResponse",
+    "ResultUnavailableResponse",
     "UpdateDraftRequest",
     "register_definition_routes",
 ]

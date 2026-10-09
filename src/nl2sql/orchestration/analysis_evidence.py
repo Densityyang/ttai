@@ -15,7 +15,7 @@ import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Literal, cast
+from typing import Final, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -30,13 +30,20 @@ from src.nl2sql.orchestration.grounding import GroundedAnswer
 
 __all__ = [
     "AnalysisAuthorityProvenance",
+    "AnalysisCausalSupport",
     "AnalysisEvidenceBundle",
     "AnalysisEvidenceError",
     "AnalysisEvidenceFact",
     "AnalysisInterpretation",
+    "AnalysisManualOriginEvidence",
     "AnalysisModelInput",
+    "AnalysisScopeProvenance",
+    "AnalysisSourceKind",
     "AnalysisStatement",
+    "DenominatorBasis",
+    "EvidenceOrigin",
     "MAX_ANALYSIS_FACTS",
+    "SamplingScope",
     "build_analysis_evidence",
     "project_analysis_model_input",
     "validate_analysis_interpretation",
@@ -48,6 +55,79 @@ _CHECKSUM_PATTERN = r"^[0-9a-f]{64}$"
 _NUMBER_PATTERN = re.compile(r"(?<![A-Za-z0-9_])[-+]?\d+(?:\.\d+)?(?![A-Za-z0-9_])")
 
 AnalysisScalar = str | bool | int | float | None
+
+# --- evidence vocabulary ------------------------------------------------------
+# Automated governed sources are stamped by execution receipts.  "manual_origin"
+# is human-asserted context: it is a DIFFERENT basis from an automated base
+# table, so the vocabulary names it explicitly instead of letting a manual input
+# borrow an approved aggregate/detail identity.
+AutomatedSourceKind = Literal["approved_aggregate", "approved_detail"]
+AnalysisSourceKind = Literal["approved_aggregate", "approved_detail", "manual_origin"]
+EvidenceOrigin = Literal["automated_governed_source", "manual_origin"]
+
+# Denominator selection and sampling range are analysis-scope choices that must
+# travel with the provenance instead of being silently fixed by the metric
+# contract.  "not_declared" is the honest default: it claims nothing.
+DenominatorBasis = Literal[
+    "metric_contract_denominator",
+    "scoped_row_count",
+    "explicit_declared_filter",
+    "not_declared",
+]
+SamplingScope = Literal[
+    "full_scope_census",
+    "bounded_sample",
+    "top_ranked_subset",
+    "not_declared",
+]
+
+_BOUNDED_REF_PATTERN = r"^[a-z][a-z0-9_.-]{0,127}$"
+
+# Causal/attribution connectives.  The bare noun "因果" is deliberately NOT a
+# marker so a non-causal disclaimer ("不构成因果结论") is never mistaken for a
+# claim; only an assertion-shaped connective triggers the causal gate.
+_CAUSAL_MARKERS: Final[tuple[str, ...]] = (
+    "导致",
+    "造成",
+    "引起",
+    "引发",
+    "致使",
+    "使得",
+    "归因",
+    "根本原因",
+    "原因在于",
+    "因为",
+    "由于",
+    "源于",
+    "起因",
+    "促成",
+    "得益于",
+    "决定性因素",
+    "because",
+    "cause",
+    "caused",
+    "causes",
+    "due to",
+    "leads to",
+    "led to",
+    "results in",
+    "resulted in",
+    "attributable",
+    "root cause",
+    "owing to",
+    "driven by",
+    "as a result of",
+)
+
+# A bounded, explicit disclaimer ("无法证明 X 导致 Y", "不表明 X 因为 Y") is not a
+# causal assertion.  Only the negated verb forms are exempted: a bare "不" is not
+# used because it appears inside ordinary words such as "不足".
+_CAUSAL_DISCLAIMER_PATTERN = re.compile(
+    r"(?:无法|不能|不应|不可|未能|没有|未)(?:证明|断言|推断|断定|确认)"
+    r"[^。！？；\n]{0,24}?(?:导致|造成|引起|引发|致使|因为|由于|归因|根本原因)"
+    r"|(?:不|未)(?:表明|代表|意味着|证明|说明)"
+    r"[^。！？；\n]{0,24}?(?:导致|造成|引起|引发|致使|因为|由于|归因|根本原因)"
+)
 
 
 class _StrictFrozenModel(BaseModel):
@@ -93,7 +173,7 @@ class AnalysisEvidenceFact(_StrictFrozenModel):
     source_id: str | None = Field(
         default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$"
     )
-    source_kind: Literal["approved_aggregate", "approved_detail"] | None = None
+    source_kind: AnalysisSourceKind | None = None
     source_checkpoint: str | None = Field(
         default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$"
     )
@@ -110,12 +190,25 @@ class AnalysisEvidenceFact(_StrictFrozenModel):
             raise ValueError("analysis evidence string value is too large")
         return value
 
+    @property
+    def origin(self) -> EvidenceOrigin:
+        """The evidence basis; manual origin is never an automated fact."""
+
+        if self.source_kind == "manual_origin":
+            return "manual_origin"
+        return "automated_governed_source"
+
     @model_validator(mode="after")
     def validate_status_value(self) -> AnalysisEvidenceFact:
         if self.status == "unavailable" and self.value is not None:
             raise ValueError("unavailable analysis evidence cannot carry a value")
         if self.status == "grounded" and self.value is None:
             raise ValueError("grounded analysis evidence requires a scalar value")
+        if self.source_kind == "manual_origin":
+            raise ValueError(
+                "manual-origin evidence must use AnalysisManualOriginEvidence, "
+                "never the automated governed fact collection"
+            )
         return self
 
 
@@ -127,15 +220,163 @@ class AnalysisAuthorityProvenance(_StrictFrozenModel):
     source_ids: tuple[str, ...] = Field(default=(), max_length=16)
     source_checkpoints: tuple[str, ...] = Field(default=(), max_length=16)
     semantic_signatures: tuple[str, ...] = Field(default=(), max_length=16)
+    # Manual-origin evidence identities, kept in a SEPARATE provenance channel
+    # so a human assertion can never be read back as an automated receipt.
+    manual_origin_ids: tuple[str, ...] = Field(default=(), max_length=16)
 
     @field_validator(
-        "receipt_step_ids", "source_ids", "source_checkpoints", "semantic_signatures"
+        "receipt_step_ids",
+        "source_ids",
+        "source_checkpoints",
+        "semantic_signatures",
+        "manual_origin_ids",
     )
     @classmethod
     def validate_unique(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(set(value)) != len(value):
             raise ValueError("analysis authority identifiers must be unique")
         return value
+
+    @field_validator("manual_origin_ids")
+    @classmethod
+    def validate_manual_origin_identities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(re.fullmatch(_CHECKSUM_PATTERN, item) is None for item in value):
+            raise ValueError("manual origin provenance identity is invalid")
+        return value
+
+
+class AnalysisManualOriginEvidence(_StrictFrozenModel):
+    """Human-asserted context, kept structurally apart from automated facts.
+
+    A manual-origin basis is never an execution receipt, never a semantic
+    signature and never a rowset digest; it carries its own attested identity so
+    downstream code can tell "an operator said so" from "an approved base table
+    returned it".
+    """
+
+    evidence_id: str = Field(pattern=_CHECKSUM_PATTERN)
+    source_kind: Literal["manual_origin"] = "manual_origin"
+    label: str = Field(min_length=1, max_length=256)
+    value: AnalysisScalar = None
+    unit: str | None = Field(default=None, min_length=1, max_length=64)
+    asserted_by_role: Literal[
+        "business_operator", "analyst", "reviewer", "system_operator"
+    ]
+    attestation_ref: str = Field(pattern=_BOUNDED_REF_PATTERN)
+    asserted_at: datetime | None = None
+
+    @field_validator("value")
+    @classmethod
+    def validate_scalar(cls, value: AnalysisScalar) -> AnalysisScalar:
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("manual origin value must be finite")
+        if isinstance(value, str) and len(value) > 1_024:
+            raise ValueError("manual origin string value is too large")
+        return value
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> AnalysisManualOriginEvidence:
+        expected = _manual_evidence_id(
+            label=self.label,
+            value=self.value,
+            unit=self.unit,
+            asserted_by_role=self.asserted_by_role,
+            attestation_ref=self.attestation_ref,
+            asserted_at=self.asserted_at,
+        )
+        if self.evidence_id != expected:
+            raise ValueError("manual origin evidence identity must match its content")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        label: str,
+        value: AnalysisScalar = None,
+        asserted_by_role: Literal[
+            "business_operator", "analyst", "reviewer", "system_operator"
+        ],
+        attestation_ref: str,
+        asserted_at: datetime | None = None,
+        unit: str | None = None,
+    ) -> AnalysisManualOriginEvidence:
+        """Deterministically identify one manual-origin assertion."""
+
+        return cls(
+            evidence_id=_manual_evidence_id(
+                label=label,
+                value=value,
+                unit=unit,
+                asserted_by_role=asserted_by_role,
+                attestation_ref=attestation_ref,
+                asserted_at=asserted_at,
+            ),
+            label=label,
+            value=value,
+            unit=unit,
+            asserted_by_role=asserted_by_role,
+            attestation_ref=attestation_ref,
+            asserted_at=asserted_at,
+        )
+
+
+class AnalysisScopeProvenance(_StrictFrozenModel):
+    """Declared denominator choice and sampling range for one analysis.
+
+    The metric contract may fix a ratio denominator internally; this record is
+    where the ANALYSIS states which denominator basis and which sampling range
+    the returned numbers actually use.  "not_declared" is the honest default and
+    claims nothing.
+    """
+
+    denominator_basis: DenominatorBasis = "not_declared"
+    denominator_ref: str | None = Field(default=None, pattern=_BOUNDED_REF_PATTERN)
+    sampling_scope: SamplingScope = "not_declared"
+    sample_limit: int | None = Field(default=None, ge=1, le=1_000_000)
+    sampled_row_count: int | None = Field(default=None, ge=0)
+    population_row_count: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_scope_coherence(self) -> AnalysisScopeProvenance:
+        if self.denominator_basis == "not_declared":
+            if self.denominator_ref is not None:
+                raise ValueError("undeclared denominator basis cannot carry a reference")
+        elif self.denominator_ref is None:
+            raise ValueError("declared denominator basis requires a reference")
+        if self.sampling_scope in {"bounded_sample", "top_ranked_subset"}:
+            if self.sample_limit is None:
+                raise ValueError("bounded sampling requires an explicit sample limit")
+        elif self.sample_limit is not None:
+            raise ValueError("unbounded sampling must not carry a sample limit")
+        if self.sampling_scope == "not_declared" and (
+            self.sampled_row_count is not None or self.population_row_count is not None
+        ):
+            raise ValueError("undeclared sampling scope must not carry row counts")
+        if (
+            self.sampled_row_count is not None
+            and self.population_row_count is not None
+            and self.sampled_row_count > self.population_row_count
+        ):
+            raise ValueError("sampled rows cannot exceed the population")
+        return self
+
+
+class AnalysisCausalSupport(_StrictFrozenModel):
+    """Declares that one projected fact may support a causal/attribution claim.
+
+    Empty by default, so ANALYZE is non-causal by default: any causal wording is
+    refused until a design is explicitly bound to a fact.
+    """
+
+    fact_id: str = Field(pattern=_CHECKSUM_PATTERN)
+    design: Literal[
+        "comparative_windows",
+        "cohort_contrast",
+        "interrupted_time_series",
+        "explicit_mechanism",
+    ]
+    contrast_ref: str | None = Field(default=None, pattern=_BOUNDED_REF_PATTERN)
 
 
 class AnalysisEvidenceBundle(_StrictFrozenModel):
@@ -147,6 +388,16 @@ class AnalysisEvidenceBundle(_StrictFrozenModel):
     analysis_window: TimeRange
     data_as_of: datetime | None = None
     authority_provenance: AnalysisAuthorityProvenance
+    # Denominator choice and sampling range travel with the analysis provenance.
+    scope_provenance: AnalysisScopeProvenance = Field(
+        default_factory=AnalysisScopeProvenance
+    )
+    # Human-asserted context is a SEPARATE collection, never merged into facts.
+    manual_origin_evidence: tuple[AnalysisManualOriginEvidence, ...] = Field(
+        default=(), max_length=16
+    )
+    # Empty by default: ANALYZE is non-causal until a design is bound to a fact.
+    causal_support: tuple[AnalysisCausalSupport, ...] = Field(default=(), max_length=16)
     degradation_flags: tuple[str, ...] = Field(default=(), max_length=64)
 
     @field_validator("metric_keys", "degradation_flags")
@@ -169,6 +420,22 @@ class AnalysisEvidenceBundle(_StrictFrozenModel):
         fact_steps = tuple(dict.fromkeys(fact.step_id for fact in self.facts))
         if self.authority_provenance.receipt_step_ids != fact_steps:
             raise ValueError("analysis authority receipts must match the facts")
+        manual_ids = tuple(item.evidence_id for item in self.manual_origin_evidence)
+        if len(set(manual_ids)) != len(manual_ids):
+            raise ValueError("analysis manual origin evidence must be unique")
+        if set(manual_ids) & set(fact_ids):
+            raise ValueError(
+                "manual origin evidence must not reuse an automated fact identity"
+            )
+        if self.authority_provenance.manual_origin_ids != manual_ids:
+            raise ValueError(
+                "analysis authority manual origin ids must match the manual evidence"
+            )
+        support_ids = tuple(item.fact_id for item in self.causal_support)
+        if len(set(support_ids)) != len(support_ids):
+            raise ValueError("analysis causal support must be unique per fact")
+        if set(support_ids) - set(fact_ids):
+            raise ValueError("analysis causal support must reference a projected fact")
         return self
 
     @property
@@ -181,8 +448,11 @@ class AnalysisStatement(_StrictFrozenModel):
 
     text: str = Field(min_length=1, max_length=2_048)
     fact_ids: tuple[str, ...] = Field(default=(), max_length=16)
+    # Manual-origin evidence is cited HERE, never in fact_ids, so a human
+    # assertion can never be read back as an automated governed fact.
+    manual_evidence_ids: tuple[str, ...] = Field(default=(), max_length=16)
 
-    @field_validator("fact_ids")
+    @field_validator("fact_ids", "manual_evidence_ids")
     @classmethod
     def validate_fact_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(set(value)) != len(value):
@@ -234,8 +504,17 @@ def build_analysis_evidence(
     record: PlanExecutionRecord,
     execution_plan_checksum: str,
     analysis_window: TimeRange,
+    scope_provenance: AnalysisScopeProvenance | None = None,
+    manual_origin_evidence: tuple[AnalysisManualOriginEvidence, ...] = (),
+    causal_support: tuple[AnalysisCausalSupport, ...] = (),
 ) -> AnalysisEvidenceBundle:
-    """Rebind grounded facts to successful execution receipts and bound them."""
+    """Rebind grounded facts to successful execution receipts and bound them.
+
+    Automated facts keep their execution-receipt authority.  Denominator/sampling
+    scope, human-asserted manual evidence and causal designs are DECLARED inputs
+    that default to "not declared"/empty, so an ordinary ANALYZE stays
+    non-causal and never silently borrows a manual basis as an automated fact.
+    """
 
     if record.status != "succeeded":
         raise AnalysisEvidenceError("analysis_execution_not_succeeded")
@@ -311,6 +590,25 @@ def build_analysis_evidence(
             flags.append("analysis_source_freshness_unknown")
         flags.extend(fact.source_degradation)
 
+    manual_tuple = tuple(manual_origin_evidence)
+    if len({item.evidence_id for item in manual_tuple}) != len(manual_tuple):
+        raise AnalysisEvidenceError("analysis_manual_origin_evidence_duplicate")
+    if {item.evidence_id for item in manual_tuple} & {
+        fact.fact_id for fact in facts
+    }:
+        raise AnalysisEvidenceError("analysis_manual_origin_identity_conflict")
+    if manual_tuple:
+        flags.append("analysis_manual_origin_evidence_present")
+    resolved_scope = scope_provenance or AnalysisScopeProvenance()
+    if (
+        resolved_scope.denominator_basis == "not_declared"
+        and resolved_scope.sampling_scope == "not_declared"
+    ):
+        flags.append("analysis_scope_undeclared")
+    support_tuple = tuple(causal_support)
+    if {item.fact_id for item in support_tuple} - {fact.fact_id for fact in facts}:
+        raise AnalysisEvidenceError("analysis_causal_support_unknown_fact")
+
     fact_tuple = tuple(facts)
     return AnalysisEvidenceBundle(
         metric_keys=tuple(dict.fromkeys(fact.metric_key for fact in fact_tuple)),
@@ -327,7 +625,11 @@ def build_analysis_evidence(
             semantic_signatures=_unique_present(
                 fact.semantic_signature for fact in fact_tuple
             ),
+            manual_origin_ids=tuple(item.evidence_id for item in manual_tuple),
         ),
+        scope_provenance=resolved_scope,
+        manual_origin_evidence=manual_tuple,
+        causal_support=support_tuple,
         degradation_flags=tuple(dict.fromkeys(flags)),
     )
 
@@ -346,8 +648,15 @@ def project_analysis_model_input(
             "metric_keys": bundle.metric_keys,
             "analysis_window": bundle.analysis_window.model_dump(mode="json"),
             "data_as_of": bundle.data_as_of.isoformat() if bundle.data_as_of else None,
+            "scope_provenance": bundle.scope_provenance.model_dump(mode="json"),
             "degradation_flags": bundle.degradation_flags,
             "facts": [fact.model_dump(mode="json") for fact in bundle.facts],
+            "manual_origin_evidence": [
+                item.model_dump(mode="json") for item in bundle.manual_origin_evidence
+            ],
+            "causal_support_fact_ids": sorted(
+                item.fact_id for item in bundle.causal_support
+            ),
         }
     )
     # DeepSeek (this deployment's provider) supports only
@@ -371,8 +680,15 @@ def project_analysis_model_input(
         "fact_ids. Do NOT write day counts, window lengths, percentages, years or "
         "averages that are not literally present in the cited facts, and do not "
         "reformat numbers (write 93.20, never 93.2 or 93.2%). When in doubt, cite "
-        "fewer facts and write fewer numbers. Return only the requested JSON object "
-        "whose exact required shape is: "
+        "fewer facts and write fewer numbers. CAUSAL RULE: never assert that one "
+        "thing caused, drove, explains or is the root cause of another unless the "
+        "statement cites at least one fact listed in causal_support_fact_ids; "
+        "otherwise describe association only and avoid causal connectives "
+        "(导致/造成/引起/引发/因为/由于/归因/根本原因/cause/because/due to/led to). "
+        "MANUAL ORIGIN RULE: manual_origin_evidence is human-asserted context, "
+        "never an automated governed base-table fact; cite its evidence_id only in "
+        "manual_evidence_ids, never in fact_ids. Return only the requested JSON "
+        "object whose exact required shape is: "
         + schema
     )
     user = (
@@ -395,9 +711,22 @@ def validate_analysis_interpretation(
     *,
     evidence: AnalysisEvidenceBundle,
 ) -> AnalysisInterpretation:
-    """Reject unknown references and numeric claims not traceable to cited facts."""
+    """Reject unknown references, untraceable numbers and unsupported causality.
+
+    Three independent gates:
+    * every cited identity must resolve (automated facts and manual evidence are
+      separate namespaces);
+    * a number may only appear when it is traceable to a cited basis;
+    * a causal/attribution assertion must cite a fact that was explicitly
+      declared as causal support -- otherwise the statement is refused with a
+      stable code instead of being passed through as prose.
+    """
 
     facts = {fact.fact_id: fact for fact in evidence.facts}
+    manual_evidence = {
+        item.evidence_id: item for item in evidence.manual_origin_evidence
+    }
+    causal_fact_ids = {item.fact_id for item in evidence.causal_support}
     statements = (
         interpretation.summary,
         *interpretation.observations,
@@ -407,6 +736,11 @@ def validate_analysis_interpretation(
         unknown = set(statement.fact_ids) - set(facts)
         if unknown:
             raise AnalysisEvidenceError("analysis_interpretation_unknown_fact")
+        unknown_manual = set(statement.manual_evidence_ids) - set(manual_evidence)
+        if unknown_manual:
+            raise AnalysisEvidenceError(
+                "analysis_interpretation_unknown_manual_evidence"
+            )
         allowed_numbers: set[str] = set()
         for fact_id in statement.fact_ids:
             fact = facts[fact_id]
@@ -420,6 +754,17 @@ def validate_analysis_interpretation(
                 "data_as_of": fact.data_as_of.isoformat() if fact.data_as_of else None,
             }
             allowed_numbers.update(_numeric_tokens(_canonical_json(traceable)))
+        for evidence_id in statement.manual_evidence_ids:
+            item = manual_evidence[evidence_id]
+            traceable = {
+                "value": item.value,
+                "unit": item.unit,
+                "label": item.label,
+                "asserted_at": (
+                    item.asserted_at.isoformat() if item.asserted_at else None
+                ),
+            }
+            allowed_numbers.update(_numeric_tokens(_canonical_json(traceable)))
         actual = _numeric_tokens(statement.text)
         if not actual <= allowed_numbers:
             import logging as _logging
@@ -430,6 +775,15 @@ def validate_analysis_interpretation(
                 list(statement.fact_ids),
             )
             raise AnalysisEvidenceError("analysis_interpretation_numeric_fact_unproven")
+        if _causal_markers(statement.text):
+            if not statement.fact_ids:
+                raise AnalysisEvidenceError(
+                    "analysis_interpretation_causal_claim_unproven"
+                )
+            if not set(statement.fact_ids) & causal_fact_ids:
+                raise AnalysisEvidenceError(
+                    "analysis_interpretation_causal_evidence_insufficient"
+                )
     return interpretation
 
 
@@ -450,6 +804,28 @@ def _grounded_fact_id(fact: AnswerFact) -> str:
     if fact.time_range is not None:
         payload["time_range"] = fact.time_range.model_dump(mode="json")
     return _checksum(payload)
+
+
+def _manual_evidence_id(
+    *,
+    label: str,
+    value: AnalysisScalar,
+    unit: str | None,
+    asserted_by_role: str,
+    attestation_ref: str,
+    asserted_at: datetime | None,
+) -> str:
+    return _checksum(
+        {
+            "source_kind": "manual_origin",
+            "label": label,
+            "value": value,
+            "unit": unit,
+            "asserted_by_role": asserted_by_role,
+            "attestation_ref": attestation_ref,
+            "asserted_at": asserted_at.isoformat() if asserted_at is not None else None,
+        }
+    )
 
 
 def _conservative_data_as_of(
@@ -474,3 +850,15 @@ def _numeric_tokens(text: str) -> set[str]:
             continue
         tokens.add(format(number.normalize(), "f"))
     return tokens
+
+
+def _causal_markers(text: str) -> tuple[str, ...]:
+    """Return causal/attribution connectives that assert a claim.
+
+    A bounded negated form ("无法证明 X 导致 Y") is scrubbed first, so an explicit
+    non-causal disclaimer is not mistaken for a causal assertion.
+    """
+
+    scrubbed = _CAUSAL_DISCLAIMER_PATTERN.sub(" ", text)
+    lowered = scrubbed.lower()
+    return tuple(marker for marker in _CAUSAL_MARKERS if marker in lowered)

@@ -17,6 +17,13 @@ from src.nl2sql.artifacts.api_definitions import (
 from src.nl2sql.artifacts.custom_definition_execution_service import (
     CustomDefinitionExecutionService,
 )
+from src.nl2sql.artifacts.definition_revalidation import (
+    ActiveReleaseEvidence,
+    AuthorizationEvidence,
+    DataSnapshotEvidence,
+    DefinitionRevalidationGate,
+    InputFreshnessDQ,
+)
 from src.nl2sql.artifacts.service import CustomDefinitionService
 from src.nl2sql.container import AppContainer
 from src.nl2sql.contracts import TimeRange
@@ -116,6 +123,57 @@ class _ControlledFetcher:
         )
 
 
+class _RevalidationAuthorization:
+    async def current_authorization(self, **_: object) -> AuthorizationEvidence:
+        return AuthorizationEvidence(authorization_revision="rev-current")
+
+
+class _RevalidationRelease:
+    async def active_release(self, **_: object) -> ActiveReleaseEvidence:
+        return ActiveReleaseEvidence(release_id="rel-current", release_checksum="b" * 64)
+
+
+class _RevalidationSnapshot:
+    async def data_snapshot(self, **_: object) -> DataSnapshotEvidence:
+        return DataSnapshotEvidence(
+            snapshot_id="snap-current", snapshot_checksum="c" * 64
+        )
+
+
+class _RevalidationBudget:
+    async def remaining_budget(self, **_: object) -> int:
+        return 5
+
+
+class _RevalidationFreshness:
+    async def assess(self, **kwargs: object) -> tuple[InputFreshnessDQ, ...]:
+        resolved = kwargs["resolved_inputs"]
+        assert isinstance(resolved, tuple)
+        return tuple(
+            InputFreshnessDQ(
+                role=item.role,
+                metric_key=item.metric_key,
+                freshness="fresh",
+                dq="pass",
+                data_as_of=item.data_as_of,
+            )
+            for item in resolved
+        )
+
+
+def _passing_revalidation() -> DefinitionRevalidationGate:
+    """Current-state evidence that a controlled test can legitimately prove."""
+
+    return DefinitionRevalidationGate(
+        authorization_provider=_RevalidationAuthorization(),
+        active_release_provider=_RevalidationRelease(),
+        data_snapshot_provider=_RevalidationSnapshot(),
+        freshness_dq_provider=_RevalidationFreshness(),
+        budget_provider=_RevalidationBudget(),
+        governed_metric_authority=lambda _key: True,
+    )
+
+
 class _Container:
     def __init__(self, resolver: _ControlledResolver | None) -> None:
         self.definitions = CustomDefinitionService(
@@ -124,6 +182,7 @@ class _Container:
         self.execution = CustomDefinitionExecutionService(
             definitions=self.definitions,
             input_resolver=resolver,
+            revalidation=_passing_revalidation(),
         )
 
     def custom_definition_service(self) -> CustomDefinitionService:
@@ -251,6 +310,13 @@ async def test_unconfigured_resolver_returns_honest_503() -> None:
 async def test_app_container_injected_fetcher_drives_controlled_http_vertical() -> None:
     fetcher = _ControlledFetcher()
     container = AppContainer(governed_metric_input_fetcher=fetcher)
+    # The stock container's revalidation wiring is deferred; this test proves the
+    # controlled vertical through a service with explicit current-state evidence.
+    container._custom_definition_execution_service = CustomDefinitionExecutionService(
+        definitions=container.custom_definition_service(),
+        input_resolver=container.calculation_input_resolver(),
+        revalidation=_passing_revalidation(),
+    )
     definitions = container.custom_definition_service()
     spec = _spec()
     version = await definitions.create_draft(

@@ -20,6 +20,7 @@ from src.core.auth.provider import (
 from src.core.auth.types import AuthUser
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import ErrorEnvelope, RequestContext, RequestIdentity, StrictContract
+from src.nl2sql.orchestration.ad_hoc_request import AdHocCalculationRequest
 from src.nl2sql.orchestration.decision_contract import (
     HITLDecision,
     HITLRequest,
@@ -69,6 +70,13 @@ class QueryRequest(StrictContract):
     # Present only when the user ACCEPTS a mode-switch suggestion: a switch
     # starts a NEW run on the SAME thread, carrying the prior run for lineage.
     switched_from_run_id: str | None = Field(default=None, min_length=1, max_length=64)
+    # OPTIONAL explicit run-scoped AD_HOC calculation carrier.  It is a STRICT
+    # typed request (no authority/lifecycle/canonical field), never a mode: the
+    # effective mode still comes from requested_mode, and an AD_HOC carrier is
+    # only executable when the run's capability grants run_scoped_derivation.
+    # The server validates and resolves it against the run's authorized context
+    # and fails closed with a stable code otherwise.
+    ad_hoc_calculation: AdHocCalculationRequest | None = None
 
     @model_validator(mode="after")
     def validate_total_size(self) -> "QueryRequest":
@@ -440,6 +448,12 @@ def _snapshot(thread_id: UUID, state: Any) -> StateSnapshot:
 
 _TYPED_RECORDED_STATUS: Final[dict[str, str]] = {
     "resolve": "resolved_pending_revalidation",
+    # Confirm is the typed form of the legacy approve alias and MUST map here
+    # too: the engine records it as resolved_pending_revalidation, so omitting it
+    # made every typed confirm unrecordable over HTTP (409) the moment something
+    # actually produced a confirmation request.  The two maps are the SAME
+    # vocabulary and must stay in step.
+    "confirm": "resolved_pending_revalidation",
     "choose": "choose_recorded_no_continuation",
     "reject": "rejected",
     "cancel": "cancelled",
@@ -460,6 +474,9 @@ _TYPED_CONTINUATION_STATUSES: Final[frozenset[str]] = frozenset(
         "rejected",
         "cancelled",
         "invalid",
+        # The typed, fail-closed outcome of a rejected in-place correction: a
+        # stable product-visible status instead of a misleading fallback.
+        "metric_plan_correction_rejected",
     }
 )
 
@@ -578,13 +595,18 @@ def register_v2_routes(app: FastAPI) -> None:
             switched_from_run_id=body.switched_from_run_id,
             envelope=envelope,
         )
-        result = await engine.ainvoke(
-            {
-                "messages": [message.model_dump() for message in body.messages],
-                "run_envelope": envelope.model_dump(mode="json"),
-            },
-            config,
-        )
+        graph_input: dict[str, object] = {
+            "messages": [message.model_dump() for message in body.messages],
+            "run_envelope": envelope.model_dump(mode="json"),
+        }
+        if body.ad_hoc_calculation is not None:
+            # Server-validated, authority-free carrier.  The engine resolves it
+            # against the run's authorized context and fails closed on any
+            # missing/ambiguous/catalog-bound input.
+            graph_input["ad_hoc_calculation"] = body.ad_hoc_calculation.model_dump(
+                mode="json"
+            )
+        result = await engine.ainvoke(graph_input, config)
         return QueryResponse(
             thread_id=thread_id,
             blocks=extract_blocks(result),
@@ -612,23 +634,28 @@ def register_v2_routes(app: FastAPI) -> None:
             switched_from_run_id=body.switched_from_run_id,
             envelope=envelope,
         )
+        extra_input: dict[str, object] = {
+            "run_envelope": envelope.model_dump(mode="json"),
+            "stream_metadata": {
+                "thread_id": str(thread_id),
+                "run_id": envelope.run_id,
+                "requested_mode": envelope.requested_mode,
+                "effective_mode": envelope.effective_mode,
+                "switched_from_run_id": envelope.switched_from_run_id,
+                "authority_provenance": _authority_provenance(request),
+            },
+        }
+        if body.ad_hoc_calculation is not None:
+            extra_input["ad_hoc_calculation"] = body.ad_hoc_calculation.model_dump(
+                mode="json"
+            )
         return StreamingResponse(
             _stream_query(
                 engine,
                 [message.model_dump() for message in body.messages],
                 config,
                 thread_id,
-                {
-                    "run_envelope": envelope.model_dump(mode="json"),
-                    "stream_metadata": {
-                        "thread_id": str(thread_id),
-                        "run_id": envelope.run_id,
-                        "requested_mode": envelope.requested_mode,
-                        "effective_mode": envelope.effective_mode,
-                        "switched_from_run_id": envelope.switched_from_run_id,
-                        "authority_provenance": _authority_provenance(request),
-                    },
-                },
+                extra_input,
             ),
             media_type="text/event-stream",
             headers={
@@ -758,7 +785,16 @@ def register_v2_routes(app: FastAPI) -> None:
                 )
 
             result = await engine.ainvoke(
-                Command(resume=incoming.model_dump(mode="json")), config
+                # The engine's typed-decision boundary is DENY-BY-DEFAULT: it
+                # consumes exactly the fields below and rebuilds request identity
+                # from the STORED request, so a forged payload cannot escalate.
+                # schema_version is part of the wire contract but is NOT one of
+                # those fields, so sending it made every production resume fail
+                # with typed_decision_unknown_field and never be recorded.
+                Command(
+                    resume=incoming.model_dump(mode="json", exclude={"schema_version"})
+                ),
+                config,
             )
             if not isinstance(result, dict):
                 raise HTTPException(
@@ -826,11 +862,21 @@ def register_v2_routes(app: FastAPI) -> None:
         result = await engine.ainvoke(Command(resume=legacy_payload), config)
         result_status = result.get("hitl_status") if isinstance(result, dict) else None
         result_version = result.get("hitl_version") if isinstance(result, dict) else None
-        if result_status not in {"approved", "modified", "rejected", "cancelled"} or not isinstance(result_version, int):
+        # An approval that revalidated CURRENT authorization and continued into
+        # governed execution reports "approved_continuing"; the legacy wire
+        # status stays "approved" so the response shape is unchanged.
+        response_status = (
+            "approved"
+            if result_status == "approved_continuing"
+            else result_status
+            if result_status in {"approved", "modified", "rejected", "cancelled"}
+            else None
+        )
+        if response_status is None or not isinstance(result_version, int):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="action was not applied")
         return ThreadActionResponse(
             thread_id=thread_id,
-            status=cast(Literal["approved", "modified", "rejected", "cancelled"], result_status),
+            status=cast(Literal["approved", "modified", "rejected", "cancelled"], response_status),
             version=result_version,
         )
 
@@ -889,13 +935,27 @@ def register_v2_routes(app: FastAPI) -> None:
     # Bounded product routers: the Definition/Publication and Library product
     # surfaces are registered separately so this module does not become a
     # monolith.  Both use the SAME server-side permission dependency.
+    from src.nl2sql.artifacts.api_artifacts import register_artifact_routes
     from src.nl2sql.artifacts.api_conflicts import register_conflict_routes
     from src.nl2sql.artifacts.api_definitions import register_definition_routes
+    from src.nl2sql.artifacts.api_exploration_confirmations import (
+        register_exploration_confirmation_routes,
+    )
     from src.nl2sql.artifacts.api_library import register_library_routes
 
     register_definition_routes(app)
     register_library_routes(app)
     register_conflict_routes(app)
+    # The result-artifact surface is its OWN product router, mounted next to the
+    # others rather than inside the Definition router: saving a result artifact
+    # is an artifact operation (A3) and must never be reachable through the
+    # definition lifecycle.
+    register_artifact_routes(app)
+    # The run-scoped EXPLORATION confirmation surface is likewise its OWN product
+    # router: it is mounted here so the §8.16 P7B "an exploration confirmation
+    # never stands in for a definition confirmation" invariant is reachable by a
+    # real caller instead of being true only inside a unit test.
+    register_exploration_confirmation_routes(app)
 
 
 def register_v1_gone_routes(app: FastAPI) -> None:

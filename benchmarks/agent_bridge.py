@@ -18,8 +18,8 @@ import time
 import uuid
 from typing import Any
 
-from benchmarks.adapters import BenchmarkCase
-from benchmarks.metrics import CaseResult
+from benchmarks.adapters import BenchmarkCase, benchmark_case_to_eval_case
+from benchmarks.metrics import CaseResult, adjudicate_case_result
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +31,30 @@ _REJECTION_SIGNALS = frozenset({
 })
 
 
-async def execute_case(case: BenchmarkCase) -> CaseResult:
-    """调用真实 agent 执行一条 benchmark case 并收集结果。"""
+# The legacy text bridge never emits a typed receipt, so its default is False.
+# The typed path (benchmarks/runner.run_typed_benchmark) sets receipt_required
+# True on every case and never routes through this bridge; a caller that asks
+# THIS bridge for a receipt obliges it too, and a missing one is
+# PROVENANCE_FAILURE rather than a pass.
+LEGACY_RECEIPT_REQUIRED = False
+TYPED_RECEIPT_REQUIRED = True
+
+
+async def execute_case(
+    case: BenchmarkCase,
+    *,
+    receipt_required: bool = LEGACY_RECEIPT_REQUIRED,
+) -> CaseResult:
+    """调用真实 agent 执行一条 benchmark case 并收集结果。
+
+    receipt_required defaults to the legacy value (False): this bridge answers
+    in prose and cannot prove a typed receipt.  The typed path does not call
+    this function at all.
+    """
     start = time.perf_counter()
     session_id = f"bench-{case.case_id}-{uuid.uuid4().hex[:8]}"
 
+    eval_case = benchmark_case_to_eval_case(case)
     result = CaseResult(
         case_id=case.case_id,
         layer=case.layer,
@@ -46,6 +65,17 @@ async def execute_case(case: BenchmarkCase) -> CaseResult:
         tolerance=case.tolerance,
         is_adversarial=case.is_adversarial,
         should_reject=case.should_reject,
+        expected_outcome=eval_case.expected_outcome,
+        oracle_state=eval_case.oracle_state,
+        mode=eval_case.mode,
+        capability=eval_case.capability,
+        risk=eval_case.risk,
+        tags=list(eval_case.tags),
+        # S3: the typed path is benchmarks/runner.run_typed_benchmark and it
+        # always requires a receipt.  THIS bridge is the explicit legacy
+        # fallback, so it defaults to False while still honouring an explicit
+        # True from a caller that wants receipt arithmetic on this path.
+        receipt_required=receipt_required,
     )
 
     try:
@@ -67,7 +97,7 @@ async def execute_case(case: BenchmarkCase) -> CaseResult:
         result.latency_ms = (time.perf_counter() - start) * 1000
         logger.warning("Case %s 执行异常: %s", case.case_id, e)
 
-    return result
+    return adjudicate_case_result(result)
 
 
 async def _call_agent(question: str, session_id: str) -> tuple[str, str]:
