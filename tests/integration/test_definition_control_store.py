@@ -2,7 +2,7 @@
 
 The definition store is gated exactly like the other control-plane contracts:
 nothing runs unless TTAI_RUN_POSTGRES_INTEGRATION=1, and the container is
-created, migrated with 001..006 and torn down by this module alone.
+created, migrated with 001..007 and torn down by this module alone.
 
 What is proven here is the end of the HALF-persisted state:
 
@@ -74,6 +74,7 @@ CONTROL_MIGRATIONS = (
     "004_semantic_registry_v3.sql",
     "005_product_artifacts.sql",
     "006_definition_store.sql",
+    "007_confirmation_audit.sql",
 )
 GOVERNED_METRIC = "demo.revenue"
 CHECKSUM_A = "a" * 64
@@ -298,6 +299,12 @@ def control_postgres() -> Iterator[dict[str, Any]]:
             f"GRANT CONNECT ON DATABASE {CONTROL_DATABASE} TO {CONTROL_APP};"
             f"GRANT USAGE ON SCHEMA public TO {CONTROL_APP};"
             f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public"
+            f" TO {CONTROL_APP};"
+            # The 007 tables are the FIRST control tables with a sequence, so the
+            # application role needs the same sequence privileges the production
+            # bootstrap grants (docker/initdb/roles.sh: readwrite).  Without this
+            # the fixture reaches the tables and then fails on the sequence.
+            f"GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public"
             f" TO {CONTROL_APP};",
             role=CONTROL_OWNER,
             password=CONTROL_OWNER_PASSWORD,
