@@ -158,44 +158,185 @@ GRANT SELECT ON ALL TABLES IN SCHEMA ai_views TO {reader};
 
 
 def _docker(
-    *arguments: str, check: bool = True, timeout: int = 60
+    *arguments: str,
+    check: bool = True,
+    timeout: int | float = 60,
+    secrets_to_redact: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        ["docker", *arguments],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if check and result.returncode != 0:
-        rendered = " ".join(arguments[:2])
+    rendered = " ".join(arguments[:2])
+    try:
+        result = subprocess.run(
+            ["docker", *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
         raise AssertionError(
-            f"docker command failed ({rendered}):\n{result.stdout}\n{result.stderr}"
+            f"docker command timed out ({rendered}) after {timeout}s"
+        ) from None
+    if check and result.returncode != 0:
+        output = _redact_secrets(
+            "\n".join(part for part in (result.stdout, result.stderr) if part),
+            secrets_to_redact,
+        )
+        raise AssertionError(
+            f"docker command failed ({rendered}):\n{output}"
         )
     return result
 
 
-def _container_logs(container: str) -> str:
-    return _docker("logs", container, check=False).stdout[-4000:]
+def _redact_secrets(value: str, secrets_to_redact: tuple[str, ...]) -> str:
+    for secret in secrets_to_redact:
+        if secret:
+            value = value.replace(secret, "[REDACTED]")
+    return value
 
 
-def _wait_for_postgres(container: str, owner: str, database: str) -> None:
-    for _ in range(90):
-        probe = _docker(
-            "exec",
-            container,
-            "pg_isready",
-            "--username",
-            owner,
-            "--dbname",
-            database,
-            check=False,
-            timeout=15,
+def _safe_process_output(
+    result: subprocess.CompletedProcess[str], secrets_to_redact: tuple[str, ...]
+) -> str:
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    return _redact_secrets(output, secrets_to_redact)[-2000:] or "<no output>"
+
+
+def _container_logs(
+    container: str, secrets_to_redact: tuple[str, ...]
+) -> str:
+    try:
+        result = _docker("logs", container, check=False, timeout=10)
+    except AssertionError as exc:
+        return _redact_secrets(f"<container logs unavailable: {exc}>", secrets_to_redact)
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    return _redact_secrets(output, secrets_to_redact)[-4000:] or "<no logs>"
+
+
+def _wait_for_postgres(
+    container: str,
+    owner: str,
+    owner_password: str,
+    database: str,
+    *,
+    secrets_to_redact: tuple[str, ...],
+    timeout_seconds: int = 90,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_readiness = "<probe not completed>"
+    last_database_check = "<database probe not completed>"
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        command_timeout = max(1, min(5, int(remaining)))
+        try:
+            readiness = _docker(
+                "exec",
+                container,
+                "pg_isready",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "5432",
+                "--username",
+                owner,
+                "--dbname",
+                database,
+                check=False,
+                timeout=command_timeout,
+                secrets_to_redact=secrets_to_redact,
+            )
+            last_readiness = (
+                f"exit={readiness.returncode}; "
+                f"{_safe_process_output(readiness, secrets_to_redact)}"
+            )
+        except AssertionError as exc:
+            last_readiness = _redact_secrets(str(exc), secrets_to_redact)
+            readiness = None
+
+        if readiness is not None and readiness.returncode == 0:
+            try:
+                database_probe = _docker(
+                    "exec",
+                    "--env",
+                    f"PGPASSWORD={owner_password}",
+                    container,
+                    "psql",
+                    "--no-psqlrc",
+                    "--no-password",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "5432",
+                    "--username",
+                    owner,
+                    "--dbname",
+                    database,
+                    "--set",
+                    "ON_ERROR_STOP=1",
+                    "--tuples-only",
+                    "--no-align",
+                    "--command",
+                    "SELECT 1",
+                    check=False,
+                    timeout=command_timeout,
+                    secrets_to_redact=secrets_to_redact,
+                )
+                last_database_check = (
+                    f"exit={database_probe.returncode}; "
+                    f"{_safe_process_output(database_probe, secrets_to_redact)}"
+                )
+                if (
+                    database_probe.returncode == 0
+                    and database_probe.stdout.strip() == "1"
+                ):
+                    return
+            except AssertionError as exc:
+                last_database_check = _redact_secrets(str(exc), secrets_to_redact)
+
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(1.0, remaining))
+
+    logs = _container_logs(container, secrets_to_redact)
+    pytest.fail(
+        "PostgreSQL fixture did not accept a TCP connection to the intended "
+        f"database within {timeout_seconds}s. Last TCP readiness: {last_readiness}. "
+        f"Last database query: {last_database_check}. Container logs:\n{logs}"
+    )
+
+
+def _remove_fixture_container(
+    container: str, secrets_to_redact: tuple[str, ...]
+) -> None:
+    removal = _docker(
+        "rm",
+        "--force",
+        "--volumes",
+        container,
+        check=False,
+        timeout=30,
+        secrets_to_redact=secrets_to_redact,
+    )
+    verification = _docker(
+        "inspect", container, check=False, timeout=10, secrets_to_redact=secrets_to_redact
+    )
+    removal_output = _safe_process_output(removal, secrets_to_redact)
+    if verification.returncode != 0 and "no such object" in verification.stderr.lower():
+        return
+    if verification.returncode == 0:
+        raise AssertionError(
+            "PostgreSQL fixture container remains after docker rm --force --volumes "
+            f"(remove exit={removal.returncode}: {removal_output}); "
+            "cleanup verification failed"
         )
-        if probe.returncode == 0:
-            return
-        time.sleep(1)
-    pytest.fail(f"PostgreSQL fixture never became ready:\n{_container_logs(container)}")
+    diagnostic = _safe_process_output(verification, secrets_to_redact)
+    raise AssertionError(
+        "Could not verify PostgreSQL fixture container cleanup "
+        f"(remove exit={removal.returncode}: {removal_output}; "
+        f"inspect: {diagnostic})"
+    )
 
 
 def _published_port(container: str) -> int:
@@ -232,8 +373,11 @@ def chain_postgres() -> Iterator[_ChainPostgres]:
     reader = "business_reader"
     owner_password = secrets.token_hex(24)
     reader_password = secrets.token_hex(24)
+    secrets_to_redact = (owner_password, reader_password)
+    run_attempted = False
 
     try:
+        run_attempted = True
         _docker(
             "run",
             "--detach",
@@ -249,13 +393,27 @@ def chain_postgres() -> Iterator[_ChainPostgres]:
             f"POSTGRES_PASSWORD={owner_password}",
             "postgres:17-alpine",
             timeout=120,
+            secrets_to_redact=secrets_to_redact,
         )
-        _wait_for_postgres(container, owner, database)
+        _wait_for_postgres(
+            container,
+            owner,
+            owner_password,
+            database,
+            secrets_to_redact=secrets_to_redact,
+        )
         _docker(
             "exec",
+            "--env",
+            f"PGPASSWORD={owner_password}",
             container,
             "psql",
             "--no-psqlrc",
+            "--no-password",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "5432",
             "--username",
             owner,
             "--dbname",
@@ -264,6 +422,7 @@ def chain_postgres() -> Iterator[_ChainPostgres]:
             "ON_ERROR_STOP=1",
             "--command",
             _SEED_SQL.format(reader=reader, password=reader_password, database=database),
+            secrets_to_redact=secrets_to_redact,
         )
         yield _ChainPostgres(
             reader_url=_async_url(
@@ -271,7 +430,8 @@ def chain_postgres() -> Iterator[_ChainPostgres]:
             )
         )
     finally:
-        _docker("rm", "--force", "--volumes", container, check=False, timeout=30)
+        if run_attempted:
+            _remove_fixture_container(container, secrets_to_redact)
 
 
 def _gateway(url: str) -> tuple[AsyncEngine, QueryGateway]:
