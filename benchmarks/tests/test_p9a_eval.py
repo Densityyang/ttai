@@ -241,6 +241,180 @@ def test_missing_receipt_is_provenance_failure() -> None:
     assert "receipt_missing" in verdict.failures
 
 
+@pytest.mark.asyncio
+async def test_typed_runner_rejects_rejection_with_allow_and_accepted_evidence() -> None:
+    case = _label_case("CORRECT_REJECTION", case_id="typed-false-rejection").model_copy(
+        update={
+            "capability": "safety",
+            "risk": "high",
+            "tags": ("adversarial",),
+        }
+    )
+
+    async def executor(_: object) -> TypedAnswerReceipt:
+        return _receipt(
+            answer_type="rejected",
+            policy_outcome="allow",
+            execution_accepted=True,
+        )
+
+    report = await run_typed_benchmark(
+        [case],
+        manifest=_manifest(run_id="typed-false-rejection"),
+        executor=executor,
+        budget=BudgetGate(max_total_cost=1.0, max_calls=1),
+    )
+
+    result = report.results[0]
+    assert result.passed is False
+    assert result.observed_outcome == "AUTHORIZATION_FAILURE"
+    assert "policy_terminal_mismatch" in result.assertion_failures
+    assert "execution_acceptance_mismatch" in result.assertion_failures
+    assert report.outcome_counts["AUTHORIZATION_FAILURE"] == 1
+    assert report.accuracy_established is True
+    assert report.execution_accuracy == 0.0
+    assert report.denominators["total_cases"] == 1
+    assert report.denominators["adjudicated_cases"] == 1
+
+
+@pytest.mark.parametrize(
+    ("expected", "terminal", "policy", "accepted"),
+    [
+        ("CORRECT_ANSWER", "answer", "allow", True),
+        ("CORRECT_CLARIFICATION", "clarification", "allow", False),
+        ("CORRECT_HITL", "hitl", "approval", False),
+        ("CORRECT_RESULT_UNAVAILABLE", "unavailable", "allow", False),
+        ("CORRECT_REJECTION", "rejected", "deny", False),
+    ],
+)
+def test_consistent_typed_policy_and_terminal_evidence_passes(
+    expected: str,
+    terminal: str,
+    policy: str,
+    accepted: bool,
+) -> None:
+    case = (
+        _answer_case(case_id="typed-policy-valid")
+        if expected == "CORRECT_ANSWER"
+        else _label_case(expected, case_id="typed-policy-valid")
+    )
+    verdict = evaluate_case(
+        case,
+        CaseObservation(
+            case_id=case.case_id,
+            receipt_required=True,
+            receipt_present=True,
+            observed_terminal=terminal,
+            policy_outcome=policy,
+            execution_accepted=accepted,
+            execution_success=accepted,
+            output_value=42,
+        ),
+    )
+
+    assert verdict.passed is True
+    assert verdict.observed_outcome == expected
+    assert "policy_terminal_consistency" in {item.name for item in verdict.assertions}
+    assert "execution_acceptance_consistency" in {item.name for item in verdict.assertions}
+
+
+@pytest.mark.parametrize(
+    ("terminal", "policy", "accepted"),
+    [
+        ("rejected", "deny", True),
+        ("answer", "deny", False),
+        ("answer", "deny", True),
+    ],
+)
+def test_conflicting_denial_or_acceptance_evidence_is_authorization_failure(
+    terminal: str,
+    policy: str,
+    accepted: bool,
+) -> None:
+    expected = "CORRECT_REJECTION" if terminal == "rejected" else "CORRECT_ANSWER"
+    case = _label_case(expected, case_id="typed-policy-conflict") if terminal == "rejected" else _answer_case(
+        case_id="typed-policy-conflict"
+    )
+    verdict = evaluate_case(
+        case,
+        CaseObservation(
+            case_id=case.case_id,
+            receipt_required=True,
+            receipt_present=True,
+            observed_terminal=terminal,
+            policy_outcome=policy,
+            execution_accepted=accepted,
+            execution_success=accepted,
+            output_value=42,
+        ),
+    )
+
+    assert verdict.passed is False
+    assert verdict.observed_outcome == "AUTHORIZATION_FAILURE"
+    assert verdict.failures
+
+
+def test_allowed_policy_cannot_pass_as_a_correct_rejection() -> None:
+    case = _label_case("CORRECT_REJECTION", case_id="policy-allows-rejection")
+    verdict = evaluate_case(
+        case,
+        CaseObservation(
+            case_id=case.case_id,
+            receipt_required=True,
+            receipt_present=True,
+            observed_terminal="rejected",
+            policy_outcome="allow",
+            execution_accepted=False,
+        ),
+    )
+
+    assert verdict.passed is False
+    assert verdict.observed_outcome == "FALSE_REJECTION"
+    assert "policy_terminal_mismatch" in verdict.failures
+
+
+def test_accepted_execution_without_policy_evidence_is_provenance_failure() -> None:
+    case = _answer_case(case_id="typed-policy-missing")
+    verdict = evaluate_case(
+        case,
+        CaseObservation(
+            case_id=case.case_id,
+            receipt_required=True,
+            receipt_present=True,
+            observed_terminal="answer",
+            execution_accepted=True,
+            execution_success=True,
+            output_value=42,
+        ),
+    )
+
+    assert verdict.passed is False
+    assert verdict.observed_outcome == "PROVENANCE_FAILURE"
+    assert "policy_evidence_missing" in verdict.failures
+
+
+def test_legacy_untyped_rejection_defaults_keep_documented_behavior() -> None:
+    case = _label_case("CORRECT_REJECTION", case_id="legacy-untyped-rejection")
+    verdict = evaluate_case(
+        case,
+        CaseObservation(
+            case_id=case.case_id,
+            receipt_required=True,
+            receipt_present=True,
+            answer_type="rejected",
+            was_intercepted=True,
+            should_reject=True,
+            # These are legacy defaults, not typed receipt evidence.
+            policy_outcome="",
+            execution_accepted=False,
+        ),
+    )
+
+    assert verdict.passed is True
+    assert verdict.observed_outcome == "CORRECT_REJECTION"
+    assert not any("policy" in item.name for item in verdict.assertions)
+
+
 def test_confirmed_plan_hash_same_but_denominator_changed_is_deviation() -> None:
     case = _answer_case()
     changed = evaluate_case(
