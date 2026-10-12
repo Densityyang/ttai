@@ -854,10 +854,10 @@ class CustomDefinitionService:
         """Resolve the exact version, verify the binding and prove readiness.
 
         The concrete parameter VALUES live in the binding, so executing with new
-        values never creates a new definition version.  A version that DECLARES
-        business semantics but is missing denominator / business-time / join
-        semantics is NOT executable (§8.16 P7B); a semantics-free version keeps
-        its A6 legacy identity and stays executable.
+        values never creates a new definition version.  A semantic-bearing
+        version must explicitly declare REQUIRED or NOT_APPLICABLE for
+        denominator, business time and join semantics.  A semantics-free version
+        keeps its A6 legacy identity and stays executable.
         """
 
         exact = await self.get_exact_version(

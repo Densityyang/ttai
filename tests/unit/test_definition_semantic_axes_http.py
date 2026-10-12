@@ -32,6 +32,10 @@ from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.types import AuthUser
 from src.core.settings import Settings
 from src.nl2sql.artifacts.api_definitions import register_definition_routes
+from src.nl2sql.artifacts.definition_semantics import (
+    DefinitionSemantics,
+    ExecutionApplicability,
+)
 from src.nl2sql.container import AppContainer
 from src.nl2sql.contracts import TimeRange
 from src.nl2sql.orchestration.custom_calculation_execution import (
@@ -461,3 +465,80 @@ def test_version_view_exposes_the_declared_axes(client: TestClient) -> None:
     # A version view carries NO object-level authority information at all.
     assert "authority" not in body
     assert "governance" not in body
+
+
+def test_execution_applicability_round_trips_and_is_an_a6_change(
+    client: TestClient,
+) -> None:
+    definition_id = _create(client)
+    _act(client, definition_id, "semantic-close")
+    applicability = ExecutionApplicability(
+        denominator="NOT_APPLICABLE",
+        time_semantics="NOT_APPLICABLE",
+        join_semantics="NOT_APPLICABLE",
+    )
+    request_semantics = DefinitionSemantics(
+        execution_applicability=applicability
+    ).model_dump(mode="json")
+
+    changed = _patch(client, definition_id, {"semantics": request_semantics})
+
+    assert changed.status_code == 200, changed.text
+    changed_body = changed.json()
+    assert changed_body["current_version"] == 2
+    assert changed_body["semantic_axes"] == [
+        "numerator_denominator",
+        "time_semantics",
+        "join_semantics",
+    ]
+    assert changed_body["version_created"] is True
+    assert changed_body["requires_business_decision"] is True
+    assert changed_body["semantic_closed"] is False
+
+    exact = _version(client, definition_id, 2)
+    assert exact.status_code == 200, exact.text
+    exact_body = exact.json()
+    assert exact_body["semantics"]["execution_applicability"] == {
+        "denominator": "NOT_APPLICABLE",
+        "time_semantics": "NOT_APPLICABLE",
+        "join_semantics": "NOT_APPLICABLE",
+    }
+    assert exact_body["declared_axes"] == changed_body["semantic_axes"]
+
+    repeated = _patch(client, definition_id, {"semantics": request_semantics})
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["current_version"] == 2
+    assert repeated.json()["version_created"] is False
+    assert repeated.json()["requires_business_decision"] is False
+
+
+@pytest.mark.parametrize(
+    "applicability",
+    [
+        {},
+        {
+            "denominator": None,
+            "time_semantics": None,
+            "join_semantics": None,
+        },
+    ],
+    ids=("empty-object", "all-axes-null"),
+)
+def test_empty_applicability_patch_is_rejected_without_state_change(
+    client: TestClient,
+    applicability: dict[str, object],
+) -> None:
+    definition_id = _create(client)
+    _act(client, definition_id, "semantic-close")
+    before_version = _version(client, definition_id, 1).json()
+    before_definition = _owned(client, definition_id)
+
+    response = _patch(
+        client,
+        definition_id,
+        {"semantics": {"execution_applicability": applicability}},
+    )
+
+    assert response.status_code == 422, response.text
+    assert _version(client, definition_id, 1).json() == before_version
+    assert _owned(client, definition_id) == before_definition

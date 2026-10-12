@@ -39,6 +39,10 @@ from src.nl2sql.artifacts.definition_control_store import (
     ControlDefinitionStore,
     DefinitionStoreIntegrityError,
 )
+from src.nl2sql.artifacts.definition_semantics import (
+    DefinitionSemantics,
+    ExecutionApplicability,
+)
 from src.nl2sql.artifacts.publication_control_store import (
     ControlPublicationCatalogue,
 )
@@ -953,6 +957,14 @@ def test_control_store_round_trips_through_the_port(
                 parameter_contract=derive_parameter_contract(_spec()),
                 title="Rate",
                 semantic_closed=True,
+                semantics=DefinitionSemantics(
+                    population="eligible service visits",
+                    execution_applicability=ExecutionApplicability(
+                        denominator="NOT_APPLICABLE",
+                        time_semantics="NOT_APPLICABLE",
+                        join_semantics="NOT_APPLICABLE",
+                    ),
+                ),
                 created_at=utcnow(),
             )
             definition = CustomDefinition(
@@ -982,9 +994,16 @@ def test_control_store_round_trips_through_the_port(
             # Governance/Authority are ORTHOGONAL axes and must survive too.
             assert restored.axes.governance == "GOVERNANCE_CANDIDATE"
             assert restored.axes.authority == "noncanonical"
+            restored_exact = await store.get_version(
+                definition_id=definition_id, version=1
+            )
+            assert restored_exact is not None
+            assert restored_exact.semantics == version.semantics
+            assert restored_exact.semantics is not None
+            assert version.semantics is not None
             assert (
-                await store.get_version(definition_id=definition_id, version=1)
-                == version
+                restored_exact.semantics.execution_applicability
+                == version.semantics.execution_applicability
             )
             assert await store.list_versions(definition_id=definition_id) == (
                 version,
@@ -1003,3 +1022,70 @@ def test_control_store_round_trips_through_the_port(
             await store.close()
 
     _run_async(scenario())
+
+
+def test_legacy_semantic_jsonb_without_applicability_loads_without_rewrite(
+    control_postgres: dict[str, Any],
+) -> None:
+    from src.nl2sql.artifacts.custom_definition import (
+        DefinitionVersion,
+        derive_parameter_contract,
+        utcnow,
+    )
+
+    definition_id = _definition_id("legacy-applicability-payload")
+    semantics = DefinitionSemantics(population="eligible service visits")
+    version = DefinitionVersion(
+        definition_id=definition_id,
+        version=1,
+        calculation=_spec(),
+        parameter_contract=derive_parameter_contract(_spec()),
+        title="Legacy semantic version",
+        semantic_closed=True,
+        semantics=semantics,
+        created_at=utcnow(),
+    )
+    legacy_payload = version.model_dump(mode="json")
+    legacy_semantics = legacy_payload["semantics"]
+    assert isinstance(legacy_semantics, dict)
+    legacy_semantics.pop("execution_applicability")
+    legacy_json = json.dumps(
+        legacy_payload, ensure_ascii=False, separators=(",", ":")
+    )
+    _psql(
+        control_postgres,
+        "INSERT INTO custom_definitions ("
+        "definition_id, owner_user_id, confirmation, retention, publication,"
+        "certification, current_version, current_payload"
+        ") VALUES ("
+        f"'{definition_id}', 'alice', 'CONFIRMED', 'SESSION', 'UNPUBLISHED',"
+        f"'UNCERTIFIED', 1, '{legacy_json}'::jsonb);",
+    )
+    _psql(
+        control_postgres,
+        "INSERT INTO custom_definition_versions ("
+        "definition_id, version, payload, checksum"
+        ") VALUES ("
+        f"'{definition_id}', 1, '{legacy_json}'::jsonb, '{version.checksum}');",
+    )
+
+    async def scenario() -> None:
+        store = ControlDefinitionStore(database_url=_async_dsn(control_postgres))
+        try:
+            restored = await store.get_version(definition_id=definition_id, version=1)
+            assert restored is not None
+            assert restored.semantics == semantics
+            assert restored.semantics is not None
+            assert restored.semantics.execution_applicability is None
+            assert restored.checksum == version.checksum
+        finally:
+            await store.close()
+
+    _run_async(scenario())
+    stored_marker = _psql(
+        control_postgres,
+        "SELECT (payload->'semantics') ? 'execution_applicability' "
+        "FROM custom_definition_versions "
+        f"WHERE definition_id = '{definition_id}' AND version = 1;",
+    )
+    assert stored_marker.stdout.strip() == "f"

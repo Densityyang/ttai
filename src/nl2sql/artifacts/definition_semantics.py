@@ -23,7 +23,7 @@ import hashlib
 import json
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # The definition-level axes.  The vocabulary is SHARED with the candidate
 # conflict contract (src/nl2sql/semantic/personal_conflict_contract.py) so the
@@ -64,6 +64,7 @@ MATERIAL_AXES: frozenset[SemanticAxis] = frozenset(AXIS_ORDER)
 
 Deduplication = Literal["none", "distinct_rows", "distinct_key"]
 NullSemantics = Literal["exclude", "include", "propagate"]
+ExecutionApplicabilityValue = Literal["REQUIRED", "NOT_APPLICABLE"]
 
 _DECLARED = 512
 
@@ -76,6 +77,40 @@ def _canonical_json(payload: object) -> str:
     return json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
     )
+
+
+class ExecutionApplicability(_StrictFrozenModel):
+    """Explicit applicability of the execution-critical semantic axes.
+
+    ``None`` means the axis is unspecified.  It never infers applicability from
+    the expression or any other definition metadata.
+    """
+
+    denominator: ExecutionApplicabilityValue | None = None
+    time_semantics: ExecutionApplicabilityValue | None = None
+    join_semantics: ExecutionApplicabilityValue | None = None
+
+    @model_validator(mode="after")
+    def require_explicit_choice(self) -> ExecutionApplicability:
+        if all(
+            value is None
+            for value in (self.denominator, self.time_semantics, self.join_semantics)
+        ):
+            raise ValueError(
+                "execution_applicability_requires_at_least_one_explicit_axis"
+            )
+        return self
+
+
+def _semantics_checksum_payload(semantics: DefinitionSemantics) -> dict[str, object]:
+    """Return the semantic checksum payload with legacy marker omission."""
+
+    payload = semantics.model_dump(mode="json")
+    if semantics.execution_applicability is None:
+        # This field did not exist in historical payloads.  Omit only this new
+        # field when absent so every prior field keeps its original bytes.
+        payload.pop("execution_applicability", None)
+    return payload
 
 
 class DefinitionSemantics(_StrictFrozenModel):
@@ -98,11 +133,12 @@ class DefinitionSemantics(_StrictFrozenModel):
     null_semantics: NullSemantics | None = None
     unit_precision: str | None = Field(default=None, max_length=_DECLARED)
     provenance: str | None = Field(default=None, max_length=_DECLARED)
+    execution_applicability: ExecutionApplicability | None = None
 
     @property
     def checksum(self) -> str:
         return hashlib.sha256(
-            _canonical_json(self.model_dump(mode="json")).encode("utf-8")
+            _canonical_json(_semantics_checksum_payload(self)).encode("utf-8")
         ).hexdigest()
 
     def axes(self) -> tuple[SemanticAxis, ...]:
@@ -129,6 +165,13 @@ class DefinitionSemantics(_StrictFrozenModel):
             declared.append("unit_precision")
         if self.provenance is not None:
             declared.append("provenance")
+        if self.execution_applicability is not None:
+            if self.execution_applicability.denominator is not None:
+                declared.append("numerator_denominator")
+            if self.execution_applicability.time_semantics is not None:
+                declared.append("time_semantics")
+            if self.execution_applicability.join_semantics is not None:
+                declared.append("join_semantics")
         return tuple(axis for axis in AXIS_ORDER if axis in declared)
 
 
@@ -146,8 +189,11 @@ class SemanticDeclaration(_StrictFrozenModel):
 
     @property
     def checksum(self) -> str:
+        payload = self.model_dump(mode="json")
+        if self.semantics is not None:
+            payload["semantics"] = _semantics_checksum_payload(self.semantics)
         return hashlib.sha256(
-            _canonical_json(self.model_dump(mode="json")).encode("utf-8")
+            _canonical_json(payload).encode("utf-8")
         ).hexdigest()
 
 
@@ -198,6 +244,23 @@ def semantic_axes(
         changed.add("unit_precision")
     if _differs(left_semantics.provenance, right_semantics.provenance):
         changed.add("provenance")
+    left_applicability = left_semantics.execution_applicability
+    right_applicability = right_semantics.execution_applicability
+    if _differs(
+        left_applicability.denominator if left_applicability else None,
+        right_applicability.denominator if right_applicability else None,
+    ):
+        changed.add("numerator_denominator")
+    if _differs(
+        left_applicability.time_semantics if left_applicability else None,
+        right_applicability.time_semantics if right_applicability else None,
+    ):
+        changed.add("time_semantics")
+    if _differs(
+        left_applicability.join_semantics if left_applicability else None,
+        right_applicability.join_semantics if right_applicability else None,
+    ):
+        changed.add("join_semantics")
     return tuple(axis for axis in AXIS_ORDER if axis in changed)
 
 
@@ -217,6 +280,7 @@ def is_material_change(
 
 __all__ = [
     "AXIS_ORDER",
+    "ExecutionApplicability",
     "MATERIAL_AXES",
     "DefinitionSemantics",
     "SemanticAxis",

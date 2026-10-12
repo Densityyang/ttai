@@ -24,6 +24,10 @@ from src.nl2sql.artifacts.definition_revalidation import (
     DefinitionRevalidationGate,
     InputFreshnessDQ,
 )
+from src.nl2sql.artifacts.definition_semantics import (
+    DefinitionSemantics,
+    ExecutionApplicability,
+)
 from src.nl2sql.artifacts.service import CustomDefinitionService
 from src.nl2sql.container import AppContainer
 from src.nl2sql.contracts import TimeRange
@@ -75,6 +79,49 @@ def _spec() -> CalculationSpec:
     )
 
 
+def _simple_spec() -> CalculationSpec:
+    return CalculationSpec(
+        calculation_id="custom.actual_count",
+        expression=InputRefOperand(role="actual"),
+        inputs=(
+            CalculationInputSpec(
+                role="actual",
+                provenance="published_gold",
+                metric_key="repair_service_archive_rate_overall_day",
+            ),
+        ),
+        unit="percent",
+        precision=2,
+        rounding="half_up",
+    )
+
+
+def _ratio_spec() -> CalculationSpec:
+    return CalculationSpec(
+        calculation_id="custom.numerator_to_denominator",
+        expression=BinaryOperand(
+            op="divide",
+            left=InputRefOperand(role="numerator"),
+            right=InputRefOperand(role="denominator"),
+        ),
+        inputs=(
+            CalculationInputSpec(
+                role="numerator",
+                provenance="published_gold",
+                metric_key="repair_service_archive_rate_overall_day",
+            ),
+            CalculationInputSpec(
+                role="denominator",
+                provenance="published_gold",
+                metric_key="repair_service_archive_rate_overall_day",
+            ),
+        ),
+        unit="ratio",
+        precision=2,
+        rounding="half_up",
+    )
+
+
 class _ControlledResolver:
     def __init__(self, actual: Decimal) -> None:
         self.actual = actual
@@ -97,6 +144,31 @@ class _ControlledResolver:
                 receipt_step_id="fetch_actual",
                 fact_id="a" * 64,
             ),
+        )
+
+
+class _RatioResolver(_ControlledResolver):
+    async def resolve_inputs(self, **_: object) -> tuple[ResolvedCalculationInput, ...]:
+        self.calls += 1
+        return tuple(
+            ResolvedCalculationInput(
+                role=role,
+                metric_key="repair_service_archive_rate_overall_day",
+                value=value,
+                unit="count",
+                data_as_of=datetime(2026, 9, 20, tzinfo=UTC),
+                time_range=TimeRange(
+                    start=date(2026, 9, 20), end=date(2026, 9, 20)
+                ),
+                provenance="published_gold",
+                source_id=f"gold.{role}",
+                receipt_step_id=f"fetch_{role}",
+                fact_id=("b" if role == "numerator" else "c") * 64,
+            )
+            for role, value in (
+                ("numerator", Decimal("3")),
+                ("denominator", Decimal("5")),
+            )
         )
 
 
@@ -194,6 +266,9 @@ class _Container:
 
 async def _client(
     resolver: _ControlledResolver | None,
+    *,
+    semantics: DefinitionSemantics | None = None,
+    spec: CalculationSpec | None = None,
 ) -> tuple[TestClient, _Container, str, CalculationSpec]:
     app = FastAPI()
     container = _Container(resolver)
@@ -206,9 +281,12 @@ async def _client(
         )
 
     app.dependency_overrides[require_nl2sql_permission] = identity
-    spec = _spec()
+    spec = spec or _spec()
     version = await container.definitions.create_draft(
-        owner_user_id="alice", title="Actual target index", calculation=spec
+        owner_user_id="alice",
+        title="Actual target index",
+        calculation=spec,
+        semantics=semantics,
     )
     await container.definitions.mark_semantic_closed(
         owner_user_id="alice", definition_id=version.definition_id
@@ -226,7 +304,11 @@ def _binding(spec: CalculationSpec, target: int) -> dict[str, object]:
     binding = CalculationExecutionBinding(
         calculation_id=spec.calculation_id,
         spec_checksum=spec.checksum,
-        parameters=(ParameterBinding(name="target_percent", value=target),),
+        parameters=(
+            (ParameterBinding(name="target_percent", value=target),)
+            if spec.parameters
+            else ()
+        ),
     )
     return binding.model_dump(mode="json")
 
@@ -284,6 +366,138 @@ async def test_controlled_http_execution_uses_server_resolved_input_only() -> No
         json={"binding": _binding(spec, 90), "actual": 999},
     )
     assert injected.status_code == 422
+
+
+async def test_simple_metric_with_explicit_not_applicable_axes_executes() -> None:
+    resolver = _ControlledResolver(Decimal("45"))
+    applicability = ExecutionApplicability(
+        denominator="NOT_APPLICABLE",
+        time_semantics="NOT_APPLICABLE",
+        join_semantics="NOT_APPLICABLE",
+    )
+    semantics = DefinitionSemantics(
+        unit_precision="percent", execution_applicability=applicability
+    )
+    client, _container, definition_id, spec = await _client(
+        resolver, semantics=semantics, spec=_simple_spec()
+    )
+    response = client.post(
+        f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute",
+        json={"binding": _binding(spec, 90)},
+    )
+
+    assert response.status_code == 200, response.text
+    assert Decimal(response.json()["value"]) == Decimal("45")
+    assert resolver.calls == 1
+
+
+async def test_ratio_required_denominator_with_value_executes() -> None:
+    resolver = _RatioResolver(Decimal("0"))
+    semantics = DefinitionSemantics(
+        numerator="on-time responses",
+        denominator="eligible responses",
+        execution_applicability=ExecutionApplicability(
+            denominator="REQUIRED",
+            time_semantics="NOT_APPLICABLE",
+            join_semantics="NOT_APPLICABLE",
+        ),
+    )
+    client, _container, definition_id, spec = await _client(
+        resolver, semantics=semantics, spec=_ratio_spec()
+    )
+    response = client.post(
+        f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute",
+        json={"binding": _binding(spec, 90)},
+    )
+
+    assert response.status_code == 200, response.text
+    assert Decimal(response.json()["value"]) == Decimal("0.6")
+    assert resolver.calls == 1
+
+
+@pytest.mark.parametrize(
+    "semantics",
+    [
+        DefinitionSemantics(population="eligible responses"),
+        DefinitionSemantics(
+            unit_precision="percent",
+            execution_applicability=ExecutionApplicability(
+                denominator="NOT_APPLICABLE",
+                time_semantics="NOT_APPLICABLE",
+            ),
+        ),
+        DefinitionSemantics(
+            execution_applicability=ExecutionApplicability(
+                denominator="REQUIRED",
+                time_semantics="NOT_APPLICABLE",
+                join_semantics="NOT_APPLICABLE",
+            ),
+        ),
+        DefinitionSemantics(
+            execution_applicability=ExecutionApplicability(
+                denominator="NOT_APPLICABLE",
+                time_semantics="REQUIRED",
+                join_semantics="NOT_APPLICABLE",
+            ),
+        ),
+        DefinitionSemantics(
+            execution_applicability=ExecutionApplicability(
+                denominator="NOT_APPLICABLE",
+                time_semantics="NOT_APPLICABLE",
+                join_semantics="REQUIRED",
+            ),
+        ),
+        DefinitionSemantics(
+            denominator="eligible responses",
+            execution_applicability=ExecutionApplicability(
+                denominator="NOT_APPLICABLE",
+                time_semantics="NOT_APPLICABLE",
+                join_semantics="NOT_APPLICABLE",
+            ),
+        ),
+        DefinitionSemantics(
+            time_semantics="business day",
+            execution_applicability=ExecutionApplicability(
+                denominator="NOT_APPLICABLE",
+                time_semantics="NOT_APPLICABLE",
+                join_semantics="NOT_APPLICABLE",
+            ),
+        ),
+        DefinitionSemantics(
+            join_semantics="service to request",
+            execution_applicability=ExecutionApplicability(
+                denominator="NOT_APPLICABLE",
+                time_semantics="NOT_APPLICABLE",
+                join_semantics="NOT_APPLICABLE",
+            ),
+        ),
+    ],
+    ids=(
+        "all-unspecified",
+        "partial-unspecified",
+        "denominator-required-value-missing",
+        "time-required-value-missing",
+        "join-required-value-missing",
+        "denominator-not-applicable-conflict",
+        "not-applicable-time-conflict",
+        "not-applicable-join-conflict",
+    ),
+)
+async def test_readiness_refuses_before_input_resolution(
+    semantics: DefinitionSemantics,
+) -> None:
+    resolver = _ControlledResolver(Decimal("45"))
+    client, _container, definition_id, spec = await _client(
+        resolver, semantics=semantics, spec=_simple_spec()
+    )
+    response = client.post(
+        f"/api/v2/nl2sql/definitions/{definition_id}/versions/1/execute",
+        json={"binding": _binding(spec, 90)},
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "definition_semantics_incomplete_for_execution"
+    assert resolver.calls == 0
 
 
 async def test_zero_target_is_governed_error_not_no_data() -> None:

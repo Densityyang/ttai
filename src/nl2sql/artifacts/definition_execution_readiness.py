@@ -1,18 +1,10 @@
 """Execution readiness of a DECLARED semantic surface (§8.16 P7B).
 
-Frozen requirement: a definition that lacks **denominator / business-time /
-join** semantics is NOT executable.  The A6 contract makes every semantic axis
-optional BY CONSTRUCTION -- a semantics-free version keeps its exact legacy
-identity and stays executable -- so this gate deliberately applies to a version
-that DECLARES semantics: once a definition opts in to declaring its business
-meaning, the execution-critical axes must be present.
-
-The three required axes are exactly the ones the frozen requirement names:
-``denominator``, ``time_semantics`` and ``join_semantics``.  This is the chosen
-expression of the requirement.  CONTRACT GAP: the contract carries no separate
-"execution complete" flag and no "is a ratio" flag, so a version that declares
-any semantics at all is held to all three axes; adding a ratio/execution flag
-would be a substantive schema change owned by another slice.
+A semantic-bearing version must explicitly mark each execution-critical axis
+REQUIRED or NOT_APPLICABLE.  REQUIRED needs the matching declared semantics;
+NOT_APPLICABLE is valid only when no matching semantic value is declared.  An
+unspecified axis fails closed.  A semantics-free version retains its legacy
+identity and executable behavior.
 
 The refusal subclasses the shared stable-refusal error, so the EXISTING HTTP
 execution route surfaces the stable code (409 + code) without being modified.
@@ -23,6 +15,7 @@ from __future__ import annotations
 from typing import Final
 
 from src.nl2sql.artifacts.custom_definition import DefinitionVersion
+from src.nl2sql.artifacts.definition_semantics import ExecutionApplicabilityValue
 from src.nl2sql.orchestration.custom_calculation_execution import (
     CustomCalculationExecutionError,
 )
@@ -55,23 +48,29 @@ class DefinitionSemanticsIncompleteForExecution(CustomCalculationExecutionError)
 
 
 def semantic_execution_gaps(version: DefinitionVersion) -> tuple[str, ...]:
-    """The execution-critical axes a version declares but does not define.
+    """Return missing or contradictory applicability declarations.
 
     A semantics-free version is the legacy identity and reports NO gap (A6
-    compatibility).  A version that declares semantics must define all three
-    execution-critical axes; the gap is returned in the frozen axis order.
+    compatibility).  A semantic-bearing version must explicitly define all
+    three applicability axes; the gap is returned in the frozen axis order.
     """
 
     semantics = version.semantics
     if semantics is None:
         return ()
+    applicability = semantics.execution_applicability
     gaps: list[str] = []
-    if semantics.denominator is None:
-        gaps.append("denominator")
-    if semantics.time_semantics is None:
-        gaps.append("time_semantics")
-    if semantics.join_semantics is None:
-        gaps.append("join_semantics")
+    for axis in EXECUTION_CRITICAL_SEMANTIC_AXES:
+        decision: ExecutionApplicabilityValue | None = (
+            getattr(applicability, axis) if applicability is not None else None
+        )
+        declared_semantics = getattr(semantics, axis)
+        if decision is None:
+            gaps.append(f"{axis}_applicability_unspecified")
+        elif decision == "REQUIRED" and declared_semantics is None:
+            gaps.append(f"{axis}_required_value_missing")
+        elif decision == "NOT_APPLICABLE" and declared_semantics is not None:
+            gaps.append(f"{axis}_not_applicable_conflicts_with_value")
     return tuple(gaps)
 
 

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from src.nl2sql.artifacts.definition_semantics import (
     AXIS_ORDER,
     MATERIAL_AXES,
     DefinitionSemantics,
+    ExecutionApplicability,
     SemanticDeclaration,
     is_material_change,
     semantic_axes,
@@ -178,6 +180,92 @@ def test_axes_lists_only_what_is_declared() -> None:
     assert DefinitionSemantics(
         unit_precision="yuan", population="x"
     ).axes() == ("population", "unit_precision")
+
+
+def test_execution_applicability_is_strict_frozen_and_serializable() -> None:
+    applicability = ExecutionApplicability(
+        denominator="REQUIRED",
+        time_semantics="NOT_APPLICABLE",
+    )
+    assert applicability.model_dump(mode="json") == {
+        "denominator": "REQUIRED",
+        "time_semantics": "NOT_APPLICABLE",
+        "join_semantics": None,
+    }
+    with pytest.raises(ValidationError):
+        ExecutionApplicability(denominator="required")  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        ExecutionApplicability.model_validate({"unknown_axis": "NOT_APPLICABLE"})
+    with pytest.raises(ValidationError):
+        applicability.denominator = "NOT_APPLICABLE"  # type: ignore[misc]
+
+
+def test_empty_execution_applicability_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        ExecutionApplicability()
+    with pytest.raises(ValidationError):
+        ExecutionApplicability.model_validate(
+            {
+                "denominator": None,
+                "time_semantics": None,
+                "join_semantics": None,
+            }
+        )
+    with pytest.raises(ValidationError):
+        DefinitionSemantics.model_validate({"execution_applicability": {}})
+
+
+def test_partial_execution_applicability_is_a_valid_typed_contract() -> None:
+    applicability = ExecutionApplicability(denominator="REQUIRED")
+    assert applicability.denominator == "REQUIRED"
+    assert applicability.time_semantics is None
+    assert applicability.join_semantics is None
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "axis"),
+    [
+        (
+            ExecutionApplicability(denominator="REQUIRED"),
+            ExecutionApplicability(denominator="NOT_APPLICABLE"),
+            "numerator_denominator",
+        ),
+        (
+            ExecutionApplicability(time_semantics="REQUIRED"),
+            ExecutionApplicability(time_semantics="NOT_APPLICABLE"),
+            "time_semantics",
+        ),
+        (
+            ExecutionApplicability(join_semantics="REQUIRED"),
+            ExecutionApplicability(join_semantics="NOT_APPLICABLE"),
+            "join_semantics",
+        ),
+    ],
+)
+def test_applicability_changes_map_to_existing_a6_axes(
+    before: ExecutionApplicability,
+    after: ExecutionApplicability,
+    axis: str,
+) -> None:
+    assert semantic_axes(
+        _declaration(semantics=DefinitionSemantics(execution_applicability=before)),
+        _declaration(semantics=DefinitionSemantics(execution_applicability=after)),
+    ) == (axis,)
+    assert DefinitionSemantics(execution_applicability=after).axes() == (axis,)
+
+
+def test_explicit_applicability_changes_the_semantic_checksum() -> None:
+    before = DefinitionSemantics(population="eligible service visits")
+    after = DefinitionSemantics(
+        population="eligible service visits",
+        execution_applicability=ExecutionApplicability(
+            denominator="NOT_APPLICABLE",
+            time_semantics="NOT_APPLICABLE",
+            join_semantics="NOT_APPLICABLE",
+        ),
+    )
+    assert before.checksum != after.checksum
+    assert after.checksum == after.model_copy().checksum
 
 
 def test_declaration_checksum_is_stable_and_sensitive() -> None:

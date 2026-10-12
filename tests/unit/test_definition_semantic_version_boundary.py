@@ -22,6 +22,8 @@ from src.nl2sql.artifacts.definition_control_store import _version_from_payload
 from src.nl2sql.artifacts.definition_semantics import (
     AXIS_ORDER,
     DefinitionSemantics,
+    ExecutionApplicability,
+    SemanticDeclaration,
 )
 from src.nl2sql.artifacts.service import (
     CustomDefinitionService,
@@ -42,6 +44,15 @@ from src.nl2sql.semantic.calculation_contract import (
 # later edit that silently moves the legacy definition identity fails here.
 LEGACY_SEMANTICS_FREE_CHECKSUM = (
     "c5ec4b2dad381ecd39597dbf1970794d868ee119e166043f6e0bf7efe7b8d817"
+)
+LEGACY_SEMANTICS_CHECKSUM = (
+    "d5532ada7987781045d8fbbde31845cb6634ed1b50f9720be97359e560e23c09"
+)
+LEGACY_SEMANTIC_VERSION_CHECKSUM = (
+    "2d15c9e32f914fa7fa418dfdbafe44ad22b24041a7ac790632e2ad98b45ae908"
+)
+LEGACY_SEMANTIC_DECLARATION_CHECKSUM = (
+    "91b0d11c431ee095b4894f484b3b7427ed4c8905d4205b14582dbe9a6106422a"
 )
 
 PINNED_DEFINITION_ID = "def_" + "a" * 32
@@ -171,6 +182,95 @@ async def test_each_semantic_axis_moves_the_version_boundary(
         await service.get_exact_version(
             owner_user_id="alice", definition_id=draft.definition_id, version=1
         )
+
+
+async def test_applicability_only_change_opens_a_new_version_and_decision() -> None:
+    service = _service()
+    before = DefinitionSemantics(
+        population="eligible service visits",
+        execution_applicability=ExecutionApplicability(
+            denominator="REQUIRED",
+            time_semantics="NOT_APPLICABLE",
+            join_semantics="NOT_APPLICABLE",
+        ),
+    )
+    after = DefinitionSemantics(
+        population="eligible service visits",
+        execution_applicability=ExecutionApplicability(
+            denominator="NOT_APPLICABLE",
+            time_semantics="NOT_APPLICABLE",
+            join_semantics="NOT_APPLICABLE",
+        ),
+    )
+    draft = await service.create_draft(
+        owner_user_id="alice", title="Simple count", calculation=_spec(), semantics=before
+    )
+    await service.mark_semantic_closed(
+        owner_user_id="alice", definition_id=draft.definition_id
+    )
+
+    outcome = await service.update_draft_with_semantics(
+        owner_user_id="alice", definition_id=draft.definition_id, semantics=after
+    )
+
+    assert outcome.semantic_axes == ("numerator_denominator",)
+    assert outcome.material is True
+    assert outcome.version_created is True
+    assert outcome.requires_business_decision is True
+    assert outcome.version.version == 2
+    assert outcome.version.semantic_closed is False
+    with pytest.raises(ValueError, match="confirm requires semantic closure"):
+        await service.confirm(owner_user_id="alice", definition_id=draft.definition_id)
+    await service.mark_semantic_closed(
+        owner_user_id="alice", definition_id=draft.definition_id
+    )
+    confirmed = await service.confirm(
+        owner_user_id="alice", definition_id=draft.definition_id
+    )
+    assert confirmed.current_version.version == 2
+    assert confirmed.current_version.semantics == after
+
+
+async def test_confirmed_applicability_version_remains_immutable() -> None:
+    service = _service()
+    semantics = DefinitionSemantics(
+        population="eligible service visits",
+        execution_applicability=ExecutionApplicability(
+            denominator="NOT_APPLICABLE",
+            time_semantics="NOT_APPLICABLE",
+            join_semantics="NOT_APPLICABLE",
+        ),
+    )
+    draft = await service.create_draft(
+        owner_user_id="alice", title="Simple count", calculation=_spec(), semantics=semantics
+    )
+    await service.mark_semantic_closed(
+        owner_user_id="alice", definition_id=draft.definition_id
+    )
+    await service.confirm(owner_user_id="alice", definition_id=draft.definition_id)
+    exact_before = await service.get_exact_version(
+        owner_user_id="alice", definition_id=draft.definition_id, version=1
+    )
+
+    changed = semantics.model_copy(
+        update={
+            "execution_applicability": ExecutionApplicability(
+                denominator="REQUIRED",
+                time_semantics="NOT_APPLICABLE",
+                join_semantics="NOT_APPLICABLE",
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="confirmed definition requires a new version"):
+        await service.update_draft_with_semantics(
+            owner_user_id="alice", definition_id=draft.definition_id, semantics=changed
+        )
+
+    exact_after = await service.get_exact_version(
+        owner_user_id="alice", definition_id=draft.definition_id, version=1
+    )
+    assert exact_after == exact_before
+    assert exact_after.checksum == exact_before.checksum
 
 
 # --- (2) a title-only edit is NOT material and keeps closure ----------------
@@ -389,6 +489,85 @@ def test_a_declared_semantic_axis_is_covered_by_the_checksum() -> None:
         assert declared.checksum != base.checksum, field
         other = base.model_copy(update={"semantics": _semantics(**{field: value})})
         assert declared.checksum == other.checksum, field
+
+
+def test_semantic_bearing_checksums_without_applicability_are_legacy_identical() -> None:
+    spec = _pinned_spec()
+    semantics = DefinitionSemantics(population="paid orders")
+    version = DefinitionVersion(
+        definition_id=PINNED_DEFINITION_ID,
+        version=1,
+        calculation=spec,
+        parameter_contract=derive_parameter_contract(spec),
+        title="M",
+        semantic_closed=True,
+        semantics=semantics,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    declaration = SemanticDeclaration(
+        expression_checksum="a" * 64,
+        parameter_contract_checksum="c" * 64,
+        semantics=semantics,
+    )
+
+    assert semantics.checksum == LEGACY_SEMANTICS_CHECKSUM
+    assert version.checksum == LEGACY_SEMANTIC_VERSION_CHECKSUM
+    assert declaration.checksum == LEGACY_SEMANTIC_DECLARATION_CHECKSUM
+
+
+def test_old_semantic_payload_decodes_without_applicability_or_backfill() -> None:
+    spec = _pinned_spec()
+    semantics = DefinitionSemantics(population="paid orders")
+    version = DefinitionVersion(
+        definition_id=PINNED_DEFINITION_ID,
+        version=1,
+        calculation=spec,
+        parameter_contract=derive_parameter_contract(spec),
+        title="M",
+        semantic_closed=True,
+        semantics=semantics,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    old_payload = version.model_dump(mode="json")
+    old_semantics = old_payload["semantics"]
+    assert isinstance(old_semantics, dict)
+    old_semantics.pop("execution_applicability")
+    raw_payload = json.dumps(old_payload, ensure_ascii=False, separators=(",", ":"))
+
+    restored = _version_from_payload(raw_payload)
+
+    assert restored.semantics == semantics
+    assert restored.semantics is not None
+    assert restored.semantics.execution_applicability is None
+    assert restored.checksum == LEGACY_SEMANTIC_VERSION_CHECKSUM
+    assert "execution_applicability" not in json.loads(raw_payload)["semantics"]
+
+
+def test_explicit_applicability_is_covered_by_definition_checksum() -> None:
+    spec = _pinned_spec()
+    base = DefinitionVersion(
+        definition_id=PINNED_DEFINITION_ID,
+        version=1,
+        calculation=spec,
+        parameter_contract=derive_parameter_contract(spec),
+        title="M",
+        semantic_closed=True,
+        semantics=DefinitionSemantics(population="paid orders"),
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    marked = base.model_copy(
+        update={
+            "semantics": DefinitionSemantics(
+                population="paid orders",
+                execution_applicability=ExecutionApplicability(
+                    denominator="NOT_APPLICABLE",
+                    time_semantics="NOT_APPLICABLE",
+                    join_semantics="NOT_APPLICABLE",
+                ),
+            )
+        }
+    )
+    assert marked.checksum != base.checksum
 
 
 def test_durable_store_round_trips_a_version_with_semantics() -> None:
