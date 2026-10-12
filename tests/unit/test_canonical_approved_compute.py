@@ -1132,9 +1132,17 @@ class _FakeGateway:
 class _RecordingCompiler:
     def __init__(self) -> None:
         self.plans: list[QueryPlan] = []
+        self.bindings: list[ApprovedCalculationBinding | None] = []
 
-    async def compile(self, plan: QueryPlan, context: ContextBundle) -> CompiledMetricQuery:
+    async def compile(
+        self,
+        plan: QueryPlan,
+        context: ContextBundle,
+        *,
+        approved_calculation_binding: ApprovedCalculationBinding | None = None,
+    ) -> CompiledMetricQuery:
         self.plans.append(plan)
+        self.bindings.append(approved_calculation_binding)
         return CompiledMetricQuery(
             sql="SELECT synthetic",
             params={},
@@ -1143,6 +1151,7 @@ class _RecordingCompiler:
             snapshot_checksum="0" * 64,
             query_plan=plan,
             context=context,
+            calculation_binding=approved_calculation_binding,
         )
 
 
@@ -1174,6 +1183,7 @@ async def test_dependency_fetch_prepare_derives_one_child_plan() -> None:
     assert child.time_range == _plan().time_range
     assert child.grain == _plan().grain
     assert child.required_permissions == _plan().required_permissions
+    assert compiler.bindings == [_binding()]
 
 
 async def test_direct_fetch_prepare_is_unchanged() -> None:
