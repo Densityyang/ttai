@@ -31,8 +31,14 @@ from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationInput,
     ApprovedComputeError,
 )
-from src.nl2sql.orchestration.execution import PlanStepError
-from src.nl2sql.orchestration.grounding import build_answer_facts
+from src.nl2sql.orchestration.execution import (
+    PlanStepError,
+    RegistryTrustedCalculationRunner,
+)
+from src.nl2sql.orchestration.grounding import (
+    build_answer_facts,
+    ground_execution_answer,
+)
 from src.nl2sql.orchestration.metric_query import (
     CompiledMetricQuery,
     GatewayMetricStepRunner,
@@ -283,6 +289,99 @@ def test_binding_rounding_requires_an_explicit_precision() -> None:
     both = _binding(precision=2, rounding="half_up")
     assert both.checksum == _binding(precision=2, rounding="half_up").checksum
     assert both.checksum != _binding(precision=2).checksum
+
+
+@pytest.mark.parametrize(
+    "numeric_overrides",
+    [
+        pytest.param({"unit": "percent"}, id="unit"),
+        pytest.param({"precision": 2}, id="precision"),
+        pytest.param(
+            {"precision": 2, "rounding": "half_up"}, id="rounding"
+        ),
+    ],
+)
+def test_numeric_binding_change_invalidates_a_plan_compiled_under_old_identity(
+    numeric_overrides: dict[str, object],
+) -> None:
+    original = _binding()
+    changed = _binding(**numeric_overrides)
+    assert changed.checksum != original.checksum
+
+    execution_plan, calculation, context = _build(binding=original)
+    failures = _validate(
+        execution_plan,
+        calculation,
+        context,
+        catalog=ApprovedCalculationCatalog([changed]),
+    )
+    assert "trusted_calculation_binding_mismatch" in failures
+    assert "trusted_calculation_dependency_binding_mismatch" in failures
+
+
+@pytest.mark.parametrize("field", ["null_strategy", "zero_strategy"])
+def test_unversioned_global_null_or_zero_policy_is_rejected(field: str) -> None:
+    payload = _binding().model_dump(mode="python")
+    payload[field] = "return_null"
+    with pytest.raises(ValidationError):
+        ApprovedCalculationBinding.model_validate(payload)
+
+
+@pytest.mark.asyncio
+async def test_ratio_1_0_output_remains_unrounded_with_numeric_binding_metadata() -> None:
+    # This freezes the existing ratio@1.0 implementation.  It is not evidence
+    # that v1.1 binding unit/precision/rounding fields are executed: the runner
+    # receives only the versioned template step and applies the registered
+    # numerator / denominator behavior.
+    binding = _binding(unit="percent", precision=2, rounding="half_up")
+    _execution_plan, calculation, _context = _build(binding=binding)
+    assert calculation.template_version == "1.0"
+
+    output = await RegistryTrustedCalculationRunner().execute(
+        step=calculation,
+        inputs={"numerator": 1.0, "denominator": 3.0},
+    )
+
+    assert output == {"ratio": 1.0 / 3.0}
+    assert output["ratio"] != 0.33
+
+
+def test_canonical_receipt_with_different_template_version_fails_grounding() -> None:
+    plan, context = _plan(), _dependency_context()
+    binding = _binding()
+    execution_plan = PlanCompiler(
+        calculation_catalog=ApprovedCalculationCatalog([binding])
+    ).compile(plan=plan, context=context, validation=_allow(plan, context))
+    calculation = next(
+        step for step in execution_plan.steps if isinstance(step, TrustedCalculationStep)
+    )
+    receipt = PlanStepReceipt(
+        step_id=calculation.step_id,
+        kind="trusted_calculation",
+        status="succeeded",
+        elapsed_ms=1,
+        output_digest="f" * 64,
+        template_id=calculation.template_id,
+        template_version="1.1",
+        binding_checksum=calculation.binding_checksum,
+        output_metric_key=calculation.output_metric_key,
+    )
+    record = PlanExecutionRecord(
+        execution_plan_checksum=execution_plan.checksum,
+        status="succeeded",
+        step_receipts=(receipt,),
+        output_step_ids=(receipt.step_id,),
+    )
+
+    answer = ground_execution_answer(
+        query_plan=plan,
+        execution_plan=execution_plan,
+        record=record,
+        outputs={calculation.step_id: {"ratio": 1.0 / 3.0}},
+    )
+
+    assert answer.facts == ()
+    assert "grounding_execution_mismatch" in answer.artifact.degradation_flags
 
 
 def test_catalog_checksum_is_order_independent_and_content_sensitive() -> None:
