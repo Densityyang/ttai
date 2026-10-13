@@ -15,6 +15,7 @@ from src.nl2sql.agents.dynamic_calc.trusted_templates import (
 from src.nl2sql.contracts import (
     ContextBundle,
     ExecutionPlan,
+    ExecutionReceipt,
     FetchMetricStep,
     PlanExecutionRecord,
     PlanStepReceipt,
@@ -31,8 +32,12 @@ from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationInput,
     ApprovedComputeError,
 )
+from src.nl2sql.orchestration.budget import RouteBudgetLedger
 from src.nl2sql.orchestration.execution import (
+    MetricStepResult,
+    PlanExecutor,
     PlanStepError,
+    PreparedMetricStep,
     RegistryTrustedCalculationRunner,
 )
 from src.nl2sql.orchestration.grounding import (
@@ -334,16 +339,84 @@ async def test_ratio_1_0_output_remains_unrounded_with_numeric_binding_metadata(
     # receives only the versioned template step and applies the registered
     # numerator / denominator behavior.
     binding = _binding(unit="percent", precision=2, rounding="half_up")
-    _execution_plan, calculation, _context = _build(binding=binding)
+    execution_plan, calculation, context = _build(binding=binding)
     assert calculation.template_version == "1.0"
 
-    output = await RegistryTrustedCalculationRunner().execute(
-        step=calculation,
-        inputs={"numerator": 1.0, "denominator": 3.0},
+    class FixtureMetricRunner:
+        async def prepare(
+            self,
+            *,
+            step: FetchMetricStep,
+            query_plan: QueryPlan,
+            context: ContextBundle,
+        ) -> PreparedMetricStep:
+            del query_plan, context
+            metric_key = step.metric_keys[0]
+            return PreparedMetricStep(
+                sql_fingerprint=("c" if metric_key == "metric.revenue" else "d") * 64,
+                join_hops=0,
+                payload=metric_key,
+                dependency_fetch=True,
+            )
+
+        async def execute(
+            self,
+            prepared: PreparedMetricStep,
+            *,
+            timeout_ms: int,
+        ) -> MetricStepResult:
+            del timeout_ms
+            value = {
+                "metric.revenue": 1.0,
+                "metric.stores": 3.0,
+            }[str(prepared.payload)]
+            return MetricStepResult(
+                value={"value": value},
+                receipt=ExecutionReceipt(
+                    datasource="fixture",
+                    readonly_role="fixture_reader",
+                    elapsed_ms=1,
+                    row_count=1,
+                    sql_fingerprint=prepared.sql_fingerprint,
+                    policy_version="h19a.numeric.fixture.v1",
+                    policy_outcome="allow",
+                ),
+            )
+
+    plan = _plan()
+    catalog = ApprovedCalculationCatalog([binding])
+    validator = PlanValidator(calculation_catalog=catalog)
+    budget = RouteBudgetLedger(route="standard")
+    validation = validator.validate_execution_plan(
+        execution_plan=execution_plan,
+        query_plan=plan,
+        context=context,
+        route_budget=budget.limits,
+    )
+    assert validation.outcome == "allow"
+    result = await PlanExecutor(
+        metric_runner=FixtureMetricRunner(),
+        trusted_calculation_runner=RegistryTrustedCalculationRunner(),
+    ).execute(
+        query_plan=plan,
+        context=context,
+        execution_plan=execution_plan,
+        validation=validation,
+        expected_policy_version=validator.policy_version,
+        expected_policy_checksum=validator.policy_checksum,
+        budget=budget,
+        deadline_ms=5_000,
     )
 
-    assert output == {"ratio": 1.0 / 3.0}
-    assert output["ratio"] != 0.33
+    assert result.record.status == "succeeded"
+    assert result.outputs[calculation.step_id] == {"ratio": 1.0 / 3.0}
+    assert result.outputs[calculation.step_id]["ratio"] != 0.33
+    receipt = next(
+        item for item in result.record.step_receipts if item.step_id == calculation.step_id
+    )
+    assert receipt.template_id == "ratio"
+    assert receipt.template_version == "1.0"
+    assert receipt.binding_checksum == binding.checksum
 
 
 def test_canonical_receipt_with_different_template_version_fails_grounding() -> None:
