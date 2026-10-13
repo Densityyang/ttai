@@ -242,6 +242,44 @@ def test_missing_receipt_is_provenance_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unknown_case_receipt_cannot_establish_accuracy_for_another_case() -> None:
+    adjudicable_without_receipt = _answer_case(case_id="adjudicable-no-receipt")
+    unknown_with_receipt = EvalCase(
+        case_id="unknown-with-receipt",
+        revision="rev-1",
+        source="unit",
+        layer="L1",
+        domain="test",
+        question="q without a reviewed oracle",
+        expected_outcome="CORRECT_ANSWER",
+        oracle=None,
+    )
+
+    async def executor(case: object) -> TypedAnswerReceipt | None:
+        if getattr(case, "case_id", None) == adjudicable_without_receipt.case_id:
+            return None
+        return _receipt()
+
+    report = await run_typed_benchmark(
+        [adjudicable_without_receipt, unknown_with_receipt],
+        manifest=_manifest(run_id="same-case-receipt-coverage"),
+        executor=executor,
+        budget=BudgetGate(max_total_cost=1.0, max_calls=2),
+    )
+
+    results = {result.case_id: result for result in report.results}
+    assert results[adjudicable_without_receipt.case_id].observed_outcome == (
+        "PROVENANCE_FAILURE"
+    )
+    assert results[unknown_with_receipt.case_id].observed_outcome == "UNKNOWN"
+    assert results[unknown_with_receipt.case_id].passed is None
+    assert report.receipts_present == 1
+    assert report.denominators["adjudicated_cases"] == 1
+    assert report.accuracy_established is False
+    assert report.denominators["adjudicated_typed_receipts_present"] == 0
+
+
+@pytest.mark.asyncio
 async def test_typed_runner_rejects_rejection_with_allow_and_accepted_evidence() -> None:
     case = _label_case("CORRECT_REJECTION", case_id="typed-false-rejection").model_copy(
         update={

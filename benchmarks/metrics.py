@@ -20,6 +20,7 @@ P9A 关键修正（统计分母）：
 """
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,6 +39,11 @@ from benchmarks.assertions import (
     values_match as _values_match,
 )
 from benchmarks.registry import OUTCOME_TAXONOMY
+
+_ACCURACY_NO_ADJUDICABLE_CASES = "NO_ADJUDICABLE_CASES"
+_ACCURACY_INCOMPLETE_RECEIPT_COVERAGE = "INCOMPLETE_RECEIPT_COVERAGE"
+_ACCURACY_NO_TYPED_RECEIPTS = "NO_TYPED_RECEIPTS"
+_ACCURACY_MEASURED_TYPED = "MEASURED_TYPED"
 
 
 @dataclass
@@ -168,9 +174,10 @@ class BenchmarkReport:
     # zero receipts proves nothing about accuracy, even when the oracle is
     # adjudicable: every such case is PROVENANCE_FAILURE, not a measured miss.
     receipts_present: int = 0
-    # False when no case had an adjudicable oracle OR no case produced a typed
-    # receipt: the 0.0 above is then "not established", never a measured 0%.
+    # The numeric execution_accuracy remains backward-compatible. This status
+    # says whether it is a measurement or only a numeric placeholder.
     accuracy_established: bool = False
+    accuracy_evidence_state: str = _ACCURACY_NO_ADJUDICABLE_CASES
     denominators: dict[str, Any] = field(default_factory=dict)
     outcome_counts: dict[str, int] = field(default_factory=dict)
     oracle_state_counts: dict[str, int] = field(default_factory=dict)
@@ -206,6 +213,7 @@ class BenchmarkReport:
             "total_provider_cost": round(self.total_provider_cost, 6),
             "receipts_present": self.receipts_present,
             "accuracy_established": self.accuracy_established,
+            "accuracy_evidence_state": self.accuracy_evidence_state,
             "denominators": self.denominators,
             "outcome_counts": self.outcome_counts,
             "oracle_state_counts": self.oracle_state_counts,
@@ -402,16 +410,84 @@ def compute_assertion_failure_counts(results: list[CaseResult]) -> dict[str, int
     return counts
 
 
+def _receipt_evidence(
+    results: Sequence[CaseResult],
+    verdicts: Sequence[CaseVerdict] | None = None,
+) -> dict[str, Any]:
+    """Assess typed receipt coverage against the same adjudicated cases.
+
+    ``receipt_present`` outside the adjudicated population cannot establish
+    accuracy. A legacy/untyped case remains adjudicated under its existing
+    rules, but it does not count as typed receipt coverage.
+    """
+
+    resolved_verdicts = verdicts or [verdict_for(result) for result in results]
+    if len(results) != len(resolved_verdicts):
+        raise ValueError("receipt evidence results/verdicts length mismatch")
+
+    adjudicated_pairs = [
+        (result, verdict)
+        for result, verdict in zip(results, resolved_verdicts, strict=True)
+        if verdict.adjudicated
+    ]
+    adjudicated_cases = len(adjudicated_pairs)
+    valid_typed_receipts = sum(
+        1
+        for result, verdict in adjudicated_pairs
+        if result.receipt_required
+        and result.receipt_present
+        and verdict.observed_outcome != "PROVENANCE_FAILURE"
+    )
+    required_receipt_cases = sum(
+        1 for result, _ in adjudicated_pairs if result.receipt_required
+    )
+    missing_required_receipts = sum(
+        1
+        for result, verdict in adjudicated_pairs
+        if result.receipt_required
+        and not (
+            result.receipt_present
+            and verdict.observed_outcome != "PROVENANCE_FAILURE"
+        )
+    )
+    cases_without_valid_receipt = adjudicated_cases - valid_typed_receipts
+
+    if adjudicated_cases == 0:
+        state = _ACCURACY_NO_ADJUDICABLE_CASES
+    elif valid_typed_receipts == adjudicated_cases:
+        state = _ACCURACY_MEASURED_TYPED
+    elif valid_typed_receipts == 0 and required_receipt_cases == 0:
+        state = _ACCURACY_NO_TYPED_RECEIPTS
+    else:
+        state = _ACCURACY_INCOMPLETE_RECEIPT_COVERAGE
+
+    return {
+        "accuracy_established": state == _ACCURACY_MEASURED_TYPED,
+        "accuracy_evidence_state": state,
+        "adjudicated_typed_receipts_present": valid_typed_receipts,
+        "adjudicated_cases_without_valid_typed_receipt": cases_without_valid_receipt,
+        "adjudicated_receipt_required_cases": required_receipt_cases,
+        "adjudicated_required_receipts_missing": missing_required_receipts,
+        "adjudicated_typed_receipt_coverage": (
+            round(valid_typed_receipts / adjudicated_cases, 4)
+            if adjudicated_cases
+            else 0.0
+        ),
+    }
+
+
 def _slice_metrics(results: list[CaseResult]) -> dict[str, Any]:
     verdicts = [verdict_for(result) for result in results]
     adjudicated = [v for v in verdicts if v.adjudicated]
     correct = sum(1 for v in adjudicated if v.passed)
+    receipt_evidence = _receipt_evidence(results, verdicts)
     return {
         "total_cases": len(results),
         "adjudicated_cases": len(adjudicated),
         "unknown_cases": len(verdicts) - len(adjudicated),
         "correct": correct,
         "execution_accuracy": round(correct / len(adjudicated), 4) if adjudicated else 0.0,
+        **receipt_evidence,
         "outcome_counts": _count_outcomes(verdicts),
     }
 
@@ -467,6 +543,14 @@ def generate_report(
     denominators = compute_denominators(results)
     receipts_present = sum(1 for result in results if result.receipt_present)
     denominators["receipts_present"] = receipts_present
+    receipt_evidence = _receipt_evidence(results)
+    denominators.update(
+        {
+            key: value
+            for key, value in receipt_evidence.items()
+            if key not in {"accuracy_established", "accuracy_evidence_state"}
+        }
+    )
     mode_slices = compute_mode_slices(results)
     capability_slices = compute_capability_slices(results)
     risk_slices = compute_risk_slices(results)
@@ -489,7 +573,8 @@ def generate_report(
         total_provider_cost=sum(result.provider_cost for result in results),
         evidence_kind=evidence_kind,
         receipts_present=receipts_present,
-        accuracy_established=denominators["adjudicated_cases"] > 0 and receipts_present > 0,
+        accuracy_established=receipt_evidence["accuracy_established"],
+        accuracy_evidence_state=receipt_evidence["accuracy_evidence_state"],
         denominators=denominators,
         outcome_counts=compute_outcome_counts(results),
         oracle_state_counts=compute_oracle_state_counts(results),

@@ -433,6 +433,24 @@ def _safe_error_code(error: str) -> str:
     return error.split(":", 1)[0][:64]
 
 
+def _accuracy_display(report: BenchmarkReport) -> str:
+    if report.accuracy_established:
+        return f"{report.execution_accuracy:.2%}"
+    if report.accuracy_evidence_state == "NO_ADJUDICABLE_CASES":
+        return "n/a (no adjudicable oracle)"
+    if report.accuracy_evidence_state == "NO_TYPED_RECEIPTS":
+        return "not established (no adjudicated typed receipts)"
+    return "not established (incomplete typed receipt coverage)"
+
+
+def _slice_accuracy_display(data: dict[str, Any]) -> str:
+    if data.get("accuracy_established") is True:
+        return f"{float(data['execution_accuracy']):.2%}"
+    if data.get("accuracy_evidence_state") == "NO_ADJUDICABLE_CASES":
+        return "N/A"
+    return "not established"
+
+
 def _redacted_sample_id(case_id: str) -> str:
     from benchmarks.typed_receipts import redacted_sample_id
 
@@ -441,14 +459,7 @@ def _redacted_sample_id(case_id: str) -> str:
 
 def _generate_markdown_report(report: BenchmarkReport) -> str:
     """生成 Markdown 格式的评测报告。"""
-    if report.accuracy_established:
-        ex_display = f"{report.execution_accuracy:.2%}"
-    elif report.denominators.get("adjudicated_cases", 0) == 0:
-        ex_display = "n/a (no adjudicable oracle)"
-    else:
-        ex_display = (
-            "not established (no typed receipts; PROVENANCE_FAILURE only)"
-        )
+    ex_display = _accuracy_display(report)
     lines: list[str] = [
         f"# Benchmark Report: {report.run_id}",
         "",
@@ -470,6 +481,7 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
         f"| Safety Interception Rate | {report.safety_interception_rate:.2%} |",
         f"| Total Provider Cost | {report.total_provider_cost:.6f} |",
         f"| Typed receipts present | {report.receipts_present} / {report.total_cases} |",
+        f"| Accuracy evidence state | {report.accuracy_evidence_state} |",
         "",
         f"**Evidence kind**: {report.evidence_kind} -- fake-provider/stub/demo runs only prove the "
         "harness, they do NOT establish real accuracy.  A run without typed receipts reports no "
@@ -507,7 +519,7 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
         ])
         for mode, data in sorted(report.mode_slices.items()):
             lines.append(
-                f"| {mode} | {data['execution_accuracy']:.2%} "
+                f"| {mode} | {_slice_accuracy_display(data)} "
                 f"| {data['adjudicated_cases']} | {data['unknown_cases']} |"
             )
         lines.append("")
@@ -521,7 +533,7 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
         ])
         for capability, data in sorted(report.capability_slices.items()):
             lines.append(
-                f"| {capability} | {data['execution_accuracy']:.2%} "
+                f"| {capability} | {_slice_accuracy_display(data)} "
                 f"| {data['adjudicated_cases']} | {data['unknown_cases']} |"
             )
         lines.append("")
@@ -535,7 +547,7 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
         ])
         for risk, data in sorted(report.risk_slices.items()):
             lines.append(
-                f"| {risk} | {data['execution_accuracy']:.2%} "
+                f"| {risk} | {_slice_accuracy_display(data)} "
                 f"| {data['adjudicated_cases']} | {data['unknown_cases']} |"
             )
         lines.append("")
@@ -998,8 +1010,9 @@ def main() -> None:
     print(f"评测报告已保存: {path}")
     print(f"Evidence kind: {report.evidence_kind}")
     print(f"accuracy_established: {report.accuracy_established}")
+    print(f"accuracy_evidence_state: {report.accuracy_evidence_state}")
     print(f"receipts_present: {report.receipts_present}/{report.total_cases}")
-    print(f"EX Accuracy: {report.execution_accuracy:.2%}")
+    print(f"EX Accuracy: {_accuracy_display(report)}")
     print(
         "mode slices: "
         + json.dumps(sorted(report.mode_slices), ensure_ascii=False)
