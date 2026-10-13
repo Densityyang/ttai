@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,10 +47,28 @@ from benchmarks.metrics import (
     generate_report,
     statistical_significance,
 )
-from benchmarks.registry import ASSERTION_VERSION, ORACLE_VERSION, EvalCase
-from benchmarks.selection import SelectionPlan, manifest_selection_fields, select_cases
+from benchmarks.registry import (
+    ASSERTION_VERSION,
+    ORACLE_VERSION,
+    EvalCase,
+    canonical_json,
+    case_set_checksum,
+    dedupe_cases,
+    sha256_hex,
+)
+from benchmarks.selection import (
+    SELECTION_VERSION,
+    SelectionPlan,
+    SelectionRun,
+    case_key,
+    is_shared_regression_case,
+    manifest_selection_fields,
+    select_cases,
+    verify_selection_checksum,
+)
 from benchmarks.typed_receipts import (
     BenchmarkManifest,
+    BudgetExceeded,
     BudgetGate,
     TypedAnswerReceipt,
     mcnemar_exact,
@@ -73,6 +92,22 @@ TypedExecutor = Callable[[CaseInput], Awaitable[TypedAnswerReceipt | None]]
 # the old semantics only.
 TYPED_RECEIPT_REQUIRED = True
 LEGACY_RECEIPT_REQUIRED = False
+DEFAULT_EXECUTOR_INVOCATIONS = 10_000
+
+
+@dataclass
+class ExecutorInvocationBudget:
+    """Independent cap for executor invocations, including zero-call receipts."""
+
+    max_invocations: int = DEFAULT_EXECUTOR_INVOCATIONS
+    invocations_used: int = 0
+
+    def precheck(self) -> None:
+        if self.invocations_used >= self.max_invocations:
+            raise BudgetExceeded("benchmark budget exhausted: executor invocation limit")
+
+    def consume(self) -> None:
+        self.invocations_used += 1
 
 
 # ── A/B/C 对照实验预置配置 ────────────────────────────────────────────────────
@@ -270,6 +305,8 @@ async def run_typed_benchmark(
     executor: TypedExecutor,
     budget: BudgetGate,
     evidence_kind: str | None = None,
+    invocation_budget: ExecutorInvocationBudget | None = None,
+    partial_on_budget_exhaustion: bool = False,
 ) -> BenchmarkReport:
     """Run a benchmark from structured receipts, never parsed answer prose.
 
@@ -282,15 +319,36 @@ async def run_typed_benchmark(
     cannot inflate a number by being counted as a success.
     """
     results: list[CaseResult] = []
+    resolved_invocation_budget = invocation_budget or ExecutorInvocationBudget()
+    starting_invocations = resolved_invocation_budget.invocations_used
+    budget_exhaustion_phase: str | None = None
+    budget_exhaustion_reason: str | None = None
     for item in cases:
         benchmark_case, eval_case = _split_case(item)
         should_reject = (
             benchmark_case.should_reject
             or eval_case.expected_outcome == "CORRECT_REJECTION"
         )
-        # S6: check the budget BEFORE the executor is ever awaited, so an
-        # over-budget case cannot spend a provider call.
-        budget.precheck(estimated_calls=1)
+        # Both gates run before every invocation. The independent invocation
+        # cap also accounts for executors that return a receipt with no model
+        # calls, which must not bypass the run budget.
+        try:
+            resolved_invocation_budget.precheck()
+        except BudgetExceeded:
+            if not partial_on_budget_exhaustion:
+                raise
+            budget_exhaustion_phase = "before_executor_invocation"
+            budget_exhaustion_reason = "executor_invocation_limit"
+            break
+        try:
+            budget.precheck(estimated_calls=1)
+        except BudgetExceeded:
+            if not partial_on_budget_exhaustion:
+                raise
+            budget_exhaustion_phase = "before_executor_invocation"
+            budget_exhaustion_reason = "provider_budget_exhausted"
+            break
+        resolved_invocation_budget.consume()
         receipt = await executor(item)
         if receipt is None:
             results.append(
@@ -330,7 +388,20 @@ async def run_typed_benchmark(
             )
             continue
         validate_receipt(receipt)
-        budget.consume(receipt)
+        receipt_cost = sum(call.estimated_cost for call in receipt.model_calls)
+        receipt_calls = len(receipt.model_calls)
+        budget_overrun = False
+        try:
+            budget.consume(receipt)
+        except BudgetExceeded:
+            if not partial_on_budget_exhaustion:
+                raise
+            # The receipt proves this invocation already happened. Preserve
+            # its actual use, mark the report incomplete, and stop before any
+            # further selected occurrence is invoked.
+            budget.cost_used += receipt_cost
+            budget.calls_used += receipt_calls
+            budget_overrun = True
         successful = receipt.execution_accepted and receipt.answer_type == "answer"
         if should_reject:
             successful = receipt.answer_type == "rejected" and receipt.policy_outcome == "deny"
@@ -348,7 +419,7 @@ async def run_typed_benchmark(
             was_intercepted=receipt.answer_type == "rejected",
             trace_id=receipt.trace_id,
             answer_receipt=receipt.model_dump(mode="json"),
-            provider_cost=sum(call.estimated_cost for call in receipt.model_calls),
+            provider_cost=receipt_cost,
             expected_outcome=eval_case.expected_outcome,
             oracle_state=eval_case.oracle_state,
             mode=eval_case.mode,
@@ -375,9 +446,44 @@ async def run_typed_benchmark(
             expected_row_count=receipt.expected_row_count,
         )
         results.append(adjudicate_case_result(result))
+        if budget_overrun:
+            budget_exhaustion_phase = "after_executor_receipt"
+            budget_exhaustion_reason = "provider_budget_exhausted"
+            break
     resolved_kind = evidence_kind or getattr(executor, "evidence_kind", "harness")
     report = generate_report(manifest.run_id, results, evidence_kind=resolved_kind)
     report.manifest = manifest.model_dump(mode="json")
+    if budget_exhaustion_phase is not None:
+        report.execution_status = "PARTIAL_BUDGET_EXHAUSTED"
+        report.execution_evidence = {
+            "status": report.execution_status,
+            "budget_exhaustion_phase": budget_exhaustion_phase,
+            "budget_exhaustion_reason": budget_exhaustion_reason,
+            "planned_occurrences": len(cases),
+            "executed_occurrences": len(results),
+            "unexecuted_occurrences": len(cases) - len(results),
+            "executor_invocations": (
+                resolved_invocation_budget.invocations_used - starting_invocations
+            ),
+            "executor_invocation_limit": resolved_invocation_budget.max_invocations,
+            "provider_call_limit": budget.max_calls,
+            "provider_call_overrun": max(0, budget.calls_used - budget.max_calls),
+            "provider_cost_limit": budget.max_total_cost,
+            "provider_cost_overrun": round(
+                max(0.0, budget.cost_used - budget.max_total_cost), 6
+            ),
+        }
+        report.accuracy_established = False
+        report.accuracy_evidence_state = "PARTIAL_EXECUTION"
+        for slices in (
+            report.mode_slices,
+            report.capability_slices,
+            report.risk_slices,
+        ):
+            for data in slices.values():
+                if data["adjudicated_cases"] > 0:
+                    data["accuracy_established"] = False
+                    data["accuracy_evidence_state"] = "PARTIAL_EXECUTION"
     return report
 
 
@@ -406,6 +512,18 @@ def save_report(report: BenchmarkReport, output_dir: Path | None = None) -> Path
             "latency_ms": round(r.latency_ms, 1),
             "error_code": _safe_error_code(r.execution_error),
             "trace_id": r.trace_id,
+            **(
+                {
+                    "case_identity_sha256": r.case_identity_sha256,
+                    "selection_checksum": r.selection_checksum,
+                    "repetition_index": r.repetition_index,
+                    "repetition_seed": r.repetition_seed,
+                    "repetition_checksum": r.repetition_checksum,
+                    "execution_run_id": r.execution_run_id,
+                }
+                if r.execution_run_id
+                else {}
+            ),
         }
         for r in report.results
     ]
@@ -434,6 +552,8 @@ def _safe_error_code(error: str) -> str:
 
 
 def _accuracy_display(report: BenchmarkReport) -> str:
+    if report.execution_status != "COMPLETE":
+        return "not established (partial execution; budget exhausted)"
     if report.accuracy_established:
         return f"{report.execution_accuracy:.2%}"
     if report.accuracy_evidence_state == "NO_ADJUDICABLE_CASES":
@@ -480,6 +600,7 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
         f"| P95 Latency | {report.p95_latency_ms:.0f} ms |",
         f"| Safety Interception Rate | {report.safety_interception_rate:.2%} |",
         f"| Total Provider Cost | {report.total_provider_cost:.6f} |",
+        f"| Execution state | {report.execution_status} |",
         f"| Typed receipts present | {report.receipts_present} / {report.total_cases} |",
         f"| Accuracy evidence state | {report.accuracy_evidence_state} |",
         "",
@@ -492,6 +613,40 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
         f"**Registry revision**: {report.manifest.get('registry_revision', '')}",
         "",
     ]
+
+    execution_evidence = report.execution_evidence
+    if execution_evidence:
+        lines.extend(
+            [
+                "## Repetition Execution",
+                "",
+                f"- Status: {execution_evidence.get('status', report.execution_status)}",
+                f"- Selection checksum: {execution_evidence.get('selection_checksum', '')}",
+                f"- Requested repetitions: {execution_evidence.get('requested_repetitions', 0)}",
+                f"- Completed repetitions: {execution_evidence.get('completed_repetitions', 0)}",
+                f"- Executed occurrences: {execution_evidence.get('executed_occurrences', 0)} / "
+                f"{execution_evidence.get('planned_occurrences', 0)}",
+                f"- Executor invocations: {execution_evidence.get('executor_invocations', 0)}",
+                f"- Executor invocation limit: {execution_evidence.get('executor_invocation_limit', 0)}",
+                f"- Provider calls: {execution_evidence.get('provider_calls', 0)}",
+                f"- Provider call limit: {execution_evidence.get('provider_call_limit', 0)}",
+                f"- Provider call overrun: {execution_evidence.get('provider_call_overrun', 0)}",
+                f"- Provider cost limit: {execution_evidence.get('provider_cost_limit', 0)}",
+                f"- Provider cost overrun: {execution_evidence.get('provider_cost_overrun', 0)}",
+                "",
+                "| Repetition | Seed | Run checksum | Execution run ID | Executed / planned | Invocations | Calls | Cost | Status |",
+                "|------------|------|---------------|------------------|--------------------|-------------|-------|------|--------|",
+            ]
+        )
+        for run in execution_evidence.get("runs", []):
+            lines.append(
+                f"| {run.get('repetition_index', '')} | {run.get('repetition_seed', '')} "
+                f"| {run.get('repetition_checksum', '')} | {run.get('execution_run_id', '')} "
+                f"| {run.get('executed_occurrences', 0)} / {run.get('planned_occurrences', 0)} "
+                f"| {run.get('executor_invocations', 0)} | {run.get('provider_calls', 0)} "
+                f"| {run.get('provider_cost', 0.0):.6f} | {run.get('status', '')} |"
+            )
+        lines.append("")
 
     denominators = report.denominators
     if denominators:
@@ -807,6 +962,266 @@ def build_manifest(
     )
 
 
+def _expected_selection_run_seed(plan: SelectionPlan, index: int) -> int:
+    digest = sha256_hex(f"{plan.selection_version}:{plan.seed}:{index}")
+    return int(digest[:8], 16)
+
+
+def _expected_selection_run_checksum(
+    plan: SelectionPlan, run: SelectionRun
+) -> str:
+    return sha256_hex(
+        canonical_json(
+            {
+                "selection_version": plan.selection_version,
+                "index": run.index,
+                "seed": run.seed,
+                "case_keys": list(run.case_keys),
+            }
+        )
+    )
+
+
+def _case_identity_sha256(case: EvalCase) -> str:
+    return sha256_hex(
+        canonical_json(
+            {"case_id": case.case_id, "revision": case.revision, "mode": case.mode}
+        )
+    )
+
+
+def _validate_eval_case_identities(cases: Sequence[EvalCase]) -> None:
+    revisions_by_key: dict[str, str] = {}
+    for case in cases:
+        key = case_key(case)
+        prior_revision = revisions_by_key.get(key)
+        if prior_revision is not None and prior_revision != case.revision:
+            raise ValueError(
+                "dataset has conflicting revisions for one case/mode selection key"
+            )
+        revisions_by_key[key] = case.revision
+
+
+def _execution_run_id(
+    manifest_run_id: str, plan: SelectionPlan, run: SelectionRun
+) -> str:
+    return "rep-" + sha256_hex(
+        canonical_json(
+            {
+                "manifest_run_id": manifest_run_id,
+                "selection_checksum": plan.checksum,
+                "repetition_index": run.index,
+                "repetition_seed": run.seed,
+                "repetition_checksum": run.checksum,
+            }
+        )
+    )[:24]
+
+
+def _validate_selection_plan_for_execution(
+    plan: SelectionPlan,
+    *,
+    source_cases: Sequence[EvalCase],
+) -> dict[str, EvalCase]:
+    if not verify_selection_checksum(plan):
+        raise ValueError("selection plan checksum mismatch")
+    if plan.selection_version != SELECTION_VERSION:
+        raise ValueError("unsupported selection plan version")
+    if plan.repetitions != len(plan.runs):
+        raise ValueError("selection repetition count does not match its run list")
+
+    reviewed_source = dedupe_cases(source_cases)
+    if plan.dataset_checksum != case_set_checksum(reviewed_source):
+        raise ValueError("selection plan dataset checksum does not match its source cases")
+    source_by_key = {case_key(case): case for case in reviewed_source}
+    mandatory_shared_keys = tuple(
+        case_key(case) for case in reviewed_source if is_shared_regression_case(case)
+    )
+    if plan.shared_regression_keys != mandatory_shared_keys:
+        raise ValueError("selection plan shared regression keys do not match source cases")
+
+    cases_by_key: dict[str, EvalCase] = {}
+    for case in plan.cases:
+        key = case_key(case)
+        if key in cases_by_key:
+            raise ValueError("selection plan has duplicate case/mode identity")
+        source_case = source_by_key.get(key)
+        if source_case is None or source_case.revision != case.revision:
+            raise ValueError("selection plan case identity/revision differs from source cases")
+        cases_by_key[key] = case
+
+    planned_case_keys = plan.case_keys()
+    if not set(mandatory_shared_keys) <= set(planned_case_keys):
+        raise ValueError("selection plan omits mandatory shared regression coverage")
+    if plan.conservative and set(planned_case_keys) != set(source_by_key):
+        raise ValueError("conservative selection plan must retain full source coverage")
+
+    for expected_index, run in enumerate(plan.runs):
+        if run.index != expected_index:
+            raise ValueError("selection run indexes are not contiguous")
+        if run.seed != _expected_selection_run_seed(plan, expected_index):
+            raise ValueError("selection run seed does not match the verified plan")
+        if run.checksum != _expected_selection_run_checksum(plan, run):
+            raise ValueError("selection run checksum mismatch")
+        if len(run.case_keys) != len(set(run.case_keys)):
+            raise ValueError("selection run repeats a case/mode occurrence")
+        if not set(run.case_keys) <= cases_by_key.keys():
+            raise ValueError("selection run refers to a case outside the verified plan")
+        if not set(mandatory_shared_keys) <= set(run.case_keys):
+            raise ValueError("selection run omits mandatory shared regression coverage")
+        if run.case_keys != planned_case_keys:
+            raise ValueError("selection run omits or reorders a selected occurrence")
+    return cases_by_key
+
+
+async def _execute_typed_selection_plan(
+    plan: SelectionPlan,
+    *,
+    source_cases: Sequence[EvalCase],
+    manifest: BenchmarkManifest,
+    executor: TypedExecutor,
+    budget: BudgetGate,
+    max_executor_invocations: int = DEFAULT_EXECUTOR_INVOCATIONS,
+) -> BenchmarkReport:
+    """Execute exactly the verified occurrences named by each SelectionRun."""
+    cases_by_key = _validate_selection_plan_for_execution(
+        plan, source_cases=source_cases
+    )
+    invocation_budget = ExecutorInvocationBudget(max_executor_invocations)
+    all_results: list[CaseResult] = []
+    run_evidence: list[dict[str, Any]] = []
+    budget_exhausted = False
+    planned_occurrences = sum(len(run.case_keys) for run in plan.runs)
+
+    for run_position, selected_run in enumerate(plan.runs):
+        run_cases = [cases_by_key[key] for key in selected_run.case_keys]
+        execution_run_id = _execution_run_id(manifest.run_id, plan, selected_run)
+        run_manifest = manifest.model_copy(update={"run_id": execution_run_id})
+
+        if budget_exhausted:
+            run_evidence.append(
+                {
+                    "status": "NOT_STARTED_BUDGET_EXHAUSTED",
+                    "repetition_index": selected_run.index,
+                    "repetition_seed": selected_run.seed,
+                    "repetition_checksum": selected_run.checksum,
+                    "execution_run_id": execution_run_id,
+                    "planned_occurrences": len(run_cases),
+                    "executed_occurrences": 0,
+                    "unexecuted_occurrences": len(run_cases),
+                    "executor_invocations": 0,
+                    "provider_calls": 0,
+                    "provider_cost": 0.0,
+                    "unexecuted_occurrence_sha256": [
+                        _case_identity_sha256(case) for case in run_cases
+                    ],
+                }
+            )
+            continue
+
+        invocations_before = invocation_budget.invocations_used
+        provider_calls_before = budget.calls_used
+        provider_cost_before = budget.cost_used
+        run_report = await run_typed_benchmark(
+            run_cases,
+            manifest=run_manifest,
+            executor=executor,
+            budget=budget,
+            invocation_budget=invocation_budget,
+            partial_on_budget_exhaustion=True,
+        )
+        completed_cases = run_cases[: len(run_report.results)]
+        for case, result in zip(completed_cases, run_report.results, strict=True):
+            result.case_identity_sha256 = _case_identity_sha256(case)
+            result.selection_checksum = plan.checksum
+            result.repetition_index = selected_run.index
+            result.repetition_seed = selected_run.seed
+            result.repetition_checksum = selected_run.checksum
+            result.execution_run_id = execution_run_id
+
+        unexecuted_cases = run_cases[len(run_report.results) :]
+        run_status = run_report.execution_status
+        run_evidence.append(
+            {
+                "status": run_status,
+                "repetition_index": selected_run.index,
+                "repetition_seed": selected_run.seed,
+                "repetition_checksum": selected_run.checksum,
+                "execution_run_id": execution_run_id,
+                "planned_occurrences": len(run_cases),
+                "executed_occurrences": len(run_report.results),
+                "unexecuted_occurrences": len(unexecuted_cases),
+                "executor_invocations": (
+                    invocation_budget.invocations_used - invocations_before
+                ),
+                "provider_calls": budget.calls_used - provider_calls_before,
+                "provider_cost": round(budget.cost_used - provider_cost_before, 6),
+                "provider_call_overrun": max(0, budget.calls_used - budget.max_calls),
+                "provider_cost_overrun": round(
+                    max(0.0, budget.cost_used - budget.max_total_cost), 6
+                ),
+                "unexecuted_occurrence_sha256": [
+                    _case_identity_sha256(case) for case in unexecuted_cases
+                ],
+                "budget_exhaustion_phase": run_report.execution_evidence.get(
+                    "budget_exhaustion_phase"
+                ),
+                "budget_exhaustion_reason": run_report.execution_evidence.get(
+                    "budget_exhaustion_reason"
+                ),
+            }
+        )
+        all_results.extend(run_report.results)
+        if run_status != "COMPLETE":
+            budget_exhausted = True
+
+    report = generate_report(
+        manifest.run_id,
+        all_results,
+        evidence_kind=getattr(executor, "evidence_kind", "harness"),
+    )
+    report.manifest = manifest.model_dump(mode="json")
+    report.execution_status = (
+        "PARTIAL_BUDGET_EXHAUSTED" if budget_exhausted else "COMPLETE"
+    )
+    report.execution_evidence = {
+        "status": report.execution_status,
+        "selection_checksum": plan.checksum,
+        "selection_version": plan.selection_version,
+        "requested_repetitions": plan.repetitions,
+        "completed_repetitions": sum(
+            1 for run in run_evidence if run["status"] == "COMPLETE"
+        ),
+        "planned_occurrences": planned_occurrences,
+        "executed_occurrences": len(all_results),
+        "unexecuted_occurrences": planned_occurrences - len(all_results),
+        "executor_invocations": invocation_budget.invocations_used,
+        "executor_invocation_limit": invocation_budget.max_invocations,
+        "provider_calls": budget.calls_used,
+        "provider_call_limit": budget.max_calls,
+        "provider_call_overrun": max(0, budget.calls_used - budget.max_calls),
+        "provider_cost": round(budget.cost_used, 6),
+        "provider_cost_limit": budget.max_total_cost,
+        "provider_cost_overrun": round(
+            max(0.0, budget.cost_used - budget.max_total_cost), 6
+        ),
+        "runs": run_evidence,
+    }
+    if budget_exhausted:
+        report.accuracy_established = False
+        report.accuracy_evidence_state = "PARTIAL_EXECUTION"
+        for slices in (
+            report.mode_slices,
+            report.capability_slices,
+            report.risk_slices,
+        ):
+            for data in slices.values():
+                if data["adjudicated_cases"] > 0:
+                    data["accuracy_established"] = False
+                    data["accuracy_evidence_state"] = "PARTIAL_EXECUTION"
+    return report
+
+
 def build_typed_executor(
     typed_runtime: str,
 ) -> ExecutorAdapter | UnavailableTypedExecutor:
@@ -835,12 +1250,14 @@ def run_typed_dataset(
     max_cases: int | None = None,
     typed_runtime: str = "production",
     run_id: str | None = None,
+    max_executor_invocations: int = DEFAULT_EXECUTOR_INVOCATIONS,
 ) -> tuple[BenchmarkReport, SelectionPlan]:
     """Load, select, and run one typed benchmark.  Used by the CLI and tests."""
     benchmark_cases = load_cases(dataset, max_cases=None)
     if not benchmark_cases:
         raise RuntimeError(f"数据集 {dataset} 为空")
     eval_cases = to_eval_cases(benchmark_cases)
+    _validate_eval_case_identities(eval_cases)
     plan = select_cases(
         eval_cases,
         changes=changes,
@@ -848,18 +1265,21 @@ def run_typed_dataset(
         repetitions=repetitions,
         max_cases=max_cases,
     )
+    _validate_selection_plan_for_execution(plan, source_cases=eval_cases)
     executor = build_typed_executor(typed_runtime)
     resolved_run_id = run_id or f"p9a-typed-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     manifest = build_manifest(run_id=resolved_run_id, plan=plan, dataset=dataset)
     report = asyncio.run(
-        run_typed_benchmark(
-            plan.cases,
+        _execute_typed_selection_plan(
+            plan,
+            source_cases=eval_cases,
             manifest=manifest,
             executor=executor,
             budget=BudgetGate(
                 max_total_cost=DEFAULT_BUDGET_COST,
                 max_calls=DEFAULT_BUDGET_CALLS,
             ),
+            max_executor_invocations=max_executor_invocations,
         )
     )
     return report, plan
@@ -969,6 +1389,7 @@ def main() -> None:
         print(f"数据集 {args.dataset} 为空，请先下载数据")
         return
     eval_cases = to_eval_cases(benchmark_cases)
+    _validate_eval_case_identities(eval_cases)
     plan = select_cases(
         eval_cases,
         changes=args.change or [],
@@ -976,6 +1397,7 @@ def main() -> None:
         repetitions=args.repetitions,
         max_cases=args.max_cases,
     )
+    _validate_selection_plan_for_execution(plan, source_cases=eval_cases)
     print("[路径] typed")
     print(
         f"selection: reason={plan.reason} checksum={plan.checksum} "
@@ -995,8 +1417,9 @@ def main() -> None:
     resolved_run_id = args.run_id or f"p9a-typed-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     manifest = build_manifest(run_id=resolved_run_id, plan=plan, dataset=args.dataset)
     report = asyncio.run(
-        run_typed_benchmark(
-            plan.cases,
+        _execute_typed_selection_plan(
+            plan,
+            source_cases=eval_cases,
             manifest=manifest,
             executor=executor,
             budget=BudgetGate(
@@ -1009,6 +1432,13 @@ def main() -> None:
     print(f"typed-runtime: {args.typed_runtime}")
     print(f"评测报告已保存: {path}")
     print(f"Evidence kind: {report.evidence_kind}")
+    print(f"execution_status: {report.execution_status}")
+    if report.execution_evidence:
+        print(
+            "repetition occurrences: "
+            f"{report.execution_evidence.get('executed_occurrences', 0)}/"
+            f"{report.execution_evidence.get('planned_occurrences', 0)}"
+        )
     print(f"accuracy_established: {report.accuracy_established}")
     print(f"accuracy_evidence_state: {report.accuracy_evidence_state}")
     print(f"receipts_present: {report.receipts_present}/{report.total_cases}")

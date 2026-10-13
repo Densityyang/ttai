@@ -35,7 +35,7 @@ from benchmarks.registry import (
     sha256_hex,
 )
 
-SELECTION_VERSION: Final[str] = "p9a-selection-1.0"
+SELECTION_VERSION: Final[str] = "p9a-selection-1.1"
 
 # ── change -> capability ────────────────────────────────────────────────────
 # A change id names the subsystem a PR touched.  Mapping it onto the
@@ -146,7 +146,7 @@ def _repetition_seed(seed: int, index: int) -> int:
 
 @dataclass(frozen=True)
 class SelectionRun:
-    """One repetition of the selected case set."""
+    """One repetition of the stable selected population."""
 
     index: int
     seed: int
@@ -289,10 +289,10 @@ def select_cases(
     ordered_selected = sorted(selected, key=lambda case: (case.case_id, case.mode))
     for index in range(repetitions):
         run_seed = _repetition_seed(seed, index)
-        run_cases = _sample_sorted(ordered_selected, max_cases=max_cases, seed=run_seed)
-        if undetermined:
-            # The conservative branch never samples down.
-            run_cases = tuple(ordered_selected)
+        # max_cases samples the optional capability-matched population above.
+        # Repetitions execute that reviewed population as-is so mandatory
+        # shared/high-risk cases cannot disappear under a second per-run cap.
+        run_cases = tuple(ordered_selected)
         run_keys = tuple(case_key(case) for case in run_cases)
         runs.append(
             SelectionRun(

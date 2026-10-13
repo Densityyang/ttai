@@ -107,6 +107,14 @@ class CaseResult:
     observed_plan_checksum: str | None = None
     expected_row_count: int | None = None
     observed_terminal: str = ""
+    # P9A repetition provenance. Raw case identity stays in memory only; report
+    # output uses case_identity_sha256 plus the run/selection coordinates.
+    case_identity_sha256: str = ""
+    selection_checksum: str = ""
+    repetition_index: int | None = None
+    repetition_seed: int | None = None
+    repetition_checksum: str = ""
+    execution_run_id: str = ""
 
     def to_observation(self) -> CaseObservation:
         return CaseObservation(
@@ -188,6 +196,8 @@ class BenchmarkReport:
     mode_slices: dict[str, dict[str, Any]] = field(default_factory=dict)
     capability_slices: dict[str, dict[str, Any]] = field(default_factory=dict)
     risk_slices: dict[str, dict[str, Any]] = field(default_factory=dict)
+    execution_status: str = "COMPLETE"
+    execution_evidence: dict[str, Any] = field(default_factory=dict)
 
     def for_mode(self, mode: str) -> dict[str, Any]:
         """One report can be sliced into three modes without a second run."""
@@ -224,6 +234,8 @@ class BenchmarkReport:
             "mode_slices": self.mode_slices,
             "capability_slices": self.capability_slices,
             "risk_slices": self.risk_slices,
+            "execution_status": self.execution_status,
+            "execution_evidence": self.execution_evidence,
         }
 
 

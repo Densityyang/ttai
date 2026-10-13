@@ -35,7 +35,9 @@ from benchmarks.registry import (
     ORACLE_VERSION,
     CaseOracle,
     EvalCase,
+    canonical_json,
     case_set_checksum,
+    sha256_hex,
 )
 from benchmarks.runner import (
     build_manifest,
@@ -365,7 +367,7 @@ def test_cli_default_is_typed_and_never_calls_a_legacy_text_parser(
     payload = json.loads(reports[0].read_text(encoding="utf-8"))
     assert payload["evidence_kind"] == "typed_runtime_unavailable"
     assert payload["manifest"]["case_selection_checksum"]
-    assert payload["manifest"]["selection_version"] == "p9a-selection-1.0"
+    assert payload["manifest"]["selection_version"] == "p9a-selection-1.1"
 
 
 def test_cli_legacy_bridge_is_explicit_and_labelled(
@@ -462,6 +464,46 @@ def test_change_maps_to_capability_and_selects_the_affected_cases() -> None:
     assert set(plan.shared_regression_keys) <= keys
 
 
+def test_mapped_repetitions_keep_shared_coverage_outside_max_case_cap() -> None:
+    cases = [
+        _eval_case(f"fetch-{index}", capability="fetch") for index in range(5)
+    ] + [
+        _eval_case("safety", capability="safety", outcome="CORRECT_REJECTION"),
+        _eval_case("high-risk", capability="compute", risk="high"),
+        _eval_case("cross-cutting", capability="build", tags=("shared_regression",)),
+    ]
+
+    plan = select_cases(
+        cases,
+        changes=["fetch"],
+        seed=31,
+        repetitions=4,
+        max_cases=1,
+    )
+
+    mandatory = set(plan.shared_regression_keys)
+    assert plan.reason == MAPPED_REASON
+    assert plan.max_cases == 1
+    assert len(plan.cases) > plan.max_cases
+    assert mandatory == {"safety::QUERY", "high-risk::QUERY", "cross-cutting::QUERY"}
+    assert verify_selection_checksum(plan)
+    assert len({run.seed for run in plan.runs}) == len(plan.runs)
+    assert all(run.case_keys == plan.case_keys() for run in plan.runs)
+    assert all(mandatory <= set(run.case_keys) for run in plan.runs)
+    for run in plan.runs:
+        expected_checksum = sha256_hex(
+            canonical_json(
+                {
+                    "selection_version": plan.selection_version,
+                    "index": run.index,
+                    "seed": run.seed,
+                    "case_keys": list(run.case_keys),
+                }
+            )
+        )
+        assert run.checksum == expected_checksum
+
+
 def test_shared_case_is_deduplicated_but_mode_variants_stay() -> None:
     shared_query = _eval_case("dup", mode="QUERY", capability="build")
     shared_build = _eval_case("dup", mode="BUILD", capability="build")
@@ -518,6 +560,7 @@ def test_unknown_scope_widens_to_the_full_regression_not_a_guess() -> None:
     assert unknown.sampling_skipped is True
     assert conservative_covers_safety_subset(unknown, cases)
     assert set(unknown.case_keys()) > set(unknown.shared_regression_keys)
+    assert all(run.case_keys == unknown.case_keys() for run in unknown.runs)
 
     empty = select_cases(cases, max_cases=2)
     assert empty.reason == CONSERVATIVE_REASON
