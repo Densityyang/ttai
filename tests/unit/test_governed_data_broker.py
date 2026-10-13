@@ -555,9 +555,28 @@ def test_compiler_cannot_alias_sensitive_source_column_into_sandbox_data() -> No
             "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id "
             "FETCH FIRST 1 ROW ONLY) AS limited_sales"
         ),
+        (
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id "
+            "ORDER BY s.amount OFFSET 1"
+        ),
+        (
+            "WITH offset_sales AS ("
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id "
+            "ORDER BY s.amount OFFSET 1) "
+            "SELECT offset_sales.amount AS amount, offset_sales.region AS region "
+            "FROM offset_sales"
+        ),
+        (
+            "SELECT offset_sales.amount AS amount, offset_sales.region AS region "
+            "FROM (SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id "
+            "ORDER BY s.amount OFFSET 1) AS offset_sales"
+        ),
     ],
 )
-def test_nested_cte_and_subquery_limits_cannot_mark_partial_data_complete(sql: str) -> None:
+def test_nested_cte_subquery_limits_and_offsets_cannot_mark_partial_data_complete(sql: str) -> None:
     request = _request()
     authorization = _authorization(request)
     effective_scope = derive_effective_scope(request, authorization)

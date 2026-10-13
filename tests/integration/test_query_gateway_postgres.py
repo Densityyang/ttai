@@ -630,6 +630,33 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
             await counterfactual_broker.request_dataset(_p5_broker_request())
         assert (len(audit.starts), len(audit.results)) == audit_counts_before_broker
 
+        offset_request = _p5_broker_request()
+        offset_authorization = await _Pg17FixtureAuthority().verify_request(offset_request)
+        offset_scope = derive_effective_scope(offset_request, offset_authorization)
+        base_compiled = _Pg17FixtureCompiler(gateway).compile_request(
+            offset_request,
+            offset_authorization,
+            offset_scope,
+        )
+        offset_sql = f"{base_compiled.sql} OFFSET 1"
+        direct_offset = await gateway.execute(
+            offset_sql,
+            {"owner_user_id": "owner-a"},
+            trace_id="test-only-offset-counterfactual",
+        )
+        assert direct_offset.accepted
+        assert direct_offset.row_count == 2
+
+        audit_counts_before_offset_broker = (len(audit.starts), len(audit.results))
+        offset_broker = GovernedDataBroker(
+            authority=_Pg17FixtureAuthority(),
+            compiler=_Pg17FixtureCompiler(gateway, sql_override=offset_sql),
+            executor=QueryGatewayDataExecutor(gateway),
+        )
+        with pytest.raises(DataRequestDenied):
+            await offset_broker.request_dataset(_p5_broker_request())
+        assert (len(audit.starts), len(audit.results)) == audit_counts_before_offset_broker
+
         with pytest.raises(DataRequestDenied):
             await broker.request_dataset(_p5_broker_request(max_rows=1))
         assert audit.results[-1]["error_code"] == QueryErrorCode.ROWS_EXCEEDED

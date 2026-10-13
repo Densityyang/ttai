@@ -313,6 +313,7 @@ def _validate_compiled_query(
         if (
             scope.expression.args.get("limit") is not None
             or scope.expression.args.get("fetch") is not None
+            or scope.expression.args.get("offset") is not None
         ):
             raise DataRequestDenied()
         physical_tables = _physical_tables(scope)
