@@ -8,8 +8,11 @@ from pydantic import ValidationError
 
 from src.nl2sql.config.settings import AgentConfig
 from src.nl2sql.infra.governance.data_broker import (
+    CompiledGovernedQuery,
     DataBrokerUnavailable,
     GovernedDataBroker,
+    _parameter_binding_fingerprint,
+    _validate_compiled_query,
 )
 from src.nl2sql.orchestration.data_request import (
     AuthorizedDataScope,
@@ -22,6 +25,7 @@ from src.nl2sql.orchestration.data_request import (
     FrozenDataset,
     FrozenRow,
     GovernedSQLCandidate,
+    OwnerRowScope,
     QueryGatewayReceiptReference,
     RelationColumnScope,
     RelationIdentity,
@@ -38,7 +42,6 @@ from src.nl2sql.orchestration.p5_runtime_readiness import assess_p5_runtime_read
 REQUEST_ID = UUID("00000000-0000-4000-8000-000000000002")
 RECEIPT_ID = UUID("00000000-0000-4000-8000-000000000003")
 QUERY_FINGERPRINT = "a" * 64
-PARAMETER_FINGERPRINT = "b" * 64
 
 
 def _scope(
@@ -80,6 +83,7 @@ def _authorization(
     owner: str | None = None,
     scope: AuthorizedDataScope | None = None,
 ) -> VerifiedDataAuthorization:
+    authorized_scope = scope or AuthorizedDataScope(relations=request.requested_scope.relations)
     return VerifiedDataAuthorization(
         schema_version="data-authorization-v1",
         request_id=request.request_id,
@@ -87,7 +91,11 @@ def _authorization(
         owner_user_id=owner or request.owner_user_id,
         authority_id="synthetic-test-authority",
         authorization_revision="test-auth-rev-1",
-        authorized_scope=scope or AuthorizedDataScope(relations=request.requested_scope.relations),
+        authorized_scope=authorized_scope,
+        owner_row_scopes=tuple(
+            OwnerRowScope(relation=item.relation, owner_column="owner_id")
+            for item in authorized_scope.relations
+        ),
     )
 
 
@@ -116,7 +124,9 @@ def _candidate(
             snapshot_id="snapshot-0004",
         ),
         query_fingerprint=query_fingerprint,
-        parameter_binding_fingerprint=PARAMETER_FINGERPRINT,
+        parameter_binding_fingerprint=_parameter_binding_fingerprint(
+            {"owner_user_id": request.owner_user_id}
+        ),
     )
 
 
@@ -137,6 +147,7 @@ def _execution(
             ReturnedColumnIdentity(
                 relation=relation_scope.relation,
                 column_name=column_name,
+                output_name=column_name,
             )
             for relation_scope in candidate.effective_scope.relations
             for column_name in relation_scope.columns
@@ -150,6 +161,7 @@ def _execution(
             query_fingerprint=candidate.query_fingerprint,
             policy_version="query-gateway-test-v1",
             policy_outcome="allow",
+            source_snapshot_id=candidate.source_snapshot.snapshot_id,
         ),
         returned_columns=actual_columns,
         rows=rows,
@@ -227,54 +239,281 @@ async def test_missing_compiler_or_executor_never_issues_a_dataset() -> None:
 
 @pytest.mark.asyncio
 async def test_synthetic_contract_path_requires_authority_compiler_and_complete_execution() -> None:
-    request = _request()
-    authorization = _authorization(request)
-    effective_scope = derive_effective_scope(request, authorization)
-    candidate = _candidate(request, authorization, effective_scope=effective_scope)
+    data_request = _request()
+    verified_authorization = _authorization(data_request)
+    expected_scope = derive_effective_scope(data_request, verified_authorization)
+    candidate = _candidate(
+        data_request,
+        verified_authorization,
+        effective_scope=expected_scope,
+    )
     execution = _execution(candidate)
     calls: list[str] = []
 
     class SyntheticAuthority:
         async def verify_request(
             self,
-            candidate_request: DataRequest,
+            request: DataRequest,
         ) -> VerifiedDataAuthorization:
             calls.append("authority")
-            assert candidate_request.request_id == request.request_id
-            return authorization
+            assert request.request_id == data_request.request_id
+            return verified_authorization
 
     class SyntheticCompiler:
         def compile_request(
             self,
-            candidate_request: DataRequest,
-            verified: VerifiedDataAuthorization,
-            scope: EffectiveDataScope,
-        ) -> GovernedSQLCandidate:
+            request: DataRequest,
+            authorization: VerifiedDataAuthorization,
+            effective_scope: EffectiveDataScope,
+        ) -> CompiledGovernedQuery:
             calls.append("compiler")
-            assert candidate_request == request
-            assert verified == authorization
-            assert scope == effective_scope
-            return candidate
+            assert request == data_request
+            assert authorization == verified_authorization
+            assert effective_scope == expected_scope
+            return CompiledGovernedQuery(
+                candidate=candidate,
+                sql=(
+                    "SELECT s.amount AS amount, s.region AS region "
+                    "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id"
+                ),
+                parameters={"owner_user_id": data_request.owner_user_id},
+                projections=tuple(
+                    ReturnedColumnIdentity(
+                        relation=relation_scope.relation,
+                        column_name=column_name,
+                        output_name=column_name,
+                    )
+                    for relation_scope in effective_scope.relations
+                    for column_name in relation_scope.columns
+                ),
+            )
 
     class SyntheticExecutor:
         async def execute_candidate(
             self,
-            compiled: GovernedSQLCandidate,
+            compiled: CompiledGovernedQuery,
             budget: DataRequestBudget,
         ) -> TrustedExecutionResult:
             calls.append("executor")
-            assert compiled == candidate
-            assert budget == request.budget
+            assert compiled.candidate == candidate
+            assert budget == data_request.budget
             return execution
 
     dataset = await GovernedDataBroker(
         authority=SyntheticAuthority(),
         compiler=SyntheticCompiler(),
         executor=SyntheticExecutor(),
-    ).request_dataset(request)
+    ).request_dataset(data_request)
 
     assert calls == ["authority", "compiler", "executor"]
     assert dataset.status == "complete"
+
+
+def test_compiled_sql_validation_tracks_joins_aliases_ctes_and_projections() -> None:
+    requested = RequestedDataScope(
+        relations=(
+            RelationColumnScope(
+                relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+                columns=("sale_id", "amount"),
+            ),
+            RelationColumnScope(
+                relation=RelationIdentity(schema_name="analytics", relation_name="customers"),
+                columns=("display_name",),
+            ),
+        )
+    )
+    request = _request(owner="owner-7", scope=requested)
+    authorization = _authorization(
+        request,
+        scope=AuthorizedDataScope(
+            relations=(
+                RelationColumnScope(
+                    relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+                    columns=("sale_id", "amount", "customer_id"),
+                ),
+                RelationColumnScope(
+                    relation=RelationIdentity(schema_name="analytics", relation_name="customers"),
+                    columns=("customer_id", "display_name"),
+                ),
+            )
+        ),
+    )
+    scope = derive_effective_scope(request, authorization)
+    parameters = {"owner_user_id": request.owner_user_id}
+    candidate = _candidate(request, authorization, effective_scope=scope)
+    projections = (
+        ReturnedColumnIdentity(
+            relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+            column_name="sale_id",
+            output_name="sale_id",
+        ),
+        ReturnedColumnIdentity(
+            relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+            column_name="amount",
+            output_name="amount",
+        ),
+        ReturnedColumnIdentity(
+            relation=RelationIdentity(schema_name="analytics", relation_name="customers"),
+            column_name="display_name",
+            output_name="customer_name",
+        ),
+    )
+    sql = (
+        "WITH owner_sales AS ("
+        "SELECT s.sale_id AS sale_key, s.customer_id AS customer_key, s.amount AS amount "
+        "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id) "
+        "SELECT os.sale_key AS sale_id, os.amount AS amount, "
+        "c.display_name AS customer_name "
+        "FROM owner_sales AS os "
+        "JOIN analytics.customers AS c "
+        "ON c.customer_id = os.customer_key AND c.owner_id = :owner_user_id"
+    )
+    compiled = CompiledGovernedQuery(
+        candidate=candidate,
+        sql=sql,
+        parameters=parameters,
+        projections=projections,
+    )
+
+    _validate_compiled_query(
+        request=request,
+        authorization=authorization,
+        effective_scope=scope,
+        compiled=compiled,
+    )
+
+    unscoped_join = CompiledGovernedQuery(
+        candidate=candidate,
+        sql=sql.replace(" AND c.owner_id = :owner_user_id", ""),
+        parameters=parameters,
+        projections=projections,
+    )
+    with pytest.raises(DataRequestDenied):
+        _validate_compiled_query(
+            request=request,
+            authorization=authorization,
+            effective_scope=scope,
+            compiled=unscoped_join,
+        )
+
+
+@pytest.mark.parametrize(
+    ("sql", "parameter_owner"),
+    [
+        (
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.payroll AS s WHERE s.owner_id = :owner_user_id",
+            "owner-7",
+        ),
+        (
+            "SELECT s.secret AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id",
+            "owner-7",
+        ),
+        (
+            'SELECT s."Amount" AS amount, s.region AS region '
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id",
+            "owner-7",
+        ),
+        (
+            "SELECT s.amount AS amount, s.region AS region "
+            'FROM analytics."Sales" AS s WHERE s.owner_id = :owner_user_id',
+            "owner-7",
+        ),
+        (
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id OR TRUE",
+            "owner-7",
+        ),
+        (
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id",
+            "owner-else",
+        ),
+    ],
+)
+def test_compiled_sql_rejects_unapproved_relation_column_or_owner_scope(
+    sql: str,
+    parameter_owner: str,
+) -> None:
+    request = _request()
+    authorization = _authorization(request)
+    scope = derive_effective_scope(request, authorization)
+    compiled = CompiledGovernedQuery(
+        candidate=_candidate(request, authorization, effective_scope=scope),
+        sql=sql,
+        parameters={"owner_user_id": parameter_owner},
+        projections=(
+            ReturnedColumnIdentity(
+                relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+                column_name="amount",
+                output_name="amount",
+            ),
+            ReturnedColumnIdentity(
+                relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+                column_name="region",
+                output_name="region",
+            ),
+        ),
+    )
+
+    with pytest.raises(DataRequestDenied):
+        _validate_compiled_query(
+            request=request,
+            authorization=authorization,
+            effective_scope=scope,
+            compiled=compiled,
+        )
+
+
+def test_frozen_dataset_projects_only_values_and_output_column_names_to_sandbox() -> None:
+    dataset = _frozen_dataset()
+
+    projection = dataset.to_sandbox_projection()
+
+    assert projection.column_names == ("amount", "region")
+    assert projection.rows == dataset.rows
+    assert "owner_user_id" not in projection.model_fields
+    assert "sql" not in projection.model_fields
+    assert "gateway_receipt_id" not in projection.model_fields
+
+
+def test_compiler_cannot_alias_sensitive_source_column_into_sandbox_data() -> None:
+    requested = _scope(columns=("api_key", "region"))
+    request = _request(scope=requested)
+    authorization = _authorization(
+        request,
+        scope=AuthorizedDataScope(relations=requested.relations),
+    )
+    effective_scope = derive_effective_scope(request, authorization)
+    compiled = CompiledGovernedQuery(
+        candidate=_candidate(request, authorization, effective_scope=effective_scope),
+        sql=(
+            "SELECT s.api_key AS visible_text, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id"
+        ),
+        parameters={"owner_user_id": request.owner_user_id},
+        projections=(
+            ReturnedColumnIdentity(
+                relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+                column_name="api_key",
+                output_name="visible_text",
+            ),
+            ReturnedColumnIdentity(
+                relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+                column_name="region",
+                output_name="region",
+            ),
+        ),
+    )
+
+    with pytest.raises(DataRequestDenied):
+        _validate_compiled_query(
+            request=request,
+            authorization=authorization,
+            effective_scope=effective_scope,
+            compiled=compiled,
+        )
 
 
 @pytest.mark.asyncio
@@ -285,30 +524,30 @@ async def test_denied_authority_never_calls_compiler_or_executor() -> None:
     class DeniedAuthority:
         async def verify_request(
             self,
-            candidate_request: DataRequest,
+            request: DataRequest,
         ) -> None:
-            del candidate_request
+            del request
             calls.append("authority")
             return None
 
     class NeverCompiler:
         def compile_request(
             self,
-            candidate_request: DataRequest,
+            request: DataRequest,
             authorization: VerifiedDataAuthorization,
-            scope: EffectiveDataScope,
-        ) -> GovernedSQLCandidate:
-            del candidate_request, authorization, scope
+            effective_scope: EffectiveDataScope,
+        ) -> CompiledGovernedQuery:
+            del request, authorization, effective_scope
             calls.append("compiler")
             raise AssertionError("compiler must not run without verified authority")
 
     class NeverExecutor:
         async def execute_candidate(
             self,
-            candidate: GovernedSQLCandidate,
+            compiled: CompiledGovernedQuery,
             budget: DataRequestBudget,
         ) -> TrustedExecutionResult:
-            del candidate, budget
+            del compiled, budget
             calls.append("executor")
             raise AssertionError("executor must not run without verified authority")
 
@@ -400,6 +639,21 @@ def test_candidate_receipt_source_and_scope_mismatch_are_rejected() -> None:
             execution=_execution(candidate, receipt=wrong_receipt),
         )
 
+    wrong_snapshot_receipt = QueryGatewayReceiptReference(
+        receipt_id=RECEIPT_ID,
+        query_fingerprint=candidate.query_fingerprint,
+        policy_version="query-gateway-test-v1",
+        policy_outcome="allow",
+        source_snapshot_id="other-snapshot",
+    )
+    with pytest.raises(DataRequestDenied):
+        build_frozen_dataset(
+            request=request,
+            authorization=authorization,
+            candidate=candidate,
+            execution=_execution(candidate, receipt=wrong_snapshot_receipt),
+        )
+
     denied_receipt = QueryGatewayReceiptReference(
         receipt_id=RECEIPT_ID,
         query_fingerprint=candidate.query_fingerprint,
@@ -431,10 +685,12 @@ def test_candidate_receipt_source_and_scope_mismatch_are_rejected() -> None:
         ReturnedColumnIdentity(
             relation=RelationIdentity(schema_name="analytics", relation_name="other"),
             column_name="amount",
+            output_name="amount",
         ),
         ReturnedColumnIdentity(
             relation=RelationIdentity(schema_name="analytics", relation_name="other"),
             column_name="region",
+            output_name="region",
         ),
     )
     with pytest.raises(DataRequestDenied):
@@ -533,13 +789,13 @@ async def test_adapter_failure_error_does_not_echo_private_values() -> None:
             request: DataRequest,
             authorization: VerifiedDataAuthorization,
             effective_scope: EffectiveDataScope,
-        ) -> GovernedSQLCandidate:
+        ) -> CompiledGovernedQuery:
             del request, authorization, effective_scope
             raise AssertionError("compiler must not run after authority failure")
 
     class UnusedExecutor:
-        async def execute_candidate(self, candidate: GovernedSQLCandidate, budget: Any) -> Any:
-            del candidate, budget
+        async def execute_candidate(self, compiled: CompiledGovernedQuery, budget: Any) -> Any:
+            del compiled, budget
             raise AssertionError("executor must not run after authority failure")
 
     with pytest.raises(DataBrokerUnavailable) as error:
@@ -555,7 +811,7 @@ async def test_adapter_failure_error_does_not_echo_private_values() -> None:
 
 def test_data_contract_slice_does_not_promote_product_codeact_readiness() -> None:
     readiness = assess_p5_runtime_readiness(
-        AgentConfig(_env_file=None, service_mode="product")
+        AgentConfig.model_validate({"service_mode": "product"})
     )
 
     assert readiness.production_arbitrary_code_ready is False

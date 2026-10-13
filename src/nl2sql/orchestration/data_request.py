@@ -205,8 +205,15 @@ def bind_data_request_owner(
         raise DataRequestValidationError() from None
 
 
+class OwnerRowScope(ImmutableDataContract):
+    """Trusted owner column for one relation; its value comes from request binding."""
+
+    relation: RelationIdentity
+    owner_column: _IDENTIFIER
+
+
 class VerifiedDataAuthorization(ImmutableDataContract):
-    """Typed authority output; no production producer is wired in this slice."""
+    """Typed, owner-bound authority output; no production producer is wired."""
 
     schema_version: Literal["data-authorization-v1"]
     request_id: UUID
@@ -215,6 +222,29 @@ class VerifiedDataAuthorization(ImmutableDataContract):
     authority_id: _OPAQUE_TOKEN
     authorization_revision: _OPAQUE_TOKEN
     authorized_scope: AuthorizedDataScope
+    owner_row_scopes: tuple[OwnerRowScope, ...]
+
+    @field_validator("owner_row_scopes")
+    @classmethod
+    def validate_owner_row_scopes(
+        cls,
+        value: tuple[OwnerRowScope, ...],
+    ) -> tuple[OwnerRowScope, ...]:
+        keys = [
+            (item.relation.schema_name, item.relation.relation_name)
+            for item in value
+        ]
+        if not value or len(keys) != len(set(keys)):
+            raise ValueError("owner row scopes are invalid")
+        return tuple(
+            sorted(
+                value,
+                key=lambda item: (
+                    item.relation.schema_name,
+                    item.relation.relation_name,
+                ),
+            )
+        )
 
     @computed_field(return_type=str)
     @property
@@ -228,6 +258,9 @@ class VerifiedDataAuthorization(ImmutableDataContract):
                 "authority_id": self.authority_id,
                 "authorization_revision": self.authorization_revision,
                 "authorized_scope": self.authorized_scope.model_dump(mode="json"),
+                "owner_row_scopes": [
+                    item.model_dump(mode="json") for item in self.owner_row_scopes
+                ],
             }
         )
 
@@ -256,6 +289,12 @@ def derive_effective_scope(
         (item.relation.schema_name, item.relation.relation_name): set(item.columns)
         for item in authorization.authorized_scope.relations
     }
+    owner_scopes = {
+        (item.relation.schema_name, item.relation.relation_name)
+        for item in authorization.owner_row_scopes
+    }
+    if owner_scopes != set(authorized):
+        raise DataRequestDenied()
     for requested in request.requested_scope.relations:
         key = (requested.relation.schema_name, requested.relation.relation_name)
         if not set(requested.columns).issubset(authorized.get(key, set())):
@@ -265,11 +304,13 @@ def derive_effective_scope(
 
 
 class DataSourceSnapshot(ImmutableDataContract):
-    """Required source and snapshot version supplied by a future trusted adapter."""
+    """Trusted source identity plus its observed database snapshot when available."""
 
     source_id: _OPAQUE_TOKEN
     source_version: _OPAQUE_TOKEN
-    snapshot_id: _OPAQUE_TOKEN
+    # A compiler may bind the expected source/version before execution. The
+    # QueryGateway supplies the actual transaction snapshot after it connects.
+    snapshot_id: _OPAQUE_TOKEN | None = None
 
 
 class GovernedSQLCandidate(ImmutableDataContract):
@@ -290,6 +331,7 @@ class GovernedSQLCandidate(ImmutableDataContract):
 class ReturnedColumnIdentity(ImmutableDataContract):
     relation: RelationIdentity
     column_name: _IDENTIFIER
+    output_name: _IDENTIFIER
 
 
 class FrozenRow(ImmutableDataContract):
@@ -303,6 +345,7 @@ class QueryGatewayReceiptReference(ImmutableDataContract):
     query_fingerprint: _SHA256
     policy_version: _OPAQUE_TOKEN
     policy_outcome: Literal["allow", "deny"]
+    source_snapshot_id: _OPAQUE_TOKEN | None = None
 
 
 class TrustedExecutionResult(ImmutableDataContract):
@@ -336,10 +379,13 @@ class FrozenDataset(ImmutableDataContract):
     authority_id: _OPAQUE_TOKEN
     authorization_revision: _OPAQUE_TOKEN
     authorized_scope: AuthorizedDataScope
+    owner_row_scopes: tuple[OwnerRowScope, ...]
     effective_scope: EffectiveDataScope
     source_snapshot: DataSourceSnapshot
     query_fingerprint: _SHA256
     gateway_receipt_id: UUID
+    gateway_receipt_query_fingerprint: _SHA256
+    gateway_receipt_snapshot_id: _OPAQUE_TOKEN
     gateway_policy_version: _OPAQUE_TOKEN
     gateway_policy_outcome: Literal["allow"]
     budget: DataRequestBudget
@@ -367,13 +413,21 @@ class FrozenDataset(ImmutableDataContract):
                 authority_id=self.authority_id,
                 authorization_revision=self.authorization_revision,
                 authorized_scope=self.authorized_scope,
+                owner_row_scopes=self.owner_row_scopes,
             )
+            derived_scope = derive_effective_scope(bound_request, bound_authorization)
         except ValidationError:
+            raise ValueError("frozen dataset identity is invalid") from None
+        except DataRequestDenied:
             raise ValueError("frozen dataset identity is invalid") from None
         if (
             bound_request.request_checksum != self.request_checksum
             or bound_authorization.authorization_checksum != self.authorization_checksum
+            or derived_scope != self.effective_scope
+            or self.gateway_receipt_query_fingerprint != self.query_fingerprint
+            or self.gateway_receipt_snapshot_id != self.source_snapshot.snapshot_id
             or self.estimated_cost > self.budget.max_cost
+            or self.source_snapshot.snapshot_id is None
         ):
             raise ValueError("frozen dataset identity is invalid")
 
@@ -397,12 +451,18 @@ class FrozenDataset(ImmutableDataContract):
             )
             for column in self.returned_columns
         ]
+        output_names = [column.output_name for column in self.returned_columns]
         expected = {
             (item.relation.schema_name, item.relation.relation_name, name)
             for item in self.effective_scope.relations
             for name in item.columns
         }
-        if not column_keys or len(column_keys) != len(set(column_keys)) or set(column_keys) != expected:
+        if (
+            not column_keys
+            or len(column_keys) != len(set(column_keys))
+            or len(output_names) != len(set(output_names))
+            or set(column_keys) != expected
+        ):
             raise ValueError("frozen dataset columns are invalid")
         if len(self.rows) > self.budget.max_rows:
             raise ValueError("frozen dataset exceeds row budget")
@@ -464,6 +524,31 @@ class FrozenDataset(ImmutableDataContract):
     def status(self) -> Literal["complete"]:
         return "complete"
 
+    def to_sandbox_projection(self) -> SandboxDatasetProjection:
+        """Return only column labels and scalar rows to an isolated sandbox."""
+
+        return SandboxDatasetProjection(
+            column_names=tuple(column.output_name for column in self.returned_columns),
+            rows=self.rows,
+        )
+
+
+class SandboxDatasetProjection(ImmutableDataContract):
+    """Data-only value object; contains no owner, SQL, receipt, or DB capability."""
+
+    column_names: tuple[_IDENTIFIER, ...]
+    rows: tuple[FrozenRow, ...]
+
+    @model_validator(mode="after")
+    def validate_projection_shape(self) -> SandboxDatasetProjection:
+        if (
+            not self.column_names
+            or len(self.column_names) != len(set(self.column_names))
+            or any(len(row.values) != len(self.column_names) for row in self.rows)
+        ):
+            raise ValueError("sandbox dataset projection is invalid")
+        return self
+
 
 def build_frozen_dataset(
     *,
@@ -475,21 +560,35 @@ def build_frozen_dataset(
     """Issue a dataset only when all typed authority and execution evidence agrees."""
 
     effective_scope = derive_effective_scope(request, authorization)
+    expected_source = candidate.source_snapshot
     if (
         candidate.request_id != request.request_id
         or candidate.request_checksum != request.request_checksum
         or candidate.authorization_checksum != authorization.authorization_checksum
         or candidate.effective_scope != effective_scope
-        or execution.source_snapshot != candidate.source_snapshot
         or execution.status != "complete"
         or execution.query_fingerprint != candidate.query_fingerprint
-        or execution.source_snapshot is None
-        or execution.gateway_receipt is None
-        or execution.gateway_receipt.query_fingerprint != candidate.query_fingerprint
-            or execution.gateway_receipt.policy_outcome != "allow"
         or execution.row_count != len(execution.rows)
         or execution.row_count > request.budget.max_rows
         or execution.estimated_cost > request.budget.max_cost
+    ):
+        raise DataRequestDenied()
+    actual_source = execution.source_snapshot
+    gateway_receipt = execution.gateway_receipt
+    if (
+        actual_source is None
+        or actual_source.snapshot_id is None
+        or actual_source.source_id != expected_source.source_id
+        or actual_source.source_version != expected_source.source_version
+        or (
+            expected_source.snapshot_id is not None
+            and actual_source.snapshot_id != expected_source.snapshot_id
+        )
+        or gateway_receipt is None
+        or gateway_receipt.query_fingerprint != candidate.query_fingerprint
+        or gateway_receipt.policy_outcome != "allow"
+        or gateway_receipt.source_snapshot_id is None
+        or gateway_receipt.source_snapshot_id != actual_source.snapshot_id
     ):
         raise DataRequestDenied()
 
@@ -503,12 +602,15 @@ def build_frozen_dataset(
             authority_id=authorization.authority_id,
             authorization_revision=authorization.authorization_revision,
             authorized_scope=authorization.authorized_scope,
+            owner_row_scopes=authorization.owner_row_scopes,
             effective_scope=effective_scope,
-            source_snapshot=execution.source_snapshot,
+            source_snapshot=actual_source,
             query_fingerprint=candidate.query_fingerprint,
-            gateway_receipt_id=execution.gateway_receipt.receipt_id,
-            gateway_policy_version=execution.gateway_receipt.policy_version,
-            gateway_policy_outcome=execution.gateway_receipt.policy_outcome,
+            gateway_receipt_id=gateway_receipt.receipt_id,
+            gateway_receipt_query_fingerprint=gateway_receipt.query_fingerprint,
+            gateway_receipt_snapshot_id=gateway_receipt.source_snapshot_id,
+            gateway_policy_version=gateway_receipt.policy_version,
+            gateway_policy_outcome=gateway_receipt.policy_outcome,
             budget=request.budget,
             estimated_cost=execution.estimated_cost,
             returned_columns=execution.returned_columns,

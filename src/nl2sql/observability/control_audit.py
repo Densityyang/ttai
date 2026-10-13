@@ -133,13 +133,22 @@ class ControlAuditStore:
         except Exception as exc:
             raise ControlAuditUnavailable("control audit/outbox write failed") from exc
 
-    async def record_sql_start(self, trace_id: str, sql: str) -> None:
+    async def record_sql_start(
+        self,
+        trace_id: str,
+        sql: str,
+        *,
+        execution_id: str,
+    ) -> None:
         await self.append(
             TraceEvent(
                 trace_id=trace_id or "unscoped",
                 stage="sql",
                 name="execution_started",
-                attributes={"sql_fingerprint": fingerprint(sql)},
+                attributes={
+                    "sql_fingerprint": fingerprint(sql),
+                    "query_execution_id": execution_id,
+                },
             )
         )
 
@@ -148,6 +157,7 @@ class ControlAuditStore:
         trace_id: str,
         sql: str,
         *,
+        execution_id: str,
         accepted: bool,
         row_count: int,
         elapsed_ms: float,
@@ -160,6 +170,7 @@ class ControlAuditStore:
                 name="execution_finished",
                 attributes={
                     "sql_fingerprint": fingerprint(sql),
+                    "query_execution_id": execution_id,
                     "accepted": accepted,
                     "row_count": row_count,
                     "elapsed_ms": round(elapsed_ms, 3),
