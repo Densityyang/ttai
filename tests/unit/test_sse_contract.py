@@ -71,6 +71,41 @@ class _ScriptedStreamingEngine:
             yield event
 
 
+class _BlockingStreamingEngine:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.cancelled = asyncio.Event()
+
+    async def astream_events(self, messages, config, version):
+        del messages, config, version
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled.set()
+        if False:
+            yield {}
+
+
+class _MultiBlockStreamingEngine:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def astream_events(self, messages, config, version):
+        del messages, config, version
+        try:
+            yield _root_event(
+                {
+                    "response_blocks": [
+                        {"type": "text", "text": "first"},
+                        {"type": "text", "text": "second"},
+                    ]
+                }
+            )
+        finally:
+            self.closed = True
+
+
 def _root_event(output):
     return {
         "event": "on_chain_end",
@@ -392,6 +427,62 @@ async def test_sse_cancelled_stream_propagates_without_terminal_event() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         [chunk async for chunk in stream]
+
+
+@pytest.mark.asyncio
+async def test_sse_client_cancellation_closes_engine_stream_without_terminal() -> None:
+    engine = _BlockingStreamingEngine()
+    chunks: list[str] = []
+    stream = stream_blocks(
+        engine,
+        [{"role": "user", "content": "hello"}],
+        {},
+        "thread-cancel-active",
+        {
+            "stream_metadata": {
+                "thread_id": "thread-cancel-active",
+                "run_id": "run-cancel-active",
+                "requested_mode": "QUERY",
+                "effective_mode": "QUERY",
+                "switched_from_run_id": None,
+                "authority_provenance": "test",
+            }
+        },
+    )
+
+    async def consume() -> None:
+        async for chunk in stream:
+            chunks.append(chunk)
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(engine.entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert engine.cancelled.is_set()
+    assert [name for name, _ in _parsed_events(chunks)] == ["metadata"]
+    assert not _terminal_events(_parsed_events(chunks))
+
+
+@pytest.mark.asyncio
+async def test_sse_disconnect_during_block_stream_closes_engine_and_omits_done() -> None:
+    engine = _MultiBlockStreamingEngine()
+    stream = stream_blocks(
+        engine,
+        [{"role": "user", "content": "hello"}],
+        {},
+        "thread-disconnect-block",
+    )
+
+    first = await anext(stream)
+    assert _parsed_events([first])[0][1]["block"]["text"] == "first"
+    await stream.aclose()
+
+    assert engine.closed
+    parsed = _parsed_events([first])
+    assert [name for name, _ in parsed] == ["block"]
+    assert not _terminal_events(parsed)
 
 
 async def test_sse_real_langgraph_root_completion_keeps_success_protocol() -> None:

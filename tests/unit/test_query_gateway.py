@@ -686,6 +686,10 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
     allowed_calls = {
         "src/core/observer.py": {"runnable.stream"},
         "src/nl2sql/infra/governance/query_gateway.py": {
+            # Reviewed cancellation control: this uses only the backend PID
+            # captured from the request's own session, then fails closed by
+            # terminating/discarding that same request connection.
+            "connection.execute",
             "session.execute",
             "session.stream",
         },

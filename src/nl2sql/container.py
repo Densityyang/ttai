@@ -75,13 +75,13 @@ class AppContainer:
         # (registry, evidence provider, resolver, deterministic provider,
         # compiler, executor, identity, authorization) are NEVER stored here.
         self._typed_deployment: tuple[Any, Any, Any, Any] | None = None
-        self._typed_resources: tuple[Any, Any, Any] | None = None
+        self._typed_resources: tuple[Any, Any, Any, Any] | None = None
         # Application-scoped product services.  These are DEMO/LOCAL and
         # NON-DURABLE: they live for the process lifetime only, deliberately so
         # for Foundation B, and state is LOST on restart.  A future Control-PG
         # implementation must be swappable behind the same service interfaces.
         self._local_real_deployment: tuple[Any, Any, Any, Any] | None = None
-        self._local_real_resources: tuple[Any, Any] | None = None
+        self._local_real_resources: tuple[Any, Any, Any] | None = None
         self._local_real_probe_attempted = False
         self._local_real_readiness: dict[str, object] | None = None
         self._local_real_latest_authoritative_date: str | None = None
@@ -976,7 +976,7 @@ class AppContainer:
         watermark = self._local_real_source_watermark
         if watermark is None or resources is None:
             return None
-        deployment = resources[1]
+        deployment = resources[2]
         if watermark.tzinfo is None or watermark.utcoffset() is None:
             watermark = watermark.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
         watermark_utc = watermark.astimezone(UTC)
@@ -1025,6 +1025,17 @@ class AppContainer:
             return None
         self._local_real_probe_attempted = True
         business_engine: Any | None = None
+        cancellation_engine: Any | None = None
+
+        async def dispose_runtime_engines() -> None:
+            for engine in (cancellation_engine, business_engine):
+                if engine is None:
+                    continue
+                try:
+                    await engine.dispose()
+                except Exception:
+                    logger.error("local-real engine cleanup failed")
+
         try:
             from pathlib import Path
 
@@ -1066,10 +1077,22 @@ class AppContainer:
                 application_name="ttai-local-real-runtime",
                 settings=settings,
             )
+            cancellation_engine = create_runtime_async_engine(
+                settings.database_url,
+                purpose=DatabasePurpose.BUSINESS_READ_ONLY,
+                application_name="ttai-local-real-cancel",
+                settings=settings,
+                pool_size=1,
+                max_overflow=3,
+            )
             session_factory = async_sessionmaker(
                 business_engine, class_=AsyncSession, expire_on_commit=False
             )
-            gateway = QueryGateway(session_factory, schema=agent_config.nl2sql_db_schema)
+            gateway = QueryGateway(
+                session_factory,
+                schema=agent_config.nl2sql_db_schema,
+                cancellation_engine=cancellation_engine,
+            )
             # Probe the PREFERRED published view FIRST.  When it is absent this
             # deployment fails closed rather than silently switching to
             # direct-table metric SQL.
@@ -1078,22 +1101,22 @@ class AppContainer:
                 logger.error(
                     "local-real published view unavailable: %s", relation_probe.status
                 )
-                await business_engine.dispose()
+                await dispose_runtime_engines()
                 return None
             latest_date = await resolve_latest_authoritative_date(session_factory)
             recent_dates = await resolve_recent_authoritative_dates(session_factory)
             if not latest_date.resolved or latest_date.latest_date is None:
                 logger.error("local-real authoritative date unavailable")
-                await business_engine.dispose()
+                await dispose_runtime_engines()
                 return None
             if not recent_dates.resolved:
                 logger.error("local-real authoritative window unavailable")
-                await business_engine.dispose()
+                await dispose_runtime_engines()
                 return None
             source_watermark = await resolve_source_watermark(session_factory)
             if not source_watermark.resolved or source_watermark.data_as_of is None:
                 logger.error("local-real source watermark unavailable")
-                await business_engine.dispose()
+                await dispose_runtime_engines()
                 return None
             snapshot_candidate = await PostgresSchemaSnapshotCollector(
                 business_engine, max_relations=1
@@ -1123,7 +1146,7 @@ class AppContainer:
             )
             if frozen_view is None:
                 logger.error("local-real published view is not configured")
-                await business_engine.dispose()
+                await dispose_runtime_engines()
                 return None
             bundle = await self._build_local_real_semantics_async(
                 snapshot_candidate=snapshot_candidate,
@@ -1152,11 +1175,7 @@ class AppContainer:
             logger.error(
                 "local-real deployment unavailable: %s", type(exc).__name__
             )
-            if business_engine is not None:
-                try:
-                    await business_engine.dispose()
-                except Exception:
-                    logger.error("local-real engine cleanup failed")
+            await dispose_runtime_engines()
             self._local_real_deployment = None
             self._local_real_resources = None
             self._local_real_latest_authoritative_date = None
@@ -1170,7 +1189,11 @@ class AppContainer:
             deployment.read_snapshot,
             deployment.gateway,
         )
-        self._local_real_resources = (business_engine, deployment)
+        self._local_real_resources = (
+            business_engine,
+            cancellation_engine,
+            deployment,
+        )
         self._local_real_latest_authoritative_date = deployment.latest_authoritative_date
         self._local_real_recent_authoritative_dates = deployment.recent_authoritative_dates
         self._local_real_source_watermark = source_watermark.data_as_of
@@ -1212,6 +1235,10 @@ class AppContainer:
 
         if self._typed_deployment is not None:
             return self._typed_deployment
+        publisher: Any | None = None
+        snapshots: Any | None = None
+        business_engine: Any | None = None
+        cancellation_engine: Any | None = None
         try:
             from pathlib import Path
 
@@ -1241,15 +1268,45 @@ class AppContainer:
                 application_name="ttai-typed-runtime",
                 settings=settings,
             )
+            cancellation_engine = create_runtime_async_engine(
+                settings.database_url,
+                purpose=DatabasePurpose.BUSINESS_READ_ONLY,
+                application_name="ttai-typed-runtime-cancel",
+                settings=settings,
+                pool_size=1,
+                max_overflow=3,
+            )
             session_factory = async_sessionmaker(
                 business_engine, class_=AsyncSession, expire_on_commit=False
             )
-            gateway = QueryGateway(session_factory, schema=agent_config.nl2sql_db_schema)
+            gateway = QueryGateway(
+                session_factory,
+                schema=agent_config.nl2sql_db_schema,
+                cancellation_engine=cancellation_engine,
+            )
         except Exception as exc:
             logger.error("typed runtime deployment unavailable: %s", type(exc).__name__)
+            for resource in (cancellation_engine, business_engine):
+                if resource is not None:
+                    try:
+                        await resource.dispose()
+                    except Exception:
+                        logger.error("typed engine cleanup failed")
+            for resource in (snapshots, publisher):
+                if resource is not None:
+                    try:
+                        await resource.close()
+                    except Exception:
+                        logger.error("typed resource close failed")
             return None
         self._typed_deployment = (views, publisher.read_active, snapshots.read, gateway)
-        self._typed_resources = (publisher, snapshots, business_engine)
+        assert cancellation_engine is not None
+        self._typed_resources = (
+            publisher,
+            snapshots,
+            business_engine,
+            cancellation_engine,
+        )
         return self._typed_deployment
 
     async def close(self) -> None:
@@ -1286,7 +1343,9 @@ class AppContainer:
             await self._audit_store.close()
             self._audit_store = None
         if self._typed_resources is not None:
-            publisher, snapshots, business_engine = self._typed_resources
+            publisher, snapshots, business_engine, cancellation_engine = (
+                self._typed_resources
+            )
             self._typed_resources = None
             self._typed_deployment = None
             for resource in (snapshots, publisher):
@@ -1298,14 +1357,24 @@ class AppContainer:
                 await business_engine.dispose()
             except Exception:
                 pass
+            try:
+                await cancellation_engine.dispose()
+            except Exception:
+                logger.error("typed cancellation engine close failed")
         if self._local_real_resources is not None:
-            business_engine, _deployment = self._local_real_resources
+            business_engine, cancellation_engine, _deployment = (
+                self._local_real_resources
+            )
             self._local_real_resources = None
             self._local_real_deployment = None
             try:
                 await business_engine.dispose()
             except Exception:
                 logger.error("local-real resource close failed")
+            try:
+                await cancellation_engine.dispose()
+            except Exception:
+                logger.error("local-real cancellation resource close failed")
         else:
             self._local_real_deployment = None
         self._local_real_probe_attempted = False

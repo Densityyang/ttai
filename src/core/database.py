@@ -106,6 +106,8 @@ def create_runtime_async_engine(
     purpose: DatabasePurpose,
     application_name: str,
     settings: Any,
+    pool_size: int | None = None,
+    max_overflow: int | None = None,
 ) -> AsyncEngine:
     """Create an async engine with the shared connection and timeout contract."""
 
@@ -117,6 +119,10 @@ def create_runtime_async_engine(
         application_name=application_name,
         settings=settings,
     )
+    if pool_size is not None:
+        kwargs["pool_size"] = pool_size
+    if max_overflow is not None:
+        kwargs["max_overflow"] = max_overflow
     return create_async_engine(database_url, **kwargs)
 
 

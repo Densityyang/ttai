@@ -16,13 +16,18 @@ import math
 import re
 import time
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 import sqlglot
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+)
 from sqlglot import exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
@@ -49,6 +54,7 @@ class QueryErrorCode(StrEnum):
     ROWS_EXCEEDED = "rows_exceeded"
     CAPACITY_EXCEEDED = "capacity_exceeded"
     TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
     CONNECTION_ERROR = "connection_error"
     TRANSIENT_DATABASE_ERROR = "transient_database_error"
     PERMISSION_DENIED = "permission_denied"
@@ -541,6 +547,7 @@ class QueryGateway:
         readonly_role: str = "business_reader",
         audit_sink: QueryAuditSink | None = None,
         concurrency_governor: ConcurrencyGovernor | None = None,
+        cancellation_engine: AsyncEngine | None = None,
     ) -> None:
         if schema and not _SAFE_IDENTIFIER.fullmatch(schema):
             raise ValueError("invalid schema identifier")
@@ -554,6 +561,11 @@ class QueryGateway:
         if max_plan_cost < 0 or max_plan_rows < 0 or max_result_bytes < 2:
             raise ValueError("query resource limits are invalid")
         self._session_factory = session_factory
+        bound_engine = getattr(session_factory, "kw", {}).get("bind")
+        self._engine: AsyncEngine | None = (
+            bound_engine if isinstance(bound_engine, AsyncEngine) else None
+        )
+        self._cancellation_engine = cancellation_engine or self._engine
         self._schema = schema
         self._timeout_seconds = timeout_seconds
         self._plan_timeout_ms = plan_timeout_ms
@@ -704,6 +716,26 @@ class QueryGateway:
                     capture_source_snapshot=capture_source_snapshot,
                     detect_row_truncation=detect_row_truncation,
                 )
+        except asyncio.CancelledError:
+            if self._audit_sink is not None:
+                try:
+                    await self._audit_sink.record_sql_result(
+                        trace_id,
+                        sql,
+                        execution_id=str(execution_id),
+                        accepted=False,
+                        row_count=0,
+                        elapsed_ms=_elapsed_ms(started),
+                        error_code=QueryErrorCode.CANCELLED,
+                        source_snapshot_fingerprint=None,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._log_internal_failure(
+                        "audit_cancelled", exc, _fingerprint(sql)
+                    )
+            raise
         except CapacityExceededError as exc:
             receipt = self._capacity_rejection(sql, exc, started)
         receipt = replace(receipt, execution_id=execution_id)
@@ -815,12 +847,29 @@ class QueryGateway:
         params: dict[str, Any],
     ) -> tuple[float, int]:
         async with self._session_factory() as session:
+            cancelled = False
+            backend_identity: tuple[int, datetime] | None = None
+            driver_connection: Any | None = None
+            if self._engine is not None:
+                request_connection = await session.connection()
+                driver_connection = (
+                    await request_connection.get_raw_connection()
+                ).driver_connection
             try:
                 async with asyncio.timeout(self._timeout_seconds):
                     await self._begin_read_only(session)
+                    if self._engine is not None:
+                        backend_identity = await self._backend_identity(session)
                     return await self._plan_with_timeout(session, prepared, params)
+            except asyncio.CancelledError:
+                cancelled = True
+                await self._recover_cancelled_session(
+                    session, driver_connection, backend_identity
+                )
+                raise
             finally:
-                await session.rollback()
+                if not cancelled:
+                    await session.rollback()
 
     async def _plan_and_run(
         self,
@@ -847,12 +896,22 @@ class QueryGateway:
         result_columns: tuple[str, ...] = ()
         try:
             async with self._session_factory() as session:
+                cancelled = False
+                backend_identity: tuple[int, datetime] | None = None
+                driver_connection: Any | None = None
+                if self._engine is not None:
+                    request_connection = await session.connection()
+                    driver_connection = (
+                        await request_connection.get_raw_connection()
+                    ).driver_connection
                 try:
                     async with asyncio.timeout(self._timeout_seconds):
                         source_snapshot = await self._begin_read_only(
                             session,
                             capture_source_snapshot=capture_source_snapshot,
                         )
+                        if self._engine is not None:
+                            backend_identity = await self._backend_identity(session)
                         cost, rows_estimate = await self._plan_with_timeout(
                             session,
                             prepared,
@@ -868,8 +927,15 @@ class QueryGateway:
                             max_result_bytes=max_result_bytes,
                             max_materialized_rows=max_materialized_rows,
                         )
+                except asyncio.CancelledError:
+                    cancelled = True
+                    await self._recover_cancelled_session(
+                        session, driver_connection, backend_identity
+                    )
+                    raise
                 finally:
-                    await session.rollback()
+                    if not cancelled:
+                        await session.rollback()
         except QueryPolicyError as exc:
             if exc.estimated_cost is None:
                 exc.estimated_cost = cost
@@ -885,6 +951,121 @@ class QueryGateway:
             ) from exc
         assert cost is not None and rows_estimate is not None
         return cost, rows_estimate, rows, masked_columns, result_columns, source_snapshot
+
+    async def _backend_identity(
+        self, session: AsyncSession
+    ) -> tuple[int, datetime]:
+        """Capture the process ID and start time of this server-owned backend."""
+
+        result = await session.execute(
+            text(
+                "SELECT pid, backend_start FROM pg_stat_activity "
+                "WHERE pid = pg_backend_pid()"
+            )
+        )
+        identity = result.fetchone()
+        if identity is None:
+            raise RuntimeError("query gateway backend identity unavailable")
+        return int(identity[0]), identity[1]
+
+    async def _recover_cancelled_session(
+        self,
+        session: AsyncSession,
+        driver_connection: Any | None,
+        backend_identity: tuple[int, datetime] | None,
+    ) -> None:
+        """Cancel the matching server query, then roll back or discard its session.
+
+        The installed asyncpg driver exposes ``terminate`` but no public
+        per-query cancellation method. A fresh bounded pool connection requests
+        cancellation using the server-owned backend PID. If PostgreSQL does not
+        accept the signal, dispose of the request connection so an uncertain
+        transaction cannot return to the pool or continue in the background.
+        """
+
+        if backend_identity is None or self._cancellation_engine is None:
+            await self._invalidate_cancelled_session(session, driver_connection)
+            return
+        backend_pid, backend_start = backend_identity
+
+        backend_stopped = False
+        driver_pid_getter = getattr(driver_connection, "get_server_pid", None)
+        driver_pid = driver_pid_getter() if callable(driver_pid_getter) else None
+        if driver_pid is not None and driver_pid != backend_pid:
+            logger.warning(
+                "query gateway cancellation connection identity mismatch server_pid=%s driver_pid=%s",
+                backend_pid,
+                driver_pid,
+            )
+        try:
+            async with self._cancellation_engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT CASE WHEN pg_backend_pid() <> :pid AND EXISTS ("
+                        "SELECT 1 FROM pg_stat_activity WHERE pid = :pid "
+                        "AND backend_start = :backend_start) THEN "
+                        "CASE WHEN pg_cancel_backend(:pid) THEN TRUE "
+                        "ELSE pg_terminate_backend(:pid) END "
+                        "ELSE FALSE END AS stopped"
+                    ),
+                    {"pid": backend_pid, "backend_start": backend_start},
+                )
+                cancellation_result = result.mappings().one_or_none()
+                backend_stopped = (
+                    cancellation_result is not None
+                    and cancellation_result["stopped"] is True
+                )
+                if not backend_stopped:
+                    logger.warning(
+                        "query gateway backend signal was not accepted backend_pid=%s",
+                        backend_pid,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "query gateway backend cancel failed error_type=%s backend_pid=%s",
+                type(exc).__name__,
+                backend_pid,
+            )
+        if not backend_stopped:
+            logger.warning(
+                "query gateway backend cancellation unconfirmed; disposing connection backend_pid=%s",
+                backend_pid,
+            )
+            await self._invalidate_cancelled_session(session, driver_connection)
+            return
+
+        try:
+            await asyncio.shield(session.rollback())
+        except Exception as exc:
+            logger.warning(
+                "query gateway cancelled session rollback failed error_type=%s",
+                type(exc).__name__,
+            )
+            await self._invalidate_cancelled_session(session, driver_connection)
+
+    @staticmethod
+    async def _invalidate_cancelled_session(
+        session: AsyncSession, driver_connection: Any | None
+    ) -> None:
+        async def terminate_and_invalidate() -> None:
+            try:
+                terminate = getattr(driver_connection, "terminate", None)
+                if callable(terminate):
+                    terminate()
+            except Exception as exc:
+                logger.warning(
+                    "query gateway cancelled driver termination failed error_type=%s",
+                    type(exc).__name__,
+                )
+            await session.invalidate()
+
+        try:
+            await asyncio.shield(terminate_and_invalidate())
+        except Exception as exc:
+            logger.warning(
+                "query gateway cancellation invalidation failed error_type=%s",
+                type(exc).__name__,
+            )
 
     async def _plan_with_timeout(
         self,

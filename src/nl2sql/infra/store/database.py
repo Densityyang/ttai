@@ -45,6 +45,7 @@ class DatabaseManager:
         self._schema = _normalize_schema(schema if schema is not None else default_schema)
 
         self._engine: AsyncEngine | None = None
+        self._cancellation_engine: AsyncEngine | None = None
         self._session_factory: async_sessionmaker[AsyncSession] | None = None
         self._query_gateway: QueryGateway | None = None
         self._schema_info: dict[str, Any] = {}
@@ -64,6 +65,14 @@ class DatabaseManager:
             application_name="ttai-business-query",
             settings=self._settings,
         )
+        self._cancellation_engine = create_runtime_async_engine(
+            self.database_url,
+            purpose=DatabasePurpose.BUSINESS_READ_ONLY,
+            application_name="ttai-business-query-cancel",
+            settings=self._settings,
+            pool_size=1,
+            max_overflow=3,
+        )
         self._session_factory = async_sessionmaker(self._engine, class_=AsyncSession, expire_on_commit=False)
         self._query_gateway = QueryGateway(
             self._session_factory,
@@ -78,6 +87,7 @@ class DatabaseManager:
             max_result_bytes=int(os.getenv("NL2SQL_MAX_RESULT_BYTES", "1000000")),
             readonly_role=_extract_role_from_database_url(self.database_url)
             or "business_reader",
+            cancellation_engine=self._cancellation_engine,
         )
         await self._load_schema_info()
 
@@ -85,7 +95,10 @@ class DatabaseManager:
         """关闭数据库连接。"""
         if self._engine is not None:
             await self._engine.dispose()
+        if self._cancellation_engine is not None:
+            await self._cancellation_engine.dispose()
         self._engine = None
+        self._cancellation_engine = None
         self._session_factory = None
         self._query_gateway = None
 

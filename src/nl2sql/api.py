@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from typing import Any
 from uuid import uuid4
 
@@ -233,59 +233,63 @@ async def stream_blocks(
             f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         )
     try:
-        async for event in supervisor.astream_events(graph_input, config, version="v2"):
-            if not isinstance(event, Mapping):
-                continue
-            parent_ids = event.get("parent_ids")
-            is_proven_root = (
-                event.get("name") == "nl2sql_v2_explicit"
-                and isinstance(parent_ids, (list, tuple))
-                and not parent_ids
-            )
-            # Only a proven root failure invalidates the whole request. A child
-            # chain may report a handled error and still produce a valid root
-            # result, so child errors must not preempt that completion.
-            if event.get("event") == "on_chain_error" and is_proven_root:
-                yield _sse_error_frame(
-                    stream_id, created, thread_id, "stream_engine_error"
+        event_stream = supervisor.astream_events(
+            graph_input, config, version="v2"
+        )
+        async with aclosing(event_stream):
+            async for event in event_stream:
+                if not isinstance(event, Mapping):
+                    continue
+                parent_ids = event.get("parent_ids")
+                is_proven_root = (
+                    event.get("name") == "nl2sql_v2_explicit"
+                    and isinstance(parent_ids, (list, tuple))
+                    and not parent_ids
                 )
-                return
-            if event.get("event") != "on_chain_end" or sent_blocks:
-                continue
-            # LangGraph v2 root completion is the only event allowed to project
-            # final product blocks. Missing metadata cannot prove root output.
-            if not is_proven_root:
-                continue
-            event_data = event.get("data")
-            output = event_data.get("output") if isinstance(event_data, Mapping) else None
-            if not isinstance(output, dict) or not _has_streamable_root_result(output):
-                continue
-            try:
-                blocks = extract_blocks(output)
-            except Exception:
-                yield _sse_error_frame(
-                    stream_id, created, thread_id, "stream_output_invalid"
-                )
-                return
-            if not blocks:
-                yield _sse_error_frame(
-                    stream_id, created, thread_id, "stream_output_invalid"
-                )
-                return
-            for sequence, block in enumerate(blocks, start=1):
-                event_id = f"{stream_id}:{sequence}"
-                payload = {
-                    "id": event_id,
-                    "created": created,
-                    "thread_id": thread_id,
-                    "block": block,
-                }
-                yield (
-                    f"id: {event_id}\n"
-                    "event: block\n"
-                    f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                )
-            sent_blocks = True
+                # Only a proven root failure invalidates the whole request. A child
+                # chain may report a handled error and still produce a valid root
+                # result, so child errors must not preempt that completion.
+                if event.get("event") == "on_chain_error" and is_proven_root:
+                    yield _sse_error_frame(
+                        stream_id, created, thread_id, "stream_engine_error"
+                    )
+                    return
+                if event.get("event") != "on_chain_end" or sent_blocks:
+                    continue
+                # LangGraph v2 root completion is the only event allowed to project
+                # final product blocks. Missing metadata cannot prove root output.
+                if not is_proven_root:
+                    continue
+                event_data = event.get("data")
+                output = event_data.get("output") if isinstance(event_data, Mapping) else None
+                if not isinstance(output, dict) or not _has_streamable_root_result(output):
+                    continue
+                try:
+                    blocks = extract_blocks(output)
+                except Exception:
+                    yield _sse_error_frame(
+                        stream_id, created, thread_id, "stream_output_invalid"
+                    )
+                    return
+                if not blocks:
+                    yield _sse_error_frame(
+                        stream_id, created, thread_id, "stream_output_invalid"
+                    )
+                    return
+                for sequence, block in enumerate(blocks, start=1):
+                    event_id = f"{stream_id}:{sequence}"
+                    payload = {
+                        "id": event_id,
+                        "created": created,
+                        "thread_id": thread_id,
+                        "block": block,
+                    }
+                    yield (
+                        f"id: {event_id}\n"
+                        "event: block\n"
+                        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    )
+                sent_blocks = True
     except asyncio.CancelledError:
         raise
     except Exception:
