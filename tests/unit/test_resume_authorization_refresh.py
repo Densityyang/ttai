@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.types import AuthUser
 from src.nl2sql.contracts import AuthorizationContext
+from src.nl2sql.hitl_action_claims import InMemoryHITLActionClaimStore
 from src.nl2sql.ownership import AUTHORIZATION_CONFIG_KEY, authorization_context_from_config
 from src.nl2sql.v2 import register_v2_routes
 
@@ -88,12 +89,16 @@ class _Container:
     def __init__(self, engine: _Engine, provider: Any) -> None:
         self._engine = engine
         self._provider = provider
+        self._hitl_action_claim_store = InMemoryHITLActionClaimStore()
 
     async def get_engine(self) -> Any:
         return self._engine
 
     def get_backend_authorization_provider(self) -> Any:
         return self._provider
+
+    def get_hitl_action_claim_store(self) -> InMemoryHITLActionClaimStore:
+        return self._hitl_action_claim_store
 
 
 def _client(engine: _Engine, provider: Any) -> TestClient:
