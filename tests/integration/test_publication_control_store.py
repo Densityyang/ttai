@@ -87,6 +87,8 @@ CONTROL_MIGRATIONS = (
 )
 APPLICATION_NAME = "ttai-publication-race"
 IDENTITY = "metric.publication.control"
+SOURCE_DEFINITION_ID = "def_" + "a" * 32
+SOURCE_DEFINITION_CHECKSUM = "b" * 64
 
 
 def _identity(label: str) -> str:
@@ -143,6 +145,52 @@ def _wait_for_postgres(container: str) -> None:
 def _published_port(container: str) -> int:
     result = _docker("port", container, "5432/tcp")
     return int(result.stdout.strip().rsplit(":", maxsplit=1)[1])
+
+
+def _seed_source_definition_versions(container: str) -> None:
+    """Seed the synthetic exact versions referenced by semantic package fixtures."""
+
+    sql = f"""
+        INSERT INTO custom_definitions (
+          definition_id, owner_user_id, current_version, current_payload
+        ) VALUES (
+          '{SOURCE_DEFINITION_ID}', 'publication-owner', 4,
+          jsonb_build_object(
+            'definition_id', '{SOURCE_DEFINITION_ID}', 'version', 4
+          )
+        );
+        DO $seed_definition_versions$
+        DECLARE selected_version INTEGER;
+        BEGIN
+          FOR selected_version IN 1..4 LOOP
+            INSERT INTO custom_definition_versions (
+              definition_id, version, payload, checksum
+            ) VALUES (
+              '{SOURCE_DEFINITION_ID}', selected_version,
+              jsonb_build_object(
+                'definition_id', '{SOURCE_DEFINITION_ID}',
+                'version', selected_version,
+                'semantic_closed', TRUE
+              ),
+              '{SOURCE_DEFINITION_CHECKSUM}'
+            );
+          END LOOP;
+        END;
+        $seed_definition_versions$;
+    """
+    _docker(
+        "exec",
+        container,
+        "psql",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-U",
+        CONTROL_OWNER,
+        "-d",
+        CONTROL_DATABASE,
+        "--command",
+        sql,
+    )
 
 
 def _psql(
@@ -230,6 +278,7 @@ def control_postgres() -> Iterator[dict[str, Any]]:
                 f"/tmp/{migration}",
                 timeout=120,
             )
+        _seed_source_definition_versions(container)
         _psql(
             stack,
             f"CREATE ROLE {CONTROL_APP} LOGIN PASSWORD '{CONTROL_APP_PASSWORD}';"
@@ -399,9 +448,9 @@ def _semantic_version(
         semantic=PublishedSemanticPackage(
             calculation=calculation,
             parameter_contract=ParameterContract(parameters=tuple(calculation.parameters)),
-            source_definition_id="def_" + "a" * 32,
+            source_definition_id=SOURCE_DEFINITION_ID,
             source_definition_version=version,
-            source_definition_checksum="b" * 64,
+            source_definition_checksum=SOURCE_DEFINITION_CHECKSUM,
         ),
     )
 
@@ -927,9 +976,9 @@ def test_direct_sql_incoherent_semantic_package_is_refused_on_read(
             {
                 "calculation": _rich_spec().model_dump(mode="json"),
                 "parameter_contract": {"parameters": []},
-                "source_definition_id": "def_" + "a" * 32,
+                "source_definition_id": SOURCE_DEFINITION_ID,
                 "source_definition_version": 1,
-                "source_definition_checksum": "b" * 64,
+                "source_definition_checksum": SOURCE_DEFINITION_CHECKSUM,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -961,8 +1010,20 @@ def test_direct_sql_incoherent_semantic_package_is_refused_on_read(
         with pytest.raises(PublicationIntegrityError):
             await catalogue.current_version(identity)
 
-        # A package that is not even an object is refused the same way.
+        # A complete database-level source identity with a malformed
+        # calculation payload is refused by the typed reader the same way.
         malformed = _identity("malformed")
+        malformed_package = json.dumps(
+            {
+                "calculation": [1, 2, 3],
+                "parameter_contract": {"parameters": []},
+                "source_definition_id": SOURCE_DEFINITION_ID,
+                "source_definition_version": 1,
+                "source_definition_checksum": SOURCE_DEFINITION_CHECKSUM,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         _psql(
             control_postgres,
             "INSERT INTO product_publication_versions ("
@@ -970,7 +1031,8 @@ def test_direct_sql_incoherent_semantic_package_is_refused_on_read(
             "definition_checksum, published_at, unit, semantic"
             ") VALUES ("
             f"'{malformed}', 1, '{malformed}', 'owner', 'Owner', 'local_demo',"
-            f"'{'a' * 64}', '2026-03-01T00:00:00Z', 'count', '[1,2,3]'::jsonb);",
+            f"'{'a' * 64}', '2026-03-01T00:00:00Z', 'count', "
+            f"'{malformed_package}'::jsonb);",
         )
         with pytest.raises(PublicationIntegrityError):
             await catalogue.versions(malformed)
