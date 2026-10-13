@@ -4,7 +4,7 @@
 - 单数据集评测
 - A/B/C 对照实验
 - 结果报告生成（JSON + Markdown）
-- 显著性检验
+- identity-verified paired descriptive comparisons
 
 Usage:
     python -m benchmarks.runner --dataset bird --max-cases 50
@@ -33,6 +33,7 @@ from benchmarks.adapters import (
 )
 from benchmarks.agent_bridge import execute_case, override_agent_config
 from benchmarks.assertions import assert_privacy_redaction
+from benchmarks.comparison import compare_reports
 from benchmarks.executor_adapter import (
     ExecutorAdapter,
     UnavailableTypedExecutor,
@@ -45,7 +46,6 @@ from benchmarks.metrics import (
     CaseResult,
     adjudicate_case_result,
     generate_report,
-    statistical_significance,
 )
 from benchmarks.registry import (
     ASSERTION_VERSION,
@@ -71,8 +71,6 @@ from benchmarks.typed_receipts import (
     BudgetExceeded,
     BudgetGate,
     TypedAnswerReceipt,
-    mcnemar_exact,
-    paired_bootstrap_interval,
     validate_receipt,
 )
 
@@ -855,45 +853,55 @@ def _generate_comparison_report(
 
     lines.append("")
 
-    # 显著性检验（如果有 >= 2 组）
     report_list = list(reports.items())
+    comparison_entries: list[dict[str, Any]] = []
+    lines.extend(
+        [
+            "## Keyed paired descriptive comparison",
+            "",
+            "No statistical significance, calibration, or release claim is made.",
+            "",
+            "| Variant | Status | Pairs | Adjudicated | Unknown | Mean paired pass delta | Reason |",
+            "|---------|--------|-------|-------------|---------|------------------------|--------|",
+        ]
+    )
     if len(report_list) >= 2:
         baseline_name, baseline_report = report_list[0]
-        baseline_scores = [
-            1.0 if r.execution_success else 0.0
-            for r in baseline_report.results
-        ]
-
-        lines.extend([
-            f"## Statistical Significance (vs {baseline_name})",
-            "",
-            "| Variant | Mean Diff | McNemar p | Paired bootstrap 95% CI |",
-            "|---------|-----------|-----------|-------------------------|",
-        ])
-
         for name, report in report_list[1:]:
-            exp_scores = [
-                1.0 if r.execution_success else 0.0
-                for r in report.results
-            ]
-            sig = statistical_significance(baseline_scores, exp_scores)
-            mcnemar = mcnemar_exact(
-                [bool(score) for score in baseline_scores],
-                [bool(score) for score in exp_scores],
+            paired = compare_reports(baseline_report, report)
+            comparison_entries.append(
+                {"variant": name, **paired.to_dict()}
             )
-            low, high = paired_bootstrap_interval(baseline_scores, exp_scores)
+            mean_delta = (
+                f"{paired.mean_paired_pass_delta:+.6f}"
+                if paired.mean_paired_pass_delta is not None
+                else "unavailable"
+            )
             lines.append(
-                f"| {name} "
-                f"| {sig['mean_diff']:+.4f} "
-                f"| {mcnemar['p_value']:.4f} "
-                f"| [{low:+.4f}, {high:+.4f}] |"
+                f"| {name} | {paired.status} | {paired.pair_count} "
+                f"| {paired.adjudicated_pair_count} | {paired.unknown_pair_count} "
+                f"| {mean_delta} | {paired.reason or ''} |"
             )
-
-        lines.append("")
+    else:
+        lines.append("| — | REFUSED | 0 | 0 | 0 | unavailable | no_candidate_variant |")
+    lines.append("")
 
     md_path = out_dir / f"comparison-{experiment_name}.md"
     md_path.write_text("\n".join(lines), encoding="utf-8")
+    comparison_path = out_dir / f"comparison-{experiment_name}.json"
+    comparison_payload = {
+        "schema_version": "1.0",
+        "experiment": experiment_name,
+        "baseline_run_id": report_list[0][1].run_id if report_list else None,
+        "comparisons": comparison_entries,
+    }
+    comparison_path.write_text(
+        json.dumps(comparison_payload, ensure_ascii=False, sort_keys=True, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
     logger.info("对照报告已生成: %s", md_path)
+    logger.info("paired comparison manifest 已生成: %s", comparison_path)
 
 
 # ── P9A typed default path ──────────────────────────────────────────────────

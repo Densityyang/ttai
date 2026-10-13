@@ -613,7 +613,9 @@ def statistical_significance(
     Returns:
         {"mean_diff": float, "t_statistic": float, "significant": bool, "n": int}
     """
-    n = min(len(baseline_scores), len(experiment_scores))
+    if len(baseline_scores) != len(experiment_scores):
+        raise ValueError("paired score arrays must have equal lengths")
+    n = len(baseline_scores)
     if n < 2:
         return {"mean_diff": 0.0, "t_statistic": 0.0, "significant": False, "n": n}
 
