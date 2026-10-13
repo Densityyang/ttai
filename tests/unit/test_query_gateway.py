@@ -574,6 +574,7 @@ async def test_gateway_receipt_and_audit_share_real_execution_identity_and_snaps
     )
     assert audit.starts[0][2] == str(receipt.execution_id)
     assert audit.results[0]["execution_id"] == str(receipt.execution_id)
+    assert audit.results[0]["source_snapshot_fingerprint"] == receipt.source_snapshot_fingerprint
 
 
 @pytest.mark.asyncio

@@ -366,7 +366,8 @@ def test_compiled_sql_validation_tracks_joins_aliases_ctes_and_projections() -> 
         "c.display_name AS customer_name "
         "FROM owner_sales AS os "
         "JOIN analytics.customers AS c "
-        "ON c.customer_id = os.customer_key AND c.owner_id = :owner_user_id"
+        "ON c.customer_id = os.customer_key "
+        "WHERE c.owner_id = :owner_user_id"
     )
     compiled = CompiledGovernedQuery(
         candidate=candidate,
@@ -384,7 +385,7 @@ def test_compiled_sql_validation_tracks_joins_aliases_ctes_and_projections() -> 
 
     unscoped_join = CompiledGovernedQuery(
         candidate=candidate,
-        sql=sql.replace(" AND c.owner_id = :owner_user_id", ""),
+        sql=sql.replace(" WHERE c.owner_id = :owner_user_id", ""),
         parameters=parameters,
         projections=projections,
     )
@@ -394,6 +395,28 @@ def test_compiled_sql_validation_tracks_joins_aliases_ctes_and_projections() -> 
             authorization=authorization,
             effective_scope=scope,
             compiled=unscoped_join,
+        )
+
+    left_join_with_on_only_scopes = CompiledGovernedQuery(
+        candidate=candidate,
+        sql=(
+            "SELECT s.sale_id AS sale_id, s.amount AS amount, "
+            "c.display_name AS customer_name "
+            "FROM analytics.sales AS s "
+            "LEFT JOIN analytics.customers AS c "
+            "ON c.customer_id = s.customer_id "
+            "AND s.owner_id = :owner_user_id "
+            "AND c.owner_id = :owner_user_id"
+        ),
+        parameters=parameters,
+        projections=projections,
+    )
+    with pytest.raises(DataRequestDenied):
+        _validate_compiled_query(
+            request=request,
+            authorization=authorization,
+            effective_scope=scope,
+            compiled=left_join_with_on_only_scopes,
         )
 
 
@@ -498,6 +521,55 @@ def test_compiler_cannot_alias_sensitive_source_column_into_sandbox_data() -> No
                 relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
                 column_name="api_key",
                 output_name="visible_text",
+            ),
+            ReturnedColumnIdentity(
+                relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+                column_name="region",
+                output_name="region",
+            ),
+        ),
+    )
+
+    with pytest.raises(DataRequestDenied):
+        _validate_compiled_query(
+            request=request,
+            authorization=authorization,
+            effective_scope=effective_scope,
+            compiled=compiled,
+        )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        (
+            "WITH limited_sales AS ("
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id LIMIT 1) "
+            "SELECT limited_sales.amount AS amount, limited_sales.region AS region "
+            "FROM limited_sales"
+        ),
+        (
+            "SELECT limited_sales.amount AS amount, limited_sales.region AS region "
+            "FROM (SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id "
+            "FETCH FIRST 1 ROW ONLY) AS limited_sales"
+        ),
+    ],
+)
+def test_nested_cte_and_subquery_limits_cannot_mark_partial_data_complete(sql: str) -> None:
+    request = _request()
+    authorization = _authorization(request)
+    effective_scope = derive_effective_scope(request, authorization)
+    compiled = CompiledGovernedQuery(
+        candidate=_candidate(request, authorization, effective_scope=effective_scope),
+        sql=sql,
+        parameters={"owner_user_id": request.owner_user_id},
+        projections=(
+            ReturnedColumnIdentity(
+                relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+                column_name="amount",
+                output_name="amount",
             ),
             ReturnedColumnIdentity(
                 relation=RelationIdentity(schema_name="analytics", relation_name="sales"),

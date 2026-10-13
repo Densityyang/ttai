@@ -73,6 +73,22 @@ class QuerySourceSnapshot:
     source_version: str
     snapshot_id: str
 
+    @property
+    def fingerprint(self) -> str:
+        payload = json.dumps(
+            {
+                "schema_version": "query-source-snapshot-v1",
+                "source_id": self.source_id,
+                "source_version": self.source_version,
+                "snapshot_id": self.snapshot_id,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
 
 @dataclass(frozen=True)
 class PreparedQuery:
@@ -111,6 +127,10 @@ class QueryReceipt:
     execution_id: UUID | None = None
     source_snapshot: QuerySourceSnapshot | None = None
     result_columns: tuple[str, ...] = ()
+
+    @property
+    def source_snapshot_fingerprint(self) -> str | None:
+        return self.source_snapshot.fingerprint if self.source_snapshot is not None else None
 
     @property
     def policy_decision(self) -> PolicyDecision:
@@ -204,6 +224,7 @@ class QueryAuditSink(Protocol):
         row_count: int,
         elapsed_ms: float,
         error_code: str | None,
+        source_snapshot_fingerprint: str | None,
     ) -> None: ...
 
 
@@ -697,6 +718,7 @@ class QueryGateway:
                     row_count=receipt.row_count,
                     elapsed_ms=receipt.elapsed_ms,
                     error_code=receipt.error.code if receipt.error else None,
+                    source_snapshot_fingerprint=receipt.source_snapshot_fingerprint,
                 )
             except Exception as exc:
                 self._log_internal_failure("audit_result", exc, receipt.sql_fingerprint)

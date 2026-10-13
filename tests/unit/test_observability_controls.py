@@ -83,8 +83,10 @@ class _UnavailableAudit:
         row_count: int,
         elapsed_ms: float,
         error_code: str | None,
+        source_snapshot_fingerprint: str | None,
     ) -> None:
         del trace_id, sql, execution_id, accepted, row_count, elapsed_ms, error_code
+        del source_snapshot_fingerprint
 
 
 class _Pool:
@@ -119,6 +121,7 @@ async def test_control_audit_writes_event_and_outbox_without_raw_sql() -> None:
         row_count=2,
         elapsed_ms=3.5,
         error_code=None,
+        source_snapshot_fingerprint="a" * 64,
     )
 
     assert len(connection.calls) == 4
@@ -131,6 +134,7 @@ async def test_control_audit_writes_event_and_outbox_without_raw_sql() -> None:
     finish_payload = json.loads(cast(str, finish_args[5]))
     assert start_payload["query_execution_id"] == "query-execution-1"
     assert finish_payload["query_execution_id"] == "query-execution-1"
+    assert finish_payload["source_snapshot_fingerprint"] == "a" * 64
     assert connection.calls[1][1][3] == "nl2sql.trace"
     assert connection.calls[3][1][3] == "nl2sql.trace"
     # Each lifecycle event and its outbox row share one acquired connection.

@@ -7,6 +7,7 @@ container created by this fixture.
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import shutil
@@ -28,11 +29,13 @@ from src.nl2sql.infra.governance.data_broker import (
     CompiledGovernedQuery,
     GovernedDataBroker,
     QueryGatewayDataExecutor,
+    _dataset_metadata_reserve,
     _parameter_binding_fingerprint,
 )
 from src.nl2sql.infra.governance.query_gateway import (
     QueryErrorCode,
     QueryGateway,
+    QuerySourceSnapshot,
     _sqlstate,
 )
 from src.nl2sql.infra.store.database import DatabaseManager
@@ -53,6 +56,7 @@ from src.nl2sql.orchestration.data_request import (
     ReturnedColumnIdentity,
     VerifiedDataAuthorization,
     bind_data_request_owner,
+    derive_effective_scope,
 )
 from src.nl2sql.orchestration.metric_query import (
     METRIC_CALCULATION_UNDEFINED,
@@ -502,8 +506,9 @@ class _Pg17FixtureAuthority:
 class _Pg17FixtureCompiler:
     """Fixed test query with no model-authored SQL or request SQL field."""
 
-    def __init__(self, gateway: QueryGateway) -> None:
+    def __init__(self, gateway: QueryGateway, *, sql_override: str | None = None) -> None:
         self._gateway = gateway
+        self._sql_override = sql_override
 
     def compile_request(
         self,
@@ -511,7 +516,7 @@ class _Pg17FixtureCompiler:
         authorization: VerifiedDataAuthorization,
         effective_scope: EffectiveDataScope,
     ) -> CompiledGovernedQuery:
-        sql = (
+        sql = self._sql_override or (
             "WITH owner_sales AS ("
             "SELECT s.sale_id AS sale_key, s.customer_id AS customer_key, "
             "s.amount AS amount FROM ai_views.broker_sales AS s "
@@ -520,7 +525,7 @@ class _Pg17FixtureCompiler:
             "c.display_name AS customer_name FROM owner_sales AS os "
             "JOIN ai_views.broker_customers AS c "
             "ON c.customer_id = os.customer_key "
-            "AND c.owner_id = :owner_user_id ORDER BY os.sale_key"
+            "WHERE c.owner_id = :owner_user_id ORDER BY os.sale_key"
         )
         parameters = {"owner_user_id": request.owner_user_id}
         prepared = self._gateway.prepare(
@@ -595,6 +600,36 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
     try:
         dataset = await broker.request_dataset(_p5_broker_request())
 
+        left_join_on_only_sql = (
+            "SELECT s.sale_id AS sale_id, s.amount AS amount, "
+            "c.display_name AS customer_name "
+            "FROM ai_views.broker_sales AS s "
+            "LEFT JOIN ai_views.broker_customers AS c "
+            "ON c.customer_id = s.customer_id "
+            "AND s.owner_id = :owner_user_id "
+            "AND c.owner_id = :owner_user_id "
+            "ORDER BY s.sale_id"
+        )
+        direct_left_join = await gateway.execute(
+            left_join_on_only_sql,
+            {"owner_user_id": "owner-a"},
+            trace_id="test-only-left-join-counterfactual",
+        )
+        assert direct_left_join.accepted
+        leaked_owner_row = next(row for row in direct_left_join.rows if row["sale_id"] == 4)
+        assert str(leaked_owner_row["amount"]) == "999.00"
+        assert leaked_owner_row["customer_name"] is None
+
+        audit_counts_before_broker = (len(audit.starts), len(audit.results))
+        counterfactual_broker = GovernedDataBroker(
+            authority=_Pg17FixtureAuthority(),
+            compiler=_Pg17FixtureCompiler(gateway, sql_override=left_join_on_only_sql),
+            executor=QueryGatewayDataExecutor(gateway),
+        )
+        with pytest.raises(DataRequestDenied):
+            await counterfactual_broker.request_dataset(_p5_broker_request())
+        assert (len(audit.starts), len(audit.results)) == audit_counts_before_broker
+
         with pytest.raises(DataRequestDenied):
             await broker.request_dataset(_p5_broker_request(max_rows=1))
         assert audit.results[-1]["error_code"] == QueryErrorCode.ROWS_EXCEEDED
@@ -602,6 +637,41 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
         with pytest.raises(DataRequestDenied):
             await broker.request_dataset(_p5_broker_request(max_cost=0.0))
         assert audit.results[-1]["error_code"] == QueryErrorCode.COST_EXCEEDED
+
+        metadata_probe_request = _p5_broker_request(max_bytes=1_000_000)
+        metadata_probe_authorization = await _Pg17FixtureAuthority().verify_request(
+            metadata_probe_request
+        )
+        metadata_probe_scope = derive_effective_scope(
+            metadata_probe_request,
+            metadata_probe_authorization,
+        )
+        metadata_probe_compiled = _Pg17FixtureCompiler(gateway).compile_request(
+            metadata_probe_request,
+            metadata_probe_authorization,
+            metadata_probe_scope,
+        )
+        metadata_reserve = _dataset_metadata_reserve(metadata_probe_compiled)
+        row_byte_budget = 32
+        byte_budget_request = _p5_broker_request(
+            max_bytes=metadata_reserve + row_byte_budget
+        )
+        assert byte_budget_request.budget.max_bytes > metadata_reserve
+        assert len(
+            json.dumps(
+                direct_left_join.rows[0],
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ) > row_byte_budget
+        audits_before_streaming_byte_failure = (len(audit.starts), len(audit.results))
+        with pytest.raises(DataRequestDenied):
+            await broker.request_dataset(byte_budget_request)
+        assert audit.results[-1]["error_code"] == QueryErrorCode.RESULT_TOO_LARGE
+        assert (len(audit.starts), len(audit.results)) == (
+            audits_before_streaming_byte_failure[0] + 1,
+            audits_before_streaming_byte_failure[1] + 1,
+        )
 
         observed_audits = len(audit.results)
         with pytest.raises(DataRequestDenied):
@@ -649,6 +719,11 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
     assert dataset.source_snapshot.source_id == "p5_local_test_only:ttai_gateway"
     assert dataset.source_snapshot.source_version == "postgres-17"
     assert dataset.gateway_receipt_snapshot_id == dataset.source_snapshot.snapshot_id
+    assert audit.results[0]["source_snapshot_fingerprint"] == QuerySourceSnapshot(
+        source_id=dataset.source_snapshot.source_id,
+        source_version=dataset.source_snapshot.source_version,
+        snapshot_id=dataset.source_snapshot.snapshot_id or "",
+    ).fingerprint
     assert audit.starts[0][1] == str(dataset.gateway_receipt_id)
     assert audit.results[0]["execution_id"] == str(dataset.gateway_receipt_id)
 

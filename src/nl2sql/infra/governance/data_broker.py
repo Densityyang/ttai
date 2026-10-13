@@ -289,8 +289,6 @@ def _validate_compiled_query(
         if len(statements) != 1 or not isinstance(statements[0], exp.Select):
             raise DataRequestDenied()
         query = statements[0]
-        if query.args.get("limit") is not None or query.args.get("fetch") is not None:
-            raise DataRequestDenied()
         scopes = list(traverse_scope(query))
         if not scopes:
             raise DataRequestDenied()
@@ -311,6 +309,11 @@ def _validate_compiled_query(
         if not isinstance(scope.expression, exp.Select):
             # Set operations and non-SELECT scopes have unclear projection
             # lineage for this row-oriented dataset contract.
+            raise DataRequestDenied()
+        if (
+            scope.expression.args.get("limit") is not None
+            or scope.expression.args.get("fetch") is not None
+        ):
             raise DataRequestDenied()
         physical_tables = _physical_tables(scope)
         for alias, relation in physical_tables:
@@ -476,30 +479,21 @@ def _has_owner_row_predicate(
     owner_user_id: str,
     parameters: Mapping[str, Any],
 ) -> bool:
-    predicates: list[exp.Expression] = []
     where = scope.expression.args.get("where")
-    if isinstance(where, exp.Where):
-        predicates.append(where.this)
-    for join in scope.expression.args.get("joins") or ():
-        if not isinstance(join, exp.Join):
+    if not isinstance(where, exp.Where):
+        return False
+    conjuncts = _conjunctive_terms(where.this)
+    if conjuncts is None:
+        return False
+    for term in conjuncts:
+        if not isinstance(term, exp.EQ):
             continue
-        on = join.args.get("on")
-        if isinstance(on, exp.Expression):
-            predicates.append(on)
-
-    for predicate in predicates:
-        conjuncts = _conjunctive_terms(predicate)
-        if conjuncts is None:
-            continue
-        for term in conjuncts:
-            if not isinstance(term, exp.EQ):
-                continue
-            left = term.this
-            right = term.expression
-            if _matches_owner_binding(left, right, alias, owner_column, owner_user_id, parameters):
-                return True
-            if _matches_owner_binding(right, left, alias, owner_column, owner_user_id, parameters):
-                return True
+        left = term.this
+        right = term.expression
+        if _matches_owner_binding(left, right, alias, owner_column, owner_user_id, parameters):
+            return True
+        if _matches_owner_binding(right, left, alias, owner_column, owner_user_id, parameters):
+            return True
     return False
 
 

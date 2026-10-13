@@ -162,19 +162,23 @@ class ControlAuditStore:
         row_count: int,
         elapsed_ms: float,
         error_code: str | None,
+        source_snapshot_fingerprint: str | None,
     ) -> None:
+        attributes: dict[str, Any] = {
+            "sql_fingerprint": fingerprint(sql),
+            "query_execution_id": execution_id,
+            "accepted": accepted,
+            "row_count": row_count,
+            "elapsed_ms": round(elapsed_ms, 3),
+            "error_code": error_code,
+        }
+        if source_snapshot_fingerprint is not None:
+            attributes["source_snapshot_fingerprint"] = source_snapshot_fingerprint
         await self.append(
             TraceEvent(
                 trace_id=trace_id or "unscoped",
                 stage="sql",
                 name="execution_finished",
-                attributes={
-                    "sql_fingerprint": fingerprint(sql),
-                    "query_execution_id": execution_id,
-                    "accepted": accepted,
-                    "row_count": row_count,
-                    "elapsed_ms": round(elapsed_ms, 3),
-                    "error_code": error_code,
-                },
+                attributes=attributes,
             )
         )
