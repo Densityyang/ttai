@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from src.nl2sql.artifacts.publication_service import PublicationService
     from src.nl2sql.artifacts.repository import InMemoryArtifactRepository
     from src.nl2sql.artifacts.service import CustomDefinitionService
+    from src.nl2sql.hitl_action_claims import HITLActionClaimStore
     from src.nl2sql.orchestration.governed_calculation_inputs import (
         GovernedMetricInputFetcher,
         TypedMetricCalculationInputResolver,
@@ -101,6 +102,7 @@ class AppContainer:
         self._local_real_count_column = "id"
         self._definition_store: DefinitionStorePort | None = None
         self._definition_run_record_store: DefinitionRunRecordStore | None = None
+        self._hitl_action_claim_store: HITLActionClaimStore | None = None
         self._definition_service: CustomDefinitionService | None = None
         # The two server-owned confirmation records are SEPARATE stores: an
         # audit record is never a field of a definition, so it can never move a
@@ -179,6 +181,7 @@ class AppContainer:
                     self._confirmation_audit_store_instance(),
                     self._exploration_confirmation_store_instance(),
                     self._definition_run_record_store_instance(),
+                    self._hitl_action_claim_store_instance(),
                 ):
                     await store.ping()
                 self._product_store_ready = True
@@ -436,6 +439,32 @@ class AppContainer:
 
                 self._definition_run_record_store = InMemoryDefinitionRunRecordStore()
         return self._definition_run_record_store
+
+    def _hitl_action_claim_store_instance(self) -> HITLActionClaimStore:
+        """Return the backend-selected atomic HITL action claim store."""
+
+        if self._hitl_action_claim_store is None:
+            if self.product_store_backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.hitl_action_claim_control_store import (
+                    ControlHITLActionClaimStore,
+                )
+
+                self._hitl_action_claim_store = ControlHITLActionClaimStore(
+                    get_settings().control_database_url or ""
+                )
+            else:
+                from src.nl2sql.hitl_action_claims import (
+                    InMemoryHITLActionClaimStore,
+                )
+
+                self._hitl_action_claim_store = InMemoryHITLActionClaimStore()
+        return self._hitl_action_claim_store
+
+    def get_hitl_action_claim_store(self) -> HITLActionClaimStore:
+        """Return the one claim store shared by all requests in this process."""
+
+        return self._hitl_action_claim_store_instance()
 
     def _exploration_confirmation_store_instance(
         self,
@@ -1387,6 +1416,12 @@ class AppContainer:
             except Exception:
                 logger.error("definition run record store close failed")
             self._definition_run_record_store = None
+        if self._hitl_action_claim_store is not None:
+            try:
+                await self._hitl_action_claim_store.close()
+            except Exception:
+                logger.error("HITL action claim store close failed")
+            self._hitl_action_claim_store = None
         if self._confirmation_audit_store is not None:
             # Same engine-ownership rule as the definition store: a
             # control-backed audit store owns its engine, and the definition

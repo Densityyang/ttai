@@ -732,6 +732,10 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
         "src/nl2sql/artifacts/definition_run_record_control_store.py": {
             "connection.execute"
         },
+        # Reviewed owner/thread/version claim writer. It stores only request
+        # digests and a bounded safe response projection in the Control DB; it
+        # has no business-query or checkpoint writer capability.
+        "src/nl2sql/hitl_action_claim_control_store.py": {"connection.execute"},
         # Reviewed confirmation-record writer: the control-PG confirmation stores
         # append the server-owned audit record and the run-scoped exploration
         # confirmation through the shared runtime engine, never through a

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.types import AuthUser
+from src.nl2sql.hitl_action_claims import InMemoryHITLActionClaimStore
 from src.nl2sql.orchestration.decision_contract import (
     HITLDecision,
     HITLRequest,
@@ -70,16 +71,25 @@ class _AuthorizationProvider:
 
 
 class _Engine:
-    def __init__(self, values: dict[str, object], decision: HITLDecision | None) -> None:
+    def __init__(
+        self,
+        values: dict[str, object],
+        decision: HITLDecision | None,
+        *,
+        fail_after_invoke: bool = False,
+    ) -> None:
         self.values = values
         self.decision = decision
         self.invocations = 0
+        self.fail_after_invoke = fail_after_invoke
 
     async def aget_state(self, _: object) -> SimpleNamespace:
         return SimpleNamespace(values=self.values)
 
     async def ainvoke(self, *_: object, **__: object) -> dict[str, object]:
         self.invocations += 1
+        if self.fail_after_invoke:
+            raise RuntimeError("simulated interruption after claim")
         if self.decision is None:
             result = {
                 **self.values,
@@ -107,6 +117,7 @@ class _Container:
     def __init__(self, engine: _Engine, provider: _AuthorizationProvider) -> None:
         self.engine = engine
         self.provider = provider
+        self.hitl_action_claim_store = InMemoryHITLActionClaimStore()
 
     async def get_engine(self) -> _Engine:
         return self.engine
@@ -114,11 +125,16 @@ class _Container:
     def get_backend_authorization_provider(self) -> _AuthorizationProvider:
         return self.provider
 
+    def get_hitl_action_claim_store(self) -> InMemoryHITLActionClaimStore:
+        return self.hitl_action_claim_store
+
     def authority_provenance(self) -> str:
         return "unavailable"
 
 
-def _client(engine: _Engine) -> tuple[TestClient, _AuthorizationProvider]:
+def _client(
+    engine: _Engine, *, raise_server_exceptions: bool = True
+) -> tuple[TestClient, _AuthorizationProvider]:
     app = FastAPI()
     provider = _AuthorizationProvider()
     app.state.container = _Container(engine, provider)
@@ -130,7 +146,7 @@ def _client(engine: _Engine) -> tuple[TestClient, _AuthorizationProvider]:
         )
 
     app.dependency_overrides[require_nl2sql_permission] = identity
-    return TestClient(app), provider
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions), provider
 
 
 def _typed_state() -> dict[str, object]:
@@ -165,6 +181,27 @@ def test_missing_discriminator_preserves_legacy_action() -> None:
     assert "target_type" not in response.json()
     assert response.json()["status"] == "approved"
     assert provider.calls == 1
+    engine.values = {}
+    replay = client.post(
+        f"/api/v2/nl2sql/threads/{_THREAD}/actions",
+        json={
+            "action": "approve",
+            "idempotency_key": "legacy-key",
+            "expected_version": 1,
+        },
+    )
+    assert replay.status_code == 200
+    assert replay.json()["idempotent"] is True
+    assert engine.invocations == 1
+    conflict = client.post(
+        f"/api/v2/nl2sql/threads/{_THREAD}/actions",
+        json={
+            "action": "reject",
+            "idempotency_key": "legacy-key",
+            "expected_version": 1,
+        },
+    )
+    assert conflict.status_code == 409
 
 
 def test_typed_decision_bypasses_legacy_gate_and_safe_continuation_is_200() -> None:
@@ -244,6 +281,7 @@ def test_typed_idempotent_exact_replay_and_conflict() -> None:
         "decision": decision.model_dump(mode="json"),
     }
     assert client.post(path, json=body).status_code == 200
+    engine.values = {}
 
     replay = client.post(path, json=body)
     assert replay.status_code == 200
@@ -260,3 +298,22 @@ def test_typed_idempotent_exact_replay_and_conflict() -> None:
         },
     )
     assert conflict.status_code == 409
+
+
+def test_interrupted_claim_remains_in_progress_and_never_invokes_twice() -> None:
+    decision = _decision()
+    engine = _Engine(_typed_state(), decision, fail_after_invoke=True)
+    client, _ = _client(engine, raise_server_exceptions=False)
+    path = f"/api/v2/nl2sql/threads/{_THREAD}/actions"
+    body = {
+        "target_type": "typed_decision",
+        "expected_version": 1,
+        "decision": decision.model_dump(mode="json"),
+    }
+
+    interrupted = client.post(path, json=body)
+    assert interrupted.status_code == 500
+    retry = client.post(path, json=body)
+    assert retry.status_code == 409
+    assert retry.json()["detail"] == "typed decision is already being processed"
+    assert engine.invocations == 1

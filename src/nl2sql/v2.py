@@ -26,6 +26,15 @@ from src.core.auth.types import AuthUser
 from src.core.settings import get_settings
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import ErrorEnvelope, RequestContext, RequestIdentity, StrictContract
+from src.nl2sql.hitl_action_claims import (
+    HITLActionClaimInput,
+    HITLActionClaimResult,
+    HITLActionClaimStore,
+    HITLActionResponseSummary,
+    HITLContinuationStatus,
+    hitl_action_payload_checksum,
+    hitl_idempotency_key_checksum,
+)
 from src.nl2sql.orchestration.ad_hoc_request import AdHocCalculationRequest
 from src.nl2sql.orchestration.decision_contract import (
     HITLDecision,
@@ -187,21 +196,7 @@ class ThreadActionResponse(StrictContract):
         "rejected",
         "cancelled",
     ] | None = None
-    continuation_status: Literal[
-        "resolved_pending_revalidation",
-        "resolved_pending_current_authorization",
-        "resolved_continuing_current_authorization",
-        "current_authorization_unavailable",
-        "current_authorization_denied",
-        "continuation_execution_plan_denied",
-        "continuation_stopped",
-        "revalidation_denied",
-        "awaiting_decision",
-        "choose_recorded_no_continuation",
-        "rejected",
-        "cancelled",
-        "invalid",
-    ] | None = None
+    continuation_status: HITLContinuationStatus | None = None
 
 
 class FeedbackRequest(StrictContract):
@@ -716,10 +711,90 @@ def _validated_typed_ledger_entry(
     return stored_request, stored_decision, stored_token, recorded_status
 
 
-def _typed_continuation_status(value: object, *, fallback: str) -> str:
+def _typed_continuation_status(
+    value: object, *, fallback: str
+) -> HITLContinuationStatus:
     if isinstance(value, str) and value in _TYPED_CONTINUATION_STATUSES:
-        return value
-    return fallback
+        return cast(HITLContinuationStatus, value)
+    return cast(HITLContinuationStatus, fallback)
+
+
+def _hitl_action_claim_store_from_request(request: Request) -> HITLActionClaimStore:
+    container = getattr(request.app.state, "container", None)
+    accessor = getattr(container, "get_hitl_action_claim_store", None)
+    if not callable(accessor):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action claim store unavailable",
+        )
+    try:
+        store = accessor()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action claim store unavailable",
+        ) from exc
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action claim store unavailable",
+        )
+    return cast(HITLActionClaimStore, store)
+
+
+def _claim_http_response(
+    *,
+    thread_id: UUID,
+    summary: HITLActionResponseSummary,
+    idempotent: bool,
+) -> ThreadActionResponse:
+    return ThreadActionResponse(
+        thread_id=thread_id,
+        target_type=summary.target_type,
+        status=summary.status,
+        version=summary.version,
+        idempotent=idempotent,
+        decision_status=summary.decision_status,
+        continuation_status=summary.continuation_status,
+    )
+
+
+async def _lookup_hitl_claim(
+    store: HITLActionClaimStore, claim: HITLActionClaimInput
+) -> HITLActionClaimResult | None:
+    try:
+        return await store.lookup(claim=claim)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action claim store unavailable",
+        ) from exc
+
+
+async def _claim_hitl_action(
+    store: HITLActionClaimStore, claim: HITLActionClaimInput
+) -> HITLActionClaimResult:
+    try:
+        return await store.claim(claim=claim)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action claim store unavailable",
+        ) from exc
+
+
+async def _complete_hitl_action(
+    store: HITLActionClaimStore,
+    claim: HITLActionClaimInput,
+    response: HITLActionResponseSummary,
+) -> None:
+    try:
+        await store.complete(claim=claim, response=response)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action result persistence unavailable",
+        ) from exc
 
 
 async def _stream_query(
@@ -1036,10 +1111,7 @@ def register_v2_routes(app: FastAPI) -> None:
         context = await _resume_request_context(request, auth_user, thread_id)
         engine = await _engine_from_request(request)
         config = _runtime_config(context)
-        state_value = await engine.aget_state(config)
-        if not state_value or not getattr(state_value, "values", None):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
-        values = cast(dict[str, object], state_value.values)
+        claim_store = _hitl_action_claim_store_from_request(request)
 
         if body.target_type == "typed_decision":
             try:
@@ -1049,12 +1121,55 @@ def register_v2_routes(app: FastAPI) -> None:
                     status_code=status.HTTP_409_CONFLICT,
                     detail="typed decision is invalid",
                 ) from exc
+            claim = HITLActionClaimInput(
+                owner_user_id=str(auth_user.user_id),
+                thread_id=thread_id,
+                pending_version=body.expected_version,
+                idempotency_key_sha256=hitl_idempotency_key_checksum(
+                    incoming.idempotency_key
+                ),
+                payload_sha256=hitl_action_payload_checksum(
+                    {
+                        "target_type": "typed_decision",
+                        "expected_version": body.expected_version,
+                        "decision": incoming.model_dump(mode="json"),
+                    }
+                ),
+            )
+            previous_claim = await _lookup_hitl_claim(claim_store, claim)
+            if previous_claim is not None:
+                if previous_claim.outcome == "replay":
+                    assert previous_claim.response is not None
+                    return _claim_http_response(
+                        thread_id=thread_id,
+                        summary=previous_claim.response,
+                        idempotent=True,
+                    )
+                if previous_claim.outcome == "conflict":
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="typed decision claim conflicts",
+                    )
+
+            state_value = await engine.aget_state(config)
+            if not state_value or not getattr(state_value, "values", None):
+                if previous_claim is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="typed decision is already being processed",
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="thread not found"
+                )
+            values = cast(dict[str, object], state_value.values)
+
             ledger = values.get("decision_ledger")
             existing = (
                 ledger.get(incoming.idempotency_key)
                 if isinstance(ledger, Mapping)
                 else None
             )
+            recorded_summary: HITLActionResponseSummary | None = None
             if existing is not None:
                 try:
                     stored_request, _, _, recorded_status = (
@@ -1072,14 +1187,59 @@ def register_v2_routes(app: FastAPI) -> None:
                 continuation = _typed_continuation_status(
                     values.get("decision_status"), fallback=recorded_status
                 )
-                return ThreadActionResponse(
-                    thread_id=thread_id,
+                recorded_summary = HITLActionResponseSummary(
                     target_type="typed_decision",
                     status="recorded",
                     version=stored_request.version,
-                    idempotent=True,
                     decision_status=cast(Any, recorded_status),
                     continuation_status=cast(Any, continuation),
+                )
+                if previous_claim is not None and previous_claim.outcome == "in_progress":
+                    # The graph checkpoint proves the claimed action was
+                    # applied, but Control-PG completion may have been
+                    # interrupted. Persist only its safe result projection.
+                    await _complete_hitl_action(
+                        claim_store, claim, recorded_summary
+                    )
+                    return _claim_http_response(
+                        thread_id=thread_id,
+                        summary=recorded_summary,
+                        idempotent=True,
+                    )
+                if previous_claim is None:
+                    # A typed checkpoint ledger carries checksummed request
+                    # and decision identities, so an exact pre-migration replay
+                    # can be adopted without invoking the graph again.
+                    created_claim = await _claim_hitl_action(claim_store, claim)
+                    if created_claim.outcome == "replay":
+                        assert created_claim.response is not None
+                        return _claim_http_response(
+                            thread_id=thread_id,
+                            summary=created_claim.response,
+                            idempotent=True,
+                        )
+                    if created_claim.outcome == "conflict":
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="typed decision claim conflicts",
+                        )
+                    await _complete_hitl_action(
+                        claim_store, claim, recorded_summary
+                    )
+                    return _claim_http_response(
+                        thread_id=thread_id,
+                        summary=recorded_summary,
+                        idempotent=True,
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="typed decision is already being processed",
+                )
+
+            if previous_claim is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="typed decision is already being processed",
                 )
 
             if values.get("decision_status") != "awaiting_decision":
@@ -1106,6 +1266,25 @@ def register_v2_routes(app: FastAPI) -> None:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="typed decision is stale or conflicting",
+                )
+
+            created_claim = await _claim_hitl_action(claim_store, claim)
+            if created_claim.outcome == "replay":
+                assert created_claim.response is not None
+                return _claim_http_response(
+                    thread_id=thread_id,
+                    summary=created_claim.response,
+                    idempotent=True,
+                )
+            if created_claim.outcome == "conflict":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="typed decision claim conflicts",
+                )
+            if created_claim.outcome == "in_progress":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="typed decision is already being processed",
                 )
 
             result = await engine.ainvoke(
@@ -1145,13 +1324,18 @@ def register_v2_routes(app: FastAPI) -> None:
             continuation = _typed_continuation_status(
                 result.get("decision_status"), fallback=recorded_status
             )
-            return ThreadActionResponse(
-                thread_id=thread_id,
+            response_summary = HITLActionResponseSummary(
                 target_type="typed_decision",
                 status="recorded",
                 version=stored_request.version,
                 decision_status=cast(Any, recorded_status),
                 continuation_status=cast(Any, continuation),
+            )
+            await _complete_hitl_action(claim_store, claim, response_summary)
+            return _claim_http_response(
+                thread_id=thread_id,
+                summary=response_summary,
+                idempotent=False,
             )
 
         if body.action is None or body.idempotency_key is None:
@@ -1159,24 +1343,102 @@ def register_v2_routes(app: FastAPI) -> None:
                 status_code=status.HTTP_409_CONFLICT,
                 detail="legacy action payload is invalid",
             )
+        claim = HITLActionClaimInput(
+            owner_user_id=str(auth_user.user_id),
+            thread_id=thread_id,
+            pending_version=body.expected_version,
+            idempotency_key_sha256=hitl_idempotency_key_checksum(
+                body.idempotency_key
+            ),
+            payload_sha256=hitl_action_payload_checksum(
+                {
+                    "target_type": "legacy_hitl",
+                    "action": body.action,
+                    "expected_version": body.expected_version,
+                    "feedback": body.feedback,
+                }
+            ),
+        )
+        previous_claim = await _lookup_hitl_claim(claim_store, claim)
+        if previous_claim is not None:
+            if previous_claim.outcome == "replay":
+                assert previous_claim.response is not None
+                return _claim_http_response(
+                    thread_id=thread_id,
+                    summary=previous_claim.response,
+                    idempotent=True,
+                )
+            if previous_claim.outcome == "conflict":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="legacy action claim conflicts",
+                )
+
+        state_value = await engine.aget_state(config)
+        if not state_value or not getattr(state_value, "values", None):
+            if previous_claim is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="legacy action is already being processed",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="thread not found"
+            )
+        values = cast(dict[str, object], state_value.values)
+
         applied_actions = values.get("applied_actions", {})
+        prior: object | None = None
         if isinstance(applied_actions, dict):
             prior = applied_actions.get(body.idempotency_key)
+        if previous_claim is not None and previous_claim.outcome == "in_progress":
             if isinstance(prior, dict):
                 prior_status = prior.get("status")
                 prior_version = prior.get("version")
-                if isinstance(prior_status, str) and isinstance(prior_version, int):
-                    return ThreadActionResponse(
+                if prior_status in {"approved", "modified", "rejected", "cancelled"} and isinstance(prior_version, int):
+                    summary = HITLActionResponseSummary(
+                        status=cast(Any, prior_status), version=prior_version
+                    )
+                    await _complete_hitl_action(claim_store, claim, summary)
+                    return _claim_http_response(
                         thread_id=thread_id,
-                        status=cast(Literal["approved", "modified", "rejected", "cancelled"], prior_status),
-                        version=prior_version,
+                        summary=summary,
                         idempotent=True,
                     )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="legacy action is already being processed",
+            )
+        if isinstance(prior, dict):
+            # Legacy checkpoints store no request digest, so a checkpoint from
+            # before durable claims cannot prove that the same key had the
+            # same feedback/action. Refuse a speculative replay.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="legacy action replay cannot be verified",
+            )
         if values.get("hitl_status") != "awaiting_action":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="thread is not awaiting an action")
         version = values.get("hitl_version")
         if version != body.expected_version:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="action version is stale")
+        created_claim = await _claim_hitl_action(claim_store, claim)
+        if created_claim.outcome == "replay":
+            assert created_claim.response is not None
+            return _claim_http_response(
+                thread_id=thread_id,
+                summary=created_claim.response,
+                idempotent=True,
+            )
+        if created_claim.outcome == "conflict":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="legacy action claim conflicts",
+            )
+        if created_claim.outcome == "in_progress":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="legacy action is already being processed",
+            )
         legacy_payload = {
             "action": body.action,
             "idempotency_key": body.idempotency_key,
@@ -1198,10 +1460,15 @@ def register_v2_routes(app: FastAPI) -> None:
         )
         if response_status is None or not isinstance(result_version, int):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="action was not applied")
-        return ThreadActionResponse(
-            thread_id=thread_id,
+        response_summary = HITLActionResponseSummary(
             status=cast(Literal["approved", "modified", "rejected", "cancelled"], response_status),
             version=result_version,
+        )
+        await _complete_hitl_action(claim_store, claim, response_summary)
+        return _claim_http_response(
+            thread_id=thread_id,
+            summary=response_summary,
+            idempotent=False,
         )
 
     @router.post("/feedback", status_code=status.HTTP_202_ACCEPTED)

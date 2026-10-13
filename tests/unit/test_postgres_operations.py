@@ -37,6 +37,7 @@ def test_control_and_checkpoint_have_independent_alembic_chains() -> None:
         "006_definition_store",
         "007_confirmation_audit",
         "008_definition_run_records",
+        "009_hitl_action_claims",
     ]
     assert [path.stem for path in checkpoint_revisions] == ["001_checkpoint_schema"]
 
