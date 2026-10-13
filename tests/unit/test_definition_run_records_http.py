@@ -225,6 +225,7 @@ async def test_owner_reads_own_run_records_over_http(
 
     run = body["runs"][0]
     assert run["run_id"].startswith("run_")
+    assert "owner_user_id" not in run
     assert run["definition_id"] == definition_id
     assert run["version"] == 1
     # binding

@@ -73,6 +73,9 @@ MIGRATIONS = (
     "003_audit_outbox.sql",
     "004_semantic_registry_v3.sql",
     "005_product_artifacts.sql",
+    "006_definition_store.sql",
+    "007_confirmation_audit.sql",
+    "008_definition_run_records.sql",
 )
 
 IDENTITY = "demo.complaint_rate"

@@ -27,6 +27,7 @@ from src.nl2sql.artifacts.definition_run_record import (
     DefinitionRunReceipt,
     DefinitionRunRecord,
     DefinitionRunRecordStore,
+    DefinitionRunRecordStoreUnavailable,
     DefinitionRunValidation,
     InMemoryDefinitionRunRecordStore,
     new_run_id,
@@ -223,6 +224,10 @@ class CustomDefinitionExecutionService:
         # this is a configuration boundary, not a revalidation branch.
         if self._input_resolver is None:
             raise CalculationInputResolverUnavailable()
+        try:
+            await self._run_records.ping()
+        except Exception as exc:
+            raise DefinitionRunRecordStoreUnavailable() from exc
         context = execution_context or DefinitionExecutionContext()
         exact = await self._definitions.get_exact_version(
             owner_user_id=owner_user_id,
@@ -257,6 +262,7 @@ class CustomDefinitionExecutionService:
         )
         if before.branch != "EXECUTE":
             return await self._record_refusal(
+                owner_user_id=owner_user_id,
                 exact=exact,
                 definition_binding=definition_binding,
                 context=context,
@@ -279,6 +285,7 @@ class CustomDefinitionExecutionService:
         )
         if after.branch != "EXECUTE":
             return await self._record_refusal(
+                owner_user_id=owner_user_id,
                 exact=exact,
                 definition_binding=definition_binding,
                 context=context,
@@ -309,6 +316,7 @@ class CustomDefinitionExecutionService:
         )
         await self._run_records.put(
             record=DefinitionRunRecord(
+                owner_user_id=owner_user_id,
                 run_id=new_run_id(),
                 definition_id=exact.definition_id,
                 version=exact.version,
@@ -326,6 +334,7 @@ class CustomDefinitionExecutionService:
     async def _record_refusal(
         self,
         *,
+        owner_user_id: str,
         exact: DefinitionVersion,
         definition_binding: DefinitionExecutionBinding,
         context: DefinitionExecutionContext,
@@ -342,6 +351,7 @@ class CustomDefinitionExecutionService:
         )
         await self._run_records.put(
             record=DefinitionRunRecord(
+                owner_user_id=owner_user_id,
                 run_id=run_id,
                 definition_id=exact.definition_id,
                 version=exact.version,

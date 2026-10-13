@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from src.nl2sql.artifacts.custom_definition_execution_service import (
         CustomDefinitionExecutionService,
     )
+    from src.nl2sql.artifacts.definition_run_record import DefinitionRunRecordStore
     from src.nl2sql.artifacts.exploration_confirmation import (
         ExplorationConfirmationService,
     )
@@ -99,6 +100,7 @@ class AppContainer:
         self._local_real_source_watermark_checked_at: datetime | None = None
         self._local_real_count_column = "id"
         self._definition_store: DefinitionStorePort | None = None
+        self._definition_run_record_store: DefinitionRunRecordStore | None = None
         self._definition_service: CustomDefinitionService | None = None
         # The two server-owned confirmation records are SEPARATE stores: an
         # audit record is never a field of a definition, so it can never move a
@@ -176,6 +178,7 @@ class AppContainer:
                     # this definition" would silently stop being durable.
                     self._confirmation_audit_store_instance(),
                     self._exploration_confirmation_store_instance(),
+                    self._definition_run_record_store_instance(),
                 ):
                     await store.ping()
                 self._product_store_ready = True
@@ -408,6 +411,31 @@ class AppContainer:
 
                 self._confirmation_audit_store = InMemoryConfirmationAuditStore()
         return self._confirmation_audit_store
+
+    def _definition_run_record_store_instance(self) -> DefinitionRunRecordStore:
+        """Build the backend-selected run store once per application container."""
+
+        if self._definition_run_record_store is None:
+            try:
+                backend = self.product_store_backend
+            except Exception:
+                backend = "memory"
+            if backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.definition_run_record_control_store import (
+                    ControlDefinitionRunRecordStore,
+                )
+
+                self._definition_run_record_store = ControlDefinitionRunRecordStore(
+                    get_settings().control_database_url or ""
+                )
+            else:
+                from src.nl2sql.artifacts.definition_run_record import (
+                    InMemoryDefinitionRunRecordStore,
+                )
+
+                self._definition_run_record_store = InMemoryDefinitionRunRecordStore()
+        return self._definition_run_record_store
 
     def _exploration_confirmation_store_instance(
         self,
@@ -731,6 +759,7 @@ class AppContainer:
             self._custom_definition_execution_service = CustomDefinitionExecutionService(
                 definitions=definitions,
                 input_resolver=self.calculation_input_resolver(),
+                run_records=self._definition_run_record_store_instance(),
                 revalidation=DefinitionRevalidationGate(
                     governed_metric_authority=definitions._is_governed_metric_key,
                     strict=get_settings().service_mode == "product",
@@ -1351,6 +1380,13 @@ class AppContainer:
                 logger.error("definition store close failed")
             self._definition_store = None
             self._definition_service = None
+        self._custom_definition_execution_service = None
+        if self._definition_run_record_store is not None:
+            try:
+                await self._definition_run_record_store.close()
+            except Exception:
+                logger.error("definition run record store close failed")
+            self._definition_run_record_store = None
         if self._confirmation_audit_store is not None:
             # Same engine-ownership rule as the definition store: a
             # control-backed audit store owns its engine, and the definition
