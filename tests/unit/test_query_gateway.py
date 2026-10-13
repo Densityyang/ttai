@@ -726,6 +726,12 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
         # a business query session.  Every statement is a fixed text(...) with
         # bound parameters; none is assembled from request data.
         "src/nl2sql/artifacts/definition_control_store.py": {"connection.execute"},
+        # Reviewed durable owner-scoped run-record store. It validates the
+        # owner/version identity and checksum through the Control database;
+        # it does not execute business SQL or hold business DB capabilities.
+        "src/nl2sql/artifacts/definition_run_record_control_store.py": {
+            "connection.execute"
+        },
         # Reviewed confirmation-record writer: the control-PG confirmation stores
         # append the server-owned audit record and the run-scoped exploration
         # confirmation through the shared runtime engine, never through a
