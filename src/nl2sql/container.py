@@ -1336,6 +1336,9 @@ class AppContainer:
         return self._typed_deployment
 
     async def close(self) -> None:
+        await _run_shielded_cleanup(self._close_resources)
+
+    async def _close_resources(self) -> None:
         self._engine = None
         self._model_gateway = None
         if self._definition_store is not None:

@@ -234,3 +234,41 @@ async def test_failed_db_manager_connect_is_not_cached(monkeypatch: pytest.Monke
     assert isinstance(manager, _Manager)
     assert database._db_manager is manager
     assert database._db_manager_schema == "ai_views"
+
+
+@pytest.mark.asyncio
+async def test_container_close_finishes_resource_disposal_after_cancellation() -> None:
+    dispose_started = asyncio.Event()
+    allow_dispose = asyncio.Event()
+    disposed: list[int] = []
+
+    class _SlowEngine:
+        async def dispose(self) -> None:
+            dispose_started.set()
+            await allow_dispose.wait()
+            disposed.append(id(self))
+
+    container = AppContainer()
+    container._typed_resources = (
+        _Closeable(),
+        _Closeable(),
+        _SlowEngine(),
+        _SlowEngine(),
+    )  # type: ignore[assignment]
+    container._local_real_resources = (
+        _SlowEngine(),
+        _SlowEngine(),
+        object(),
+    )  # type: ignore[assignment]
+
+    close_task = asyncio.create_task(container.close())
+    await dispose_started.wait()
+    close_task.cancel()
+    allow_dispose.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    assert len(disposed) == 4
+    assert container._typed_resources is None
+    assert container._local_real_resources is None
