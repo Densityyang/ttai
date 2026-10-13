@@ -8,8 +8,9 @@ is therefore no longer true for the control-backed product stores.
 Gate (identical to tests/integration/test_postgres_governance.py):
 TTAI_RUN_POSTGRES_INTEGRATION=1, otherwise the whole module skips.
 
-The module starts its OWN pgvector/pgvector:pg17 container and applies the frozen
-docker/migrations/control/001..005 in order.
+The module starts its OWN pgvector/pgvector:pg17 container and applies the local
+Control schema through migration 009 so AppContainer readiness matches the
+current product-store contract.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ MIGRATIONS = (
     "006_definition_store.sql",
     "007_confirmation_audit.sql",
     "008_definition_run_records.sql",
+    "009_hitl_action_claims.sql",
 )
 
 

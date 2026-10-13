@@ -2,7 +2,7 @@
 
 The catalogue is gated exactly like the governance contract: nothing runs unless
 TTAI_RUN_POSTGRES_INTEGRATION=1, and the container is created, migrated with
-001..005 and torn down by this module alone.
+001..009 and torn down by this module alone.
 
 What is proven here is BEHAVIOURAL EQUIVALENCE with the process-local port
 (src/nl2sql/artifacts/publication.py), including the frozen error codes, plus the
@@ -83,6 +83,7 @@ CONTROL_MIGRATIONS = (
     "006_definition_store.sql",
     "007_confirmation_audit.sql",
     "008_definition_run_records.sql",
+    "009_hitl_action_claims.sql",
 )
 APPLICATION_NAME = "ttai-publication-race"
 IDENTITY = "metric.publication.control"

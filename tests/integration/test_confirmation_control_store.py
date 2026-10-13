@@ -2,7 +2,7 @@
 
 The records are gated exactly like the other control-plane contracts: nothing runs
 unless TTAI_RUN_POSTGRES_INTEGRATION=1, and the container is created, migrated
-with 001..007 and torn down by this module alone.
+with 001..009 and torn down by this module alone.
 
 What is proven here, at execution level:
 
@@ -91,6 +91,7 @@ CONTROL_MIGRATIONS = (
     "006_definition_store.sql",
     "007_confirmation_audit.sql",
     "008_definition_run_records.sql",
+    "009_hitl_action_claims.sql",
 )
 GOVERNED_METRIC = "demo.revenue"
 MISSING_DEFINITION = "def_" + "0" * 32

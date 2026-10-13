@@ -3,8 +3,8 @@
 Gate (identical to tests/integration/test_postgres_governance.py):
 TTAI_RUN_POSTGRES_INTEGRATION=1, otherwise the whole module skips.
 
-The module starts its OWN pgvector/pgvector:pg17 container, applies the frozen
-docker/migrations/control/001..005 in order, and exercises
+The module starts its OWN pgvector/pgvector:pg17 container, applies the local
+Control schema through migration 009, and exercises
 ControlLibraryRepository against it.  The composed PublicationCatalogue stays
 the in-memory implementation: PUBLICATION state is delegated, PERSONAL state
 (installs, Stars, withdrawal acknowledgement) is durable.
@@ -76,6 +76,7 @@ MIGRATIONS = (
     "006_definition_store.sql",
     "007_confirmation_audit.sql",
     "008_definition_run_records.sql",
+    "009_hitl_action_claims.sql",
 )
 
 IDENTITY = "demo.complaint_rate"

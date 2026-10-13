@@ -2,7 +2,7 @@
 
 The definition store is gated exactly like the other control-plane contracts:
 nothing runs unless TTAI_RUN_POSTGRES_INTEGRATION=1, and the container is
-created, migrated with 001..008 and torn down by this module alone.
+created, migrated with 001..009 and torn down by this module alone.
 
 What is proven here is the end of the HALF-persisted state:
 
@@ -100,6 +100,7 @@ CONTROL_MIGRATIONS = (
     "006_definition_store.sql",
     "007_confirmation_audit.sql",
     "008_definition_run_records.sql",
+    "009_hitl_action_claims.sql",
 )
 GOVERNED_METRIC = "demo.revenue"
 CHECKSUM_A = "a" * 64
