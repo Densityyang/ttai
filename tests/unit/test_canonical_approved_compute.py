@@ -339,7 +339,16 @@ async def test_ratio_1_0_output_remains_unrounded_with_numeric_binding_metadata(
     # receives only the versioned template step and applies the registered
     # numerator / denominator behavior.
     binding = _binding(unit="percent", precision=2, rounding="half_up")
-    execution_plan, calculation, context = _build(binding=binding)
+    plan, context = _plan(), _dependency_context()
+    catalog = ApprovedCalculationCatalog([binding])
+    execution_plan = PlanCompiler(calculation_catalog=catalog).compile(
+        plan=plan,
+        context=context,
+        validation=_allow(plan, context),
+    )
+    calculation = next(
+        step for step in execution_plan.steps if isinstance(step, TrustedCalculationStep)
+    )
     assert calculation.template_version == "1.0"
 
     class FixtureMetricRunner:
@@ -383,8 +392,6 @@ async def test_ratio_1_0_output_remains_unrounded_with_numeric_binding_metadata(
                 ),
             )
 
-    plan = _plan()
-    catalog = ApprovedCalculationCatalog([binding])
     validator = PlanValidator(calculation_catalog=catalog)
     budget = RouteBudgetLedger(route="standard")
     validation = validator.validate_execution_plan(
