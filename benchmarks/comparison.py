@@ -326,7 +326,9 @@ def _validated_provenance(
     legacy_extras = manifest.get("legacy_extras") or {}
     if not isinstance(legacy_extras, dict):
         return None, "invalid_manifest_provenance"
-    explicit_config_checksum = legacy_extras.get("variant_config_sha256")
+    explicit_config_checksum = legacy_extras.get(
+        "effective_runtime_config_sha256"
+    )
     if explicit_config_checksum is not None and not _valid_sha256(
         explicit_config_checksum
     ):

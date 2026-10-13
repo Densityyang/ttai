@@ -4,10 +4,13 @@ import contextlib
 import copy
 import hashlib
 import json
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 
 from benchmarks.adapters import BenchmarkCase
 from benchmarks.comparison import compare_reports
@@ -355,8 +358,23 @@ async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_res
             ]
         },
     )
-    monkeypatch.setattr(runner, "override_agent_config", lambda _overrides: contextlib.nullcontext())
-    monkeypatch.setattr(runner, "save_report", lambda _report: None)
+    resolved_config = {"model": "base-model"}
+
+    @contextlib.contextmanager
+    def override_config(overrides: dict[str, Any]):
+        previous = resolved_config["model"]
+        resolved_config["model"] = overrides["model"]
+        try:
+            yield
+        finally:
+            resolved_config["model"] = previous
+
+    monkeypatch.setattr(runner, "override_agent_config", override_config)
+    monkeypatch.setattr(
+        runner,
+        "_effective_runtime_config_sha256",
+        lambda: _sha(resolved_config["model"]),
+    )
 
     async def fake_run_benchmark(
         selected: list[BenchmarkCase], *, run_id: str, use_stub: bool
@@ -405,6 +423,16 @@ async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_res
     assert comparison["unknown_pair_count"] == 2
     assert comparison["mean_paired_pass_delta"] is None
     assert "case-a" not in json.dumps(payload)
+    assert "candidate-model" not in json.dumps(payload)
+    assert comparison["manifest"]["baseline"]["runtime_config_sha256"] != (
+        comparison["manifest"]["candidate"]["runtime_config_sha256"]
+    )
+    assert all(result.case_identity_sha256 == "" for report in reports.values() for result in report.results)
+    for report in reports.values():
+        persisted = json.loads(
+            (tmp_path / f"{report.run_id}.json").read_text(encoding="utf-8")
+        )
+        assert "case_identity_sha256" not in json.dumps(persisted)
     assert "COMPLETE" in markdown
     assert "NO_TYPED_RECEIPTS" in markdown
     assert "unavailable" in markdown
@@ -417,3 +445,49 @@ def test_legacy_positional_helpers_refuse_mismatched_array_lengths() -> None:
         paired_bootstrap_interval([1.0, 0.0], [1.0])
     with pytest.raises(ValueError, match="equal lengths"):
         mcnemar_exact([True, False], [True])
+
+
+def test_effective_config_fingerprint_redacts_secret_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.nl2sql.config.settings as agent_settings
+    from benchmarks.runner import _effective_runtime_config_sha256
+
+    first = agent_settings.AgentConfig(
+        embedding_api_key=SecretStr("secret-value-one")
+    )
+    second = agent_settings.AgentConfig(
+        embedding_api_key=SecretStr("secret-value-two")
+    )
+    absent = agent_settings.AgentConfig(
+        embedding_api_key=SecretStr("not-needed")
+    )
+
+    monkeypatch.setattr(agent_settings, "get_agent_config", lambda: first)
+    first_fingerprint = _effective_runtime_config_sha256()
+    monkeypatch.setattr(agent_settings, "get_agent_config", lambda: second)
+    second_fingerprint = _effective_runtime_config_sha256()
+    monkeypatch.setattr(agent_settings, "get_agent_config", lambda: absent)
+    absent_fingerprint = _effective_runtime_config_sha256()
+
+    assert first_fingerprint == second_fingerprint
+    assert first_fingerprint != absent_fingerprint
+    assert "secret-value" not in first_fingerprint
+
+
+def test_config_override_logs_never_include_secret_values(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import src.nl2sql.config.settings as agent_settings
+    from benchmarks.agent_bridge import override_agent_config
+
+    config = SimpleNamespace(api_key="original-secret")
+    monkeypatch.setattr(agent_settings, "get_agent_config", lambda: config)
+    caplog.set_level(logging.INFO)
+
+    with override_agent_config({"api_key": "candidate-secret"}):
+        assert config.api_key == "candidate-secret"
+
+    assert config.api_key == "original-secret"
+    assert "candidate-secret" not in caplog.text
+    assert "original-secret" not in caplog.text

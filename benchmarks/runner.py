@@ -820,12 +820,7 @@ async def run_experiment(
     for config in configs:
         name = config["name"]
         overrides = config.get("overrides", {})
-        logger.info(
-            "运行实验组: %s (%s) config_sha256=%s",
-            name,
-            config["description"],
-            sha256_hex(canonical_json(overrides)),
-        )
+        logger.info("运行实验组: %s (%s)", name, config["description"])
 
         run_id = f"{experiment_name}-{name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
@@ -833,11 +828,13 @@ async def run_experiment(
             report = await run_benchmark(
                 selected_cases, run_id=run_id, use_stub=use_stub
             )
+            runtime_config_checksum = _effective_runtime_config_sha256()
         else:
             with override_agent_config(overrides):
                 report = await run_benchmark(
                     selected_cases, run_id=run_id, use_stub=use_stub
                 )
+                runtime_config_checksum = _effective_runtime_config_sha256()
 
         _attach_experiment_pair_identity(
             report,
@@ -848,14 +845,49 @@ async def run_experiment(
             plan=plan,
             selection_run=selection_run,
             selected_eval_cases=selected_eval_cases,
+            runtime_config_checksum=runtime_config_checksum,
         )
 
         reports[name] = report
-        save_report(report)
 
     _generate_comparison_report(experiment_name, reports)
 
+    # Per-case identities exist only long enough to make the exact comparison.
+    # Persisted run reports keep aggregate selection provenance, not the
+    # per-case pseudonymous keys that could be guessed from a known dataset.
+    for report in reports.values():
+        _scrub_experiment_pair_identity(report)
+        save_report(report)
+
     return reports
+
+
+def _effective_runtime_config_sha256() -> str:
+    """Fingerprint effective agent configuration without serializing secrets."""
+
+    from src.nl2sql.config.settings import get_agent_config
+
+    config = get_agent_config()
+    payload = config.model_dump(mode="json")
+    if not isinstance(payload, dict):
+        raise TypeError("effective agent configuration must serialize to an object")
+    for field_name in getattr(type(config), "model_fields", {}):
+        value = getattr(config, field_name, None)
+        secret_value = getattr(value, "get_secret_value", None)
+        if callable(secret_value):
+            raw = secret_value()
+            payload[field_name] = {"configured": bool(raw and raw != "not-needed")}
+    return sha256_hex(canonical_json(payload))
+
+
+def _scrub_experiment_pair_identity(report: BenchmarkReport) -> None:
+    for result in report.results:
+        result.case_identity_sha256 = ""
+        result.selection_checksum = ""
+        result.repetition_index = None
+        result.repetition_seed = None
+        result.repetition_checksum = ""
+        result.execution_run_id = ""
 
 
 def _attach_experiment_pair_identity(
@@ -868,6 +900,7 @@ def _attach_experiment_pair_identity(
     plan: SelectionPlan,
     selection_run: SelectionRun,
     selected_eval_cases: Sequence[EvalCase],
+    runtime_config_checksum: str,
 ) -> None:
     """Bind exact run-time cases to legacy results without cross-run position pairing."""
 
@@ -906,7 +939,6 @@ def _attach_experiment_pair_identity(
         plan=plan,
         dataset=dataset,
     )
-    config_checksum = sha256_hex(canonical_json(variant_config))
     manifest = manifest.model_copy(
         update={
             "model_profile_version": f"legacy-ab-{variant_name}",
@@ -915,7 +947,8 @@ def _attach_experiment_pair_identity(
                 **manifest.legacy_extras,
                 "experiment": experiment_name,
                 "variant_name": variant_name,
-                "variant_config_sha256": config_checksum,
+                "override_fields": sorted(variant_config),
+                "effective_runtime_config_sha256": runtime_config_checksum,
             },
         }
     )
