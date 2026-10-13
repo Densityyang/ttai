@@ -248,7 +248,12 @@ async def test_container_close_finishes_resource_disposal_after_cancellation() -
             await allow_dispose.wait()
             disposed.append(id(self))
 
+    class _FailingClose:
+        async def close(self) -> None:
+            raise RuntimeError("audit close failed")
+
     container = AppContainer()
+    container._audit_store = _FailingClose()  # type: ignore[assignment]
     container._typed_resources = (
         _Closeable(),
         _Closeable(),
@@ -272,3 +277,4 @@ async def test_container_close_finishes_resource_disposal_after_cancellation() -
     assert len(disposed) == 4
     assert container._typed_resources is None
     assert container._local_real_resources is None
+    assert container._audit_store is None

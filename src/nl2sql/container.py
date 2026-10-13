@@ -1405,8 +1405,12 @@ class AppContainer:
             self._exploration_confirmation_store = None
             self._exploration_confirmation_service = None
         if self._audit_store is not None:
-            await self._audit_store.close()
-            self._audit_store = None
+            try:
+                await self._audit_store.close()
+            except Exception:
+                logger.error("control audit store close failed")
+            finally:
+                self._audit_store = None
         if self._typed_resources is not None:
             publisher, snapshots, business_engine, cancellation_engine = (
                 self._typed_resources
