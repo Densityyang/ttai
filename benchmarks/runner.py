@@ -863,11 +863,15 @@ async def run_experiment(
 
 
 def _effective_runtime_config_sha256() -> str:
-    """Fingerprint effective agent configuration without serializing secrets."""
+    """Fingerprint effective dispatch settings and provider availability safely."""
 
+    import os
+
+    from src.core.settings import get_settings
     from src.nl2sql.config.settings import get_agent_config
 
     config = get_agent_config()
+    settings = get_settings()
     payload = config.model_dump(mode="json")
     if not isinstance(payload, dict):
         raise TypeError("effective agent configuration must serialize to an object")
@@ -877,6 +881,33 @@ def _effective_runtime_config_sha256() -> str:
         if callable(secret_value):
             raw = secret_value()
             payload[field_name] = {"configured": bool(raw and raw != "not-needed")}
+    deepseek_configured = bool(
+        os.environ.get("DEEPSEEK_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY_FILE")
+        or settings.openai_api_key
+    )
+    nvidia_configured = bool(
+        os.environ.get("NVIDIA_API_KEY")
+        or os.environ.get("NVIDIA_API_KEY_FILE")
+    )
+    payload["provider_dispatch"] = {
+        "deepseek": {
+            "configured": deepseek_configured,
+            "base_url": config.deepseek_base_url,
+            "fast_model": config.deepseek_flash_model,
+            "pro_model": config.deepseek_pro_model,
+        },
+        "nvidia": {
+            "configured": nvidia_configured,
+            "base_url": config.nvidia_nim_base_url,
+            "fast_model": config.nvidia_nim_model_fast,
+        },
+        "legacy_openai_compatible": {
+            "configured": bool(settings.openai_api_key),
+            "base_url": settings.openai_base_url,
+            "model": settings.model_name,
+        },
+    }
     return sha256_hex(canonical_json(payload))
 
 

@@ -450,6 +450,7 @@ def test_legacy_positional_helpers_refuse_mismatched_array_lengths() -> None:
 def test_effective_config_fingerprint_redacts_secret_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import src.core.settings as core_settings
     import src.nl2sql.config.settings as agent_settings
     from benchmarks.runner import _effective_runtime_config_sha256
 
@@ -462,6 +463,22 @@ def test_effective_config_fingerprint_redacts_secret_values(
     absent = agent_settings.AgentConfig(
         embedding_api_key=SecretStr("not-needed")
     )
+    monkeypatch.setattr(
+        core_settings,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_api_key="",
+            openai_base_url="https://legacy.example",
+            model_name="legacy-model",
+        ),
+    )
+    for environment_name in (
+        "DEEPSEEK_API_KEY",
+        "DEEPSEEK_API_KEY_FILE",
+        "NVIDIA_API_KEY",
+        "NVIDIA_API_KEY_FILE",
+    ):
+        monkeypatch.delenv(environment_name, raising=False)
 
     monkeypatch.setattr(agent_settings, "get_agent_config", lambda: first)
     first_fingerprint = _effective_runtime_config_sha256()
@@ -469,10 +486,14 @@ def test_effective_config_fingerprint_redacts_secret_values(
     second_fingerprint = _effective_runtime_config_sha256()
     monkeypatch.setattr(agent_settings, "get_agent_config", lambda: absent)
     absent_fingerprint = _effective_runtime_config_sha256()
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "runtime-provider-secret")
+    configured_fingerprint = _effective_runtime_config_sha256()
 
     assert first_fingerprint == second_fingerprint
     assert first_fingerprint != absent_fingerprint
     assert "secret-value" not in first_fingerprint
+    assert absent_fingerprint != configured_fingerprint
+    assert "runtime-provider-secret" not in configured_fingerprint
 
 
 def test_config_override_logs_never_include_secret_values(
