@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
@@ -116,6 +117,72 @@ def extract_blocks(result: dict[str, Any]) -> list[dict[str, Any]]:
     return serialize_response_blocks([TextBlock(text="No response was produced.")])
 
 
+def _has_streamable_root_result(result: dict[str, Any]) -> bool:
+    """Return whether a root output contains a real public response source.
+
+    ``extract_blocks`` keeps its compatibility fallback for non-streaming
+    callers.  The SSE terminal protocol must not treat that fallback as a
+    successful graph result.
+    """
+
+    response_blocks = result.get("response_blocks")
+    if isinstance(response_blocks, list) and response_blocks:
+        return True
+
+    capability = result.get("mode_capability_outcome")
+    if isinstance(capability, Mapping) and capability.get("suggested_mode"):
+        return True
+
+    pending = result.get("pending_decision")
+    if isinstance(pending, Mapping):
+        from src.nl2sql.orchestration.decision_contract import revalidate_request
+
+        try:
+            revalidate_request(pending)
+        except Exception:
+            pass
+        else:
+            return True
+
+    structured = result.get("structured_response")
+    structured_blocks = (
+        structured.get("blocks")
+        if isinstance(structured, Mapping)
+        else getattr(structured, "blocks", None)
+    )
+    if isinstance(structured_blocks, (list, tuple)) and structured_blocks:
+        return True
+
+    messages = result.get("messages")
+    if isinstance(messages, list):
+        return any(
+            getattr(message, "type", None) == "ai"
+            and isinstance(content := getattr(message, "content", None), str)
+            and bool(content.strip())
+            for message in messages
+        )
+    return False
+
+
+def _sse_error_frame(
+    stream_id: str, created: int, thread_id: str, code: str
+) -> str:
+    """Build a safe, stable terminal error without internal exception data."""
+
+    event_id = f"{stream_id}:error"
+    payload = {
+        "id": event_id,
+        "created": created,
+        "thread_id": thread_id,
+        "code": code,
+    }
+    return (
+        f"id: {event_id}\n"
+        "event: error\n"
+        f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    )
+
+
 async def stream_blocks(
     supervisor: Any,
     input_messages: list[dict[str, str]],
@@ -165,32 +232,71 @@ async def stream_blocks(
             "event: metadata\n"
             f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         )
-    async for event in supervisor.astream_events(graph_input, config, version="v2"):
-        if event.get("event") != "on_chain_end" or sent_blocks:
-            continue
-        # LangGraph v2 root completion is the only event allowed to project the
-        # final product blocks.  Missing metadata is fail-closed: it cannot be
-        # proven to be the root graph completion.
-        if event.get("name") != "nl2sql_v2_explicit":
-            continue
-        parent_ids = event.get("parent_ids")
-        if not isinstance(parent_ids, (list, tuple)) or parent_ids:
-            continue
-        output = event.get("data", {}).get("output")
-        if not isinstance(output, dict):
-            continue
-        for sequence, block in enumerate(extract_blocks(output), start=1):
-            event_id = f"{stream_id}:{sequence}"
-            payload = {
-                "id": event_id,
-                "created": created,
-                "thread_id": thread_id,
-                "block": block,
-            }
-            yield (
-                f"id: {event_id}\n"
-                "event: block\n"
-                f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    try:
+        async for event in supervisor.astream_events(graph_input, config, version="v2"):
+            if not isinstance(event, Mapping):
+                continue
+            parent_ids = event.get("parent_ids")
+            is_proven_root = (
+                event.get("name") == "nl2sql_v2_explicit"
+                and isinstance(parent_ids, (list, tuple))
+                and not parent_ids
             )
-        sent_blocks = True
-    yield f"id: {stream_id}:done\nevent: done\ndata: [DONE]\n\n"
+            # Only a proven root failure invalidates the whole request. A child
+            # chain may report a handled error and still produce a valid root
+            # result, so child errors must not preempt that completion.
+            if event.get("event") == "on_chain_error" and is_proven_root:
+                yield _sse_error_frame(
+                    stream_id, created, thread_id, "stream_engine_error"
+                )
+                return
+            if event.get("event") != "on_chain_end" or sent_blocks:
+                continue
+            # LangGraph v2 root completion is the only event allowed to project
+            # final product blocks. Missing metadata cannot prove root output.
+            if not is_proven_root:
+                continue
+            event_data = event.get("data")
+            output = event_data.get("output") if isinstance(event_data, Mapping) else None
+            if not isinstance(output, dict) or not _has_streamable_root_result(output):
+                continue
+            try:
+                blocks = extract_blocks(output)
+            except Exception:
+                yield _sse_error_frame(
+                    stream_id, created, thread_id, "stream_output_invalid"
+                )
+                return
+            if not blocks:
+                yield _sse_error_frame(
+                    stream_id, created, thread_id, "stream_output_invalid"
+                )
+                return
+            for sequence, block in enumerate(blocks, start=1):
+                event_id = f"{stream_id}:{sequence}"
+                payload = {
+                    "id": event_id,
+                    "created": created,
+                    "thread_id": thread_id,
+                    "block": block,
+                }
+                yield (
+                    f"id: {event_id}\n"
+                    "event: block\n"
+                    f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                )
+            sent_blocks = True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Keep exception strings and implementation details out of the public
+        # stream. Previously emitted blocks remain usable but are not success.
+        yield _sse_error_frame(stream_id, created, thread_id, "stream_engine_error")
+        return
+
+    if sent_blocks:
+        yield f"id: {stream_id}:done\nevent: done\ndata: [DONE]\n\n"
+    else:
+        yield _sse_error_frame(
+            stream_id, created, thread_id, "stream_root_result_missing"
+        )

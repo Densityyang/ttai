@@ -316,7 +316,10 @@ async def test_unnamed_chain_end_does_not_finalize() -> None:
         extra_input=_metadata_input(),
     )
     events = _sse_events(payload)
-    assert [name for name, _ in events] == ["metadata", "done"]
+    assert [name for name, _ in events] == ["metadata", "error"]
+    errors = [data for name, data in events if name == "error"]
+    assert len(errors) == 1
+    assert errors[0]["code"] == "stream_root_result_missing"
     assert "leak" not in payload
 
 
@@ -336,7 +339,10 @@ async def test_named_ordinary_child_does_not_finalize() -> None:
         extra_input=_metadata_input(),
     )
     events = _sse_events(payload)
-    assert [name for name, _ in events] == ["metadata", "done"]
+    assert [name for name, _ in events] == ["metadata", "error"]
+    errors = [data for name, data in events if name == "error"]
+    assert len(errors) == 1
+    assert errors[0]["code"] == "stream_root_result_missing"
     assert "leak" not in payload
 
 
@@ -356,7 +362,10 @@ async def test_root_named_event_with_parent_ids_does_not_finalize() -> None:
         extra_input=_metadata_input(),
     )
     events = _sse_events(payload)
-    assert [name for name, _ in events] == ["metadata", "done"]
+    assert [name for name, _ in events] == ["metadata", "error"]
+    errors = [data for name, data in events if name == "error"]
+    assert len(errors) == 1
+    assert errors[0]["code"] == "stream_root_result_missing"
     assert "leak" not in payload
 
 
