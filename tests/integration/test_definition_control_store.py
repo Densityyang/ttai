@@ -226,6 +226,7 @@ def _psql(
     stack: dict[str, Any],
     sql: str,
     *,
+    database: str = CONTROL_DATABASE,
     role: str = CONTROL_APP,
     password: str = CONTROL_APP_PASSWORD,
     check: bool = True,
@@ -242,7 +243,7 @@ def _psql(
         "--username",
         role,
         "--dbname",
-        CONTROL_DATABASE,
+        database,
         "--tuples-only",
         "--no-align",
         "--set",
@@ -254,13 +255,18 @@ def _psql(
 
 
 def _owner_psql(
-    stack: dict[str, Any], sql: str, *, check: bool = True
+    stack: dict[str, Any],
+    sql: str,
+    *,
+    database: str = CONTROL_DATABASE,
+    check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     return _psql(
         stack,
         sql,
         role=CONTROL_OWNER,
         password=CONTROL_OWNER_PASSWORD,
+        database=database,
         check=check,
     )
 
@@ -1131,6 +1137,104 @@ def test_legacy_semantic_jsonb_without_applicability_loads_without_rewrite(
     assert stored_marker.stdout.strip() == "f"
 
 
+def test_control_alembic_chain_upgrades_008_then_009(
+    control_postgres: dict[str, Any],
+) -> None:
+    """Exercise the real 007 -> 008 -> 009 Alembic path on isolated PG17."""
+
+    database = "ttai_control_alembic"
+    _owner_psql(
+        control_postgres,
+        f"CREATE DATABASE {database};",
+        database="postgres",
+    )
+    container = str(control_postgres["container"])
+    for migration in CONTROL_MIGRATIONS[:7]:
+        source = ROOT / "docker/migrations/control" / migration
+        _docker("cp", str(source), f"{container}:/tmp/{migration}")
+        _docker(
+            "exec",
+            container,
+            "psql",
+            "-1",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            CONTROL_OWNER,
+            "-d",
+            database,
+            "-q",
+            "-f",
+            f"/tmp/{migration}",
+            timeout=120,
+        )
+
+    environment = os.environ.copy()
+    environment["CONTROL_MIGRATOR_DATABASE_URL"] = (
+        f"postgresql+psycopg://{CONTROL_OWNER}:{CONTROL_OWNER_PASSWORD}"
+        f"@127.0.0.1:{control_postgres['port']}/{database}"
+    )
+    environment.pop("CONTROL_MIGRATOR_DATABASE_URL_FILE", None)
+
+    def alembic(*arguments: str) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "alembic",
+                "-c",
+                str(ROOT / "docker/alembic/control.ini"),
+                *arguments,
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert result.returncode == 0, (
+            f"Alembic {' '.join(arguments)} failed with exit {result.returncode}"
+        )
+
+    alembic("stamp", "007_confirmation_audit")
+    alembic("upgrade", "008_definition_run_records")
+    assert _owner_psql(
+        control_postgres,
+        "SELECT version_num FROM alembic_version;",
+        database=database,
+    ).stdout.strip() == "008_definition_run_records"
+    assert _owner_psql(
+        control_postgres,
+        "SELECT count(*) FROM schema_migrations "
+        "WHERE version = '008_definition_run_records';",
+        database=database,
+    ).stdout.strip() == "1"
+    assert _owner_psql(
+        control_postgres,
+        "SELECT to_regclass('public.hitl_action_claims') IS NULL;",
+        database=database,
+    ).stdout.strip() == "t"
+
+    alembic("upgrade", "009_hitl_action_claims")
+    assert _owner_psql(
+        control_postgres,
+        "SELECT version_num FROM alembic_version;",
+        database=database,
+    ).stdout.strip() == "009_hitl_action_claims"
+    assert _owner_psql(
+        control_postgres,
+        "SELECT count(*) FROM schema_migrations WHERE version IN ("
+        "'008_definition_run_records', '009_hitl_action_claims');",
+        database=database,
+    ).stdout.strip() == "2"
+    assert _owner_psql(
+        control_postgres,
+        "SELECT to_regclass('public.hitl_action_claims') IS NOT NULL;",
+        database=database,
+    ).stdout.strip() == "t"
+
+
 def test_definition_run_records_are_owner_scoped_immutable_and_durable(
     control_postgres: dict[str, Any], control_backend: None
 ) -> None:
@@ -1329,6 +1433,37 @@ def test_definition_run_records_are_owner_scoped_immutable_and_durable(
         "definition_run_records_identity,"
         "definition_run_records_version_created_idx"
     )
+
+    blocked_update = _psql(
+        control_postgres,
+        "UPDATE definition_run_records "
+        "SET payload_checksum = payload_checksum "
+        "WHERE owner_user_id = 'alice' "
+        f"AND definition_id = '{definition_id}' AND version = 1 "
+        f"AND run_id = '{run_id}';",
+        check=False,
+    )
+    assert blocked_update.returncode != 0
+    assert "definition_run_record_append_only" in blocked_update.stderr
+
+    blocked_delete = _psql(
+        control_postgres,
+        "DELETE FROM definition_run_records "
+        "WHERE owner_user_id = 'alice' "
+        f"AND definition_id = '{definition_id}' AND version = 1 "
+        f"AND run_id = '{run_id}';",
+        check=False,
+    )
+    assert blocked_delete.returncode != 0
+    assert "definition_run_record_append_only" in blocked_delete.stderr
+    still_present = _owner_psql(
+        control_postgres,
+        "SELECT count(*) FROM definition_run_records "
+        "WHERE owner_user_id = 'alice' "
+        f"AND definition_id = '{definition_id}' AND version = 1 "
+        f"AND run_id = '{run_id}';",
+    )
+    assert still_present.stdout.strip() == "1"
 
     # Simulate out-of-band corruption: one row gets a bad checksum and another
     # remains JSON-shaped but no longer decodes as the declared strict model.
