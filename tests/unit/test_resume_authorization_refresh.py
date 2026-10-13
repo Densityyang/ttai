@@ -73,8 +73,14 @@ class _Engine:
             metadata={},
         )
 
-    async def aget_state_history(self, config: dict[str, Any]):
-        del config
+    async def aget_state_history(
+        self,
+        config: dict[str, Any],
+        *,
+        before: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ):
+        del config, before, limit
         yield SimpleNamespace(values={"messages": []}, config={}, metadata={})
 
 

@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import secrets
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from typing import Any, Final, Literal, cast
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.provider import (
@@ -18,6 +23,7 @@ from src.core.auth.provider import (
     resolve_authorization_context,
 )
 from src.core.auth.types import AuthUser
+from src.core.settings import get_settings
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import ErrorEnvelope, RequestContext, RequestIdentity, StrictContract
 from src.nl2sql.orchestration.ad_hoc_request import AdHocCalculationRequest
@@ -47,6 +53,15 @@ from src.nl2sql.ownership import runtime_config
 MAX_MESSAGE_BYTES = 8 * 1024
 MAX_MESSAGES = 20
 MAX_REQUEST_BYTES = 32 * 1024
+HISTORY_DEFAULT_PAGE_SIZE = 20
+HISTORY_MAX_PAGE_SIZE = 100
+HISTORY_MAX_CURSOR_CHARS = 4096
+HISTORY_MAX_RESPONSE_BYTES = 512 * 1024
+HISTORY_MAX_SNAPSHOT_BYTES = 64 * 1024
+HISTORY_MAX_MESSAGES_PER_SNAPSHOT = 100
+HISTORY_MAX_MESSAGE_BYTES = 8 * 1024
+_HISTORY_CURSOR_KEY_CONTEXT = b"ttai-v2-history-cursor-key-v1"
+_DEV_HISTORY_CURSOR_KEY = secrets.token_bytes(32)
 
 
 class QueryMessage(StrictContract):
@@ -110,11 +125,26 @@ class StateSnapshot(StrictContract):
     checkpoint_id: str
     messages: list[MessageItem]
     created_at: str | None = None
+    messages_truncated: bool = False
 
 
 class ThreadHistoryResponse(StrictContract):
     thread_id: UUID
     snapshots: list[StateSnapshot]
+    limit: int = Field(default=HISTORY_DEFAULT_PAGE_SIZE, ge=1, le=HISTORY_MAX_PAGE_SIZE)
+    has_more: bool = False
+    next_cursor: str | None = None
+
+
+class _HistoryCursor(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    version: Literal[1] = 1
+    thread_id: UUID
+    owner_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    page_size: int = Field(ge=1, le=HISTORY_MAX_PAGE_SIZE)
+    anchor_checkpoint_id: str = Field(min_length=1, max_length=256)
+    before_checkpoint_id: str = Field(min_length=1, max_length=256)
 
 
 class ThreadActionRequest(StrictContract):
@@ -446,6 +476,176 @@ def _snapshot(thread_id: UUID, state: Any) -> StateSnapshot:
     )
 
 
+def _truncate_utf8_prefix(value: str, max_bytes: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _history_snapshot(thread_id: UUID, state: Any) -> StateSnapshot:
+    from src.nl2sql.api import extract_messages
+
+    values = getattr(state, "values", {})
+    config = getattr(state, "config", {})
+    metadata = getattr(state, "metadata", {})
+    checkpoint_id = config.get("configurable", {}).get("checkpoint_id", "")
+    created_at = metadata.get("created_at") if metadata else None
+    raw_messages = list(extract_messages(values))
+    messages_truncated = len(raw_messages) > HISTORY_MAX_MESSAGES_PER_SNAPSHOT
+    raw_messages = raw_messages[-HISTORY_MAX_MESSAGES_PER_SNAPSHOT:]
+    messages: list[MessageItem] = []
+    for item in raw_messages:
+        message = MessageItem.model_validate(item)
+        content, truncated = _truncate_utf8_prefix(
+            message.content,
+            HISTORY_MAX_MESSAGE_BYTES,
+        )
+        messages_truncated = messages_truncated or truncated
+        messages.append(MessageItem(role=message.role, content=content))
+
+    while True:
+        snapshot = StateSnapshot(
+            thread_id=thread_id,
+            checkpoint_id=str(checkpoint_id),
+            messages=messages,
+            created_at=str(created_at) if created_at else None,
+            messages_truncated=messages_truncated,
+        )
+        if len(snapshot.model_dump_json().encode("utf-8")) <= HISTORY_MAX_SNAPSHOT_BYTES:
+            return snapshot
+        messages_truncated = True
+        if len(messages) > 1:
+            # Keep the most recent messages when bounding one checkpoint projection.
+            messages = messages[1:]
+            continue
+        if messages and messages[0].content:
+            content, _ = _truncate_utf8_prefix(
+                messages[0].content,
+                max(1, len(messages[0].content.encode("utf-8")) // 2),
+            )
+            messages = [MessageItem(role=messages[0].role, content=content)]
+            continue
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="history snapshot exceeds response limit",
+        )
+
+
+def _history_cursor_key() -> bytes:
+    """Derive a cross-replica cursor key without exposing database credentials."""
+
+    settings = get_settings()
+    key_material = settings.checkpoint_database_url or settings.control_database_url
+    if not key_material:
+        if settings.service_mode == "product":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="history pagination unavailable",
+            )
+        # Local single-process development has no shared database secret. This
+        # ephemeral key keeps test/dev cursors tamper-evident without implying
+        # cross-process durability in infra-dev.
+        return _DEV_HISTORY_CURSOR_KEY
+    return hmac.new(
+        key_material.encode("utf-8"),
+        _HISTORY_CURSOR_KEY_CONTEXT,
+        hashlib.sha256,
+    ).digest()
+
+
+def _owner_fingerprint(user_id: int | str) -> str:
+    return hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()
+
+
+def _b64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _encode_history_cursor(cursor: _HistoryCursor) -> str:
+    payload = json.dumps(
+        cursor.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    encoded_payload = _b64url_encode(payload)
+    signature = _b64url_encode(
+        hmac.new(_history_cursor_key(), encoded_payload.encode("ascii"), hashlib.sha256).digest()
+    )
+    token = f"{encoded_payload}.{signature}"
+    if len(token) > HISTORY_MAX_CURSOR_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="history pagination unavailable",
+        )
+    return token
+
+
+def _decode_history_cursor(
+    token: str,
+    *,
+    thread_id: UUID,
+    owner_user_id: int | str,
+) -> _HistoryCursor:
+    if len(token) > HISTORY_MAX_CURSOR_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="invalid history cursor",
+        )
+    try:
+        encoded_payload, signature = token.split(".", maxsplit=1)
+        if not encoded_payload or not signature:
+            raise ValueError("invalid cursor shape")
+        expected = _b64url_encode(
+            hmac.new(
+                _history_cursor_key(),
+                encoded_payload.encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        )
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("invalid cursor signature")
+        padding = "=" * (-len(encoded_payload) % 4)
+        payload_json = base64.urlsafe_b64decode(encoded_payload + padding)
+        cursor = _HistoryCursor.model_validate_json(payload_json)
+    except (UnicodeError, ValueError, TypeError, ValidationError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="invalid history cursor",
+        ) from None
+    if cursor.thread_id != thread_id or cursor.owner_fingerprint != _owner_fingerprint(owner_user_id):
+        # Match the route's non-owner behavior; a cursor is never an authority.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
+    return cursor
+
+
+def _config_at_checkpoint(config: RunnableConfig, checkpoint_id: str) -> RunnableConfig:
+    result = dict(config)
+    configurable = dict(cast(Mapping[str, object], result.get("configurable", {})))
+    configurable["checkpoint_id"] = checkpoint_id
+    result["configurable"] = configurable
+    return cast(RunnableConfig, result)
+
+
+async def _require_history_checkpoint(
+    engine: Any,
+    config: RunnableConfig,
+    *,
+    thread_id: UUID,
+    checkpoint_id: str,
+) -> None:
+    state_value = await engine.aget_state(_config_at_checkpoint(config, checkpoint_id))
+    if not state_value or not getattr(state_value, "values", None):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="history cursor stale")
+    if _snapshot(thread_id, state_value).checkpoint_id != checkpoint_id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="history cursor stale")
+
+
+def _history_response_bytes(response: ThreadHistoryResponse) -> int:
+    return len(response.model_dump_json().encode("utf-8"))
+
+
 _TYPED_RECORDED_STATUS: Final[dict[str, str]] = {
     "resolve": "resolved_pending_revalidation",
     # Confirm is the typed form of the legacy approve alias and MUST map here
@@ -681,18 +881,142 @@ def register_v2_routes(app: FastAPI) -> None:
     async def get_history(
         thread_id: UUID,
         request: Request,
+        limit: int = Query(
+            default=HISTORY_DEFAULT_PAGE_SIZE,
+            ge=1,
+            le=HISTORY_MAX_PAGE_SIZE,
+        ),
+        cursor: str | None = Query(default=None, max_length=HISTORY_MAX_CURSOR_CHARS),
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> ThreadHistoryResponse:
         context = _request_context(request, auth_user, thread_id)
-        snapshots = [
-            _snapshot(thread_id, state_value)
-            async for state_value in (await _engine_from_request(request)).aget_state_history(
-                runtime_config(context)
+        engine = await _engine_from_request(request)
+        config = cast(RunnableConfig, runtime_config(context))
+        cursor_value: _HistoryCursor | None = None
+        before_config: RunnableConfig | None = None
+        anchor_checkpoint_id: str | None = None
+        if cursor is not None:
+            cursor_value = _decode_history_cursor(
+                cursor,
+                thread_id=thread_id,
+                owner_user_id=auth_user.user_id,
             )
-        ]
-        if not snapshots:
+            if "limit" in request.query_params and limit != cursor_value.page_size:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="history cursor limit mismatch",
+                )
+            page_size = cursor_value.page_size
+            anchor_checkpoint_id = cursor_value.anchor_checkpoint_id
+            await _require_history_checkpoint(
+                engine,
+                config,
+                thread_id=thread_id,
+                checkpoint_id=cursor_value.anchor_checkpoint_id,
+            )
+            await _require_history_checkpoint(
+                engine,
+                config,
+                thread_id=thread_id,
+                checkpoint_id=cursor_value.before_checkpoint_id,
+            )
+            before_config = _config_at_checkpoint(
+                config,
+                cursor_value.before_checkpoint_id,
+            )
+        else:
+            page_size = limit
+
+        # LangGraph's checkpointers order checkpoint_id DESC (newest first) and
+        # support a bounded `limit` plus an exclusive `before` checkpoint.
+        # Fetch one lookahead item only; never materialize the full history.
+        state_values: list[Any] = []
+        async for state_value in engine.aget_state_history(
+            config,
+            before=before_config,
+            limit=page_size + 1,
+        ):
+            state_values.append(state_value)
+            if len(state_values) >= page_size + 1:
+                break
+        if not state_values:
+            if cursor_value is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="history cursor stale",
+                )
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
-        return ThreadHistoryResponse(thread_id=thread_id, snapshots=snapshots)
+
+        has_lookahead = len(state_values) > page_size
+        candidates = state_values[:page_size]
+        snapshots: list[StateSnapshot] = []
+        for index, state_value in enumerate(candidates):
+            snapshot = _history_snapshot(thread_id, state_value)
+            candidate_snapshots = [*snapshots, snapshot]
+            if anchor_checkpoint_id is None:
+                anchor_checkpoint_id = candidate_snapshots[0].checkpoint_id
+            candidate_has_more = index + 1 < len(candidates) or has_lookahead
+            candidate_cursor = (
+                _encode_history_cursor(
+                    _HistoryCursor(
+                        thread_id=thread_id,
+                        owner_fingerprint=_owner_fingerprint(auth_user.user_id),
+                        page_size=page_size,
+                        anchor_checkpoint_id=anchor_checkpoint_id,
+                        before_checkpoint_id=snapshot.checkpoint_id,
+                    )
+                )
+                if candidate_has_more
+                else None
+            )
+            candidate_response = ThreadHistoryResponse(
+                thread_id=thread_id,
+                snapshots=candidate_snapshots,
+                limit=page_size,
+                has_more=candidate_has_more,
+                next_cursor=candidate_cursor,
+            )
+            if _history_response_bytes(candidate_response) > HISTORY_MAX_RESPONSE_BYTES:
+                if not snapshots:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="history snapshot exceeds response limit",
+                    )
+                break
+            snapshots.append(snapshot)
+
+        if not snapshots:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="history snapshot exceeds response limit",
+            )
+        has_more = len(snapshots) < len(candidates) or has_lookahead
+        next_cursor = (
+            _encode_history_cursor(
+                _HistoryCursor(
+                    thread_id=thread_id,
+                    owner_fingerprint=_owner_fingerprint(auth_user.user_id),
+                    page_size=page_size,
+                    anchor_checkpoint_id=anchor_checkpoint_id or snapshots[0].checkpoint_id,
+                    before_checkpoint_id=snapshots[-1].checkpoint_id,
+                )
+            )
+            if has_more
+            else None
+        )
+        response = ThreadHistoryResponse(
+            thread_id=thread_id,
+            snapshots=snapshots,
+            limit=page_size,
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
+        if _history_response_bytes(response) > HISTORY_MAX_RESPONSE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="history page exceeds response limit",
+            )
+        return response
 
     @router.post(
         "/threads/{thread_id}/actions",
