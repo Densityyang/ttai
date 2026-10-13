@@ -14,6 +14,7 @@ from src.nl2sql.agents.sql_agent.graph import (
     get_sql_agent_graph as get_semantic_sql_agent_graph,
 )
 from src.nl2sql.config.settings import get_agent_config
+from src.nl2sql.orchestration.p5_runtime_readiness import assess_p5_runtime_readiness
 
 
 async def get_or_create_sql_graph(
@@ -79,11 +80,11 @@ async def warmup_runtime() -> None:
     await get_or_create_semantic_sql_graph()
 
     config = get_agent_config()
-    if config.codeact_capability()[0]:
-        if config.codeact_mode == "trusted-template":
-            await get_or_create_dynamic_calc_graph()
-        else:
-            await get_or_create_codeact_graph()
+    readiness = assess_p5_runtime_readiness(config)
+    if readiness.trusted_template_permitted:
+        await get_or_create_dynamic_calc_graph()
+    elif readiness.unsafe_dev_permitted:
+        await get_or_create_codeact_graph()
 
     if config.enable_graph_rag:
         from src.nl2sql.infra.store.graph_rag import get_schema_relation_graph
