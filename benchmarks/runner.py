@@ -778,15 +778,15 @@ async def run_experiment(
     max_cases: int | None = None,
     use_stub: bool = False,
 ) -> dict[str, BenchmarkReport]:
-    """执行 A/B/C 对照实验。
+    """执行 A/B/C 对照实验并保留可验证的用例配对身份。
 
     Args:
         use_stub: True 时使用桩实现（离线框架验证）
 
     对照实验流程:
-    1. 加载统一 case 集
-    2. 对每组配置：临时覆写 AgentConfig → 运行评测 → 恢复
-    3. 生成对照比较报告 + 显著性检验
+    1. 对统一 case 集生成一个固定、可校验的选择计划
+    2. 每个变体执行同一组 case，并把选择身份绑定到实际结果
+    3. 只生成精确配对的描述性比较；没有身份时明确拒绝
     """
     if experiment_name not in EXPERIMENT_CONFIGS:
         raise ValueError(
@@ -795,24 +795,60 @@ async def run_experiment(
         )
 
     configs = EXPERIMENT_CONFIGS[experiment_name]
-    cases = load_cases(dataset, max_cases=max_cases)
-    if not cases:
+    source_cases = load_cases(dataset, max_cases=None)
+    if not source_cases:
         raise RuntimeError(f"数据集 {dataset} 为空")
+    source_eval_cases = to_eval_cases(source_cases)
+    _validate_eval_case_identities(source_eval_cases)
+    plan = select_cases(
+        source_eval_cases,
+        seed=0,
+        repetitions=1,
+        max_cases=max_cases,
+    )
+    cases_by_key = _validate_selection_plan_for_execution(
+        plan, source_cases=source_eval_cases
+    )
+    selection_run = plan.runs[0]
+    selected_eval_cases = [cases_by_key[key] for key in selection_run.case_keys]
+    selected_cases = [
+        eval_case_to_benchmark_case(case) for case in selected_eval_cases
+    ]
 
     reports: dict[str, BenchmarkReport] = {}
 
     for config in configs:
         name = config["name"]
         overrides = config.get("overrides", {})
-        logger.info("运行实验组: %s (%s) overrides=%s", name, config["description"], overrides)
+        logger.info(
+            "运行实验组: %s (%s) config_sha256=%s",
+            name,
+            config["description"],
+            sha256_hex(canonical_json(overrides)),
+        )
 
         run_id = f"{experiment_name}-{name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
         if use_stub or not overrides:
-            report = await run_benchmark(cases, run_id=run_id, use_stub=use_stub)
+            report = await run_benchmark(
+                selected_cases, run_id=run_id, use_stub=use_stub
+            )
         else:
             with override_agent_config(overrides):
-                report = await run_benchmark(cases, run_id=run_id, use_stub=use_stub)
+                report = await run_benchmark(
+                    selected_cases, run_id=run_id, use_stub=use_stub
+                )
+
+        _attach_experiment_pair_identity(
+            report,
+            dataset=dataset,
+            variant_name=name,
+            variant_config=overrides,
+            experiment_name=experiment_name,
+            plan=plan,
+            selection_run=selection_run,
+            selected_eval_cases=selected_eval_cases,
+        )
 
         reports[name] = report
         save_report(report)
@@ -820,6 +856,98 @@ async def run_experiment(
     _generate_comparison_report(experiment_name, reports)
 
     return reports
+
+
+def _attach_experiment_pair_identity(
+    report: BenchmarkReport,
+    *,
+    dataset: str,
+    variant_name: str,
+    variant_config: dict[str, Any],
+    experiment_name: str,
+    plan: SelectionPlan,
+    selection_run: SelectionRun,
+    selected_eval_cases: Sequence[EvalCase],
+) -> None:
+    """Bind exact run-time cases to legacy results without cross-run position pairing."""
+
+    execution_run_id = _execution_run_id(report.run_id, plan, selection_run)
+    cases_by_result_key: dict[tuple[str, str], EvalCase | None] = {}
+    for case in selected_eval_cases:
+        key = (case.case_id, case.legacy_expected_mode)
+        if key in cases_by_result_key:
+            cases_by_result_key[key] = None
+        else:
+            cases_by_result_key[key] = case
+
+    seen: set[tuple[str, str]] = set()
+    identity_complete = len(report.results) == len(selected_eval_cases)
+    for result in report.results:
+        key = (result.case_id, result.expected_mode)
+        case = cases_by_result_key.get(key)
+        if case is None or key in seen:
+            identity_complete = False
+            continue
+        seen.add(key)
+        result.case_identity_sha256 = _case_identity_sha256(case)
+        result.mode = case.mode
+        result.selection_checksum = plan.checksum
+        result.repetition_index = selection_run.index
+        result.repetition_seed = selection_run.seed
+        result.repetition_checksum = selection_run.checksum
+        result.execution_run_id = execution_run_id
+    identity_complete = identity_complete and len(seen) == len(selected_eval_cases)
+    if not identity_complete:
+        for result in report.results:
+            result.case_identity_sha256 = ""
+
+    manifest = build_manifest(
+        run_id=report.run_id,
+        plan=plan,
+        dataset=dataset,
+    )
+    config_checksum = sha256_hex(canonical_json(variant_config))
+    manifest = manifest.model_copy(
+        update={
+            "model_profile_version": f"legacy-ab-{variant_name}",
+            "matrix": (variant_name,),
+            "legacy_extras": {
+                **manifest.legacy_extras,
+                "experiment": experiment_name,
+                "variant_name": variant_name,
+                "variant_config_sha256": config_checksum,
+            },
+        }
+    )
+    planned = len(selected_eval_cases)
+    executed = len(report.results)
+    status = "COMPLETE" if planned == executed else "PARTIAL"
+    report.total_cases = executed
+    report.manifest = manifest.model_dump(mode="json")
+    report.execution_status = status
+    report.execution_evidence = {
+        "status": status,
+        "selection_checksum": plan.checksum,
+        "selection_version": plan.selection_version,
+        "requested_repetitions": plan.repetitions,
+        "completed_repetitions": 1 if status == "COMPLETE" else 0,
+        "planned_occurrences": planned,
+        "executed_occurrences": executed,
+        "unexecuted_occurrences": max(0, planned - executed),
+        "pair_identity_state": "VALID" if identity_complete else "UNAVAILABLE",
+        "runs": [
+            {
+                "status": status,
+                "repetition_index": selection_run.index,
+                "repetition_seed": selection_run.seed,
+                "repetition_checksum": selection_run.checksum,
+                "execution_run_id": execution_run_id,
+                "planned_occurrences": planned,
+                "executed_occurrences": executed,
+                "unexecuted_occurrences": max(0, planned - executed),
+            }
+        ],
+    }
 
 
 def _generate_comparison_report(
@@ -837,14 +965,26 @@ def _generate_comparison_report(
         "",
         "## Results",
         "",
-        "| Variant | EX Acc | DM S@1 | SQL Fail | P95 Lat | Safety |",
-        "|---------|--------|--------|----------|---------|--------|",
+        "| Variant | Run State | Accuracy Evidence | EX Acc | DM S@1 | SQL Fail | P95 Lat | Safety |",
+        "|---------|-----------|-------------------|--------|--------|----------|---------|--------|",
     ]
 
     for name, report in reports.items():
+        ex_accuracy = (
+            f"{report.execution_accuracy:.2%}"
+            if report.accuracy_established
+            else "unavailable"
+        )
+        accuracy_evidence = (
+            "MEASURED"
+            if report.accuracy_established
+            else report.accuracy_evidence_state
+        )
         lines.append(
             f"| {name} "
-            f"| {report.execution_accuracy:.2%} "
+            f"| {report.execution_status} "
+            f"| {accuracy_evidence} "
+            f"| {ex_accuracy} "
             f"| {report.dynamic_metric_success_at_1:.2%} "
             f"| {report.sql_failure_rate:.2%} "
             f"| {report.p95_latency_ms:.0f}ms "
@@ -866,7 +1006,7 @@ def _generate_comparison_report(
         ]
     )
     if len(report_list) >= 2:
-        baseline_name, baseline_report = report_list[0]
+        _baseline_name, baseline_report = report_list[0]
         for name, report in report_list[1:]:
             paired = compare_reports(baseline_report, report)
             comparison_entries.append(

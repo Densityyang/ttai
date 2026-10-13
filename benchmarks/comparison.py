@@ -87,6 +87,7 @@ def compare_reports(
         "registry_revision",
         "oracle_version",
         "assertion_version",
+        "enabled_modes",
     )
     if any(
         baseline_provenance[field] != candidate_provenance[field]
@@ -115,12 +116,20 @@ def compare_reports(
 
     outcomes: Counter[str] = Counter()
     deltas: list[int] = []
-    pair_manifest: list[dict[str, Any]] = []
+    pair_identity_digests: list[str] = []
     for identity in sorted(baseline_pairs, key=lambda item: item.digest):
         baseline_result = baseline_pairs[identity]
         candidate_result = candidate_pairs[identity]
-        baseline_pass = _adjudicated_pass(baseline_result)
-        candidate_pass = _adjudicated_pass(candidate_result)
+        baseline_pass = (
+            _adjudicated_pass(baseline_result)
+            if baseline.accuracy_established
+            else None
+        )
+        candidate_pass = (
+            _adjudicated_pass(candidate_result)
+            if candidate.accuracy_established
+            else None
+        )
         if baseline_pass is None or candidate_pass is None:
             outcomes["unknown"] += 1
         elif baseline_pass and candidate_pass:
@@ -135,13 +144,7 @@ def compare_reports(
         else:
             outcomes["both_fail"] += 1
             deltas.append(0)
-        pair_manifest.append(
-            {
-                "pair_identity_sha256": identity.digest,
-                "baseline_pass": baseline_pass,
-                "candidate_pass": candidate_pass,
-            }
-        )
+        pair_identity_digests.append(identity.digest)
 
     shared = {field: baseline_provenance[field] for field in shared_fields}
     payload = {
@@ -154,8 +157,17 @@ def compare_reports(
         "shared_selection": shared,
         "baseline": baseline_provenance,
         "candidate": candidate_provenance,
-        "pair_count": len(pair_manifest),
-        "pairs": pair_manifest,
+        "accuracy_evidence": {
+            "baseline_established": baseline.accuracy_established,
+            "baseline_state": baseline.accuracy_evidence_state,
+            "candidate_established": candidate.accuracy_established,
+            "candidate_state": candidate.accuracy_evidence_state,
+        },
+        "pair_count": len(pair_identity_digests),
+        "pair_identity_set_sha256": sha256_hex(
+            canonical_json(sorted(pair_identity_digests))
+        ),
+        "outcome_counts": {key: outcomes[key] for key in sorted(outcomes)},
     }
     manifest = {
         **payload,
@@ -165,7 +177,7 @@ def compare_reports(
     return PairedComparison(
         status="PAIRED_DESCRIPTIVE",
         reason=None,
-        pair_count=len(pair_manifest),
+        pair_count=len(pair_identity_digests),
         adjudicated_pair_count=adjudicated_count,
         unknown_pair_count=outcomes["unknown"],
         outcome_counts={key: outcomes[key] for key in sorted(outcomes)},
@@ -200,6 +212,8 @@ def _validated_provenance(
         or report.total_cases != executed
     ):
         return None, "incomplete_execution_coverage"
+    if evidence.get("pair_identity_state") == "UNAVAILABLE":
+        return None, "unavailable_pair_identity"
 
     manifest = report.manifest
     if not isinstance(manifest, dict):
@@ -238,14 +252,30 @@ def _validated_provenance(
 
     requested_repetitions = evidence.get("requested_repetitions")
     runs = evidence.get("runs")
+    enabled_modes = manifest.get("enabled_modes")
+    matrix = manifest.get("matrix")
     if (
         not isinstance(requested_repetitions, int)
         or requested_repetitions < 1
         or not isinstance(runs, list)
         or len(runs) != requested_repetitions
+        or evidence.get("completed_repetitions") != requested_repetitions
+        or not isinstance(enabled_modes, (list, tuple))
+        or not enabled_modes
+        or any(not isinstance(mode, str) or not mode for mode in enabled_modes)
+        or len(set(enabled_modes)) != len(enabled_modes)
+        or not isinstance(matrix, (list, tuple))
+        or any(not isinstance(item, str) or not item for item in matrix)
+        or len(set(matrix)) != len(matrix)
     ):
         return None, "incomplete_repetition_evidence"
     repetition_provenance: dict[int, tuple[int, str, str]] = {}
+    result_counts: Counter[int] = Counter(
+        result.repetition_index
+        for result in report.results
+        if isinstance(result.repetition_index, int)
+    )
+    planned_occurrences_by_repetition: Counter[int] = Counter()
     for run in runs:
         if not isinstance(run, dict):
             return None, "invalid_repetition_evidence"
@@ -253,6 +283,8 @@ def _validated_provenance(
         seed = run.get("repetition_seed")
         checksum = run.get("repetition_checksum")
         execution_run_id = run.get("execution_run_id")
+        run_planned = run.get("planned_occurrences")
+        run_executed = run.get("executed_occurrences")
         if (
             not isinstance(index, int)
             or index < 0
@@ -263,14 +295,25 @@ def _validated_provenance(
             or not isinstance(execution_run_id, str)
             or not execution_run_id
             or run.get("status") != "COMPLETE"
-            or run.get("planned_occurrences") != run.get("executed_occurrences")
+            or not isinstance(run_planned, int)
+            or run_planned < 1
+            or not isinstance(run_executed, int)
+            or run_planned != run_executed
             or run.get("unexecuted_occurrences") != 0
             or index in repetition_provenance
         ):
             return None, "invalid_repetition_evidence"
+        if run_executed != result_counts[index]:
+            return None, "inconsistent_repetition_result_count"
+        planned_occurrences_by_repetition[index] = run_planned
         repetition_provenance[index] = (seed, checksum, execution_run_id)
     if set(repetition_provenance) != set(range(requested_repetitions)):
         return None, "incomplete_repetition_evidence"
+    if (
+        sum(planned_occurrences_by_repetition.values()) != planned
+        or sum(result_counts.values()) != executed
+    ):
+        return None, "inconsistent_repetition_totals"
 
     provenance = {
         key: manifest[key]
@@ -278,6 +321,35 @@ def _validated_provenance(
     }
     provenance["matrix"] = list(provenance["matrix"])
     provenance["enabled_modes"] = list(provenance["enabled_modes"])
+    provenance["accuracy_established"] = report.accuracy_established
+    provenance["accuracy_evidence_state"] = report.accuracy_evidence_state
+    legacy_extras = manifest.get("legacy_extras") or {}
+    if not isinstance(legacy_extras, dict):
+        return None, "invalid_manifest_provenance"
+    explicit_config_checksum = legacy_extras.get("variant_config_sha256")
+    if explicit_config_checksum is not None and not _valid_sha256(
+        explicit_config_checksum
+    ):
+        return None, "invalid_runtime_config_checksum"
+    provenance["runtime_config_sha256"] = (
+        explicit_config_checksum
+        if isinstance(explicit_config_checksum, str)
+        else sha256_hex(
+            canonical_json(
+                {
+                    key: provenance[key]
+                    for key in (
+                        "matrix",
+                        "enabled_modes",
+                        "prompt_version",
+                        "policy_version",
+                        "semantic_version",
+                        "model_profile_version",
+                    )
+                }
+            )
+        )
+    )
     provenance["requested_repetitions"] = requested_repetitions
     provenance["repetitions"] = [
         {
@@ -300,6 +372,8 @@ def _index_results(
     }
     pairs: dict[_PairIdentity, CaseResult] = {}
     for result in report.results:
+        if result.mode not in provenance["enabled_modes"]:
+            return None, "result_mode_not_enabled"
         if (
             not _valid_sha256(result.case_identity_sha256)
             or result.selection_checksum != provenance["case_selection_checksum"]

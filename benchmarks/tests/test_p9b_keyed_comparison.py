@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -8,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from benchmarks.adapters import BenchmarkCase
 from benchmarks.comparison import compare_reports
 from benchmarks.metrics import (
     BenchmarkReport,
@@ -34,6 +36,7 @@ def _report(
     selection_checksum: str = _SELECTION,
     revision: str | None = None,
     execution_status: str = "COMPLETE",
+    accuracy_established: bool = True,
 ) -> BenchmarkReport:
     identities = order or list(outcomes)
     runs: dict[int, dict[str, Any]] = {}
@@ -99,6 +102,10 @@ def _report(
         results=results,
         manifest=manifest,
         execution_status=execution_status,
+        accuracy_established=accuracy_established,
+        accuracy_evidence_state=(
+            "MEASURED_TYPED" if accuracy_established else "NO_TYPED_RECEIPTS"
+        ),
         execution_evidence={
             "status": execution_status,
             "selection_checksum": selection_checksum,
@@ -107,6 +114,7 @@ def _report(
             "executed_occurrences": planned,
             "unexecuted_occurrences": 0,
             "requested_repetitions": len(runs),
+            "completed_repetitions": len(runs),
             "runs": [runs[index] for index in sorted(runs)],
         },
     )
@@ -151,7 +159,12 @@ def test_keyed_comparison_pairs_reordered_cases_and_repetitions() -> None:
     }
     assert comparison.manifest["baseline"]["git_revision"] == "base-1234567"
     assert comparison.manifest["candidate"]["git_revision"] == "candidate-7654321"
+    assert comparison.manifest["baseline"]["runtime_config_sha256"] != comparison.manifest[
+        "candidate"
+    ]["runtime_config_sha256"]
     assert "case-a" not in json.dumps(comparison.manifest)
+    assert "pairs" not in comparison.manifest
+    assert len(comparison.manifest["pair_identity_set_sha256"]) == 64
 
 
 def test_keyed_comparison_keeps_unknown_pairs_out_of_descriptive_denominator() -> None:
@@ -174,6 +187,22 @@ def test_keyed_comparison_keeps_unknown_pairs_out_of_descriptive_denominator() -
     assert comparison.adjudicated_pair_count == 1
     assert comparison.unknown_pair_count == 1
     assert comparison.mean_paired_pass_delta == 1.0
+
+
+def test_keyed_comparison_does_not_promote_unestablished_accuracy() -> None:
+    baseline = _report(
+        "baseline", {("case-a", 0): True}, accuracy_established=False
+    )
+    candidate = _report(
+        "candidate", {("case-a", 0): True}, accuracy_established=False
+    )
+
+    comparison = compare_reports(baseline, candidate)
+
+    assert comparison.status == "PAIRED_DESCRIPTIVE"
+    assert comparison.adjudicated_pair_count == 0
+    assert comparison.unknown_pair_count == 1
+    assert comparison.mean_paired_pass_delta is None
 
 
 def test_keyed_comparison_refuses_missing_extra_and_duplicate_pairs() -> None:
@@ -223,9 +252,7 @@ def test_keyed_comparison_refuses_revision_mode_selection_and_partial_mismatches
         "shared_selection_provenance_mismatch"
     )
     assert compare_reports(baseline, partial).reason == "partial_run"
-    assert compare_reports(baseline, mode_mismatch).reason == (
-        "pair_set_mismatch_missing_1_extra_1"
-    )
+    assert compare_reports(baseline, mode_mismatch).reason == "result_mode_not_enabled"
     assert compare_reports(baseline, case_revision_mismatch).reason == (
         "pair_set_mismatch_missing_1_extra_1"
     )
@@ -245,12 +272,31 @@ def test_keyed_comparison_refuses_legacy_or_incomplete_identity() -> None:
     assert compare_reports(baseline, incomplete).reason == "incomplete_execution_coverage"
 
 
+def test_keyed_comparison_reconciles_each_repetition_with_result_counts() -> None:
+    baseline = _report(
+        "baseline",
+        {("case-a", 0): True, ("case-a", 1): False},
+    )
+    malformed = copy.deepcopy(
+        _report(
+            "malformed",
+            {("case-a", 0): True, ("case-a", 1): False},
+        )
+    )
+    malformed.execution_evidence["runs"][1]["executed_occurrences"] = 0
+
+    comparison = compare_reports(baseline, malformed)
+
+    assert comparison.status == "REFUSED"
+    assert comparison.reason == "invalid_repetition_evidence"
+
+
 def test_comparison_report_emits_deterministic_json_manifest_and_no_p_values(
-    tmp_path: Path, monkeypatch: object
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import benchmarks.runner as runner
 
-    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)  # type: ignore[attr-defined]
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
     baseline = _report("baseline", {("case-a", 0): False})
     candidate = _report("candidate", {("case-a", 0): True})
 
@@ -265,6 +311,103 @@ def test_comparison_report_emits_deterministic_json_manifest_and_no_p_values(
     assert "Statistical Significance" not in markdown
     assert "McNemar p" not in markdown
     assert "bootstrap" not in markdown
+
+
+@pytest.mark.asyncio
+async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import benchmarks.runner as runner
+
+    cases = [
+        BenchmarkCase(
+            case_id="case-a",
+            source="synthetic",
+            layer="L1",
+            domain="orders",
+            question="case a",
+            gold_sql="SELECT 1",
+            gold_value=1,
+        ),
+        BenchmarkCase(
+            case_id="case-b",
+            source="synthetic",
+            layer="L1",
+            domain="orders",
+            question="case b",
+            gold_sql="SELECT 2",
+            gold_value=2,
+        ),
+    ]
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(runner, "load_cases", lambda *_args, **_kwargs: list(cases))
+    monkeypatch.setattr(
+        runner,
+        "EXPERIMENT_CONFIGS",
+        {
+            "synthetic-paired": [
+                {"name": "baseline", "description": "baseline", "overrides": {}},
+                {
+                    "name": "candidate",
+                    "description": "candidate",
+                    "overrides": {"model": "candidate-model"},
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(runner, "override_agent_config", lambda _overrides: contextlib.nullcontext())
+    monkeypatch.setattr(runner, "save_report", lambda _report: None)
+
+    async def fake_run_benchmark(
+        selected: list[BenchmarkCase], *, run_id: str, use_stub: bool
+    ) -> BenchmarkReport:
+        del use_stub
+        selected_cases = list(selected)
+        if "candidate" in run_id:
+            selected_cases.reverse()
+        results = [
+            CaseResult(
+                case_id=case.case_id,
+                layer=case.layer,
+                domain=case.domain,
+                expected_mode=case.expected_mode,
+                mode="QUERY",
+                adjudicated=True,
+                passed=True,
+            )
+            for case in selected_cases
+        ]
+        return BenchmarkReport(
+            run_id=run_id,
+            total_cases=len(results),
+            results=results,
+            accuracy_established=False,
+            accuracy_evidence_state="NO_TYPED_RECEIPTS",
+        )
+
+    monkeypatch.setattr(runner, "run_benchmark", fake_run_benchmark)
+    reports = await runner.run_experiment("synthetic-paired", dataset="synthetic")
+
+    assert set(reports) == {"baseline", "candidate"}
+    baseline, candidate = reports["baseline"], reports["candidate"]
+    assert baseline.execution_evidence["pair_identity_state"] == "VALID"
+    assert candidate.execution_evidence["pair_identity_state"] == "VALID"
+    assert baseline.manifest["case_selection_checksum"] == candidate.manifest[
+        "case_selection_checksum"
+    ]
+    payload = json.loads(
+        (tmp_path / "comparison-synthetic-paired.json").read_text(encoding="utf-8")
+    )
+    markdown = (tmp_path / "comparison-synthetic-paired.md").read_text(encoding="utf-8")
+    comparison = payload["comparisons"][0]
+    assert comparison["status"] == "PAIRED_DESCRIPTIVE"
+    assert comparison["pair_count"] == 2
+    assert comparison["unknown_pair_count"] == 2
+    assert comparison["mean_paired_pass_delta"] is None
+    assert "case-a" not in json.dumps(payload)
+    assert "COMPLETE" in markdown
+    assert "NO_TYPED_RECEIPTS" in markdown
+    assert "unavailable" in markdown
 
 
 def test_legacy_positional_helpers_refuse_mismatched_array_lengths() -> None:
