@@ -831,10 +831,14 @@ async def test_close_disposes_resources_and_clears_cached_state(
         async def dispose(self) -> None:
             disposed.append(True)
 
-    container._local_real_resources = (_Engine(), object())  # type: ignore[assignment]
+    container._local_real_resources = (
+        _Engine(),
+        _Engine(),
+        object(),
+    )  # type: ignore[assignment]
     container._local_real_deployment = (1, 2, 3, 4)  # type: ignore[assignment]
     await container.close()
-    assert disposed == [True], "the created engine must be disposed"
+    assert disposed == [True, True], "both runtime engines must be disposed"
     assert container._local_real_resources is None
     assert container._local_real_deployment is None
     assert container._local_real_readiness is None

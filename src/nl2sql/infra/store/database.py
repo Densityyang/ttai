@@ -59,6 +59,19 @@ class DatabaseManager:
         """建立数据库连接并加载 schema 信息。"""
         if not self.database_url:
             raise ValueError("DATABASE_URL 未设置")
+        try:
+            await self._connect_runtime()
+        except BaseException:
+            cleanup_task = asyncio.create_task(
+                self._dispose_resources(suppress_errors=True)
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
+            raise
+
+    async def _connect_runtime(self) -> None:
         self._engine = create_runtime_async_engine(
             self.database_url,
             purpose=DatabasePurpose.BUSINESS_READ_ONLY,
@@ -93,14 +106,31 @@ class DatabaseManager:
 
     async def disconnect(self) -> None:
         """关闭数据库连接。"""
-        if self._engine is not None:
-            await self._engine.dispose()
-        if self._cancellation_engine is not None:
-            await self._cancellation_engine.dispose()
+        cleanup_task = asyncio.create_task(
+            self._dispose_resources(suppress_errors=False)
+        )
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+            raise
+
+    async def _dispose_resources(self, *, suppress_errors: bool) -> None:
+        engines = (self._cancellation_engine, self._engine)
         self._engine = None
         self._cancellation_engine = None
         self._session_factory = None
         self._query_gateway = None
+        errors: list[BaseException] = []
+        for engine in engines:
+            if engine is None:
+                continue
+            try:
+                await engine.dispose()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors and not suppress_errors:
+            raise errors[0]
 
     async def _load_schema_info(self) -> None:
         if self._engine is None:
@@ -228,8 +258,9 @@ async def get_db_manager(schema: str | None = None) -> DatabaseManager:
 
     async with _db_manager_lock:
         if _db_manager is None:
-            _db_manager = DatabaseManager(schema=requested_schema)
-            await _db_manager.connect()
+            manager = DatabaseManager(schema=requested_schema)
+            await manager.connect()
+            _db_manager = manager
             _db_manager_schema = requested_schema
         elif _db_manager_schema != requested_schema:
             raise ValueError(

@@ -49,6 +49,15 @@ from src.nl2sql.observability.control_audit import ControlAuditStore
 logger = logging.getLogger(__name__)
 
 
+async def _run_shielded_cleanup(cleanup: Callable[[], Any]) -> None:
+    cleanup_task = asyncio.create_task(cleanup())
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        await cleanup_task
+        raise
+
+
 class RuntimeDependencyUnavailable(RuntimeError):
     """A required runtime dependency is unavailable without exposing its secret details."""
 
@@ -1101,22 +1110,22 @@ class AppContainer:
                 logger.error(
                     "local-real published view unavailable: %s", relation_probe.status
                 )
-                await dispose_runtime_engines()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             latest_date = await resolve_latest_authoritative_date(session_factory)
             recent_dates = await resolve_recent_authoritative_dates(session_factory)
             if not latest_date.resolved or latest_date.latest_date is None:
                 logger.error("local-real authoritative date unavailable")
-                await dispose_runtime_engines()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             if not recent_dates.resolved:
                 logger.error("local-real authoritative window unavailable")
-                await dispose_runtime_engines()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             source_watermark = await resolve_source_watermark(session_factory)
             if not source_watermark.resolved or source_watermark.data_as_of is None:
                 logger.error("local-real source watermark unavailable")
-                await dispose_runtime_engines()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             snapshot_candidate = await PostgresSchemaSnapshotCollector(
                 business_engine, max_relations=1
@@ -1146,7 +1155,7 @@ class AppContainer:
             )
             if frozen_view is None:
                 logger.error("local-real published view is not configured")
-                await dispose_runtime_engines()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             bundle = await self._build_local_real_semantics_async(
                 snapshot_candidate=snapshot_candidate,
@@ -1168,6 +1177,16 @@ class AppContainer:
                 },
                 count_column="id",
             )
+        except asyncio.CancelledError:
+            await _run_shielded_cleanup(dispose_runtime_engines)
+            self._local_real_probe_attempted = False
+            self._local_real_deployment = None
+            self._local_real_resources = None
+            self._local_real_latest_authoritative_date = None
+            self._local_real_recent_authoritative_dates = ()
+            self._local_real_source_watermark = None
+            self._local_real_source_watermark_checked_at = None
+            raise
         except Exception as exc:
             # Fail closed and dispose a partially constructed engine.  The
             # public readiness surface receives only a stable reason; detailed
@@ -1175,7 +1194,7 @@ class AppContainer:
             logger.error(
                 "local-real deployment unavailable: %s", type(exc).__name__
             )
-            await dispose_runtime_engines()
+            await _run_shielded_cleanup(dispose_runtime_engines)
             self._local_real_deployment = None
             self._local_real_resources = None
             self._local_real_latest_authoritative_date = None
@@ -1239,6 +1258,21 @@ class AppContainer:
         snapshots: Any | None = None
         business_engine: Any | None = None
         cancellation_engine: Any | None = None
+
+        async def dispose_typed_resources() -> None:
+            for resource in (cancellation_engine, business_engine):
+                if resource is not None:
+                    try:
+                        await resource.dispose()
+                    except Exception:
+                        logger.error("typed engine cleanup failed")
+            for resource in (snapshots, publisher):
+                if resource is not None:
+                    try:
+                        await resource.close()
+                    except Exception:
+                        logger.error("typed resource close failed")
+
         try:
             from pathlib import Path
 
@@ -1284,20 +1318,12 @@ class AppContainer:
                 schema=agent_config.nl2sql_db_schema,
                 cancellation_engine=cancellation_engine,
             )
+        except asyncio.CancelledError:
+            await _run_shielded_cleanup(dispose_typed_resources)
+            raise
         except Exception as exc:
             logger.error("typed runtime deployment unavailable: %s", type(exc).__name__)
-            for resource in (cancellation_engine, business_engine):
-                if resource is not None:
-                    try:
-                        await resource.dispose()
-                    except Exception:
-                        logger.error("typed engine cleanup failed")
-            for resource in (snapshots, publisher):
-                if resource is not None:
-                    try:
-                        await resource.close()
-                    except Exception:
-                        logger.error("typed resource close failed")
+            await _run_shielded_cleanup(dispose_typed_resources)
             return None
         self._typed_deployment = (views, publisher.read_active, snapshots.read, gateway)
         assert cancellation_engine is not None
