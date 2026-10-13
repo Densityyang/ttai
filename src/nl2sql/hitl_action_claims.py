@@ -35,6 +35,7 @@ HITLContinuationStatus = Literal[
     "rejected",
     "cancelled",
     "invalid",
+    "metric_plan_correction_rejected",
 ]
 
 
@@ -79,7 +80,11 @@ class HITLActionResponseSummary(StrictContract):
         if self.target_type == "typed_decision":
             if self.status != "recorded" or self.decision_status is None:
                 raise ValueError("typed_hitl_response_incoherent")
-        elif self.decision_status is not None or self.continuation_status is not None:
+        elif (
+            self.status == "recorded"
+            or self.decision_status is not None
+            or self.continuation_status is not None
+        ):
             raise ValueError("legacy_hitl_response_incoherent")
         return self
 

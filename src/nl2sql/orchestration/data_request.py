@@ -128,8 +128,61 @@ class AuthorizedDataScope(_DataScope):
     """Relations and columns returned by a trusted server authority."""
 
 
+class AuthorizedJoinScope(ImmutableDataContract):
+    """One authority-approved relation key and preserved-side join shape."""
+
+    left_relation: RelationIdentity
+    left_column: _IDENTIFIER
+    right_relation: RelationIdentity
+    right_column: _IDENTIFIER
+    join_type: Literal["inner", "left"]
+
+    @model_validator(mode="after")
+    def validate_distinct_relations(self) -> AuthorizedJoinScope:
+        if self.left_relation == self.right_relation:
+            raise ValueError("authorized join relations must be distinct")
+        return self
+
+
 class EffectiveDataScope(_DataScope):
-    """Requested scope after complete authorization; partial grants are denied."""
+    """Requested fields and only the joins granted by trusted authority."""
+
+    authorized_joins: tuple[AuthorizedJoinScope, ...] = ()
+
+    @field_validator("authorized_joins")
+    @classmethod
+    def validate_authorized_joins(
+        cls,
+        value: tuple[AuthorizedJoinScope, ...],
+    ) -> tuple[AuthorizedJoinScope, ...]:
+        keys = [
+            (
+                item.left_relation.schema_name,
+                item.left_relation.relation_name,
+                item.left_column,
+                item.right_relation.schema_name,
+                item.right_relation.relation_name,
+                item.right_column,
+                item.join_type,
+            )
+            for item in value
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("effective join scopes are invalid")
+        return tuple(
+            sorted(
+                value,
+                key=lambda item: (
+                    item.left_relation.schema_name,
+                    item.left_relation.relation_name,
+                    item.left_column,
+                    item.right_relation.schema_name,
+                    item.right_relation.relation_name,
+                    item.right_column,
+                    item.join_type,
+                ),
+            )
+        )
 
 
 class DataRequestBudget(ImmutableDataContract):
@@ -215,7 +268,7 @@ class OwnerRowScope(ImmutableDataContract):
 class VerifiedDataAuthorization(ImmutableDataContract):
     """Typed, owner-bound authority output; no production producer is wired."""
 
-    schema_version: Literal["data-authorization-v1"]
+    schema_version: Literal["data-authorization-v1", "data-authorization-v2"]
     request_id: UUID
     request_checksum: _SHA256
     owner_user_id: _OWNER_ID
@@ -223,6 +276,7 @@ class VerifiedDataAuthorization(ImmutableDataContract):
     authorization_revision: _OPAQUE_TOKEN
     authorized_scope: AuthorizedDataScope
     owner_row_scopes: tuple[OwnerRowScope, ...]
+    authorized_joins: tuple[AuthorizedJoinScope, ...] = ()
 
     @field_validator("owner_row_scopes")
     @classmethod
@@ -246,23 +300,85 @@ class VerifiedDataAuthorization(ImmutableDataContract):
             )
         )
 
+    @field_validator("authorized_joins")
+    @classmethod
+    def validate_authorized_joins(
+        cls,
+        value: tuple[AuthorizedJoinScope, ...],
+    ) -> tuple[AuthorizedJoinScope, ...]:
+        keys = [
+            (
+                item.left_relation.schema_name,
+                item.left_relation.relation_name,
+                item.left_column,
+                item.right_relation.schema_name,
+                item.right_relation.relation_name,
+                item.right_column,
+                item.join_type,
+            )
+            for item in value
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("authorized join scopes are invalid")
+        return tuple(
+            sorted(
+                value,
+                key=lambda item: (
+                    item.left_relation.schema_name,
+                    item.left_relation.relation_name,
+                    item.left_column,
+                    item.right_relation.schema_name,
+                    item.right_relation.relation_name,
+                    item.right_column,
+                    item.join_type,
+                ),
+            )
+        )
+
+    @model_validator(mode="after")
+    def validate_join_columns(self) -> VerifiedDataAuthorization:
+        if self.schema_version == "data-authorization-v1" and self.authorized_joins:
+            raise ValueError("authorization v1 cannot declare joins")
+        columns_by_relation = {
+            (item.relation.schema_name, item.relation.relation_name): set(item.columns)
+            for item in self.authorized_scope.relations
+        }
+        for join in self.authorized_joins:
+            left_key = (
+                join.left_relation.schema_name,
+                join.left_relation.relation_name,
+            )
+            right_key = (
+                join.right_relation.schema_name,
+                join.right_relation.relation_name,
+            )
+            if (
+                join.left_column not in columns_by_relation.get(left_key, set())
+                or join.right_column not in columns_by_relation.get(right_key, set())
+            ):
+                raise ValueError("authorized join columns are outside the grant")
+        return self
+
     @computed_field(return_type=str)
     @property
     def authorization_checksum(self) -> str:
-        return _sha256(
-            {
-                "schema_version": self.schema_version,
-                "request_id": str(self.request_id),
-                "request_checksum": self.request_checksum,
-                "owner_user_id": self.owner_user_id,
-                "authority_id": self.authority_id,
-                "authorization_revision": self.authorization_revision,
-                "authorized_scope": self.authorized_scope.model_dump(mode="json"),
-                "owner_row_scopes": [
-                    item.model_dump(mode="json") for item in self.owner_row_scopes
-                ],
-            }
-        )
+        payload = {
+            "schema_version": self.schema_version,
+            "request_id": str(self.request_id),
+            "request_checksum": self.request_checksum,
+            "owner_user_id": self.owner_user_id,
+            "authority_id": self.authority_id,
+            "authorization_revision": self.authorization_revision,
+            "authorized_scope": self.authorized_scope.model_dump(mode="json"),
+            "owner_row_scopes": [
+                item.model_dump(mode="json") for item in self.owner_row_scopes
+            ],
+        }
+        if self.schema_version == "data-authorization-v2":
+            payload["authorized_joins"] = [
+                item.model_dump(mode="json") for item in self.authorized_joins
+            ]
+        return _sha256(payload)
 
 
 class DataRequestDenied(ValueError):
@@ -300,7 +416,22 @@ def derive_effective_scope(
         if not set(requested.columns).issubset(authorized.get(key, set())):
             raise DataRequestDenied()
 
-    return EffectiveDataScope(relations=request.requested_scope.relations)
+    requested_keys = {
+        (item.relation.schema_name, item.relation.relation_name)
+        for item in request.requested_scope.relations
+    }
+    effective_joins = tuple(
+        join
+        for join in authorization.authorized_joins
+        if {
+            (join.left_relation.schema_name, join.left_relation.relation_name),
+            (join.right_relation.schema_name, join.right_relation.relation_name),
+        }.issubset(requested_keys)
+    )
+    return EffectiveDataScope(
+        relations=request.requested_scope.relations,
+        authorized_joins=effective_joins,
+    )
 
 
 class DataSourceSnapshot(ImmutableDataContract):
@@ -316,7 +447,7 @@ class DataSourceSnapshot(ImmutableDataContract):
 class GovernedSQLCandidate(ImmutableDataContract):
     """Compiler evidence only; intentionally contains no SQL text or bind values."""
 
-    schema_version: Literal["governed-sql-candidate-v1"]
+    schema_version: Literal["governed-sql-candidate-v1", "governed-sql-candidate-v2"]
     request_id: UUID
     request_checksum: _SHA256
     authorization_checksum: _SHA256
@@ -326,6 +457,15 @@ class GovernedSQLCandidate(ImmutableDataContract):
     source_snapshot: DataSourceSnapshot
     query_fingerprint: _SHA256
     parameter_binding_fingerprint: _SHA256
+
+    @model_validator(mode="after")
+    def validate_scope_version(self) -> GovernedSQLCandidate:
+        if (
+            self.schema_version == "governed-sql-candidate-v1"
+            and self.effective_scope.authorized_joins
+        ):
+            raise ValueError("candidate v1 cannot bind authorized joins")
+        return self
 
 
 class ReturnedColumnIdentity(ImmutableDataContract):
@@ -371,7 +511,7 @@ class TrustedExecutionResult(ImmutableDataContract):
 class FrozenDataset(ImmutableDataContract):
     """Complete immutable rowset plus the provenance required for future replay."""
 
-    schema_version: Literal["frozen-dataset-v1"]
+    schema_version: Literal["frozen-dataset-v1", "frozen-dataset-v2"]
     request_id: UUID
     request_checksum: _SHA256
     owner_user_id: _OWNER_ID
@@ -380,6 +520,10 @@ class FrozenDataset(ImmutableDataContract):
     authorization_revision: _OPAQUE_TOKEN
     authorized_scope: AuthorizedDataScope
     owner_row_scopes: tuple[OwnerRowScope, ...]
+    authorization_schema_version: Literal[
+        "data-authorization-v1", "data-authorization-v2"
+    ] = "data-authorization-v1"
+    authorized_joins: tuple[AuthorizedJoinScope, ...] = ()
     effective_scope: EffectiveDataScope
     source_snapshot: DataSourceSnapshot
     query_fingerprint: _SHA256
@@ -395,6 +539,17 @@ class FrozenDataset(ImmutableDataContract):
 
     @model_validator(mode="after")
     def validate_complete_rows(self) -> FrozenDataset:
+        if (
+            self.schema_version == "frozen-dataset-v1"
+            and (
+                self.authorization_schema_version != "data-authorization-v1"
+                or self.authorized_joins
+            )
+        ) or (
+            self.schema_version == "frozen-dataset-v2"
+            and self.authorization_schema_version != "data-authorization-v2"
+        ):
+            raise ValueError("frozen dataset authorization version is invalid")
         try:
             bound_request = DataRequest(
                 schema_version="data-request-v1",
@@ -406,7 +561,7 @@ class FrozenDataset(ImmutableDataContract):
                 budget=self.budget,
             )
             bound_authorization = VerifiedDataAuthorization(
-                schema_version="data-authorization-v1",
+                schema_version=self.authorization_schema_version,
                 request_id=self.request_id,
                 request_checksum=self.request_checksum,
                 owner_user_id=self.owner_user_id,
@@ -414,6 +569,7 @@ class FrozenDataset(ImmutableDataContract):
                 authorization_revision=self.authorization_revision,
                 authorized_scope=self.authorized_scope,
                 owner_row_scopes=self.owner_row_scopes,
+                authorized_joins=self.authorized_joins,
             )
             derived_scope = derive_effective_scope(bound_request, bound_authorization)
         except ValidationError:
@@ -594,7 +750,11 @@ def build_frozen_dataset(
 
     try:
         dataset = FrozenDataset(
-            schema_version="frozen-dataset-v1",
+            schema_version=(
+                "frozen-dataset-v2"
+                if authorization.schema_version == "data-authorization-v2"
+                else "frozen-dataset-v1"
+            ),
             request_id=request.request_id,
             request_checksum=request.request_checksum,
             owner_user_id=request.owner_user_id,
@@ -603,6 +763,8 @@ def build_frozen_dataset(
             authorization_revision=authorization.authorization_revision,
             authorized_scope=authorization.authorized_scope,
             owner_row_scopes=authorization.owner_row_scopes,
+            authorization_schema_version=authorization.schema_version,
+            authorized_joins=authorization.authorized_joins,
             effective_scope=effective_scope,
             source_snapshot=actual_source,
             query_fingerprint=candidate.query_fingerprint,

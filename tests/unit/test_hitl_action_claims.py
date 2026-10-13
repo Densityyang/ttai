@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 from uuid import UUID
+
+import pytest
+from pydantic import ValidationError
 
 from src.nl2sql.hitl_action_claims import (
     HITLActionClaimInput,
@@ -36,8 +40,27 @@ def _response() -> HITLActionResponseSummary:
         status="recorded",
         version=1,
         decision_status="resolved_pending_revalidation",
-        continuation_status="current_authorization_denied",
+        continuation_status="metric_plan_correction_rejected",
     )
+
+
+@pytest.mark.parametrize("target_type", [None, "legacy_hitl"])
+def test_legacy_response_cannot_use_typed_recorded_status(
+    target_type: Literal["legacy_hitl"] | None,
+) -> None:
+    with pytest.raises(ValidationError):
+        HITLActionResponseSummary(
+            target_type=target_type,
+            status="recorded",
+            version=1,
+        )
+
+    legacy = HITLActionResponseSummary(
+        target_type=target_type,
+        status="approved",
+        version=1,
+    )
+    assert legacy.status == "approved"
 
 
 async def test_atomic_claim_has_one_winner_and_replays_safe_completion() -> None:

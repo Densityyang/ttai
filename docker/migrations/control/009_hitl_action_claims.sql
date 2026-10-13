@@ -48,9 +48,9 @@ CREATE TABLE IF NOT EXISTS hitl_action_claims (
         OR response_summary->>'target_type' IN ('legacy_hitl', 'typed_decision')
       )
       AND (
-        response_summary->>'target_type' IS DISTINCT FROM 'typed_decision'
-        OR (
-          response_summary->>'status' = 'recorded'
+        (
+          response_summary->>'target_type' = 'typed_decision'
+          AND response_summary->>'status' = 'recorded'
           AND response_summary->>'decision_status' IN (
             'resolved_pending_revalidation', 'choose_recorded_no_continuation',
             'rejected', 'cancelled'
@@ -62,15 +62,17 @@ CREATE TABLE IF NOT EXISTS hitl_action_claims (
             'current_authorization_unavailable', 'current_authorization_denied',
             'continuation_execution_plan_denied', 'continuation_stopped',
             'revalidation_denied', 'awaiting_decision',
-            'choose_recorded_no_continuation', 'rejected', 'cancelled', 'invalid'
+            'choose_recorded_no_continuation', 'rejected', 'cancelled', 'invalid',
+            'metric_plan_correction_rejected'
           )
         )
-        AND (
-          response_summary->>'target_type' = 'typed_decision'
-          OR (
-            response_summary->>'decision_status' IS NULL
-            AND response_summary->>'continuation_status' IS NULL
+        OR (
+          response_summary->>'target_type' IS DISTINCT FROM 'typed_decision'
+          AND response_summary->>'status' IN (
+            'approved', 'modified', 'rejected', 'cancelled'
           )
+          AND response_summary->>'decision_status' IS NULL
+          AND response_summary->>'continuation_status' IS NULL
         )
       )
     )

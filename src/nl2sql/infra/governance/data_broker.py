@@ -25,6 +25,7 @@ from src.nl2sql.infra.governance.query_gateway import (
     is_sensitive_column_name,
 )
 from src.nl2sql.orchestration.data_request import (
+    AuthorizedJoinScope,
     DataRequest,
     DataRequestBudget,
     DataRequestDenied,
@@ -316,19 +317,38 @@ def _validate_compiled_query(
             or scope.expression.args.get("offset") is not None
         ):
             raise DataRequestDenied()
+        if any(
+            scope.expression.args.get(argument) is not None
+            for argument in ("group", "having", "qualify", "distinct")
+        ):
+            # DataRequest has no aggregation or row-filter semantics. A query
+            # that groups, deduplicates, or applies a post-filter cannot prove
+            # that its result is the complete requested row set.
+            raise DataRequestDenied()
         physical_tables = _physical_tables(scope)
+        owner_columns: dict[str, str] = {}
         for alias, relation in physical_tables:
             key = _relation_key(relation)
             if key not in authorized_columns or key not in row_scope_columns:
                 raise DataRequestDenied()
-            if not _has_owner_row_predicate(
+            owner_columns[alias] = row_scope_columns[key]
+        if owner_columns:
+            if not _has_exact_owner_row_predicates(
                 scope=scope,
-                alias=alias,
-                owner_column=row_scope_columns[key],
+                owner_columns=owner_columns,
                 owner_user_id=request.owner_user_id,
                 parameters=parameters,
             ):
                 raise DataRequestDenied()
+        elif scope.expression.args.get("where") is not None:
+            # A predicate over a CTE/derived-only scope can silently remove
+            # rows after the physical owner checks have already succeeded.
+            raise DataRequestDenied()
+        _validate_join_predicates(
+            scope=scope,
+            lineages=lineages,
+            authorized_joins=effective_scope.authorized_joins,
+        )
 
         for column in scope.columns:
             if column.is_star or column.name == "*":
@@ -475,11 +495,81 @@ def _resolve_column_lineage(
     raise DataRequestDenied()
 
 
-def _has_owner_row_predicate(
+def _validate_join_predicates(
     *,
     scope: Scope,
-    alias: str,
-    owner_column: str,
+    lineages: dict[int, dict[str, _ColumnLineage]],
+    authorized_joins: tuple[AuthorizedJoinScope, ...],
+) -> None:
+    joins = scope.expression.args.get("joins") or ()
+    for join in joins:
+        if not isinstance(join, exp.Join) or not isinstance(join.this, exp.Table):
+            raise DataRequestDenied()
+        side = join.args.get("side")
+        kind = join.args.get("kind")
+        if kind not in (None, "OUTER"):
+            raise DataRequestDenied()
+        if side is None:
+            join_type = "inner"
+        elif side == "LEFT":
+            join_type = "left"
+        else:
+            # RIGHT/FULL joins reverse which requested rows are preserved.
+            raise DataRequestDenied()
+
+        on_expression = join.args.get("on")
+        if not isinstance(on_expression, exp.Expr):
+            raise DataRequestDenied()
+        conjuncts = _conjunctive_terms(on_expression)
+        if (
+            conjuncts is None
+            or len(conjuncts) != 1
+            or not isinstance(conjuncts[0], exp.EQ)
+            or not isinstance(conjuncts[0].this, exp.Column)
+            or not isinstance(conjuncts[0].expression, exp.Column)
+        ):
+            # The authority contract currently grants one exact key equality
+            # per join. Extra ON conditions need their own explicit semantics.
+            raise DataRequestDenied()
+
+        predicate = conjuncts[0]
+        left_operand = predicate.this
+        right_operand = predicate.expression
+        join_target_alias = _table_alias(join.this)
+        left_alias = _identifier_value(left_operand.args.get("table"))
+        right_alias = _identifier_value(right_operand.args.get("table"))
+        if left_alias == join_target_alias and right_alias != join_target_alias:
+            left_operand, right_operand = right_operand, left_operand
+        elif right_alias != join_target_alias or left_alias == join_target_alias:
+            raise DataRequestDenied()
+
+        left_lineage = _resolve_column_lineage(scope, left_operand, lineages)
+        right_lineage = _resolve_column_lineage(scope, right_operand, lineages)
+        if join_type == "left" and not isinstance(
+            scope.sources.get(join_target_alias), Scope
+        ):
+            # A WHERE owner filter over a physical nullable side converts a
+            # LEFT JOIN into an effective inner filter. Require that side to be
+            # owner-scoped in a CTE before the join, where null preservation is
+            # still observable.
+            raise DataRequestDenied()
+        matches = tuple(
+            authorized_join
+            for authorized_join in authorized_joins
+            if authorized_join.join_type == join_type
+            and authorized_join.left_relation == left_lineage.relation
+            and authorized_join.left_column == left_lineage.column_name
+            and authorized_join.right_relation == right_lineage.relation
+            and authorized_join.right_column == right_lineage.column_name
+        )
+        if len(matches) != 1:
+            raise DataRequestDenied()
+
+
+def _has_exact_owner_row_predicates(
+    *,
+    scope: Scope,
+    owner_columns: Mapping[str, str],
     owner_user_id: str,
     parameters: Mapping[str, Any],
 ) -> bool:
@@ -487,18 +577,31 @@ def _has_owner_row_predicate(
     if not isinstance(where, exp.Where):
         return False
     conjuncts = _conjunctive_terms(where.this)
-    if conjuncts is None:
+    if conjuncts is None or len(conjuncts) != len(owner_columns):
         return False
+    matched_aliases: set[str] = set()
     for term in conjuncts:
         if not isinstance(term, exp.EQ):
-            continue
+            return False
         left = term.this
         right = term.expression
-        if _matches_owner_binding(left, right, alias, owner_column, owner_user_id, parameters):
-            return True
-        if _matches_owner_binding(right, left, alias, owner_column, owner_user_id, parameters):
-            return True
-    return False
+        matches = {
+            alias
+            for alias, owner_column in owner_columns.items()
+            if _matches_owner_binding(
+                left, right, alias, owner_column, owner_user_id, parameters
+            )
+            or _matches_owner_binding(
+                right, left, alias, owner_column, owner_user_id, parameters
+            )
+        }
+        if len(matches) != 1:
+            return False
+        alias = next(iter(matches))
+        if alias in matched_aliases:
+            return False
+        matched_aliases.add(alias)
+    return matched_aliases == set(owner_columns)
 
 
 def _conjunctive_terms(expression: exp.Expr) -> list[exp.Expr] | None:

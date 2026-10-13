@@ -16,6 +16,7 @@ from src.nl2sql.infra.governance.data_broker import (
 )
 from src.nl2sql.orchestration.data_request import (
     AuthorizedDataScope,
+    AuthorizedJoinScope,
     DataRequest,
     DataRequestBudget,
     DataRequestDenied,
@@ -82,10 +83,13 @@ def _authorization(
     *,
     owner: str | None = None,
     scope: AuthorizedDataScope | None = None,
+    authorized_joins: tuple[AuthorizedJoinScope, ...] = (),
 ) -> VerifiedDataAuthorization:
     authorized_scope = scope or AuthorizedDataScope(relations=request.requested_scope.relations)
     return VerifiedDataAuthorization(
-        schema_version="data-authorization-v1",
+        schema_version=(
+            "data-authorization-v2" if authorized_joins else "data-authorization-v1"
+        ),
         request_id=request.request_id,
         request_checksum=request.request_checksum,
         owner_user_id=owner or request.owner_user_id,
@@ -96,6 +100,7 @@ def _authorization(
             OwnerRowScope(relation=item.relation, owner_column="owner_id")
             for item in authorized_scope.relations
         ),
+        authorized_joins=authorized_joins,
     )
 
 
@@ -108,8 +113,13 @@ def _candidate(
     request_checksum: str | None = None,
     authorization_checksum: str | None = None,
 ) -> GovernedSQLCandidate:
+    resolved_scope = effective_scope or derive_effective_scope(request, authorization)
     return GovernedSQLCandidate(
-        schema_version="governed-sql-candidate-v1",
+        schema_version=(
+            "governed-sql-candidate-v2"
+            if resolved_scope.authorized_joins
+            else "governed-sql-candidate-v1"
+        ),
         request_id=request.request_id,
         request_checksum=request_checksum or request.request_checksum,
         authorization_checksum=(
@@ -117,7 +127,7 @@ def _candidate(
         ),
         compiler_id="test-compiler",
         compiler_version="contract-test-v1",
-        effective_scope=effective_scope or derive_effective_scope(request, authorization),
+        effective_scope=resolved_scope,
         source_snapshot=DataSourceSnapshot(
             source_id="test-source",
             source_version="snapshot-version-4",
@@ -309,7 +319,7 @@ async def test_synthetic_contract_path_requires_authority_compiler_and_complete_
     assert dataset.status == "complete"
 
 
-def test_compiled_sql_validation_tracks_joins_aliases_ctes_and_projections() -> None:
+def test_compiled_sql_requires_authorized_join_key_and_rejects_extra_filters() -> None:
     requested = RequestedDataScope(
         relations=(
             RelationColumnScope(
@@ -336,6 +346,19 @@ def test_compiled_sql_validation_tracks_joins_aliases_ctes_and_projections() -> 
                     columns=("customer_id", "display_name"),
                 ),
             )
+        ),
+        authorized_joins=(
+            AuthorizedJoinScope(
+                left_relation=RelationIdentity(
+                    schema_name="analytics", relation_name="sales"
+                ),
+                left_column="customer_id",
+                right_relation=RelationIdentity(
+                    schema_name="analytics", relation_name="customers"
+                ),
+                right_column="customer_id",
+                join_type="inner",
+            ),
         ),
     )
     scope = derive_effective_scope(request, authorization)
@@ -383,6 +406,26 @@ def test_compiled_sql_validation_tracks_joins_aliases_ctes_and_projections() -> 
         compiled=compiled,
     )
 
+    no_join_authority = _authorization(
+        request,
+        scope=authorization.authorized_scope,
+    )
+    assert no_join_authority.authorization_checksum != authorization.authorization_checksum
+    no_join_scope = derive_effective_scope(request, no_join_authority)
+    no_join_compiled = CompiledGovernedQuery(
+        candidate=_candidate(request, no_join_authority, effective_scope=no_join_scope),
+        sql=sql,
+        parameters=parameters,
+        projections=projections,
+    )
+    with pytest.raises(DataRequestDenied):
+        _validate_compiled_query(
+            request=request,
+            authorization=no_join_authority,
+            effective_scope=no_join_scope,
+            compiled=no_join_compiled,
+        )
+
     unscoped_join = CompiledGovernedQuery(
         candidate=candidate,
         sql=sql.replace(" WHERE c.owner_id = :owner_user_id", ""),
@@ -395,6 +438,53 @@ def test_compiled_sql_validation_tracks_joins_aliases_ctes_and_projections() -> 
             authorization=authorization,
             effective_scope=scope,
             compiled=unscoped_join,
+        )
+
+    filtered_derived_join = CompiledGovernedQuery(
+        candidate=candidate,
+        sql=(
+            "WITH owner_sales AS ("
+            "SELECT s.sale_id AS sale_key, s.customer_id AS customer_key, "
+            "s.amount AS amount FROM analytics.sales AS s "
+            "WHERE s.owner_id = :owner_user_id), "
+            "owner_customers AS ("
+            "SELECT c.customer_id AS customer_key, c.display_name AS customer_name "
+            "FROM analytics.customers AS c WHERE c.owner_id = :owner_user_id) "
+            "SELECT os.sale_key AS sale_id, os.amount AS amount, "
+            "oc.customer_name AS customer_name FROM owner_sales AS os "
+            "JOIN owner_customers AS oc "
+            "ON os.customer_key = oc.customer_key AND oc.customer_name <> 'Bob'"
+        ),
+        parameters=parameters,
+        projections=projections,
+    )
+    with pytest.raises(DataRequestDenied):
+        _validate_compiled_query(
+            request=request,
+            authorization=authorization,
+            effective_scope=scope,
+            compiled=filtered_derived_join,
+        )
+
+    mismatched_join_key = CompiledGovernedQuery(
+        candidate=candidate,
+        sql=(
+            "SELECT s.sale_id AS sale_id, s.amount AS amount, "
+            "c.display_name AS customer_name "
+            "FROM analytics.sales AS s "
+            "JOIN analytics.customers AS c ON s.sale_id = c.customer_id "
+            "WHERE s.owner_id = :owner_user_id "
+            "AND c.owner_id = :owner_user_id"
+        ),
+        parameters=parameters,
+        projections=projections,
+    )
+    with pytest.raises(DataRequestDenied):
+        _validate_compiled_query(
+            request=request,
+            authorization=authorization,
+            effective_scope=scope,
+            compiled=mismatched_join_key,
         )
 
     left_join_with_on_only_scopes = CompiledGovernedQuery(
@@ -418,6 +508,164 @@ def test_compiled_sql_validation_tracks_joins_aliases_ctes_and_projections() -> 
             effective_scope=scope,
             compiled=left_join_with_on_only_scopes,
         )
+
+
+def test_compiled_sql_accepts_complete_single_relation_cte() -> None:
+    request = _request()
+    authorization = _authorization(request)
+    scope = derive_effective_scope(request, authorization)
+    compiled = CompiledGovernedQuery(
+        candidate=_candidate(request, authorization, effective_scope=scope),
+        sql=(
+            "WITH owner_sales AS ("
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id) "
+            "SELECT owner_sales.amount AS amount, owner_sales.region AS region "
+            "FROM owner_sales"
+        ),
+        parameters={"owner_user_id": request.owner_user_id},
+        projections=(
+            ReturnedColumnIdentity(
+                relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+                column_name="amount",
+                output_name="amount",
+            ),
+            ReturnedColumnIdentity(
+                relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+                column_name="region",
+                output_name="region",
+            ),
+        ),
+    )
+
+    _validate_compiled_query(
+        request=request,
+        authorization=authorization,
+        effective_scope=scope,
+        compiled=compiled,
+    )
+
+
+def test_left_join_owner_scope_preserves_rows_through_a_prefiltered_cte() -> None:
+    request = _request(
+        scope=RequestedDataScope(
+            relations=(
+                RelationColumnScope(
+                    relation=RelationIdentity(
+                        schema_name="analytics",
+                        relation_name="sales",
+                    ),
+                    columns=("sale_id", "amount"),
+                ),
+                RelationColumnScope(
+                    relation=RelationIdentity(
+                        schema_name="analytics",
+                        relation_name="customers",
+                    ),
+                    columns=("display_name",),
+                ),
+            )
+        )
+    )
+    authorized_scope = AuthorizedDataScope(
+        relations=(
+            RelationColumnScope(
+                relation=RelationIdentity(
+                    schema_name="analytics",
+                    relation_name="sales",
+                ),
+                columns=("sale_id", "amount", "customer_id"),
+            ),
+            RelationColumnScope(
+                relation=RelationIdentity(
+                    schema_name="analytics",
+                    relation_name="customers",
+                ),
+                columns=("customer_id", "display_name"),
+            ),
+        )
+    )
+    join_rule = AuthorizedJoinScope(
+        left_relation=RelationIdentity(
+            schema_name="analytics",
+            relation_name="sales",
+        ),
+        left_column="customer_id",
+        right_relation=RelationIdentity(
+            schema_name="analytics",
+            relation_name="customers",
+        ),
+        right_column="customer_id",
+        join_type="left",
+    )
+    authorization = _authorization(
+        request,
+        scope=authorized_scope,
+        authorized_joins=(join_rule,),
+    )
+    scope = derive_effective_scope(request, authorization)
+    parameters = {"owner_user_id": request.owner_user_id}
+    projections = (
+        ReturnedColumnIdentity(
+            relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+            column_name="sale_id",
+            output_name="sale_id",
+        ),
+        ReturnedColumnIdentity(
+            relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+            column_name="amount",
+            output_name="amount",
+        ),
+        ReturnedColumnIdentity(
+            relation=RelationIdentity(schema_name="analytics", relation_name="customers"),
+            column_name="display_name",
+            output_name="customer_name",
+        ),
+    )
+
+    nullable_physical_side = CompiledGovernedQuery(
+        candidate=_candidate(request, authorization, effective_scope=scope),
+        sql=(
+            "SELECT s.sale_id AS sale_id, s.amount AS amount, "
+            "c.display_name AS customer_name "
+            "FROM analytics.sales AS s "
+            "LEFT JOIN analytics.customers AS c "
+            "ON s.customer_id = c.customer_id "
+            "WHERE s.owner_id = :owner_user_id "
+            "AND c.owner_id = :owner_user_id"
+        ),
+        parameters=parameters,
+        projections=projections,
+    )
+    with pytest.raises(DataRequestDenied):
+        _validate_compiled_query(
+            request=request,
+            authorization=authorization,
+            effective_scope=scope,
+            compiled=nullable_physical_side,
+        )
+
+    prefitered_right_side = CompiledGovernedQuery(
+        candidate=_candidate(request, authorization, effective_scope=scope),
+        sql=(
+            "WITH owner_customers AS ("
+            "SELECT c.customer_id AS customer_key, c.display_name AS customer_name "
+            "FROM analytics.customers AS c WHERE c.owner_id = :owner_user_id) "
+            "SELECT s.sale_id AS sale_id, s.amount AS amount, "
+            "oc.customer_name AS customer_name FROM analytics.sales AS s "
+            "LEFT JOIN owner_customers AS oc "
+            "ON s.customer_id = oc.customer_key "
+            "WHERE s.owner_id = :owner_user_id"
+        ),
+        parameters=parameters,
+        projections=projections,
+    )
+    _validate_compiled_query(
+        request=request,
+        authorization=authorization,
+        effective_scope=scope,
+        compiled=prefitered_right_side,
+    )
 
 
 @pytest.mark.parametrize(
@@ -446,6 +694,37 @@ def test_compiled_sql_validation_tracks_joins_aliases_ctes_and_projections() -> 
         (
             "SELECT s.amount AS amount, s.region AS region "
             "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id OR TRUE",
+            "owner-7",
+        ),
+        (
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s "
+            "WHERE s.owner_id = :owner_user_id AND FALSE",
+            "owner-7",
+        ),
+        (
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s "
+            "WHERE s.owner_id = :owner_user_id AND s.amount > 100",
+            "owner-7",
+        ),
+        (
+            "SELECT DISTINCT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id",
+            "owner-7",
+        ),
+        (
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id "
+            "GROUP BY s.amount, s.region",
+            "owner-7",
+        ),
+        (
+            "WITH owner_sales AS ("
+            "SELECT s.amount AS amount, s.region AS region "
+            "FROM analytics.sales AS s WHERE s.owner_id = :owner_user_id) "
+            "SELECT os.amount AS amount, os.region AS region FROM owner_sales AS os "
+            "WHERE os.amount > 100",
             "owner-7",
         ),
         (

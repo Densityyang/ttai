@@ -42,6 +42,7 @@ from src.nl2sql.infra.store.database import DatabaseManager
 from src.nl2sql.orchestration.budget import RouteBudgetLedger
 from src.nl2sql.orchestration.data_request import (
     AuthorizedDataScope,
+    AuthorizedJoinScope,
     DataRequest,
     DataRequestBudget,
     DataRequestDenied,
@@ -477,7 +478,7 @@ class _Pg17FixtureAuthority:
             )
         )
         return VerifiedDataAuthorization(
-            schema_version="data-authorization-v1",
+            schema_version="data-authorization-v2",
             request_id=request.request_id,
             request_checksum=request.request_checksum,
             owner_user_id=request.owner_user_id,
@@ -498,6 +499,21 @@ class _Pg17FixtureAuthority:
                         relation_name="broker_customers",
                     ),
                     owner_column="owner_id",
+                ),
+            ),
+            authorized_joins=(
+                AuthorizedJoinScope(
+                    left_relation=RelationIdentity(
+                        schema_name="ai_views",
+                        relation_name="broker_sales",
+                    ),
+                    left_column="customer_id",
+                    right_relation=RelationIdentity(
+                        schema_name="ai_views",
+                        relation_name="broker_customers",
+                    ),
+                    right_column="customer_id",
+                    join_type="inner",
                 ),
             ),
         )
@@ -534,7 +550,11 @@ class _Pg17FixtureCompiler:
             detect_row_truncation=True,
         )
         candidate = GovernedSQLCandidate(
-            schema_version="governed-sql-candidate-v1",
+            schema_version=(
+                "governed-sql-candidate-v2"
+                if effective_scope.authorized_joins
+                else "governed-sql-candidate-v1"
+            ),
             request_id=request.request_id,
             request_checksum=request.request_checksum,
             authorization_checksum=authorization.authorization_checksum,
@@ -630,6 +650,61 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
             await counterfactual_broker.request_dataset(_p5_broker_request())
         assert (len(audit.starts), len(audit.results)) == audit_counts_before_broker
 
+        filtered_join_sql = (
+            "WITH owner_sales AS ("
+            "SELECT s.sale_id AS sale_key, s.customer_id AS customer_key, "
+            "s.amount AS amount FROM ai_views.broker_sales AS s "
+            "WHERE s.owner_id = :owner_user_id) "
+            "SELECT os.sale_key AS sale_id, os.amount AS amount, "
+            "c.display_name AS customer_name FROM owner_sales AS os "
+            "JOIN ai_views.broker_customers AS c "
+            "ON os.customer_key = c.customer_id AND c.display_name <> 'Bob' "
+            "WHERE c.owner_id = :owner_user_id ORDER BY os.sale_key"
+        )
+        direct_filtered_join = await gateway.execute(
+            filtered_join_sql,
+            {"owner_user_id": "owner-a"},
+            trace_id="test-only-data-request-join-filter-counterfactual",
+        )
+        assert direct_filtered_join.accepted
+        assert direct_filtered_join.row_count == 2
+        audits_before_filtered_join_broker = (len(audit.starts), len(audit.results))
+        filtered_join_broker = GovernedDataBroker(
+            authority=_Pg17FixtureAuthority(),
+            compiler=_Pg17FixtureCompiler(gateway, sql_override=filtered_join_sql),
+            executor=QueryGatewayDataExecutor(gateway),
+        )
+        with pytest.raises(DataRequestDenied):
+            await filtered_join_broker.request_dataset(_p5_broker_request())
+        assert (len(audit.starts), len(audit.results)) == audits_before_filtered_join_broker
+
+        filtered_subset_sql = (
+            "SELECT s.sale_id AS sale_id, s.amount AS amount, "
+            "c.display_name AS customer_name "
+            "FROM ai_views.broker_sales AS s "
+            "JOIN ai_views.broker_customers AS c "
+            "ON c.customer_id = s.customer_id "
+            "WHERE s.owner_id = :owner_user_id "
+            "AND c.owner_id = :owner_user_id AND s.amount > 6 "
+            "ORDER BY s.sale_id"
+        )
+        direct_filtered_subset = await gateway.execute(
+            filtered_subset_sql,
+            {"owner_user_id": "owner-a"},
+            trace_id="test-only-data-request-filter-counterfactual",
+        )
+        assert direct_filtered_subset.accepted
+        assert direct_filtered_subset.row_count == 2
+        audits_before_filtered_broker = (len(audit.starts), len(audit.results))
+        filtered_broker = GovernedDataBroker(
+            authority=_Pg17FixtureAuthority(),
+            compiler=_Pg17FixtureCompiler(gateway, sql_override=filtered_subset_sql),
+            executor=QueryGatewayDataExecutor(gateway),
+        )
+        with pytest.raises(DataRequestDenied):
+            await filtered_broker.request_dataset(_p5_broker_request())
+        assert (len(audit.starts), len(audit.results)) == audits_before_filtered_broker
+
         offset_request = _p5_broker_request()
         offset_authorization = await _Pg17FixtureAuthority().verify_request(offset_request)
         offset_scope = derive_effective_scope(offset_request, offset_authorization)
@@ -679,7 +754,7 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
             metadata_probe_scope,
         )
         metadata_reserve = _dataset_metadata_reserve(metadata_probe_compiled)
-        row_byte_budget = 32
+        row_byte_budget = 10
         byte_budget_request = _p5_broker_request(
             max_bytes=metadata_reserve + row_byte_budget
         )

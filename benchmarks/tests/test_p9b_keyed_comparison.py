@@ -19,8 +19,14 @@ from benchmarks.metrics import (
     CaseResult,
     statistical_significance,
 )
+from benchmarks.registry import EvalCase
 from benchmarks.runner import _generate_comparison_report
-from benchmarks.typed_receipts import mcnemar_exact, paired_bootstrap_interval
+from benchmarks.typed_receipts import (
+    ProviderCallReceipt,
+    TypedAnswerReceipt,
+    mcnemar_exact,
+    paired_bootstrap_interval,
+)
 
 _DATASET = "a" * 64
 _SELECTION = "b" * 64
@@ -28,6 +34,59 @@ _SELECTION = "b" * 64
 
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+class _TypedHarnessExecutor:
+    evidence_kind = "harness"
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+
+    async def __call__(self, case: EvalCase) -> TypedAnswerReceipt:
+        expected = case.oracle.expected_value if case.oracle is not None else 0
+        result = (
+            -1
+            if self.model == "candidate-model" and case.case_id == "case-a"
+            else expected
+        )
+        return TypedAnswerReceipt(
+            trace_id="synthetic-harness-trace",
+            answer_type="answer",
+            answer_hash="a" * 64,
+            candidate_score=1.0,
+            policy_outcome="allow",
+            execution_accepted=True,
+            execution_row_count=1,
+            result_value=result,
+        )
+
+
+class _OverBudgetTypedExecutor:
+    evidence_kind = "harness"
+
+    async def __call__(self, case: EvalCase) -> TypedAnswerReceipt:
+        value = case.oracle.expected_value if case.oracle is not None else 0
+        return TypedAnswerReceipt(
+            trace_id="synthetic-over-budget-trace",
+            answer_type="answer",
+            answer_hash="b" * 64,
+            candidate_score=1.0,
+            policy_outcome="allow",
+            execution_accepted=True,
+            execution_row_count=1,
+            result_value=value,
+            model_calls=(
+                ProviderCallReceipt(
+                    alias="fast.default",
+                    stage="answer",
+                    resolved_model="synthetic-model",
+                    input_tokens=1,
+                    output_tokens=1,
+                    estimated_cost=100.0,
+                    latency_ms=1.0,
+                ),
+            ),
+        )
 
 
 def _report(
@@ -317,7 +376,7 @@ def test_comparison_report_emits_deterministic_json_manifest_and_no_p_values(
 
 
 @pytest.mark.asyncio
-async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_results(
+async def test_run_experiment_emits_typed_paired_comparison(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import benchmarks.runner as runner
@@ -349,7 +408,11 @@ async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_res
         "EXPERIMENT_CONFIGS",
         {
             "synthetic-paired": [
-                {"name": "baseline", "description": "baseline", "overrides": {}},
+                {
+                    "name": "baseline",
+                    "description": "baseline",
+                    "overrides": {"model": "baseline-model"},
+                },
                 {
                     "name": "candidate",
                     "description": "candidate",
@@ -358,7 +421,7 @@ async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_res
             ]
         },
     )
-    resolved_config = {"model": "base-model"}
+    resolved_config = {"model": "unused-model"}
 
     @contextlib.contextmanager
     def override_config(overrides: dict[str, Any]):
@@ -376,38 +439,20 @@ async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_res
         lambda: _sha(resolved_config["model"]),
     )
 
-    async def fake_run_benchmark(
-        selected: list[BenchmarkCase], *, run_id: str, use_stub: bool
-    ) -> BenchmarkReport:
-        del use_stub
-        selected_cases = list(selected)
-        if "candidate" in run_id:
-            selected_cases.reverse()
-        results = [
-            CaseResult(
-                case_id=case.case_id,
-                layer=case.layer,
-                domain=case.domain,
-                expected_mode=case.expected_mode,
-                mode="QUERY",
-                adjudicated=True,
-                passed=case.case_id != "case-a",
-            )
-            for case in selected_cases
-        ]
-        return BenchmarkReport(
-            run_id=run_id,
-            total_cases=len(results),
-            results=results,
-            accuracy_established=False,
-            accuracy_evidence_state="NO_TYPED_RECEIPTS",
-        )
+    def fake_build_typed_executor(typed_runtime: str) -> _TypedHarnessExecutor:
+        assert typed_runtime == "demo"
+        return _TypedHarnessExecutor(resolved_config["model"])
 
-    monkeypatch.setattr(runner, "run_benchmark", fake_run_benchmark)
-    reports = await runner.run_experiment("synthetic-paired", dataset="synthetic")
+    monkeypatch.setattr(runner, "build_typed_executor", fake_build_typed_executor)
+    reports = await runner.run_experiment(
+        "synthetic-paired", dataset="synthetic", typed_runtime="demo"
+    )
 
     assert set(reports) == {"baseline", "candidate"}
     baseline, candidate = reports["baseline"], reports["candidate"]
+    assert baseline.evidence_kind == candidate.evidence_kind == "harness"
+    assert baseline.accuracy_established is True
+    assert candidate.accuracy_established is True
     assert baseline.execution_evidence["pair_identity_state"] == "VALID"
     assert candidate.execution_evidence["pair_identity_state"] == "VALID"
     assert baseline.manifest["case_selection_checksum"] == candidate.manifest[
@@ -420,8 +465,11 @@ async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_res
     comparison = payload["comparisons"][0]
     assert comparison["status"] == "PAIRED_DESCRIPTIVE"
     assert comparison["pair_count"] == 2
-    assert comparison["unknown_pair_count"] == 2
-    assert comparison["mean_paired_pass_delta"] is None
+    assert comparison["adjudicated_pair_count"] == 2
+    assert comparison["unknown_pair_count"] == 0
+    assert comparison["mean_paired_pass_delta"] == -0.5
+    assert comparison["evidence_kind"] == "harness"
+    assert {item["evidence_kind"] for item in payload["variants"]} == {"harness"}
     assert "case-a" not in json.dumps(payload)
     assert "candidate-model" not in json.dumps(payload)
     assert comparison["manifest"]["baseline"]["runtime_config_sha256"] != (
@@ -442,8 +490,151 @@ async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_res
             assert per_case_hash not in serialized_run
             assert per_case_hash not in markdown_run
     assert "COMPLETE" in markdown
-    assert "NO_TYPED_RECEIPTS" in markdown
-    assert "unavailable" in markdown
+    assert "harness" in markdown
+    assert "MEASURED" in markdown
+
+
+def test_experiment_cli_defaults_to_fail_closed_and_hides_unestablished_accuracy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import sys
+
+    import benchmarks.runner as runner
+
+    cases = [
+        BenchmarkCase(
+            case_id="case-a",
+            source="synthetic",
+            layer="L1",
+            domain="orders",
+            question="case a",
+            gold_sql="SELECT 1",
+            gold_value=1,
+        ),
+        BenchmarkCase(
+            case_id="case-b",
+            source="synthetic",
+            layer="L1",
+            domain="orders",
+            question="case b",
+            gold_sql="SELECT 2",
+            gold_value=2,
+        ),
+    ]
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(runner, "load_cases", lambda *_args, **_kwargs: list(cases))
+    monkeypatch.setattr(
+        runner,
+        "EXPERIMENT_CONFIGS",
+        {
+            "synthetic-paired": [
+                {"name": "baseline", "description": "baseline", "overrides": {}},
+                {"name": "candidate", "description": "candidate", "overrides": {}},
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        runner, "_effective_runtime_config_sha256", lambda: _sha("production")
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark-runner",
+            "--experiment",
+            "synthetic-paired",
+            "--dataset",
+            "enterprise",
+        ],
+    )
+
+    runner.main()
+
+    output = capsys.readouterr().out
+    assert "accuracy=not established" in output
+    assert "INCOMPLETE_RECEIPT_COVERAGE" in output
+    assert "typed_runtime_unavailable" in output
+    assert "EX=0.00%" not in output
+    payload = json.loads(
+        (tmp_path / "comparison-synthetic-paired.json").read_text(encoding="utf-8")
+    )
+    assert all(item["accuracy_established"] is False for item in payload["variants"])
+    assert all(
+        item["evidence_kind"] == "typed_runtime_unavailable"
+        for item in payload["variants"]
+    )
+    assert payload["comparisons"][0]["unknown_pair_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_partial_experiment_does_not_persist_unexecuted_case_hashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import benchmarks.runner as runner
+
+    cases = [
+        BenchmarkCase(
+            case_id="case-a",
+            source="synthetic",
+            layer="L1",
+            domain="orders",
+            question="case a",
+            gold_sql="SELECT 1",
+            gold_value=1,
+        ),
+        BenchmarkCase(
+            case_id="case-b",
+            source="synthetic",
+            layer="L1",
+            domain="orders",
+            question="case b",
+            gold_sql="SELECT 2",
+            gold_value=2,
+        ),
+    ]
+    monkeypatch.setattr(runner, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(runner, "load_cases", lambda *_args, **_kwargs: list(cases))
+    monkeypatch.setattr(
+        runner,
+        "EXPERIMENT_CONFIGS",
+        {
+            "synthetic-partial": [
+                {"name": "baseline", "description": "baseline", "overrides": {}},
+                {"name": "candidate", "description": "candidate", "overrides": {}},
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        runner, "build_typed_executor", lambda _runtime: _OverBudgetTypedExecutor()
+    )
+    monkeypatch.setattr(
+        runner, "_effective_runtime_config_sha256", lambda: _sha("harness")
+    )
+    case_hashes = {
+        runner._case_identity_sha256(case) for case in runner.to_eval_cases(cases)
+    }
+
+    reports = await runner.run_experiment(
+        "synthetic-partial", dataset="synthetic", typed_runtime="demo"
+    )
+
+    assert set(reports) == {"baseline", "candidate"}
+    for report in reports.values():
+        assert report.execution_status == "PARTIAL_BUDGET_EXHAUSTED"
+        assert all(
+            "unexecuted_occurrence_sha256" not in run
+            for run in report.execution_evidence["runs"]
+        )
+        persisted = json.dumps(
+            json.loads(
+                (tmp_path / f"{report.run_id}.json").read_text(encoding="utf-8")
+            )
+        )
+        assert "unexecuted_occurrence_sha256" not in persisted
+        assert all(case_hash not in persisted for case_hash in case_hashes)
 
 
 def test_legacy_positional_helpers_refuse_mismatched_array_lengths() -> None:

@@ -8,7 +8,11 @@ from fastapi.testclient import TestClient
 
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.types import AuthUser
-from src.nl2sql.hitl_action_claims import InMemoryHITLActionClaimStore
+from src.nl2sql.hitl_action_claims import (
+    HITLActionClaimInput,
+    HITLActionResponseSummary,
+    InMemoryHITLActionClaimStore,
+)
 from src.nl2sql.orchestration.decision_contract import (
     HITLDecision,
     HITLRequest,
@@ -77,11 +81,13 @@ class _Engine:
         decision: HITLDecision | None,
         *,
         fail_after_invoke: bool = False,
+        decision_status: str = "current_authorization_denied",
     ) -> None:
         self.values = values
         self.decision = decision
         self.invocations = 0
         self.fail_after_invoke = fail_after_invoke
+        self.decision_status = decision_status
 
     async def aget_state(self, _: object) -> SimpleNamespace:
         return SimpleNamespace(values=self.values)
@@ -106,7 +112,7 @@ class _Engine:
                 "decision_ledger": {
                     self.decision.idempotency_key: _ledger(request, self.decision)
                 },
-                "decision_status": "current_authorization_denied",
+                "decision_status": self.decision_status,
                 "pending_decision": None,
             }
         self.values = result
@@ -114,10 +120,15 @@ class _Engine:
 
 
 class _Container:
-    def __init__(self, engine: _Engine, provider: _AuthorizationProvider) -> None:
+    def __init__(
+        self,
+        engine: _Engine,
+        provider: _AuthorizationProvider,
+        claim_store: InMemoryHITLActionClaimStore | None = None,
+    ) -> None:
         self.engine = engine
         self.provider = provider
-        self.hitl_action_claim_store = InMemoryHITLActionClaimStore()
+        self.hitl_action_claim_store = claim_store or InMemoryHITLActionClaimStore()
 
     async def get_engine(self) -> _Engine:
         return self.engine
@@ -133,11 +144,14 @@ class _Container:
 
 
 def _client(
-    engine: _Engine, *, raise_server_exceptions: bool = True
+    engine: _Engine,
+    *,
+    raise_server_exceptions: bool = True,
+    claim_store: InMemoryHITLActionClaimStore | None = None,
 ) -> tuple[TestClient, _AuthorizationProvider]:
     app = FastAPI()
     provider = _AuthorizationProvider()
-    app.state.container = _Container(engine, provider)
+    app.state.container = _Container(engine, provider, claim_store)
     register_v2_routes(app)
 
     async def identity() -> AuthUser:
@@ -317,3 +331,56 @@ def test_interrupted_claim_remains_in_progress_and_never_invokes_twice() -> None
     assert retry.status_code == 409
     assert retry.json()["detail"] == "typed decision is already being processed"
     assert engine.invocations == 1
+
+
+class _FailFirstCompletionStore(InMemoryHITLActionClaimStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.completion_attempts = 0
+
+    async def complete(
+        self,
+        *,
+        claim: HITLActionClaimInput,
+        response: HITLActionResponseSummary,
+    ) -> None:
+        self.completion_attempts += 1
+        if self.completion_attempts == 1:
+            raise RuntimeError("simulated interruption after checkpoint save")
+        await super().complete(claim=claim, response=response)
+
+
+def test_retry_completes_claim_after_checkpoint_was_saved() -> None:
+    decision = _decision()
+    engine = _Engine(
+        _typed_state(),
+        decision,
+        decision_status="metric_plan_correction_rejected",
+    )
+    claim_store = _FailFirstCompletionStore()
+    client, _ = _client(
+        engine,
+        claim_store=claim_store,
+        raise_server_exceptions=False,
+    )
+    path = f"/api/v2/nl2sql/threads/{_THREAD}/actions"
+    body = {
+        "target_type": "typed_decision",
+        "expected_version": 1,
+        "decision": decision.model_dump(mode="json"),
+    }
+
+    interrupted = client.post(path, json=body)
+    assert interrupted.status_code == 503
+    assert engine.invocations == 1
+    saved_ledger = engine.values.get("decision_ledger")
+    assert isinstance(saved_ledger, dict)
+    assert decision.idempotency_key in saved_ledger
+
+    recovered = client.post(path, json=body)
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["idempotent"] is True
+    assert recovered.json()["decision_status"] == "resolved_pending_revalidation"
+    assert recovered.json()["continuation_status"] == "metric_plan_correction_rejected"
+    assert engine.invocations == 1
+    assert claim_store.completion_attempts == 2

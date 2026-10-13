@@ -89,7 +89,7 @@ def _published_port(container: str) -> int:
     return int(result.stdout.strip().rsplit(":", maxsplit=1)[1])
 
 
-def _psql(container: str, sql: str) -> str:
+def _psql(container: str, sql: str, *, check: bool = True) -> str:
     result = _docker(
         "exec",
         "--env",
@@ -109,8 +109,9 @@ def _psql(container: str, sql: str) -> str:
         "ON_ERROR_STOP=1",
         "--command",
         sql,
+        check=check,
     )
-    return result.stdout.strip()
+    return f"{result.stdout}{result.stderr}".strip()
 
 
 @pytest.fixture(scope="module")
@@ -230,7 +231,7 @@ def _response() -> HITLActionResponseSummary:
         status="recorded",
         version=3,
         decision_status="resolved_pending_revalidation",
-        continuation_status="current_authorization_denied",
+        continuation_status="metric_plan_correction_rejected",
     )
 
 
@@ -296,6 +297,34 @@ async def test_control_claims_are_atomic_durable_private_and_owner_scoped(
         assert "raw-feedback-must-not-be-stored" not in stored_projection
         assert "raw-decision-payload-must-not-be-stored" not in stored_projection
         assert "slot_bindings" not in stored_projection
+
+        invalid_legacy_response = _psql(
+            str(control_postgres["container"]),
+            "INSERT INTO hitl_action_claims "
+            "(owner_user_id, thread_id, pending_version, idempotency_key_sha256, "
+            "payload_sha256, state, response_summary, response_sha256, created_at, updated_at) "
+            "VALUES ('alice', '22222222-2222-2222-2222-222222222222', 99, "
+            f"'{ 'a' * 64 }', '{ 'b' * 64 }', 'completed', "
+            "'{\"target_type\":\"legacy_hitl\",\"status\":\"approved\","
+            "\"version\":\"100\",\"decision_status\":\"resolved_pending_revalidation\"}'::jsonb, "
+            f"'{ 'c' * 64 }', now(), now())",
+            check=False,
+        )
+        assert "hitl_action_claims_response_state_coherent" in invalid_legacy_response
+
+        invalid_legacy_recorded = _psql(
+            str(control_postgres["container"]),
+            "INSERT INTO hitl_action_claims "
+            "(owner_user_id, thread_id, pending_version, idempotency_key_sha256, "
+            "payload_sha256, state, response_summary, response_sha256, created_at, updated_at) "
+            "VALUES ('alice', '22222222-2222-2222-2222-222222222222', 100, "
+            f"'{ 'a' * 64 }', '{ 'b' * 64 }', 'completed', "
+            "'{\"target_type\":\"legacy_hitl\",\"status\":\"recorded\","
+            "\"version\":\"101\"}'::jsonb, "
+            f"'{ 'c' * 64 }', now(), now())",
+            check=False,
+        )
+        assert "hitl_action_claims_response_state_coherent" in invalid_legacy_recorded
     finally:
         await first.close()
         await second.close()
