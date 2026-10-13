@@ -375,10 +375,13 @@ def _validate_compiled_query(
     }
     actual: set[tuple[tuple[str, str], str]] = set()
     projection_names: set[str] = set()
-    if len(compiled.projections) != len(final_scope.expression.selects):
+    if not isinstance(final_scope.expression, exp.Select):
+        raise DataRequestDenied()
+    select_expressions = final_scope.expression.selects
+    if len(compiled.projections) != len(select_expressions):
         raise DataRequestDenied()
     for expression, projection in zip(
-        final_scope.expression.selects,
+        select_expressions,
         compiled.projections,
         strict=True,
     ):
@@ -497,7 +500,7 @@ def _has_owner_row_predicate(
     return False
 
 
-def _conjunctive_terms(expression: exp.Expression) -> list[exp.Expression] | None:
+def _conjunctive_terms(expression: exp.Expr) -> list[exp.Expr] | None:
     if isinstance(expression, exp.Or):
         return None
     if isinstance(expression, exp.And):
@@ -510,8 +513,8 @@ def _conjunctive_terms(expression: exp.Expression) -> list[exp.Expression] | Non
 
 
 def _matches_owner_binding(
-    column_expression: exp.Expression,
-    parameter_expression: exp.Expression,
+    column_expression: exp.Expr,
+    parameter_expression: exp.Expr,
     alias: str,
     owner_column: str,
     owner_user_id: str,
