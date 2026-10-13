@@ -485,7 +485,12 @@ async def run_typed_benchmark(
     return report
 
 
-def save_report(report: BenchmarkReport, output_dir: Path | None = None) -> Path:
+def save_report(
+    report: BenchmarkReport,
+    output_dir: Path | None = None,
+    *,
+    include_sample_ids: bool = True,
+) -> Path:
     """保存评测报告为 JSON + Markdown。"""
     out_dir = output_dir or RESULTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -495,7 +500,11 @@ def save_report(report: BenchmarkReport, output_dir: Path | None = None) -> Path
     report_dict = report.to_dict()
     report_dict["case_details"] = [
         {
-            "sample_id": _redacted_sample_id(r.case_id),
+            **(
+                {"sample_id": _redacted_sample_id(r.case_id)}
+                if include_sample_ids
+                else {}
+            ),
             "layer": r.layer,
             "domain": r.domain,
             "mode": r.mode,
@@ -536,7 +545,10 @@ def save_report(report: BenchmarkReport, output_dir: Path | None = None) -> Path
 
     # Markdown 报告
     md_path = out_dir / f"{report.run_id}.md"
-    md_path.write_text(_generate_markdown_report(report), encoding="utf-8")
+    md_path.write_text(
+        _generate_markdown_report(report, include_sample_ids=include_sample_ids),
+        encoding="utf-8",
+    )
 
     logger.info("报告已保存: %s, %s", json_path, md_path)
     return json_path
@@ -575,7 +587,9 @@ def _redacted_sample_id(case_id: str) -> str:
     return redacted_sample_id(case_id)
 
 
-def _generate_markdown_report(report: BenchmarkReport) -> str:
+def _generate_markdown_report(
+    report: BenchmarkReport, *, include_sample_ids: bool = True
+) -> str:
     """生成 Markdown 格式的评测报告。"""
     ex_display = _accuracy_display(report)
     lines: list[str] = [
@@ -759,12 +773,25 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
         lines.extend([
             "## Failed Cases (Top 20)",
             "",
-            "| Sample ID | Layer | Error code |",
-            "|-----------|-------|------------|",
+            (
+                "| Sample ID | Layer | Error code |"
+                if include_sample_ids
+                else "| Layer | Error code |"
+            ),
+            (
+                "|-----------|-------|------------|"
+                if include_sample_ids
+                else "|-------|------------|"
+            ),
         ])
         for r in failed[:20]:
             error_code = _safe_error_code(r.execution_error) or "unknown"
-            lines.append(f"| {_redacted_sample_id(r.case_id)} | {r.layer} | {error_code} |")
+            if include_sample_ids:
+                lines.append(
+                    f"| {_redacted_sample_id(r.case_id)} | {r.layer} | {error_code} |"
+                )
+            else:
+                lines.append(f"| {r.layer} | {error_code} |")
         if len(failed) > 20:
             lines.append(f"| ... | ... | {len(failed) - 20} more |")
         lines.append("")
@@ -857,7 +884,7 @@ async def run_experiment(
     # per-case pseudonymous keys that could be guessed from a known dataset.
     for report in reports.values():
         _scrub_experiment_pair_identity(report)
-        save_report(report)
+        save_report(report, include_sample_ids=False)
 
     return reports
 

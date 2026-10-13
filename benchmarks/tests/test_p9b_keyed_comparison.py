@@ -391,7 +391,7 @@ async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_res
                 expected_mode=case.expected_mode,
                 mode="QUERY",
                 adjudicated=True,
-                passed=True,
+                passed=case.case_id != "case-a",
             )
             for case in selected_cases
         ]
@@ -432,7 +432,15 @@ async def test_run_experiment_emits_reachable_keyed_comparison_for_reordered_res
         persisted = json.loads(
             (tmp_path / f"{report.run_id}.json").read_text(encoding="utf-8")
         )
-        assert "case_identity_sha256" not in json.dumps(persisted)
+        serialized_run = json.dumps(persisted)
+        markdown_run = (tmp_path / f"{report.run_id}.md").read_text(encoding="utf-8")
+        assert "case_identity_sha256" not in serialized_run
+        assert '"sample_id"' not in serialized_run
+        assert "Sample ID" not in markdown_run
+        for case_id in ("case-a", "case-b"):
+            per_case_hash = hashlib.sha256(case_id.encode("utf-8")).hexdigest()[:16]
+            assert per_case_hash not in serialized_run
+            assert per_case_hash not in markdown_run
     assert "COMPLETE" in markdown
     assert "NO_TYPED_RECEIPTS" in markdown
     assert "unavailable" in markdown
