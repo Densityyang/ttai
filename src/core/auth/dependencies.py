@@ -215,7 +215,7 @@ async def require_user(
             trace_id,
             user.user_id,
             request.method,
-            request.url.path,
+            request.scope["path"],
             len(user.permissions),
         )
         return user
@@ -227,7 +227,7 @@ async def require_user(
             exc.status_code,
             exc.code,
             request.method,
-            request.url.path,
+            request.scope["path"],
             elapsed_ms,
         )
         raise _to_http_exception(exc) from exc
@@ -248,7 +248,7 @@ def require_permission(permission: str) -> Callable[..., Awaitable[AuthUser]]:
             user.user_id,
             permission,
             request.method,
-            request.url.path,
+            request.scope["path"],
         )
         raise HTTPException(
             status_code=403,
@@ -263,7 +263,7 @@ async def require_nl2sql_permission(
     user: AuthUser = Depends(require_user),
     settings: Settings = Depends(get_settings),
 ) -> AuthUser:
-    path = request.url.path
+    path = request.scope["path"]
     permission = _required_nl2sql_permission(request.method, path, settings)
     trace_id = _get_trace_id(request)
 
@@ -291,7 +291,7 @@ async def require_nl2sql_permission(
             user.user_id,
             permission,
             request.method,
-            request.url.path,
+            request.scope["path"],
             len(user.permissions),
         )
         return user
@@ -302,7 +302,7 @@ async def require_nl2sql_permission(
         user.user_id,
         permission,
         request.method,
-        request.url.path,
+        request.scope["path"],
         len(user.permissions),
     )
     raise HTTPException(

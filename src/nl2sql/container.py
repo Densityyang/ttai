@@ -419,10 +419,7 @@ class AppContainer:
         """Build the backend-selected run store once per application container."""
 
         if self._definition_run_record_store is None:
-            try:
-                backend = self.product_store_backend
-            except Exception:
-                backend = "memory"
+            backend = self.product_store_backend
             if backend == "control":
                 from src.core.settings import get_settings
                 from src.nl2sql.artifacts.definition_run_record_control_store import (

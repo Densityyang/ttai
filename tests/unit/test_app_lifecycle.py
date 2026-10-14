@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+from typing import cast
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +10,12 @@ from fastapi.testclient import TestClient
 from main import create_app
 from src.core.settings import get_settings
 from src.nl2sql.container import AppContainer
+
+
+class FailingRunRecordBackendContainer(AppContainer):
+    @property
+    def product_store_backend(self) -> str:
+        raise RuntimeError("backend configuration unavailable")
 
 
 def test_infra_dev_is_ready_without_a_model(monkeypatch) -> None:
@@ -112,6 +120,115 @@ def test_api_lifespan_never_runs_migrations_or_index_builds() -> None:
         "create_all(",
     ):
         assert forbidden_call not in source
+
+
+def test_run_record_backend_resolution_does_not_fall_back_to_memory() -> None:
+    container = FailingRunRecordBackendContainer()
+
+    with pytest.raises(RuntimeError, match="backend configuration unavailable"):
+        container._definition_run_record_store_instance()
+
+    assert container._definition_run_record_store is None
+
+
+def test_infra_dev_run_record_backend_keeps_explicit_memory_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.nl2sql.artifacts.definition_run_record import (
+        InMemoryDefinitionRunRecordStore,
+    )
+
+    monkeypatch.setenv("SERVICE_MODE", "infra-dev")
+    monkeypatch.setenv("PRODUCT_STORE_BACKEND", "memory")
+    get_settings.cache_clear()
+    try:
+        container = AppContainer()
+        store = container._definition_run_record_store_instance()
+        assert isinstance(store, InMemoryDefinitionRunRecordStore)
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_control_run_record_failure_keeps_product_readiness_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.nl2sql.artifacts.definition_run_record_control_store as run_store_module
+    import src.nl2sql.container as container_module
+
+    class ReadyStore:
+        async def ping(self) -> None:
+            return None
+
+    class FailingControlRunRecordStore:
+        def __init__(self, database_url: str) -> None:
+            self.database_url = database_url
+
+        async def ping(self) -> None:
+            raise ConnectionError("private Control endpoint")
+
+    class FakeCheckpointerManager:
+        async def init(self, *, setup: bool = True) -> None:
+            assert setup is False
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setenv("SERVICE_MODE", "product")
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("TT_API_BASE_URL", "http://auth.invalid")
+    monkeypatch.setenv("MODEL_REQUIRED", "false")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://business_reader:test@business.invalid/business",
+    )
+    monkeypatch.delenv("PRODUCT_STORE_BACKEND", raising=False)
+    monkeypatch.setenv("CONTROL_DATABASE_URL", "")
+    monkeypatch.delenv("CONTROL_DATABASE_URL_FILE", raising=False)
+    get_settings.cache_clear()
+    monkeypatch.setattr(container_module, "CheckpointerManager", FakeCheckpointerManager)
+    monkeypatch.setattr(
+        run_store_module,
+        "ControlDefinitionRunRecordStore",
+        FailingControlRunRecordStore,
+    )
+    try:
+        container = AppContainer()
+        ready = ReadyStore()
+        for name in (
+            "artifact_repository",
+            "publication_catalogue",
+            "library_repository",
+        ):
+            monkeypatch.setattr(container, name, AsyncMock(return_value=ready))
+        for name in (
+            "_definition_store_instance",
+            "_confirmation_audit_store_instance",
+            "_exploration_confirmation_store_instance",
+            "_hitl_action_claim_store_instance",
+        ):
+            monkeypatch.setattr(container, name, lambda: ready)
+
+        await container.start()
+
+        assert container.product_store_backend == "control"
+        assert isinstance(
+            container._definition_run_record_store,
+            FailingControlRunRecordStore,
+        )
+        report = container.readiness_report(model_available=True)
+        assert report["status"] == "not_ready"
+        components = cast(dict[str, dict[str, object]], report["components"])
+        assert components["product_store"] == {
+            "status": "unavailable",
+            "required": True,
+        }
+        reasons = report["degradation_reasons"]
+        assert isinstance(reasons, tuple)
+        assert "product_store_initialization_failed" in reasons
+        assert "private Control endpoint" not in str(report)
+    finally:
+        get_settings.cache_clear()
 
 
 def test_dependency_failure_keeps_liveness_but_fails_readiness(monkeypatch) -> None:
