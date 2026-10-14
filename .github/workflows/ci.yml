@@ -52,9 +52,12 @@ jobs:
           git diff --check "${RANGE}" -- . \
             ':(exclude)tests/fixtures/v4_p1/authoritative/**' \
             ':(exclude)MASTER_PR_PLAN_V4.md'
-      - run: uv run ruff check src tests
+      - run: uv run ruff check src tests benchmarks
       - run: uv run pyright
       - run: uv run pytest
+      # P9A: the benchmark harness has its own contract tests; a green
+      # src/tests run must not be allowed to stand in for a verified evaluator.
+      - run: uv run pytest benchmarks/tests -q
       - run: uv run pip-audit
 
   secrets:
@@ -121,14 +124,10 @@ jobs:
           enable-cache: true
       - run: uv python install 3.13
       - run: uv sync --frozen --all-groups
-      - name: Verify PostgreSQL governance, QueryGateway, metric execution and product-store persistence
+      - name: Verify all PostgreSQL integration contracts
         run: >
           uv run pytest -vv -s
-          tests/integration/test_postgres_governance.py
-          tests/integration/test_query_gateway_postgres.py
-          tests/integration/test_publication_control_store.py
-          tests/integration/test_library_control_store.py
-          tests/integration/test_product_store_persistence.py
+          tests/integration
 
   compose-contract:
     runs-on: ubuntu-latest

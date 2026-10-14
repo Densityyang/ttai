@@ -42,6 +42,20 @@ _THREAD_INVOKE_ROUTES = (
         "POST",
         re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/versions/[0-9]+/execute$"),
     ),
+    # The per-run audit records of ONE exact version.  Both the collection and
+    # the single-record reader are listed EXPLICITLY: an unmapped route fails
+    # closed with 403 AUTH_PERMISSION_POLICY_MISSING rather than silently
+    # inheriting a permission, so a new reader must be authorized by name here.
+    (
+        "GET",
+        re.compile(rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/versions/[0-9]+/runs$"),
+    ),
+    (
+        "GET",
+        re.compile(
+            rf"^{_V2_NL2SQL_PREFIX}/definitions/[^/]+/versions/[0-9]+/runs/[^/]+$"
+        ),
+    ),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/install$")),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/uninstall$")),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/star$")),
@@ -54,6 +68,26 @@ _THREAD_INVOKE_ROUTES = (
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/fork$")),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/certify$")),
     ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/library/withdraw$")),
+    # Result artifacts.  Saving a RESULT artifact is an ARTIFACT operation: it
+    # creates no definition, selects no BUILD and changes no mode.  It is
+    # nevertheless listed EXPLICITLY by name, exactly like every other product
+    # route, so an unmapped route still fails closed with
+    # AUTH_PERMISSION_POLICY_MISSING instead of silently inheriting a grant.
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/artifacts$")),
+    ("GET", re.compile(rf"^{_V2_NL2SQL_PREFIX}/artifacts$")),
+    ("GET", re.compile(rf"^{_V2_NL2SQL_PREFIX}/artifacts/[^/]+$")),
+    ("PUT", re.compile(rf"^{_V2_NL2SQL_PREFIX}/artifacts/[^/]+$")),
+    # Run-scoped EXPLORATION confirmations.  Recording one is a NON-authoritative
+    # result action: it never selects BUILD, never confirms a definition and
+    # never changes a mode.  Every method is nevertheless listed EXPLICITLY by
+    # name, so an unmapped route still fails closed with
+    # AUTH_PERMISSION_POLICY_MISSING instead of silently inheriting a grant.
+    ("POST", re.compile(rf"^{_V2_NL2SQL_PREFIX}/exploration-confirmations$")),
+    ("GET", re.compile(rf"^{_V2_NL2SQL_PREFIX}/exploration-confirmations$")),
+    (
+        "GET",
+        re.compile(rf"^{_V2_NL2SQL_PREFIX}/exploration-confirmations/[^/]+$"),
+    ),
 )
 
 
@@ -181,7 +215,7 @@ async def require_user(
             trace_id,
             user.user_id,
             request.method,
-            request.url.path,
+            request.scope["path"],
             len(user.permissions),
         )
         return user
@@ -193,7 +227,7 @@ async def require_user(
             exc.status_code,
             exc.code,
             request.method,
-            request.url.path,
+            request.scope["path"],
             elapsed_ms,
         )
         raise _to_http_exception(exc) from exc
@@ -214,7 +248,7 @@ def require_permission(permission: str) -> Callable[..., Awaitable[AuthUser]]:
             user.user_id,
             permission,
             request.method,
-            request.url.path,
+            request.scope["path"],
         )
         raise HTTPException(
             status_code=403,
@@ -229,7 +263,7 @@ async def require_nl2sql_permission(
     user: AuthUser = Depends(require_user),
     settings: Settings = Depends(get_settings),
 ) -> AuthUser:
-    path = request.url.path
+    path = request.scope["path"]
     permission = _required_nl2sql_permission(request.method, path, settings)
     trace_id = _get_trace_id(request)
 
@@ -257,7 +291,7 @@ async def require_nl2sql_permission(
             user.user_id,
             permission,
             request.method,
-            request.url.path,
+            request.scope["path"],
             len(user.permissions),
         )
         return user
@@ -268,7 +302,7 @@ async def require_nl2sql_permission(
         user.user_id,
         permission,
         request.method,
-        request.url.path,
+        request.scope["path"],
         len(user.permissions),
     )
     raise HTTPException(

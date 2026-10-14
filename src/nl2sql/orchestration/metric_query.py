@@ -12,7 +12,7 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Any, Literal, cast
@@ -37,6 +37,7 @@ from src.nl2sql.orchestration.approved_compute import (
 )
 from src.nl2sql.orchestration.candidates import rowset_sha256
 from src.nl2sql.orchestration.execution import (
+    AdHocCalculationRunner,
     MetricStepResult,
     PlanExecutor,
     PlanStepError,
@@ -228,6 +229,12 @@ class CompiledMetricQuery:
     # scope id collection is NEVER copied into a public receipt or log.
     authorization_revision: str | None = None
     authorization_scope_level: str | None = None
+    # Request-local authority snapshot for canonical dependency queries.  It is
+    # retained only so execute() can re-prove the complete binding against the
+    # active release immediately before QueryGateway.execute.
+    calculation_binding: ApprovedCalculationBinding | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 class MetricQueryCompiler:
@@ -303,7 +310,13 @@ class MetricQueryCompiler:
             expected_revision=self._expected_revision,
         )
 
-    async def compile(self, plan: QueryPlan, context: ContextBundle) -> CompiledMetricQuery:
+    async def compile(
+        self,
+        plan: QueryPlan,
+        context: ContextBundle,
+        *,
+        approved_calculation_binding: ApprovedCalculationBinding | None = None,
+    ) -> CompiledMetricQuery:
         plan = QueryPlan.model_validate(query_plan_payload(plan))
         context = ContextBundle.model_validate_json(context.model_dump_json())
         # FIRST, the frozen admission semantics: a disabled agent, an empty
@@ -335,26 +348,23 @@ class MetricQueryCompiler:
         if (release is None or release.state != SemanticReleaseState.ACTIVE
                 or release.release_id != str(context.semantic_release_id)):
             raise PlanStepError("metric_active_release_mismatch")
+        if approved_calculation_binding is not None:
+            self._preflight_calculation_binding(
+                binding=approved_calculation_binding,
+                release=release,
+                context=context,
+                domain=plan.domain,
+                metric_key=plan.metric_keys[0],
+            )
         snapshot = await self._read_snapshot(str(context.schema_snapshot_id))
         if (snapshot is None or snapshot.state != SchemaSnapshotState.VALIDATED
                 or snapshot.snapshot_id != str(context.schema_snapshot_id)
                 or release.schema_snapshot_id != snapshot.snapshot_id
                 or release.schema_snapshot_checksum != snapshot.checksum):
             raise PlanStepError("metric_schema_snapshot_mismatch")
-        documents = [doc for doc in release.documents if doc.document_id == plan.metric_keys[0]]
-        if len(documents) != 1:
-            raise PlanStepError("metric_contract_missing")
-        document = documents[0]
-        try:
-            metric = MetricContract.model_validate_json(document.metadata.get("execution_contract", ""))
-        except ValueError as exc:
-            raise PlanStepError("metric_contract_invalid") from exc
-        if (metric.asset_id != document.document_id or metric.domain != plan.domain
-                or document.metadata.get("status") != "active"
-                or document.metadata.get("domain") != metric.domain
-                or document.metadata.get("owner") != metric.owner
-                or metric.release_status != "active" or not metric.assistant_enabled):
-            raise PlanStepError("metric_contract_inactive")
+        metric = _active_metric_contract(
+            release, plan.metric_keys[0], domain=plan.domain
+        )
         policy = self._policies.get(metric.eligibility_policy_id)
         if policy is None:
             raise PlanStepError("metric_source_or_policy_missing")
@@ -365,7 +375,55 @@ class MetricQueryCompiler:
         if (not isinstance(evaluated_at, datetime) or evaluated_at.tzinfo is None
                 or evaluated_at.utcoffset() != timedelta(0)):
             raise PlanStepError("metric_evaluation_clock_invalid")
-        return await self._select_source(plan, context, metric, policy, release, snapshot, evaluated_at)
+        compiled = await self._select_source(
+            plan, context, metric, policy, release, snapshot, evaluated_at
+        )
+        if approved_calculation_binding is not None:
+            return replace(compiled, calculation_binding=approved_calculation_binding)
+        return compiled
+
+    def _preflight_calculation_binding(
+        self,
+        *,
+        binding: ApprovedCalculationBinding,
+        release: SemanticRelease,
+        context: ContextBundle,
+        domain: str,
+        metric_key: str,
+    ) -> None:
+        """Validate every binding input against one trusted active release.
+
+        This runs during each canonical dependency compile, both in prepare and
+        again in execute.  In particular, the first dependency cannot reach the
+        gateway until every later input's release document and contract hash has
+        also been checked.
+        """
+
+        if (
+            binding.semantic_release_id != release.release_id
+            or binding.semantic_release_id != str(context.semantic_release_id)
+        ):
+            raise PlanStepError("metric_dependency_release_mismatch")
+        if binding.semantic_release_checksum != release.checksum:
+            raise PlanStepError("metric_semantic_release_checksum_mismatch")
+        if not any(item.metric_key == metric_key for item in binding.inputs):
+            raise PlanStepError("metric_dependency_metric_mismatch")
+        if binding.canonical_metric_key not in context.asset_ids:
+            raise PlanStepError("metric_dependency_output_unresolved")
+
+        for item in binding.inputs:
+            if item.metric_key not in context.asset_ids:
+                raise PlanStepError("metric_dependency_metric_unresolved")
+            metric = _active_metric_contract(release, item.metric_key, domain=domain)
+            if aggregate_definition_checksum(metric) != item.metric_contract_sha256:
+                raise PlanStepError("metric_contract_checksum_mismatch")
+            if metric.eligibility_policy_id not in self._policies:
+                raise PlanStepError("metric_source_or_policy_missing")
+            if (
+                "*" not in self._identity.permissions
+                and not set(metric.required_permissions) <= self._identity.permissions
+            ):
+                raise PlanStepError("metric_permission_denied")
 
     def _compile_source(
         self, plan: QueryPlan, context: ContextBundle, metric: MetricContract,
@@ -821,10 +879,14 @@ class GatewayMetricStepRunner:
             query = await self._compiler.compile(query_plan, context)
             prepared = self._gateway.prepare(query.sql)
             return PreparedMetricStep(prepared.fingerprint, 0, query)
-        dependency_plan = self._dependency_plan(
+        dependency_plan, binding = self._dependency_plan(
             step=step, query_plan=query_plan, context=context
         )
-        query = await self._compiler.compile(dependency_plan, context)
+        query = await self._compiler.compile(
+            dependency_plan,
+            context,
+            approved_calculation_binding=binding,
+        )
         prepared = self._gateway.prepare(query.sql)
         return PreparedMetricStep(prepared.fingerprint, 0, query, dependency_fetch=True)
 
@@ -834,7 +896,7 @@ class GatewayMetricStepRunner:
         step: FetchMetricStep,
         query_plan: QueryPlan,
         context: ContextBundle,
-    ) -> QueryPlan:
+    ) -> tuple[QueryPlan, ApprovedCalculationBinding]:
         """Derive the ephemeral child plan fetching ONE trusted binding input.
 
         A dependency fetch names a single metric key that is deliberately NOT the
@@ -878,7 +940,7 @@ class GatewayMetricStepRunner:
         # Only the requested metric identity changes: domain, filters, time
         # range, grain, source strategy and permission requirements stay exactly
         # as the validated plan declared them, and compile() re-validates.
-        return query_plan.model_copy(update={"metric_keys": step.metric_keys})
+        return query_plan.model_copy(update={"metric_keys": step.metric_keys}), binding
 
     def _adhoc_dependency_plan(
         self,
@@ -917,7 +979,11 @@ class GatewayMetricStepRunner:
             raise PlanStepError("metric_prepared_query_invalid")
         async with asyncio.timeout(timeout_ms / 1000):
             # Re-read active authority immediately before gateway execution.
-            current = await self._compiler.compile(query.query_plan, query.context)
+            current = await self._compiler.compile(
+                query.query_plan,
+                query.context,
+                approved_calculation_binding=query.calculation_binding,
+            )
             if (current.sql != query.sql or current.params != query.params
                     or current.snapshot_checksum != query.snapshot_checksum
                     or current.operation != query.operation or current.dimension != query.dimension
@@ -929,6 +995,15 @@ class GatewayMetricStepRunner:
                     or current.degradation != query.degradation
                     or current.authorization_revision != query.authorization_revision
                     or current.authorization_scope_level != query.authorization_scope_level
+                    or (
+                        current.calculation_binding.checksum
+                        if current.calculation_binding is not None
+                        else None
+                    ) != (
+                        query.calculation_binding.checksum
+                        if query.calculation_binding is not None
+                        else None
+                    )
                     or self._gateway.prepare(current.sql).fingerprint != prepared.sql_fingerprint):
                 raise PlanStepError("metric_prepared_query_changed")
             result = await self._gateway.execute(current.sql, current.params)
@@ -1066,6 +1141,7 @@ def metric_plan_executor(
     *,
     trusted_calculation_runner: TrustedCalculationRunner | None = None,
     calculation_catalog: ApprovedCalculationCatalog | None = None,
+    ad_hoc_calculation_runner: AdHocCalculationRunner | None = None,
 ) -> PlanExecutor:
     """Explicit request-scoped wiring; default AppContainer remains fail closed.
 
@@ -1074,6 +1150,11 @@ def metric_plan_executor(
     here does not make any unbound production metric executable.  The same holds
     for calculation_catalog: without it no dependency fetch is ever admitted, so
     the AppContainer default remains fail closed.
+
+    ad_hoc_calculation_runner DEFAULTS TO NONE.  A run-scoped AD_HOC
+    calculation therefore fails closed with ad_hoc_calculation_unavailable
+    unless a caller that has already proven the run's run_scoped_derivation
+    capability explicitly injects the shared evaluator.
     """
 
     return PlanExecutor(
@@ -1085,6 +1166,7 @@ def metric_plan_executor(
             if trusted_calculation_runner is not None
             else RegistryTrustedCalculationRunner()
         ),
+        ad_hoc_calculation_runner=ad_hoc_calculation_runner,
     )
 
 
@@ -1097,6 +1179,38 @@ def aggregate_definition_checksum(contract: FrozenContract) -> str:
     """Deployment approval fingerprint for the complete typed definition."""
     payload = json.dumps(contract.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _active_metric_contract(
+    release: SemanticRelease,
+    metric_key: str,
+    *,
+    domain: str,
+) -> MetricContract:
+    """Resolve one executable metric contract from a trusted release document."""
+
+    documents = [doc for doc in release.documents if doc.document_id == metric_key]
+    if len(documents) != 1:
+        raise PlanStepError("metric_contract_missing")
+    document = documents[0]
+    try:
+        metric = MetricContract.model_validate_json(
+            document.metadata.get("execution_contract", "")
+        )
+    except ValueError as exc:
+        raise PlanStepError("metric_contract_invalid") from exc
+    if (
+        metric.asset_id != document.document_id
+        or document.document_id != metric_key
+        or metric.domain != domain
+        or document.metadata.get("status") != "active"
+        or document.metadata.get("domain") != metric.domain
+        or document.metadata.get("owner") != metric.owner
+        or metric.release_status != "active"
+        or not metric.assistant_enabled
+    ):
+        raise PlanStepError("metric_contract_inactive")
+    return metric
 
 
 def _validate_aggregate_columns(mapping: AggregateColumns, columns: dict[str, str]) -> None:

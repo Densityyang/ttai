@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -34,6 +36,24 @@ class _StructuredAnswer(BaseModel):
 
     answer: str
     confidence: float = Field(ge=0, le=1)
+
+
+class _BlockingHttpTransport(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.closed = False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled.set()
+        return httpx.Response(200, request=request, json={})
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def _request(*, alias: str, stage: str = "answer") -> ModelRequest:
@@ -590,6 +610,71 @@ async def test_openai_compatible_adapter_classifies_timeout() -> None:
 
     assert raised.value.retryable is True
     assert raised.value.failure.provider == "primary"
+
+
+@pytest.mark.asyncio
+async def test_provider_cancellation_reaches_transport_and_closes_client() -> None:
+    transport = _BlockingHttpTransport()
+    provider = OpenAICompatibleProvider(
+        "primary",
+        "https://provider.invalid/v1",
+        "test",
+        transport=transport,
+    )
+    class _FallbackProvider:
+        provider_name = "fallback"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(
+            self,
+            *,
+            model: str,
+            messages: list[dict[str, Any]],
+            timeout_ms: int,
+            max_output_tokens: int,
+            response_schema: dict[str, Any] | None = None,
+        ) -> ProviderResponse:
+            del model, messages, timeout_ms, max_output_tokens, response_schema
+            self.calls += 1
+            return ProviderResponse(
+                content="fallback",
+                model="small-fallback",
+                usage={"input_tokens": 1, "output_tokens": 1},
+                finish_reason="stop",
+            )
+
+        async def list_models(self) -> tuple[str, ...]:
+            return ("small-fallback",)
+
+    fallback = _FallbackProvider()
+    gateway = ModelGateway(
+        providers={"primary": provider, "fallback": fallback},
+        profiles={
+            "fast.default": ModelProfile(
+                "fast.default",
+                "test-v1",
+                frozenset({"answer"}),
+                ModelTarget("primary", "small", "small"),
+                ModelTarget("fallback", "small-fallback", "small"),
+            )
+        },
+    )
+    task = asyncio.create_task(
+        gateway.invoke(
+            _request(alias="fast.default"),
+            CallBudget(deadline_ms=1_000, token_budget=100, cost_budget=1, max_attempts=2),
+        )
+    )
+    await asyncio.wait_for(transport.entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert transport.cancelled.is_set()
+    assert transport.closed is True
+    assert fallback.calls == 0
 
 
 def test_route_decisions_are_replayable_and_risk_weighted() -> None:

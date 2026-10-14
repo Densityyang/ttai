@@ -8,6 +8,11 @@ from fastapi.testclient import TestClient
 
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.types import AuthUser
+from src.nl2sql.hitl_action_claims import (
+    HITLActionClaimInput,
+    HITLActionResponseSummary,
+    InMemoryHITLActionClaimStore,
+)
 from src.nl2sql.orchestration.decision_contract import (
     HITLDecision,
     HITLRequest,
@@ -70,16 +75,27 @@ class _AuthorizationProvider:
 
 
 class _Engine:
-    def __init__(self, values: dict[str, object], decision: HITLDecision | None) -> None:
+    def __init__(
+        self,
+        values: dict[str, object],
+        decision: HITLDecision | None,
+        *,
+        fail_after_invoke: bool = False,
+        decision_status: str = "current_authorization_denied",
+    ) -> None:
         self.values = values
         self.decision = decision
         self.invocations = 0
+        self.fail_after_invoke = fail_after_invoke
+        self.decision_status = decision_status
 
     async def aget_state(self, _: object) -> SimpleNamespace:
         return SimpleNamespace(values=self.values)
 
     async def ainvoke(self, *_: object, **__: object) -> dict[str, object]:
         self.invocations += 1
+        if self.fail_after_invoke:
+            raise RuntimeError("simulated interruption after claim")
         if self.decision is None:
             result = {
                 **self.values,
@@ -96,7 +112,7 @@ class _Engine:
                 "decision_ledger": {
                     self.decision.idempotency_key: _ledger(request, self.decision)
                 },
-                "decision_status": "current_authorization_denied",
+                "decision_status": self.decision_status,
                 "pending_decision": None,
             }
         self.values = result
@@ -104,9 +120,15 @@ class _Engine:
 
 
 class _Container:
-    def __init__(self, engine: _Engine, provider: _AuthorizationProvider) -> None:
+    def __init__(
+        self,
+        engine: _Engine,
+        provider: _AuthorizationProvider,
+        claim_store: InMemoryHITLActionClaimStore | None = None,
+    ) -> None:
         self.engine = engine
         self.provider = provider
+        self.hitl_action_claim_store = claim_store or InMemoryHITLActionClaimStore()
 
     async def get_engine(self) -> _Engine:
         return self.engine
@@ -114,14 +136,22 @@ class _Container:
     def get_backend_authorization_provider(self) -> _AuthorizationProvider:
         return self.provider
 
+    def get_hitl_action_claim_store(self) -> InMemoryHITLActionClaimStore:
+        return self.hitl_action_claim_store
+
     def authority_provenance(self) -> str:
         return "unavailable"
 
 
-def _client(engine: _Engine) -> tuple[TestClient, _AuthorizationProvider]:
+def _client(
+    engine: _Engine,
+    *,
+    raise_server_exceptions: bool = True,
+    claim_store: InMemoryHITLActionClaimStore | None = None,
+) -> tuple[TestClient, _AuthorizationProvider]:
     app = FastAPI()
     provider = _AuthorizationProvider()
-    app.state.container = _Container(engine, provider)
+    app.state.container = _Container(engine, provider, claim_store)
     register_v2_routes(app)
 
     async def identity() -> AuthUser:
@@ -130,7 +160,7 @@ def _client(engine: _Engine) -> tuple[TestClient, _AuthorizationProvider]:
         )
 
     app.dependency_overrides[require_nl2sql_permission] = identity
-    return TestClient(app), provider
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions), provider
 
 
 def _typed_state() -> dict[str, object]:
@@ -165,6 +195,27 @@ def test_missing_discriminator_preserves_legacy_action() -> None:
     assert "target_type" not in response.json()
     assert response.json()["status"] == "approved"
     assert provider.calls == 1
+    engine.values = {}
+    replay = client.post(
+        f"/api/v2/nl2sql/threads/{_THREAD}/actions",
+        json={
+            "action": "approve",
+            "idempotency_key": "legacy-key",
+            "expected_version": 1,
+        },
+    )
+    assert replay.status_code == 200
+    assert replay.json()["idempotent"] is True
+    assert engine.invocations == 1
+    conflict = client.post(
+        f"/api/v2/nl2sql/threads/{_THREAD}/actions",
+        json={
+            "action": "reject",
+            "idempotency_key": "legacy-key",
+            "expected_version": 1,
+        },
+    )
+    assert conflict.status_code == 409
 
 
 def test_typed_decision_bypasses_legacy_gate_and_safe_continuation_is_200() -> None:
@@ -244,6 +295,7 @@ def test_typed_idempotent_exact_replay_and_conflict() -> None:
         "decision": decision.model_dump(mode="json"),
     }
     assert client.post(path, json=body).status_code == 200
+    engine.values = {}
 
     replay = client.post(path, json=body)
     assert replay.status_code == 200
@@ -260,3 +312,75 @@ def test_typed_idempotent_exact_replay_and_conflict() -> None:
         },
     )
     assert conflict.status_code == 409
+
+
+def test_interrupted_claim_remains_in_progress_and_never_invokes_twice() -> None:
+    decision = _decision()
+    engine = _Engine(_typed_state(), decision, fail_after_invoke=True)
+    client, _ = _client(engine, raise_server_exceptions=False)
+    path = f"/api/v2/nl2sql/threads/{_THREAD}/actions"
+    body = {
+        "target_type": "typed_decision",
+        "expected_version": 1,
+        "decision": decision.model_dump(mode="json"),
+    }
+
+    interrupted = client.post(path, json=body)
+    assert interrupted.status_code == 500
+    retry = client.post(path, json=body)
+    assert retry.status_code == 409
+    assert retry.json()["detail"] == "typed decision is already being processed"
+    assert engine.invocations == 1
+
+
+class _FailFirstCompletionStore(InMemoryHITLActionClaimStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.completion_attempts = 0
+
+    async def complete(
+        self,
+        *,
+        claim: HITLActionClaimInput,
+        response: HITLActionResponseSummary,
+    ) -> None:
+        self.completion_attempts += 1
+        if self.completion_attempts == 1:
+            raise RuntimeError("simulated interruption after checkpoint save")
+        await super().complete(claim=claim, response=response)
+
+
+def test_retry_completes_claim_after_checkpoint_was_saved() -> None:
+    decision = _decision()
+    engine = _Engine(
+        _typed_state(),
+        decision,
+        decision_status="metric_plan_correction_rejected",
+    )
+    claim_store = _FailFirstCompletionStore()
+    client, _ = _client(
+        engine,
+        claim_store=claim_store,
+        raise_server_exceptions=False,
+    )
+    path = f"/api/v2/nl2sql/threads/{_THREAD}/actions"
+    body = {
+        "target_type": "typed_decision",
+        "expected_version": 1,
+        "decision": decision.model_dump(mode="json"),
+    }
+
+    interrupted = client.post(path, json=body)
+    assert interrupted.status_code == 503
+    assert engine.invocations == 1
+    saved_ledger = engine.values.get("decision_ledger")
+    assert isinstance(saved_ledger, dict)
+    assert decision.idempotency_key in saved_ledger
+
+    recovered = client.post(path, json=body)
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["idempotent"] is True
+    assert recovered.json()["decision_status"] == "resolved_pending_revalidation"
+    assert recovered.json()["continuation_status"] == "metric_plan_correction_rejected"
+    assert engine.invocations == 1
+    assert claim_store.completion_attempts == 2

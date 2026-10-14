@@ -32,12 +32,16 @@ class _FakeResult:
         plan: Any = None,
         rows: list[tuple[Any, ...]] | None = None,
         keys: list[str] | None = None,
+        one: tuple[Any, ...] | None = None,
     ) -> None:
         self._plan = plan
         self._rows = rows or []
         self._keys = keys or ["id", "api_key"]
+        self._one = one
 
     def fetchone(self) -> tuple[Any] | None:
+        if self._one is not None:
+            return self._one
         return (self._plan,) if self._plan is not None else None
 
     def keys(self) -> list[str]:
@@ -89,6 +93,11 @@ class _FakeSession:
             if self.explain_error is not None:
                 raise self.explain_error
             return _FakeResult(plan=self.plan)
+        if "current_database()" in rendered:
+            return _FakeResult(
+                keys=["database_name", "server_version_num", "snapshot_id"],
+                one=("ttai_test", "170005", "100:105:"),
+            )
         return _FakeResult()
 
     async def stream(
@@ -118,18 +127,33 @@ class _FakeAuditSink:
     def __init__(self, *, fail_start: bool = False, fail_result: bool = False) -> None:
         self.fail_start = fail_start
         self.fail_result = fail_result
-        self.starts: list[tuple[str, str]] = []
+        self.starts: list[tuple[str, str, str]] = []
         self.results: list[dict[str, Any]] = []
 
-    async def record_sql_start(self, trace_id: str, sql: str) -> None:
+    async def record_sql_start(
+        self,
+        trace_id: str,
+        sql: str,
+        *,
+        execution_id: str,
+    ) -> None:
         if self.fail_start:
             raise RuntimeError("audit connection detail")
-        self.starts.append((trace_id, sql))
+        self.starts.append((trace_id, sql, execution_id))
 
-    async def record_sql_result(self, trace_id: str, sql: str, **values: Any) -> None:
+    async def record_sql_result(
+        self,
+        trace_id: str,
+        sql: str,
+        *,
+        execution_id: str,
+        **values: Any,
+    ) -> None:
         if self.fail_result:
             raise RuntimeError("audit connection detail")
-        self.results.append({"trace_id": trace_id, "sql": sql, **values})
+        self.results.append(
+            {"trace_id": trace_id, "sql": sql, "execution_id": execution_id, **values}
+        )
 
 
 def test_policy_rewrites_limit_and_qualifies_business_tables() -> None:
@@ -462,6 +486,98 @@ async def test_gateway_enforces_result_bytes_while_streaming() -> None:
 
 
 @pytest.mark.asyncio
+async def test_gateway_per_request_cost_rows_and_bytes_are_enforced() -> None:
+    cost_session = _FakeSession(
+        plan=[{"Plan": {"Total Cost": 20, "Plan Rows": 1}}],
+        rows=[(1,)],
+        keys=["value"],
+    )
+    row_session = _FakeSession(
+        plan=[{"Plan": {"Total Cost": 1, "Plan Rows": 5}}],
+        rows=[(1,)],
+        keys=["value"],
+    )
+    byte_session = _FakeSession(
+        plan=[{"Plan": {"Total Cost": 1, "Plan Rows": 1}}],
+        rows=[("x" * 100,)],
+        keys=["payload"],
+    )
+
+    cost = await QueryGateway(cast(Any, _FakeSessionFactory(cost_session))).execute(
+        "SELECT value FROM orders",
+        max_plan_cost=5,
+    )
+    rows = await QueryGateway(cast(Any, _FakeSessionFactory(row_session))).execute(
+        "SELECT value FROM orders",
+        max_rows=2,
+        detect_row_truncation=True,
+    )
+    size = await QueryGateway(cast(Any, _FakeSessionFactory(byte_session))).execute(
+        "SELECT payload FROM orders",
+        max_result_bytes=32,
+    )
+
+    assert cost.error is not None and cost.error.code == QueryErrorCode.COST_EXCEEDED
+    assert not any(command.startswith("SELECT") for command in cost_session.commands)
+    assert rows.error is not None and rows.error.code == QueryErrorCode.ROWS_EXCEEDED
+    assert not any(command.startswith("SELECT") for command in row_session.commands)
+    assert size.error is not None and size.error.code == QueryErrorCode.RESULT_TOO_LARGE
+    assert size.rows == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_overflow_probe_rejects_extra_row_before_receipt_materialization() -> None:
+    session = _FakeSession(
+        plan=[{"Plan": {"Total Cost": 1, "Plan Rows": 3}}],
+        rows=[(1,), (2,), (3,)],
+        keys=["value"],
+    )
+
+    receipt = await QueryGateway(
+        cast(Any, _FakeSessionFactory(session)),
+        schema="ai_views",
+    ).execute(
+        "SELECT value FROM orders",
+        max_rows=2,
+        detect_row_truncation=True,
+    )
+
+    assert receipt.error is not None
+    assert receipt.error.code == QueryErrorCode.ROWS_EXCEEDED
+    assert receipt.rows == []
+    executed_sql = [command for command in session.commands if command.startswith("SELECT")]
+    assert executed_sql == ["SELECT value FROM ai_views.orders LIMIT 3"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_receipt_and_audit_share_real_execution_identity_and_snapshot() -> None:
+    session = _FakeSession(
+        plan=[{"Plan": {"Total Cost": 1, "Plan Rows": 1}}],
+        rows=[(1,)],
+        keys=["value"],
+    )
+    audit = _FakeAuditSink()
+    receipt = await QueryGateway(
+        cast(Any, _FakeSessionFactory(session)),
+        audit_sink=audit,
+    ).execute("SELECT 1 AS value", trace_id="request-trace", capture_source_snapshot=True)
+
+    assert receipt.accepted
+    assert receipt.execution_id is not None
+    assert receipt.source_snapshot is not None
+    assert receipt.source_snapshot.source_id == "business_postgres:ttai_test"
+    assert receipt.source_snapshot.source_version == "postgres-17"
+    assert receipt.source_snapshot.snapshot_id == "100:105:"
+    assert receipt.result_columns == ("value",)
+    assert session.commands[0] == (
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    )
+    assert audit.starts[0][2] == str(receipt.execution_id)
+    assert audit.results[0]["execution_id"] == str(receipt.execution_id)
+    assert audit.results[0]["source_snapshot_fingerprint"] == receipt.source_snapshot_fingerprint
+
+
+@pytest.mark.asyncio
 async def test_gateway_classifies_timeout_as_retryable() -> None:
     session = _FakeSession(
         plan=[{"Plan": {"Total Cost": 1, "Plan Rows": 1}}],
@@ -520,7 +636,10 @@ async def test_gateway_audit_is_fail_closed_and_records_structured_result() -> N
     assert blocked.error.code == QueryErrorCode.AUDIT_UNAVAILABLE
     assert blocked_factory.sessions == []
     assert accepted.accepted
-    assert audit.starts == [("trace-ok", "SELECT 1 AS value")]
+    assert len(audit.starts) == 1
+    assert audit.starts[0][:2] == ("trace-ok", "SELECT 1 AS value")
+    assert audit.starts[0][2] == str(accepted.execution_id)
+    assert audit.results[0]["execution_id"] == str(accepted.execution_id)
     assert audit.results[0]["accepted"] is True
     assert audit.results[0]["row_count"] == 1
     assert audit.results[0]["error_code"] is None
@@ -567,9 +686,16 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
     allowed_calls = {
         "src/core/observer.py": {"runnable.stream"},
         "src/nl2sql/infra/governance/query_gateway.py": {
+            # Reviewed cancellation control: this uses only the backend PID
+            # captured from the request's own session, then fails closed by
+            # terminating/discarding that same request connection.
+            "connection.execute",
             "session.execute",
             "session.stream",
         },
+        # The owner-bound broker adapter uses the sole business SQL boundary;
+        # it never receives or creates an AsyncSession or database engine.
+        "src/nl2sql/infra/governance/data_broker.py": {"self._gateway.execute"},
         "src/nl2sql/infra/store/database.py": {
             "conn.execute",
             "self._query_gateway.execute",
@@ -594,6 +720,30 @@ def test_all_database_execution_calls_are_explicitly_allowlisted() -> None:
         # reads and writes installs/Stars/withdrawal acks through the shared
         # runtime engine, never through a business query session.
         "src/nl2sql/artifacts/library_control_store.py": {"connection.execute"},
+        # Reviewed definition writer: the control-PG definition store reads and
+        # writes the stable identity, the exact immutable versions and the
+        # per-version lifecycle through the shared runtime engine, never through
+        # a business query session.  Every statement is a fixed text(...) with
+        # bound parameters; none is assembled from request data.
+        "src/nl2sql/artifacts/definition_control_store.py": {"connection.execute"},
+        # Reviewed durable owner-scoped run-record store. It validates the
+        # owner/version identity and checksum through the Control database;
+        # it does not execute business SQL or hold business DB capabilities.
+        "src/nl2sql/artifacts/definition_run_record_control_store.py": {
+            "connection.execute"
+        },
+        # Reviewed owner/thread/version claim writer. It stores only request
+        # digests and a bounded safe response projection in the Control DB; it
+        # has no business-query or checkpoint writer capability.
+        "src/nl2sql/hitl_action_claim_control_store.py": {"connection.execute"},
+        # Reviewed confirmation-record writer: the control-PG confirmation stores
+        # append the server-owned audit record and the run-scoped exploration
+        # confirmation through the shared runtime engine, never through a
+        # business query session.  Every statement is a fixed text(...) with
+        # bound parameters; none is assembled from request data.
+        "src/nl2sql/artifacts/confirmation_control_store.py": {
+            "connection.execute"
+        },
         # Reviewed Mode3 orchestration call: the service resolves governed
         # scalar evidence and invokes the pure Calculation Runtime; it is not a
         # database session or QueryGateway bypass.

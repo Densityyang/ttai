@@ -1,0 +1,961 @@
+"""Owner-bound broker seam and its private QueryGateway execution adapter.
+
+The authority and compiler remain injected capabilities. The repository does
+not register a production authority or wire this broker into a product route.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from decimal import Decimal
+from types import MappingProxyType
+from typing import Any, Mapping, Protocol
+from uuid import UUID
+
+import sqlglot
+from sqlglot import exp
+from sqlglot.optimizer.scope import Scope, traverse_scope
+
+from src.nl2sql.infra.governance.query_gateway import (
+    QueryGateway,
+    is_sensitive_column_name,
+)
+from src.nl2sql.orchestration.data_request import (
+    AuthorizedJoinScope,
+    DataRequest,
+    DataRequestBudget,
+    DataRequestDenied,
+    DataSourceSnapshot,
+    EffectiveDataScope,
+    FrozenDataset,
+    FrozenRow,
+    GovernedSQLCandidate,
+    QueryGatewayReceiptReference,
+    RelationIdentity,
+    ReturnedColumnIdentity,
+    TrustedExecutionResult,
+    VerifiedDataAuthorization,
+    build_frozen_dataset,
+    derive_effective_scope,
+)
+
+
+class DataBrokerUnavailable(RuntimeError):
+    """Safe refusal when a trusted broker component fails or is absent."""
+
+    def __init__(self) -> None:
+        super().__init__("governed_data_broker_unavailable")
+
+
+@dataclass(frozen=True)
+class CompiledGovernedQuery:
+    """Private compiler-to-executor handoff; never serialized to a sandbox."""
+
+    candidate: GovernedSQLCandidate
+    sql: str = field(repr=False)
+    parameters: Mapping[str, Any] = field(repr=False)
+    projections: tuple[ReturnedColumnIdentity, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameters", MappingProxyType(dict(self.parameters)))
+
+
+class DataAuthorizationAuthority(Protocol):
+    """Server-side source of owner-bound relation, column, and row grants."""
+
+    async def verify_request(
+        self,
+        request: DataRequest,
+    ) -> VerifiedDataAuthorization | None: ...
+
+
+class DeterministicDataCompiler(Protocol):
+    """Trusted compiler; it receives typed scope and never model-authored SQL."""
+
+    def compile_request(
+        self,
+        request: DataRequest,
+        authorization: VerifiedDataAuthorization,
+        effective_scope: EffectiveDataScope,
+    ) -> CompiledGovernedQuery: ...
+
+
+class SqlGlotGovernedDataCompiler:
+    """Compile a small, typed DataRequest subset without model-authored SQL.
+
+    The compiler supports one relation or two relations connected by exactly
+    one authority-approved join. Every physical relation is owner-filtered in
+    its own CTE before the optional join, so a LEFT JOIN preserves unmatched
+    rows. Ambiguous or larger join graphs fail closed until the request
+    contract can express their intended shape.
+    """
+
+    _COMPILER_ID = "ttai-sqlglot-data-request-compiler"
+    _COMPILER_VERSION = "1"
+
+    def __init__(
+        self,
+        gateway: QueryGateway,
+        *,
+        source_id: str,
+        source_version: str,
+    ) -> None:
+        self._gateway = gateway
+        self._source_snapshot = DataSourceSnapshot(
+            source_id=source_id,
+            source_version=source_version,
+        )
+
+    def compile_request(
+        self,
+        request: DataRequest,
+        authorization: VerifiedDataAuthorization,
+        effective_scope: EffectiveDataScope,
+    ) -> CompiledGovernedQuery:
+        if (
+            authorization.request_id != request.request_id
+            or authorization.request_checksum != request.request_checksum
+            or authorization.owner_user_id != request.owner_user_id
+            or derive_effective_scope(request, authorization) != effective_scope
+        ):
+            raise DataRequestDenied()
+
+        requested_relations = effective_scope.relations
+        if not 1 <= len(requested_relations) <= 2:
+            raise DataRequestDenied()
+
+        requested_keys = {
+            _relation_key(item.relation) for item in requested_relations
+        }
+        authorized_columns = {
+            _relation_key(item.relation): set(item.columns)
+            for item in authorization.authorized_scope.relations
+        }
+        owner_columns = {
+            _relation_key(item.relation): item.owner_column
+            for item in authorization.owner_row_scopes
+        }
+        for relation_scope in requested_relations:
+            key = _relation_key(relation_scope.relation)
+            if (
+                key not in authorized_columns
+                or key not in owner_columns
+                or not set(relation_scope.columns).issubset(authorized_columns[key])
+            ):
+                raise DataRequestDenied()
+
+        joins = effective_scope.authorized_joins
+        selected_join: AuthorizedJoinScope | None = None
+        if len(requested_relations) == 1:
+            if joins:
+                raise DataRequestDenied()
+        else:
+            if len(joins) != 1:
+                raise DataRequestDenied()
+            selected_join = joins[0]
+            if {
+                _relation_key(selected_join.left_relation),
+                _relation_key(selected_join.right_relation),
+            } != requested_keys:
+                raise DataRequestDenied()
+
+        relation_aliases = {
+            _relation_key(item.relation): f"r{index}"
+            for index, item in enumerate(requested_relations)
+        }
+        cte_names = {
+            _relation_key(item.relation): f"owner_scope_{index}"
+            for index, item in enumerate(requested_relations)
+        }
+        cte_sql: list[str] = []
+        for relation_scope in requested_relations:
+            key = _relation_key(relation_scope.relation)
+            needed_columns = set(relation_scope.columns)
+            needed_columns.add(owner_columns[key])
+            if selected_join is not None:
+                if key == _relation_key(selected_join.left_relation):
+                    needed_columns.add(selected_join.left_column)
+                if key == _relation_key(selected_join.right_relation):
+                    needed_columns.add(selected_join.right_column)
+            projected_columns = ", ".join(
+                f'"source_row".{_quote_sql_identifier(column)} '
+                f'AS {_quote_sql_identifier(column)}'
+                for column in sorted(needed_columns)
+            )
+            relation_sql = (
+                f"{_quote_sql_identifier(relation_scope.relation.schema_name)}."
+                f"{_quote_sql_identifier(relation_scope.relation.relation_name)}"
+            )
+            owner_column = _quote_sql_identifier(owner_columns[key])
+            cte_sql.append(
+                f"{_quote_sql_identifier(cte_names[key])} AS ("
+                f"SELECT {projected_columns} FROM {relation_sql} AS \"source_row\" "
+                f"WHERE \"source_row\".{owner_column} = :owner_user_id)"
+            )
+
+        projection_columns = [
+            (relation_scope, column)
+            for relation_scope in requested_relations
+            for column in relation_scope.columns
+        ]
+        name_counts: dict[str, int] = {}
+        for _, column in projection_columns:
+            name_counts[column] = name_counts.get(column, 0) + 1
+        output_names: list[str] = []
+        used_output_names: set[str] = set()
+        for index, (relation_scope, column) in enumerate(projection_columns):
+            output_name = column
+            if name_counts[column] > 1:
+                output_name = f"{relation_scope.relation.relation_name}_{column}"
+            if len(output_name) > 63 or output_name in used_output_names:
+                digest = hashlib.sha256(
+                    (
+                        f"{index}:{relation_scope.relation.schema_name}."
+                        f"{relation_scope.relation.relation_name}.{column}"
+                    ).encode("utf-8")
+                ).hexdigest()[:16]
+                output_name = f"c{index}_{digest}"
+            if output_name in used_output_names:
+                raise DataRequestDenied()
+            used_output_names.add(output_name)
+            output_names.append(output_name)
+
+        select_sql = ", ".join(
+            f"{_quote_sql_identifier(relation_aliases[_relation_key(item.relation)])}."
+            f"{_quote_sql_identifier(column)} AS {_quote_sql_identifier(output_name)}"
+            for (item, column), output_name in zip(
+                projection_columns,
+                output_names,
+                strict=True,
+            )
+        )
+        if selected_join is None:
+            relation_scope = requested_relations[0]
+            relation_key = _relation_key(relation_scope.relation)
+            from_sql = (
+                f"{_quote_sql_identifier(cte_names[relation_key])} AS "
+                f"{_quote_sql_identifier(relation_aliases[relation_key])}"
+            )
+        else:
+            left_key = _relation_key(selected_join.left_relation)
+            right_key = _relation_key(selected_join.right_relation)
+            join_keyword = "LEFT JOIN" if selected_join.join_type == "left" else "JOIN"
+            from_sql = (
+                f"{_quote_sql_identifier(cte_names[left_key])} AS "
+                f"{_quote_sql_identifier(relation_aliases[left_key])} {join_keyword} "
+                f"{_quote_sql_identifier(cte_names[right_key])} AS "
+                f"{_quote_sql_identifier(relation_aliases[right_key])} ON "
+                f"{_quote_sql_identifier(relation_aliases[left_key])}."
+                f"{_quote_sql_identifier(selected_join.left_column)} = "
+                f"{_quote_sql_identifier(relation_aliases[right_key])}."
+                f"{_quote_sql_identifier(selected_join.right_column)}"
+            )
+
+        order_sql = ", ".join(
+            f"{_quote_sql_identifier(relation_aliases[_relation_key(item.relation)])}."
+            f"{_quote_sql_identifier(column)}"
+            for item, column in projection_columns
+        )
+        sql = (
+            f"WITH {', '.join(cte_sql)} SELECT {select_sql} "
+            f"FROM {from_sql} ORDER BY {order_sql}"
+        )
+        parameters = {"owner_user_id": request.owner_user_id}
+        prepared = self._gateway.prepare(
+            sql,
+            max_rows=request.budget.max_rows,
+            detect_row_truncation=True,
+        )
+        candidate = GovernedSQLCandidate(
+            schema_version=(
+                "governed-sql-candidate-v2" if selected_join is not None
+                else "governed-sql-candidate-v1"
+            ),
+            request_id=request.request_id,
+            request_checksum=request.request_checksum,
+            authorization_checksum=authorization.authorization_checksum,
+            compiler_id=self._COMPILER_ID,
+            compiler_version=self._COMPILER_VERSION,
+            effective_scope=effective_scope,
+            source_snapshot=self._source_snapshot,
+            query_fingerprint=prepared.fingerprint,
+            parameter_binding_fingerprint=_parameter_binding_fingerprint(parameters),
+        )
+        projections = tuple(
+            ReturnedColumnIdentity(
+                relation=relation_scope.relation,
+                column_name=column,
+                output_name=output_name,
+            )
+            for (relation_scope, column), output_name in zip(
+                projection_columns,
+                output_names,
+                strict=True,
+            )
+        )
+        return CompiledGovernedQuery(
+            candidate=candidate,
+            sql=sql,
+            parameters=parameters,
+            projections=projections,
+        )
+
+
+class GovernedDataExecutor(Protocol):
+    """Trusted adapter; it alone owns QueryGateway and database sessions."""
+
+    async def execute_candidate(
+        self,
+        compiled: CompiledGovernedQuery,
+        budget: DataRequestBudget,
+    ) -> TrustedExecutionResult: ...
+
+
+class GovernedDataBroker:
+    """No-default-allow orchestration for owner-bound frozen data requests."""
+
+    def __init__(
+        self,
+        *,
+        authority: DataAuthorizationAuthority | None = None,
+        compiler: DeterministicDataCompiler | None = None,
+        executor: GovernedDataExecutor | None = None,
+    ) -> None:
+        self._authority = authority
+        self._compiler = compiler
+        self._executor = executor
+
+    async def request_dataset(self, request: DataRequest) -> FrozenDataset:
+        """Issue only a complete rowset matching this owner and exact request."""
+
+        if self._authority is None or self._compiler is None or self._executor is None:
+            raise DataBrokerUnavailable()
+
+        try:
+            authorization = await self._authority.verify_request(request)
+            if authorization is None:
+                raise DataRequestDenied()
+            effective_scope = derive_effective_scope(request, authorization)
+            compiled = self._compiler.compile_request(
+                request,
+                authorization,
+                effective_scope,
+            )
+            _validate_compiled_query(
+                request=request,
+                authorization=authorization,
+                effective_scope=effective_scope,
+                compiled=compiled,
+            )
+            execution = await self._executor.execute_candidate(compiled, request.budget)
+            return build_frozen_dataset(
+                request=request,
+                authorization=authorization,
+                candidate=compiled.candidate,
+                execution=execution,
+            )
+        except (DataBrokerUnavailable, DataRequestDenied):
+            raise
+        except Exception:
+            # Adapter errors may contain SQL, private scopes, or credentials.
+            raise DataBrokerUnavailable() from None
+
+
+class QueryGatewayDataExecutor:
+    """Execute private compiled SQL through QueryGateway under request limits."""
+
+    def __init__(self, gateway: QueryGateway) -> None:
+        self._gateway = gateway
+
+    async def execute_candidate(
+        self,
+        compiled: CompiledGovernedQuery,
+        budget: DataRequestBudget,
+    ) -> TrustedExecutionResult:
+        candidate = compiled.candidate
+        max_result_bytes = budget.max_bytes - _dataset_metadata_reserve(compiled)
+        if max_result_bytes < 2:
+            raise DataRequestDenied()
+
+        # Re-prepare the exact private SQL at the executor boundary. The
+        # candidate fingerprint is accepted only when QueryGateway derives it
+        # from this SQL under the same row ceiling used for execution.
+        prepared = self._gateway.prepare(
+            compiled.sql,
+            max_rows=budget.max_rows,
+            detect_row_truncation=True,
+        )
+        if (
+            prepared.fingerprint != candidate.query_fingerprint
+            or set(prepared.parameter_names) != set(compiled.parameters)
+        ):
+            raise DataRequestDenied()
+
+        receipt = await self._gateway.execute(
+            compiled.sql,
+            dict(compiled.parameters),
+            trace_id=str(candidate.request_id),
+            max_rows=budget.max_rows,
+            max_result_bytes=max_result_bytes,
+            max_plan_cost=budget.max_cost,
+            capture_source_snapshot=True,
+            detect_row_truncation=True,
+        )
+        snapshot = receipt.source_snapshot
+        expected_source = candidate.source_snapshot
+        if (
+            not receipt.accepted
+            or receipt.error is not None
+            or receipt.execution_id is None
+            or receipt.sql_fingerprint != candidate.query_fingerprint
+            or receipt.policy_version != prepared.policy_version
+            or receipt.policy_outcome != "allow"
+            or receipt.estimated_cost is None
+            or receipt.estimated_cost > budget.max_cost
+            or receipt.row_count != len(receipt.rows)
+            or receipt.row_count > budget.max_rows
+            or receipt.masked_columns
+            or snapshot is None
+            or snapshot.source_id != expected_source.source_id
+            or snapshot.source_version != expected_source.source_version
+            or snapshot.snapshot_id == ""
+            or (
+                expected_source.snapshot_id is not None
+                and snapshot.snapshot_id != expected_source.snapshot_id
+            )
+        ):
+            raise DataRequestDenied()
+
+        projection_names = tuple(item.output_name for item in compiled.projections)
+        if receipt.result_columns != projection_names:
+            raise DataRequestDenied()
+
+        rows = tuple(
+            FrozenRow(
+                values=tuple(_normalize_data_cell(row[name]) for name in projection_names)
+            )
+            for row in receipt.rows
+            if tuple(row) == projection_names
+        )
+        if len(rows) != len(receipt.rows):
+            raise DataRequestDenied()
+
+        return TrustedExecutionResult(
+            status="complete",
+            query_fingerprint=receipt.sql_fingerprint,
+            source_snapshot=DataSourceSnapshot(
+                source_id=snapshot.source_id,
+                source_version=snapshot.source_version,
+                snapshot_id=snapshot.snapshot_id,
+            ),
+            gateway_receipt=QueryGatewayReceiptReference(
+                receipt_id=receipt.execution_id,
+                query_fingerprint=receipt.sql_fingerprint,
+                policy_version=receipt.policy_version,
+                policy_outcome="allow",
+                source_snapshot_id=snapshot.snapshot_id,
+            ),
+            returned_columns=compiled.projections,
+            rows=rows,
+            row_count=receipt.row_count,
+            estimated_cost=receipt.estimated_cost,
+        )
+
+
+@dataclass(frozen=True)
+class _ColumnLineage:
+    relation: RelationIdentity
+    column_name: str
+
+
+def _validate_compiled_query(
+    *,
+    request: DataRequest,
+    authorization: VerifiedDataAuthorization,
+    effective_scope: EffectiveDataScope,
+    compiled: CompiledGovernedQuery,
+) -> None:
+    if not isinstance(compiled, CompiledGovernedQuery):
+        raise DataRequestDenied()
+    candidate = compiled.candidate
+    if (
+        candidate.request_id != request.request_id
+        or candidate.request_checksum != request.request_checksum
+        or candidate.authorization_checksum != authorization.authorization_checksum
+        or candidate.effective_scope != effective_scope
+        or not compiled.sql.strip()
+        or candidate.parameter_binding_fingerprint
+        != _parameter_binding_fingerprint(compiled.parameters)
+    ):
+        raise DataRequestDenied()
+
+    authorized_columns = {
+        _relation_key(item.relation): set(item.columns)
+        for item in authorization.authorized_scope.relations
+    }
+    owner_scopes = {
+        _relation_key(item.relation): item for item in authorization.owner_row_scopes
+    }
+    row_scope_columns = {
+        key: scope.owner_column for key, scope in owner_scopes.items()
+    }
+    if set(owner_scopes) != set(authorized_columns):
+        raise DataRequestDenied()
+
+    try:
+        statements = sqlglot.parse(compiled.sql, read="postgres")
+        if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+            raise DataRequestDenied()
+        query = statements[0]
+        scopes = list(traverse_scope(query))
+        if not scopes:
+            raise DataRequestDenied()
+    except DataRequestDenied:
+        raise
+    except Exception:
+        raise DataRequestDenied() from None
+
+    parameters = dict(compiled.parameters)
+    placeholder_names = {
+        placeholder.name for placeholder in query.find_all(exp.Placeholder)
+    }
+    if placeholder_names != set(parameters):
+        raise DataRequestDenied()
+
+    lineages: dict[int, dict[str, _ColumnLineage]] = {}
+    for scope in scopes:
+        if not isinstance(scope.expression, exp.Select):
+            # Set operations and non-SELECT scopes have unclear projection
+            # lineage for this row-oriented dataset contract.
+            raise DataRequestDenied()
+        if (
+            scope.expression.args.get("limit") is not None
+            or scope.expression.args.get("fetch") is not None
+            or scope.expression.args.get("offset") is not None
+        ):
+            raise DataRequestDenied()
+        if any(
+            scope.expression.args.get(argument) is not None
+            for argument in ("group", "having", "qualify", "distinct")
+        ):
+            # DataRequest has no aggregation or row-filter semantics. A query
+            # that groups, deduplicates, or applies a post-filter cannot prove
+            # that its result is the complete requested row set.
+            raise DataRequestDenied()
+        physical_tables = _physical_tables(scope)
+        owner_columns: dict[str, str] = {}
+        for alias, relation in physical_tables:
+            key = _relation_key(relation)
+            if key not in authorized_columns or key not in row_scope_columns:
+                raise DataRequestDenied()
+            owner_columns[alias] = row_scope_columns[key]
+        if owner_columns:
+            if not _has_exact_owner_row_predicates(
+                scope=scope,
+                owner_columns=owner_columns,
+                owner_user_id=request.owner_user_id,
+                parameters=parameters,
+            ):
+                raise DataRequestDenied()
+        elif scope.expression.args.get("where") is not None:
+            # A predicate over a CTE/derived-only scope can silently remove
+            # rows after the physical owner checks have already succeeded.
+            raise DataRequestDenied()
+        _validate_join_predicates(
+            scope=scope,
+            lineages=lineages,
+            authorized_joins=effective_scope.authorized_joins,
+        )
+
+        for column in scope.columns:
+            if column.is_star or column.name == "*":
+                raise DataRequestDenied()
+            lineage = _resolve_column_lineage(scope, column, lineages)
+            if is_sensitive_column_name(lineage.column_name):
+                raise DataRequestDenied()
+            key = _relation_key(lineage.relation)
+            allowed = authorized_columns.get(key, set())
+            if lineage.column_name not in allowed and lineage.column_name != row_scope_columns.get(key):
+                raise DataRequestDenied()
+
+        projected: dict[str, _ColumnLineage] = {}
+        for expression in scope.expression.selects:
+            if isinstance(expression, exp.Alias):
+                output_name = _identifier_value(expression.args.get("alias"))
+                source_expression = expression.this
+            else:
+                source_expression = expression
+                output_name = (
+                    _identifier_value(expression.this)
+                    if isinstance(expression, exp.Column)
+                    else ""
+                )
+            if not output_name or not isinstance(source_expression, exp.Column):
+                raise DataRequestDenied()
+            output_key = output_name
+            if output_key in projected:
+                raise DataRequestDenied()
+            projected[output_key] = _resolve_column_lineage(
+                scope,
+                source_expression,
+                lineages,
+            )
+        lineages[id(scope)] = projected
+
+    final_scope = scopes[-1]
+    expected = {
+        (
+            _relation_key(relation_scope.relation),
+            column_name,
+        )
+        for relation_scope in request.requested_scope.relations
+        for column_name in relation_scope.columns
+    }
+    actual: set[tuple[tuple[str, str], str]] = set()
+    projection_names: set[str] = set()
+    if not isinstance(final_scope.expression, exp.Select):
+        raise DataRequestDenied()
+    select_expressions = final_scope.expression.selects
+    if len(compiled.projections) != len(select_expressions):
+        raise DataRequestDenied()
+    for expression, projection in zip(
+        select_expressions,
+        compiled.projections,
+        strict=True,
+    ):
+        if isinstance(expression, exp.Alias):
+            output_name = _identifier_value(expression.args.get("alias"))
+            source_expression = expression.this
+        else:
+            source_expression = expression
+            output_name = (
+                _identifier_value(expression.this)
+                if isinstance(expression, exp.Column)
+                else ""
+            )
+        if (
+            not output_name
+            or not isinstance(source_expression, exp.Column)
+            or output_name != projection.output_name
+        ):
+            raise DataRequestDenied()
+        lineage = _resolve_column_lineage(final_scope, source_expression, lineages)
+        identity = (
+            _relation_key(projection.relation),
+            projection.column_name,
+        )
+        actual_identity = (_relation_key(lineage.relation), lineage.column_name)
+        if identity != actual_identity:
+            raise DataRequestDenied()
+        actual.add(identity)
+        projection_names.add(projection.output_name)
+
+    if actual != expected or len(actual) != len(compiled.projections):
+        raise DataRequestDenied()
+    if len(projection_names) != len(compiled.projections):
+        raise DataRequestDenied()
+
+
+def _physical_tables(scope: Scope) -> tuple[tuple[str, RelationIdentity], ...]:
+    physical: list[tuple[str, RelationIdentity]] = []
+    for table in scope.tables:
+        source = scope.sources.get(_table_alias(table))
+        if isinstance(source, Scope):
+            continue
+        if not isinstance(source, exp.Table):
+            raise DataRequestDenied()
+        schema = _identifier_value(source.args.get("db"))
+        relation = _identifier_value(source.args.get("this"))
+        alias = _table_alias(source)
+        if not schema or not relation or not alias:
+            raise DataRequestDenied()
+        physical.append(
+            (
+                alias,
+                RelationIdentity(schema_name=schema, relation_name=relation),
+            )
+        )
+    if not physical and any(
+        not isinstance(source, Scope) for source in scope.sources.values()
+    ):
+        raise DataRequestDenied()
+    return tuple(physical)
+
+
+def _resolve_column_lineage(
+    scope: Scope,
+    column: exp.Column,
+    lineages: dict[int, dict[str, _ColumnLineage]],
+) -> _ColumnLineage:
+    source_alias = _identifier_value(column.args.get("table"))
+    if not source_alias:
+        sources = tuple(scope.sources)
+        if len(sources) != 1:
+            raise DataRequestDenied()
+        source_alias = sources[0]
+    source = scope.sources.get(source_alias)
+    column_name = _identifier_value(column.args.get("this"))
+    if isinstance(source, exp.Table):
+        schema = _identifier_value(source.args.get("db"))
+        relation = _identifier_value(source.args.get("this"))
+        if not schema or not relation or not column_name:
+            raise DataRequestDenied()
+        return _ColumnLineage(
+            relation=RelationIdentity(schema_name=schema, relation_name=relation),
+            column_name=column_name,
+        )
+    if isinstance(source, Scope):
+        lineage = lineages.get(id(source), {}).get(column_name)
+        if lineage is None:
+            raise DataRequestDenied()
+        return lineage
+    raise DataRequestDenied()
+
+
+def _validate_join_predicates(
+    *,
+    scope: Scope,
+    lineages: dict[int, dict[str, _ColumnLineage]],
+    authorized_joins: tuple[AuthorizedJoinScope, ...],
+) -> None:
+    joins = scope.expression.args.get("joins") or ()
+    for join in joins:
+        if not isinstance(join, exp.Join) or not isinstance(join.this, exp.Table):
+            raise DataRequestDenied()
+        side = join.args.get("side")
+        kind = join.args.get("kind")
+        if kind not in (None, "OUTER"):
+            raise DataRequestDenied()
+        if side is None:
+            join_type = "inner"
+        elif side == "LEFT":
+            join_type = "left"
+        else:
+            # RIGHT/FULL joins reverse which requested rows are preserved.
+            raise DataRequestDenied()
+
+        on_expression = join.args.get("on")
+        if not isinstance(on_expression, exp.Expr):
+            raise DataRequestDenied()
+        conjuncts = _conjunctive_terms(on_expression)
+        if (
+            conjuncts is None
+            or len(conjuncts) != 1
+            or not isinstance(conjuncts[0], exp.EQ)
+            or not isinstance(conjuncts[0].this, exp.Column)
+            or not isinstance(conjuncts[0].expression, exp.Column)
+        ):
+            # The authority contract currently grants one exact key equality
+            # per join. Extra ON conditions need their own explicit semantics.
+            raise DataRequestDenied()
+
+        predicate = conjuncts[0]
+        left_operand = predicate.this
+        right_operand = predicate.expression
+        join_target_alias = _table_alias(join.this)
+        left_alias = _identifier_value(left_operand.args.get("table"))
+        right_alias = _identifier_value(right_operand.args.get("table"))
+        if left_alias == join_target_alias and right_alias != join_target_alias:
+            left_operand, right_operand = right_operand, left_operand
+        elif right_alias != join_target_alias or left_alias == join_target_alias:
+            raise DataRequestDenied()
+
+        left_lineage = _resolve_column_lineage(scope, left_operand, lineages)
+        right_lineage = _resolve_column_lineage(scope, right_operand, lineages)
+        if join_type == "left" and not isinstance(
+            scope.sources.get(join_target_alias), Scope
+        ):
+            # A WHERE owner filter over a physical nullable side converts a
+            # LEFT JOIN into an effective inner filter. Require that side to be
+            # owner-scoped in a CTE before the join, where null preservation is
+            # still observable.
+            raise DataRequestDenied()
+        matches = tuple(
+            authorized_join
+            for authorized_join in authorized_joins
+            if authorized_join.join_type == join_type
+            and authorized_join.left_relation == left_lineage.relation
+            and authorized_join.left_column == left_lineage.column_name
+            and authorized_join.right_relation == right_lineage.relation
+            and authorized_join.right_column == right_lineage.column_name
+        )
+        if len(matches) != 1:
+            raise DataRequestDenied()
+
+
+def _has_exact_owner_row_predicates(
+    *,
+    scope: Scope,
+    owner_columns: Mapping[str, str],
+    owner_user_id: str,
+    parameters: Mapping[str, Any],
+) -> bool:
+    where = scope.expression.args.get("where")
+    if not isinstance(where, exp.Where):
+        return False
+    conjuncts = _conjunctive_terms(where.this)
+    if conjuncts is None or len(conjuncts) != len(owner_columns):
+        return False
+    matched_aliases: set[str] = set()
+    for term in conjuncts:
+        if not isinstance(term, exp.EQ):
+            return False
+        left = term.this
+        right = term.expression
+        matches = {
+            alias
+            for alias, owner_column in owner_columns.items()
+            if _matches_owner_binding(
+                left, right, alias, owner_column, owner_user_id, parameters
+            )
+            or _matches_owner_binding(
+                right, left, alias, owner_column, owner_user_id, parameters
+            )
+        }
+        if len(matches) != 1:
+            return False
+        alias = next(iter(matches))
+        if alias in matched_aliases:
+            return False
+        matched_aliases.add(alias)
+    return matched_aliases == set(owner_columns)
+
+
+def _conjunctive_terms(expression: exp.Expr) -> list[exp.Expr] | None:
+    if isinstance(expression, exp.Or):
+        return None
+    if isinstance(expression, exp.And):
+        left = _conjunctive_terms(expression.this)
+        right = _conjunctive_terms(expression.expression)
+        if left is None or right is None:
+            return None
+        return [*left, *right]
+    return [expression]
+
+
+def _matches_owner_binding(
+    column_expression: exp.Expr,
+    parameter_expression: exp.Expr,
+    alias: str,
+    owner_column: str,
+    owner_user_id: str,
+    parameters: Mapping[str, Any],
+) -> bool:
+    if (
+        not isinstance(column_expression, exp.Column)
+        or not isinstance(parameter_expression, exp.Placeholder)
+        or _identifier_value(column_expression.args.get("table")) != alias
+        or _identifier_value(column_expression.args.get("this")) != owner_column
+    ):
+        return False
+    parameter = parameters.get(parameter_expression.name)
+    return isinstance(parameter, str) and parameter == owner_user_id
+
+
+def _dataset_metadata_reserve(compiled: CompiledGovernedQuery) -> int:
+    snapshot = compiled.candidate.source_snapshot
+    reserved_snapshot = {
+        "source_id": snapshot.source_id,
+        "source_version": snapshot.source_version,
+        "snapshot_id": "x" * 256,
+    }
+    payload = {
+        "source_snapshot": reserved_snapshot,
+        "returned_columns": [item.model_dump(mode="json") for item in compiled.projections],
+        "rows": [],
+    }
+    rendered = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return len(rendered) - 2
+
+
+def _normalize_data_cell(value: Any) -> str | int | float | bool | None:
+    if value is None or type(value) in (str, int, bool):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise DataRequestDenied()
+        return value
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise DataRequestDenied()
+        return str(value)
+    if isinstance(value, (datetime, date, UUID)):
+        return value.isoformat() if isinstance(value, (datetime, date)) else str(value)
+    raise DataRequestDenied()
+
+
+def _parameter_binding_fingerprint(parameters: Mapping[str, Any]) -> str:
+    try:
+        payload = {
+            key: _canonical_binding_value(value)
+            for key, value in sorted(parameters.items())
+        }
+        rendered = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except Exception:
+        raise DataRequestDenied() from None
+    return hashlib.sha256(rendered).hexdigest()
+
+
+def _canonical_binding_value(value: Any) -> Any:
+    if value is None or type(value) in (str, int, bool):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    if isinstance(value, Decimal) and value.is_finite():
+        return {"decimal": str(value)}
+    if isinstance(value, (datetime, date)):
+        return {"datetime": value.isoformat()}
+    if isinstance(value, UUID):
+        return {"uuid": str(value)}
+    if isinstance(value, (tuple, list)):
+        return [_canonical_binding_value(item) for item in value]
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return {
+            key: _canonical_binding_value(item)
+            for key, item in sorted(value.items())
+        }
+    raise ValueError("query parameter value is unsupported")
+
+
+_SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
+
+def _quote_sql_identifier(identifier: str) -> str:
+    if not _SQL_IDENTIFIER.fullmatch(identifier):
+        raise DataRequestDenied()
+    return f'"{identifier}"'
+
+
+def _relation_key(relation: RelationIdentity) -> tuple[str, str]:
+    return relation.schema_name, relation.relation_name
+
+
+def _identifier_value(identifier: Any) -> str:
+    if not isinstance(identifier, exp.Identifier):
+        return ""
+    value = identifier.name
+    return value if identifier.args.get("quoted") else value.lower()
+
+
+def _table_alias(table: exp.Table) -> str:
+    alias = table.args.get("alias")
+    if isinstance(alias, exp.TableAlias):
+        return _identifier_value(alias.args.get("this"))
+    return _identifier_value(table.args.get("this"))

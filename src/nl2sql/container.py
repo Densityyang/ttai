@@ -13,10 +13,19 @@ if TYPE_CHECKING:
     from src.nl2sql.artifacts.custom_definition_execution_service import (
         CustomDefinitionExecutionService,
     )
+    from src.nl2sql.artifacts.definition_run_record import DefinitionRunRecordStore
+    from src.nl2sql.artifacts.exploration_confirmation import (
+        ExplorationConfirmationService,
+    )
     from src.nl2sql.artifacts.library import InMemoryLibraryRepository
     from src.nl2sql.artifacts.library_control_store import ControlLibraryRepository
     from src.nl2sql.artifacts.personal_conflict_product_service import (
         PersonalConflictProductService,
+    )
+    from src.nl2sql.artifacts.ports import (
+        ConfirmationAuditPort,
+        DefinitionStorePort,
+        ExplorationConfirmationPort,
     )
     from src.nl2sql.artifacts.product_library_service import ProductLibraryService
     from src.nl2sql.artifacts.publication import PublicationCatalogue
@@ -26,6 +35,7 @@ if TYPE_CHECKING:
     from src.nl2sql.artifacts.publication_service import PublicationService
     from src.nl2sql.artifacts.repository import InMemoryArtifactRepository
     from src.nl2sql.artifacts.service import CustomDefinitionService
+    from src.nl2sql.hitl_action_claims import HITLActionClaimStore
     from src.nl2sql.orchestration.governed_calculation_inputs import (
         GovernedMetricInputFetcher,
         TypedMetricCalculationInputResolver,
@@ -39,6 +49,15 @@ from src.nl2sql.infra.memory.checkpointer import CheckpointerManager
 from src.nl2sql.observability.control_audit import ControlAuditStore
 
 logger = logging.getLogger(__name__)
+
+
+async def _run_shielded_cleanup(cleanup: Callable[[], Any]) -> None:
+    cleanup_task = asyncio.create_task(cleanup())
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        await cleanup_task
+        raise
 
 
 class RuntimeDependencyUnavailable(RuntimeError):
@@ -67,13 +86,13 @@ class AppContainer:
         # (registry, evidence provider, resolver, deterministic provider,
         # compiler, executor, identity, authorization) are NEVER stored here.
         self._typed_deployment: tuple[Any, Any, Any, Any] | None = None
-        self._typed_resources: tuple[Any, Any, Any] | None = None
+        self._typed_resources: tuple[Any, Any, Any, Any] | None = None
         # Application-scoped product services.  These are DEMO/LOCAL and
         # NON-DURABLE: they live for the process lifetime only, deliberately so
         # for Foundation B, and state is LOST on restart.  A future Control-PG
         # implementation must be swappable behind the same service interfaces.
         self._local_real_deployment: tuple[Any, Any, Any, Any] | None = None
-        self._local_real_resources: tuple[Any, Any] | None = None
+        self._local_real_resources: tuple[Any, Any, Any] | None = None
         self._local_real_probe_attempted = False
         self._local_real_readiness: dict[str, object] | None = None
         self._local_real_latest_authoritative_date: str | None = None
@@ -81,9 +100,23 @@ class AppContainer:
         self._local_real_source_watermark: Any | None = None
         self._local_real_source_watermark_checked_at: datetime | None = None
         self._local_real_count_column = "id"
+        self._definition_store: DefinitionStorePort | None = None
+        self._definition_run_record_store: DefinitionRunRecordStore | None = None
+        self._hitl_action_claim_store: HITLActionClaimStore | None = None
         self._definition_service: CustomDefinitionService | None = None
+        # The two server-owned confirmation records are SEPARATE stores: an
+        # audit record is never a field of a definition, so it can never move a
+        # definition checksum.  They are backend-selected exactly like the
+        # definition store.
+        self._confirmation_audit_store: ConfirmationAuditPort | None = None
+        self._exploration_confirmation_store: (
+            ExplorationConfirmationPort | None
+        ) = None
         self._artifact_repository: (
             InMemoryArtifactRepository | ControlArtifactRepository | None
+        ) = None
+        self._exploration_confirmation_service: (
+            ExplorationConfirmationService | None
         ) = None
         self._library_repository: (
             InMemoryLibraryRepository | ControlLibraryRepository | None
@@ -136,6 +169,19 @@ class AppContainer:
                     await self.artifact_repository(),
                     await self.publication_catalogue(),
                     await self.library_repository(),
+                    # The definition store is built through the SAME accessor the
+                    # request path uses, so readiness and every route observe ONE
+                    # store.  A definition store that cannot be reached is never
+                    # reported as ready.
+                    self._definition_store_instance(),
+                    # The two confirmation records are part of the SAME
+                    # readiness gate: a control-backed deployment that cannot
+                    # reach its audit trail is NOT ready, because "who confirmed
+                    # this definition" would silently stop being durable.
+                    self._confirmation_audit_store_instance(),
+                    self._exploration_confirmation_store_instance(),
+                    self._definition_run_record_store_instance(),
+                    self._hitl_action_claim_store_instance(),
                 ):
                     await store.ping()
                 self._product_store_ready = True
@@ -303,8 +349,157 @@ class AppContainer:
                 self._local_real_readiness = {"status": "ready"}
         return self.readiness_report(model_available=False)
 
+    def _definition_store_instance(self) -> DefinitionStorePort:
+        """The backend-selected definition store, built ONCE per container.
+
+        The store is chosen by the SAME immutable setting as the other product
+        stores.  In a control-backed deployment it is built here and PINGED by
+        start(), so a store that cannot be reached is never reported ready; the
+        process-local implementation is the deliberate infra-dev/test default.
+        """
+
+        if self._definition_store is None:
+            try:
+                backend = self.product_store_backend
+            except Exception:
+                # Direct unit tests may build a container without bootstrapping
+                # Settings; the process-local store is the safe default there.
+                backend = "memory"
+            if backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.definition_control_store import (
+                    ControlDefinitionStore,
+                )
+
+                self._definition_store = ControlDefinitionStore(
+                    get_settings().control_database_url or ""
+                )
+            else:
+                from src.nl2sql.artifacts.definition_store import (
+                    InMemoryDefinitionStore,
+                )
+
+                self._definition_store = InMemoryDefinitionStore()
+        return self._definition_store
+
+    def _confirmation_audit_store_instance(self) -> ConfirmationAuditPort:
+        """The backend-selected confirmation audit store, built ONCE.
+
+        It is chosen by the SAME immutable setting as the definition store and is
+        PINGED by start(), so a control-backed deployment whose audit trail is
+        unreachable is never reported ready.  The process-local implementation
+        remains the infra-dev/test default.
+        """
+
+        if self._confirmation_audit_store is None:
+            try:
+                backend = self.product_store_backend
+            except Exception:
+                # Direct unit tests may build a container without bootstrapping
+                # Settings; the process-local store is the safe default there.
+                backend = "memory"
+            if backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.confirmation_control_store import (
+                    ControlConfirmationAuditStore,
+                )
+
+                self._confirmation_audit_store = ControlConfirmationAuditStore(
+                    get_settings().control_database_url or ""
+                )
+            else:
+                from src.nl2sql.artifacts.definition_confirmation_audit import (
+                    InMemoryConfirmationAuditStore,
+                )
+
+                self._confirmation_audit_store = InMemoryConfirmationAuditStore()
+        return self._confirmation_audit_store
+
+    def _definition_run_record_store_instance(self) -> DefinitionRunRecordStore:
+        """Build the backend-selected run store once per application container."""
+
+        if self._definition_run_record_store is None:
+            backend = self.product_store_backend
+            if backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.definition_run_record_control_store import (
+                    ControlDefinitionRunRecordStore,
+                )
+
+                self._definition_run_record_store = ControlDefinitionRunRecordStore(
+                    get_settings().control_database_url or ""
+                )
+            else:
+                from src.nl2sql.artifacts.definition_run_record import (
+                    InMemoryDefinitionRunRecordStore,
+                )
+
+                self._definition_run_record_store = InMemoryDefinitionRunRecordStore()
+        return self._definition_run_record_store
+
+    def _hitl_action_claim_store_instance(self) -> HITLActionClaimStore:
+        """Return the backend-selected atomic HITL action claim store."""
+
+        if self._hitl_action_claim_store is None:
+            if self.product_store_backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.hitl_action_claim_control_store import (
+                    ControlHITLActionClaimStore,
+                )
+
+                self._hitl_action_claim_store = ControlHITLActionClaimStore(
+                    get_settings().control_database_url or ""
+                )
+            else:
+                from src.nl2sql.hitl_action_claims import (
+                    InMemoryHITLActionClaimStore,
+                )
+
+                self._hitl_action_claim_store = InMemoryHITLActionClaimStore()
+        return self._hitl_action_claim_store
+
+    def get_hitl_action_claim_store(self) -> HITLActionClaimStore:
+        """Return the one claim store shared by all requests in this process."""
+
+        return self._hitl_action_claim_store_instance()
+
+    def _exploration_confirmation_store_instance(
+        self,
+    ) -> ExplorationConfirmationPort:
+        """The backend-selected exploration confirmation store, built ONCE.
+
+        Same immutable setting and same readiness gate as the other product
+        stores.  It is a pure constructor, so the accessor stays synchronous.
+        """
+
+        if self._exploration_confirmation_store is None:
+            try:
+                backend = self.product_store_backend
+            except Exception:
+                backend = "memory"
+            if backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.confirmation_control_store import (
+                    ControlExplorationConfirmationStore,
+                )
+
+                self._exploration_confirmation_store = (
+                    ControlExplorationConfirmationStore(
+                        get_settings().control_database_url or ""
+                    )
+                )
+            else:
+                from src.nl2sql.artifacts.exploration_confirmation import (
+                    InMemoryExplorationConfirmationStore,
+                )
+
+                self._exploration_confirmation_store = (
+                    InMemoryExplorationConfirmationStore()
+                )
+        return self._exploration_confirmation_store
+
     def custom_definition_service(self) -> CustomDefinitionService:
-        """The application-scoped definition service (DEMO/local, non-durable)."""
+        """The application-scoped definition service over the selected store."""
 
         if self._definition_service is None:
             from src.nl2sql.artifacts.service import CustomDefinitionService
@@ -355,7 +550,12 @@ class AppContainer:
 
                 resolver = deny_resolver
             self._definition_service = CustomDefinitionService(
-                governed_metric_key_resolver=resolver
+                store=self._definition_store_instance(),
+                governed_metric_key_resolver=resolver,
+                # The audit trail is a SEPARATE, server-owned store: in a
+                # control-backed deployment "who confirmed this exact version"
+                # survives a restart, and it is never part of the definition.
+                confirmation_audit=self._confirmation_audit_store_instance(),
             )
         return self._definition_service
 
@@ -409,6 +609,31 @@ class AppContainer:
 
                 self._artifact_repository = InMemoryArtifactRepository()
         return self._artifact_repository
+
+    def exploration_confirmation_service(self) -> ExplorationConfirmationService:
+        """The application-scoped run-scoped EXPLORATION confirmation service.
+
+        The definition dependency is injected READ-ONLY.  The service is typed
+        against the narrow ``DefinitionExactVersionReader`` protocol (one
+        owner-scoped ``get_exact_version``), so it cannot name - and therefore
+        cannot reach - any definition mutation.  It is a PURE constructor, so the
+        accessor is synchronous exactly like ``custom_definition_service()``.
+        """
+
+        if self._exploration_confirmation_service is None:
+            from src.nl2sql.artifacts.exploration_confirmation import (
+                ExplorationConfirmationService,
+            )
+
+            self._exploration_confirmation_service = ExplorationConfirmationService(
+                # READ-ONLY definition injection is preserved: the service wraps
+                # whatever it is given in ReadOnlyDefinitionReader, so it cannot
+                # name a definition mutation.  Only the run-scoped STORE changes
+                # with the backend.
+                definitions=self.custom_definition_service(),
+                store=self._exploration_confirmation_store_instance(),
+            )
+        return self._exploration_confirmation_service
 
     async def publication_catalogue(
         self,
@@ -536,16 +761,35 @@ class AppContainer:
         return self._personal_conflict_product_service
 
     def custom_definition_execution_service(self) -> CustomDefinitionExecutionService:
-        """Application-scoped Mode3 service; real resolver binding is deferred."""
+        """Application-scoped Mode3 service with a mode-scoped revalidation gate.
+
+        The §8.19 CURRENT-authority providers (current authorization / active
+        release / data snapshot / freshness-DQ / remaining budget) are NOT wired
+        here by plan.  product mode therefore keeps the strict, fail-closed gate:
+        an unconfigured provider is UNAVAILABLE.  infra-dev / demo RELAXES that
+        to a recorded degradation -- the rerun proceeds, but every execution
+        names the authority it did not check, so an unconfigured deployment is
+        never a silent pass.  The governed-metric authority is always bound to
+        the definition service and is never a skippable check.
+        """
 
         if self._custom_definition_execution_service is None:
             from src.nl2sql.artifacts.custom_definition_execution_service import (
                 CustomDefinitionExecutionService,
             )
+            from src.nl2sql.artifacts.definition_revalidation import (
+                DefinitionRevalidationGate,
+            )
 
+            definitions = self.custom_definition_service()
             self._custom_definition_execution_service = CustomDefinitionExecutionService(
-                definitions=self.custom_definition_service(),
+                definitions=definitions,
                 input_resolver=self.calculation_input_resolver(),
+                run_records=self._definition_run_record_store_instance(),
+                revalidation=DefinitionRevalidationGate(
+                    governed_metric_authority=definitions._is_governed_metric_key,
+                    strict=get_settings().service_mode == "product",
+                ),
             )
         return self._custom_definition_execution_service
 
@@ -649,12 +893,19 @@ class AppContainer:
             identity: Any,
             authorization: Any,
             expected_revision: str | None,
+            capabilities: frozenset[str] = frozenset(),
         ) -> Any:
             from src.core.auth.demo_provider import DEMO_REVISION_PREFIX
             from src.nl2sql.contracts import AuthorizationContext
             from src.nl2sql.demo.runtime import build_demo_runtime
             from src.nl2sql.orchestration.typed_runtime import TypedRuntimeUnavailable
 
+            # The DEMO path deliberately does NOT auto-inject an AD_HOC runner
+            # from the run capability set: a synthetic demo fixture must never
+            # fabricate a production arithmetic seam.  build_demo_runtime's
+            # explicit ad_hoc_calculation_runner argument stays the ONLY demo
+            # injection point (and defaults to None).
+            del capabilities
             if not isinstance(authorization, AuthorizationContext):
                 return TypedRuntimeUnavailable(reason="authorization_context_missing")
             if not authorization.authorization_revision.startswith(DEMO_REVISION_PREFIX):
@@ -685,6 +936,7 @@ class AppContainer:
             identity: Any,
             authorization: Any,
             expected_revision: str | None,
+            capabilities: frozenset[str] = frozenset(),
         ) -> Any:
             from src.nl2sql.contracts import AuthorizationContext
             from src.nl2sql.orchestration.typed_runtime import (
@@ -706,6 +958,7 @@ class AppContainer:
                 identity=identity,
                 authorization=authorization,
                 expected_revision=expected_revision,
+                capabilities=capabilities,
             )
 
         return factory
@@ -723,6 +976,7 @@ class AppContainer:
             identity: Any,
             authorization: Any,
             expected_revision: str | None,
+            capabilities: frozenset[str] = frozenset(),
         ) -> Any:
             from src.nl2sql.contracts import AuthorizationContext
             from src.nl2sql.local_real.deployment import (
@@ -763,6 +1017,7 @@ class AppContainer:
                 # ONE bounded bootstrap scan cap that admits the frozen case.
                 bootstrap_scan_max_rows=LOCAL_REAL_BOOTSTRAP_SCAN_MAX_ROWS,
                 expected_revision=expected_revision,
+                capabilities=capabilities,
             )
 
         return factory
@@ -785,7 +1040,7 @@ class AppContainer:
         watermark = self._local_real_source_watermark
         if watermark is None or resources is None:
             return None
-        deployment = resources[1]
+        deployment = resources[2]
         if watermark.tzinfo is None or watermark.utcoffset() is None:
             watermark = watermark.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
         watermark_utc = watermark.astimezone(UTC)
@@ -834,6 +1089,17 @@ class AppContainer:
             return None
         self._local_real_probe_attempted = True
         business_engine: Any | None = None
+        cancellation_engine: Any | None = None
+
+        async def dispose_runtime_engines() -> None:
+            for engine in (cancellation_engine, business_engine):
+                if engine is None:
+                    continue
+                try:
+                    await engine.dispose()
+                except Exception:
+                    logger.error("local-real engine cleanup failed")
+
         try:
             from pathlib import Path
 
@@ -875,10 +1141,22 @@ class AppContainer:
                 application_name="ttai-local-real-runtime",
                 settings=settings,
             )
+            cancellation_engine = create_runtime_async_engine(
+                settings.database_url,
+                purpose=DatabasePurpose.BUSINESS_READ_ONLY,
+                application_name="ttai-local-real-cancel",
+                settings=settings,
+                pool_size=1,
+                max_overflow=3,
+            )
             session_factory = async_sessionmaker(
                 business_engine, class_=AsyncSession, expire_on_commit=False
             )
-            gateway = QueryGateway(session_factory, schema=agent_config.nl2sql_db_schema)
+            gateway = QueryGateway(
+                session_factory,
+                schema=agent_config.nl2sql_db_schema,
+                cancellation_engine=cancellation_engine,
+            )
             # Probe the PREFERRED published view FIRST.  When it is absent this
             # deployment fails closed rather than silently switching to
             # direct-table metric SQL.
@@ -887,22 +1165,22 @@ class AppContainer:
                 logger.error(
                     "local-real published view unavailable: %s", relation_probe.status
                 )
-                await business_engine.dispose()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             latest_date = await resolve_latest_authoritative_date(session_factory)
             recent_dates = await resolve_recent_authoritative_dates(session_factory)
             if not latest_date.resolved or latest_date.latest_date is None:
                 logger.error("local-real authoritative date unavailable")
-                await business_engine.dispose()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             if not recent_dates.resolved:
                 logger.error("local-real authoritative window unavailable")
-                await business_engine.dispose()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             source_watermark = await resolve_source_watermark(session_factory)
             if not source_watermark.resolved or source_watermark.data_as_of is None:
                 logger.error("local-real source watermark unavailable")
-                await business_engine.dispose()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             snapshot_candidate = await PostgresSchemaSnapshotCollector(
                 business_engine, max_relations=1
@@ -932,7 +1210,7 @@ class AppContainer:
             )
             if frozen_view is None:
                 logger.error("local-real published view is not configured")
-                await business_engine.dispose()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             bundle = await self._build_local_real_semantics_async(
                 snapshot_candidate=snapshot_candidate,
@@ -954,6 +1232,16 @@ class AppContainer:
                 },
                 count_column="id",
             )
+        except asyncio.CancelledError:
+            await _run_shielded_cleanup(dispose_runtime_engines)
+            self._local_real_probe_attempted = False
+            self._local_real_deployment = None
+            self._local_real_resources = None
+            self._local_real_latest_authoritative_date = None
+            self._local_real_recent_authoritative_dates = ()
+            self._local_real_source_watermark = None
+            self._local_real_source_watermark_checked_at = None
+            raise
         except Exception as exc:
             # Fail closed and dispose a partially constructed engine.  The
             # public readiness surface receives only a stable reason; detailed
@@ -961,11 +1249,7 @@ class AppContainer:
             logger.error(
                 "local-real deployment unavailable: %s", type(exc).__name__
             )
-            if business_engine is not None:
-                try:
-                    await business_engine.dispose()
-                except Exception:
-                    logger.error("local-real engine cleanup failed")
+            await _run_shielded_cleanup(dispose_runtime_engines)
             self._local_real_deployment = None
             self._local_real_resources = None
             self._local_real_latest_authoritative_date = None
@@ -979,7 +1263,11 @@ class AppContainer:
             deployment.read_snapshot,
             deployment.gateway,
         )
-        self._local_real_resources = (business_engine, deployment)
+        self._local_real_resources = (
+            business_engine,
+            cancellation_engine,
+            deployment,
+        )
         self._local_real_latest_authoritative_date = deployment.latest_authoritative_date
         self._local_real_recent_authoritative_dates = deployment.recent_authoritative_dates
         self._local_real_source_watermark = source_watermark.data_as_of
@@ -1021,6 +1309,25 @@ class AppContainer:
 
         if self._typed_deployment is not None:
             return self._typed_deployment
+        publisher: Any | None = None
+        snapshots: Any | None = None
+        business_engine: Any | None = None
+        cancellation_engine: Any | None = None
+
+        async def dispose_typed_resources() -> None:
+            for resource in (cancellation_engine, business_engine):
+                if resource is not None:
+                    try:
+                        await resource.dispose()
+                    except Exception:
+                        logger.error("typed engine cleanup failed")
+            for resource in (snapshots, publisher):
+                if resource is not None:
+                    try:
+                        await resource.close()
+                    except Exception:
+                        logger.error("typed resource close failed")
+
         try:
             from pathlib import Path
 
@@ -1050,25 +1357,96 @@ class AppContainer:
                 application_name="ttai-typed-runtime",
                 settings=settings,
             )
+            cancellation_engine = create_runtime_async_engine(
+                settings.database_url,
+                purpose=DatabasePurpose.BUSINESS_READ_ONLY,
+                application_name="ttai-typed-runtime-cancel",
+                settings=settings,
+                pool_size=1,
+                max_overflow=3,
+            )
             session_factory = async_sessionmaker(
                 business_engine, class_=AsyncSession, expire_on_commit=False
             )
-            gateway = QueryGateway(session_factory, schema=agent_config.nl2sql_db_schema)
+            gateway = QueryGateway(
+                session_factory,
+                schema=agent_config.nl2sql_db_schema,
+                cancellation_engine=cancellation_engine,
+            )
+        except asyncio.CancelledError:
+            await _run_shielded_cleanup(dispose_typed_resources)
+            raise
         except Exception as exc:
             logger.error("typed runtime deployment unavailable: %s", type(exc).__name__)
+            await _run_shielded_cleanup(dispose_typed_resources)
             return None
         self._typed_deployment = (views, publisher.read_active, snapshots.read, gateway)
-        self._typed_resources = (publisher, snapshots, business_engine)
+        assert cancellation_engine is not None
+        self._typed_resources = (
+            publisher,
+            snapshots,
+            business_engine,
+            cancellation_engine,
+        )
         return self._typed_deployment
 
     async def close(self) -> None:
+        await _run_shielded_cleanup(self._close_resources)
+
+    async def _close_resources(self) -> None:
         self._engine = None
         self._model_gateway = None
+        if self._definition_store is not None:
+            # The definition store owns its own engine when it is control-backed;
+            # dispose it here and drop the service that holds it, so a reused
+            # container never serves a disposed pool.
+            try:
+                await self._definition_store.close()
+            except Exception:
+                logger.error("definition store close failed")
+            self._definition_store = None
+            self._definition_service = None
+        self._custom_definition_execution_service = None
+        if self._definition_run_record_store is not None:
+            try:
+                await self._definition_run_record_store.close()
+            except Exception:
+                logger.error("definition run record store close failed")
+            self._definition_run_record_store = None
+        if self._hitl_action_claim_store is not None:
+            try:
+                await self._hitl_action_claim_store.close()
+            except Exception:
+                logger.error("HITL action claim store close failed")
+            self._hitl_action_claim_store = None
+        if self._confirmation_audit_store is not None:
+            # Same engine-ownership rule as the definition store: a
+            # control-backed audit store owns its engine, and the definition
+            # service holds it, so both are dropped together.
+            try:
+                await self._confirmation_audit_store.close()
+            except Exception:
+                logger.error("confirmation audit store close failed")
+            self._confirmation_audit_store = None
+            self._definition_service = None
+        if self._exploration_confirmation_store is not None:
+            try:
+                await self._exploration_confirmation_store.close()
+            except Exception:
+                logger.error("exploration confirmation store close failed")
+            self._exploration_confirmation_store = None
+            self._exploration_confirmation_service = None
         if self._audit_store is not None:
-            await self._audit_store.close()
-            self._audit_store = None
+            try:
+                await self._audit_store.close()
+            except Exception:
+                logger.error("control audit store close failed")
+            finally:
+                self._audit_store = None
         if self._typed_resources is not None:
-            publisher, snapshots, business_engine = self._typed_resources
+            publisher, snapshots, business_engine, cancellation_engine = (
+                self._typed_resources
+            )
             self._typed_resources = None
             self._typed_deployment = None
             for resource in (snapshots, publisher):
@@ -1080,14 +1458,24 @@ class AppContainer:
                 await business_engine.dispose()
             except Exception:
                 pass
+            try:
+                await cancellation_engine.dispose()
+            except Exception:
+                logger.error("typed cancellation engine close failed")
         if self._local_real_resources is not None:
-            business_engine, _deployment = self._local_real_resources
+            business_engine, cancellation_engine, _deployment = (
+                self._local_real_resources
+            )
             self._local_real_resources = None
             self._local_real_deployment = None
             try:
                 await business_engine.dispose()
             except Exception:
                 logger.error("local-real resource close failed")
+            try:
+                await cancellation_engine.dispose()
+            except Exception:
+                logger.error("local-real cancellation resource close failed")
         else:
             self._local_real_deployment = None
         self._local_real_probe_attempted = False

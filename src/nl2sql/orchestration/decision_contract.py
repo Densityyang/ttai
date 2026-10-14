@@ -3,9 +3,12 @@
 TYPED_CLARIFICATION_DECISION_RESUME_CONTRACT_V1.
 
 This module defines strict, frozen typed objects for resumable governed
-decisions plus ONE pure projection from an existing clarify validation record.
-It is CONTRACT + PURE PROJECTION ONLY: it performs no I/O, mutates no engine
-graph, and wires nothing into LangGraph, /actions, checkpoints or execution.
+decisions plus the pure producers that create them: a clarification request
+from an existing clarify validation record, and business-confirmation /
+risk-policy requests from a validated plan+context and explicit policy
+identity.  It is CONTRACT + PURE PRODUCER ONLY: it performs no I/O, mutates no
+engine graph, and wires nothing into LangGraph, /actions, checkpoints or
+execution.
 
 INVARIANTS
 ----------
@@ -28,6 +31,15 @@ INVARIANTS
   slot text as SQL.  Statement delimiters are rejected as defense-in-depth, NOT
   as a SQL classifier; bounded literal text that merely resembles SQL remains
   valid user data.
+* IN-PLACE CORRECTION: decision_kind="metric_plan_confirmation" is the ONE kind
+  whose resolution payload is a correction of the run's own derived-calculation
+  inputs.  A correction is a CHOICE among server-derived, already-authorized
+  candidates carried on the request (resolution_options); it is never free text,
+  never a second formula representation, never a new metric identity.  It grants
+  no authority, creates no definition, changes no canonicality and reaches no
+  definition lifecycle.  Any choice outside the candidate set fails closed, and
+  the candidate set is re-derived from the restored plan/context at continuation
+  time so a tampered checkpoint cannot widen it.
 """
 
 from __future__ import annotations
@@ -35,6 +47,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Annotated, Final, Literal, TypeVar
@@ -59,6 +72,7 @@ DecisionKind = Literal[
     "clarification",
     "business_confirmation",
     "risk_policy_decision",
+    "metric_plan_confirmation",
 ]
 DecisionAction = Literal["resolve", "confirm", "modify", "choose", "reject", "cancel"]
 
@@ -68,6 +82,15 @@ _REQUEST_ACTIONS: Final[dict[DecisionKind, tuple[DecisionAction, ...]]] = {
     "clarification": ("resolve", "choose", "reject", "cancel"),
     "business_confirmation": ("confirm", "modify", "reject", "cancel"),
     "risk_policy_decision": ("confirm", "reject", "cancel"),
+    # The run-scoped FORMULA-PLAN confirmation is the ONE kind whose resolution
+    # payload is an IN-PLACE CORRECTION of the run's own derived-calculation
+    # inputs.  It is a SEPARATE kind precisely so no frozen action set is
+    # widened: the definition/material confirmations above keep their exact
+    # vocabulary.  `modify` is ABSENT on purpose - a correction is expressed as
+    # `resolve` ONLY, so there is exactly one way to correct and no ambiguity
+    # between "record a note" and "change the inputs".  This kind reaches no
+    # definition/lifecycle surface and grants no authority.
+    "metric_plan_confirmation": ("confirm", "resolve", "reject", "cancel"),
 }
 
 # Bounded value limits for resolved slots (fail-closed, pre-coercion).
@@ -399,6 +422,14 @@ def _guard_slot_scalar(value: object) -> None:
 _SlotScalar = str | bool | int | float | Decimal
 SlotValue = _SlotScalar | tuple[_SlotScalar, ...]
 
+# Bounded limits for the ONE kind that may carry an in-place correction.
+MAX_RESOLUTION_OPTIONS: Final[int] = 16
+MAX_RESOLUTION_CANDIDATES: Final[int] = 32
+MAX_METRIC_ID_LENGTH: Final[int] = 256
+# A metric identity a correction may SELECT.  It is a bounded identifier, never
+# free text: the contract never parses it and never treats it as SQL.
+AuthorizedMetricId = Annotated[str, Field(min_length=1, max_length=MAX_METRIC_ID_LENGTH)]
+
 
 class SlotBinding(_StrictDecisionModel):
     """One typed resolved-slot binding.
@@ -432,6 +463,55 @@ class SlotBinding(_StrictDecisionModel):
         return value
 
 
+class ResolutionOption(_StrictDecisionModel):
+    """One bindable role plus the server-derived, ALREADY-AUTHORIZED choices.
+
+    A correction is a CHOICE among these candidates - never free text, never a
+    second formula representation and never a new metric identity.  The
+    candidates are derived server-side from the run's OWN question-resolved plan
+    intersected with the run's authorized context, so:
+
+    * naming them reveals nothing the caller is not already authorized to see;
+    * they are exactly the set the governed resolver would accept for this run,
+      so a correction can never widen the accessible metric range.
+
+    This object carries no authority, no lifecycle, no canonicality and no
+    capability field; `extra="forbid"` plus the forbidden-field guard enforce it.
+    """
+
+    slot: SlotName
+    candidates: tuple[AuthorizedMetricId, ...] = Field(
+        min_length=1, max_length=MAX_RESOLUTION_CANDIDATES
+    )
+
+    @field_validator("slot")
+    @classmethod
+    def _slot_is_not_reserved(cls, value: str) -> str:
+        if value in RESERVED_SLOT_NAMES:
+            raise ValueError("resolution slot name is reserved control-plane vocabulary")
+        return value
+
+    @field_validator("candidates")
+    @classmethod
+    def _candidates_are_bounded_unique_metric_ids(
+        cls, value: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        for candidate in value:
+            if not candidate.strip():
+                raise ValueError("resolution candidate must be non-blank")
+            if any(ord(char) < 32 or ord(char) == 127 for char in candidate):
+                raise ValueError(
+                    "resolution candidate must not contain control characters"
+                )
+            if any(marker in candidate for marker in _SQL_MARKERS):
+                raise ValueError(
+                    "resolution candidate must not contain statement delimiters"
+                )
+        if len(set(value)) != len(value):
+            raise ValueError("resolution candidates must be unique")
+        return value
+
+
 class HITLRequest(_StrictDecisionModel):
     """A suspended decision bound to the exact validation state.
 
@@ -449,6 +529,12 @@ class HITLRequest(_StrictDecisionModel):
     policy_checksum: Checksum
     issue_codes: tuple[IssueCode, ...] = Field(default=(), max_length=32)
     unresolved_slots: tuple[SlotName, ...] = Field(default=(), max_length=16)
+    # The correction surface of a metric_plan_confirmation: one bounded entry per
+    # BINDABLE formula role, naming the server-derived, already-authorized
+    # candidates that role may be re-bound to.  Empty for every other kind.
+    resolution_options: tuple[ResolutionOption, ...] = Field(
+        default=(), max_length=MAX_RESOLUTION_OPTIONS
+    )
     # Display metadata only; never identity and never authority.  Excluded from
     # the request checksum by construction.
     safe_summary: str | None = Field(default=None, max_length=512)
@@ -483,6 +569,16 @@ class HITLRequest(_StrictDecisionModel):
             )
         return value
 
+    @field_validator("resolution_options")
+    @classmethod
+    def _unique_resolution_slots(
+        cls, value: tuple[ResolutionOption, ...]
+    ) -> tuple[ResolutionOption, ...]:
+        slots = [item.slot for item in value]
+        if len(set(slots)) != len(slots):
+            raise ValueError("resolution options must be unique by slot")
+        return value
+
     @field_validator("safe_summary")
     @classmethod
     def _safe_summary_has_no_control_characters(
@@ -506,6 +602,20 @@ class HITLRequest(_StrictDecisionModel):
                 raise ValueError("clarification request requires at least one issue code")
         elif self.unresolved_slots:
             raise ValueError("non-clarification request must not carry unresolved slots")
+        if self.decision_kind == "metric_plan_confirmation":
+            # A correction needs something to choose FROM: offering `resolve`
+            # without any authorized candidate would be an unbounded action.
+            if "resolve" in self.allowed_actions and not self.resolution_options:
+                raise ValueError(
+                    "a metric plan confirmation may only offer resolve when it "
+                    "carries resolution options"
+                )
+        elif self.resolution_options:
+            # The correction surface is scoped to the ONE kind that has it, so no
+            # other decision can carry - or be mistaken for - a correction.
+            raise ValueError(
+                "only a metric plan confirmation may carry resolution options"
+            )
         return self
 
     @property
@@ -548,7 +658,34 @@ class HITLDecision(_StrictDecisionModel):
         if self.action in ("resolve", "choose"):
             if not self.slot_bindings:
                 failures.append("decision_resolution_payload_missing")
-            if bound - set(request.unresolved_slots):
+            if request.decision_kind == "metric_plan_confirmation":
+                # The in-place correction is a CHOICE among server-derived,
+                # already-authorized candidates.  Fail closed on:
+                #   * a slot that is not one of the request's bindable roles;
+                #   * a value outside that role's candidate set (this covers
+                #     free text AND an unauthorized/nonexistent metric
+                #     identically, so nothing is leaked about existence);
+                #   * a non-string payload (never free text, never a second
+                #     formula representation);
+                #   * the same metric selected for two roles (the governed
+                #     resolver refuses duplicates, so this fails closed earlier).
+                options = {item.slot: item for item in request.resolution_options}
+                if bound - set(options):
+                    failures.append("decision_unknown_slot_binding")
+                selected: list[str] = []
+                for item in self.slot_bindings:
+                    option = options.get(item.slot)
+                    if option is None:
+                        continue
+                    if not isinstance(item.value, str) or (
+                        item.value not in option.candidates
+                    ):
+                        failures.append("decision_binding_value_not_a_candidate")
+                    else:
+                        selected.append(item.value)
+                if len(set(selected)) != len(selected):
+                    failures.append("decision_binding_value_duplicate")
+            elif bound - set(request.unresolved_slots):
                 failures.append("decision_unknown_slot_binding")
             # A resolve MAY bind a proper subset of the request's unresolved
             # slots: multi-round clarification resolves the remaining slots in
@@ -658,9 +795,10 @@ def clarification_request(
 ) -> HITLRequest:
     """Pure projection: a clarify validation record -> typed HITLRequest.
 
-    No I/O, no authority, no producer for business/risk kinds.  Fails closed
-    when the validation is not a clarify, when the bound hashes do not match the
-    supplied plan/context, or when no unresolved slot actually exists.
+    No I/O and no authority.  Fails closed when the validation is not a clarify,
+    when the bound hashes do not match the supplied plan/context, or when no
+    unresolved slot actually exists.  business_confirmation_request and
+    risk_policy_decision_request are the sibling producers for the other kinds.
     """
 
     if validation.outcome != "clarify":
@@ -701,6 +839,188 @@ def clarification_request(
     )
 
 
+def _confirmation_request(
+    *,
+    decision_kind: Literal["business_confirmation", "risk_policy_decision"],
+    plan: QueryPlan,
+    context: ContextBundle,
+    policy_version: str,
+    policy_checksum: str,
+    issue_codes: tuple[str, ...],
+    version: int = 1,
+    safe_summary: str | None = None,
+) -> HITLRequest:
+    """Shared fail-closed HITLRequest constructor for the two material kinds.
+
+    Reuses HITLRequest's own kind/action/forbidden-field validation instead of
+    introducing a second decision interface.
+    """
+
+    normalized_codes = tuple(dict.fromkeys(code.strip() for code in issue_codes))
+    if not normalized_codes or any(not code for code in normalized_codes):
+        raise DecisionContractError(
+            "material decision request requires at least one non-blank issue code"
+        )
+    if re.fullmatch(r"^[0-9a-f]{64}$", policy_checksum) is None:
+        raise DecisionContractError(
+            "material decision request policy checksum is invalid"
+        )
+    identity = {
+        "decision_kind": decision_kind,
+        "version": version,
+        "plan_sha256": plan.checksum,
+        "context_checksum": context.checksum,
+        "policy_version": policy_version,
+        "policy_checksum": policy_checksum,
+        "issue_codes": list(normalized_codes),
+    }
+    prefix = "business-" if decision_kind == "business_confirmation" else "risk-"
+    return HITLRequest(
+        request_id=prefix + _checksum(identity)[:32],
+        decision_kind=decision_kind,
+        version=version,
+        allowed_actions=_REQUEST_ACTIONS[decision_kind],
+        plan_sha256=plan.checksum,
+        context_checksum=context.checksum,
+        policy_version=policy_version,
+        policy_checksum=policy_checksum,
+        issue_codes=normalized_codes,
+        unresolved_slots=(),
+        safe_summary=safe_summary,
+    )
+
+
+def business_confirmation_request(
+    *,
+    plan: QueryPlan,
+    context: ContextBundle,
+    policy_version: str,
+    policy_checksum: str,
+    issue_codes: tuple[str, ...],
+    version: int = 1,
+    safe_summary: str | None = None,
+) -> HITLRequest:
+    """Pure producer: a material business-plan confirmation -> HITLRequest.
+
+    This is the missing producer for decision_kind="business_confirmation".
+    It is reason-oriented: the caller must supply at least one bounded issue
+    code.  It carries no unresolved slots, no authority, no mode and no
+    canonical/definition confirmation; it never replaces a definition
+    confirmation and never grants canonical authority.
+    """
+
+    return _confirmation_request(
+        decision_kind="business_confirmation",
+        plan=plan,
+        context=context,
+        policy_version=policy_version,
+        policy_checksum=policy_checksum,
+        issue_codes=issue_codes,
+        version=version,
+        safe_summary=safe_summary,
+    )
+
+
+def risk_policy_decision_request(
+    *,
+    plan: QueryPlan,
+    context: ContextBundle,
+    policy_version: str,
+    policy_checksum: str,
+    issue_codes: tuple[str, ...],
+    version: int = 1,
+    safe_summary: str | None = None,
+) -> HITLRequest:
+    """Pure producer: a material risk/sensitivity decision -> HITLRequest.
+
+    This is the missing producer for decision_kind="risk_policy_decision".  It
+    only offers confirm/reject/cancel and never a resolution payload, so it can
+    never smuggle a data/org/relation authorization through a risk acceptance.
+    """
+
+    return _confirmation_request(
+        decision_kind="risk_policy_decision",
+        plan=plan,
+        context=context,
+        policy_version=policy_version,
+        policy_checksum=policy_checksum,
+        issue_codes=issue_codes,
+        version=version,
+        safe_summary=safe_summary,
+    )
+
+
+def metric_plan_confirmation_request(
+    *,
+    plan: QueryPlan,
+    context: ContextBundle,
+    policy_version: str,
+    policy_checksum: str,
+    issue_codes: tuple[str, ...],
+    resolution_options: tuple[ResolutionOption, ...] = (),
+    version: int = 1,
+    safe_summary: str | None = None,
+) -> HITLRequest:
+    """Pure producer: the run-scoped FORMULA-PLAN confirmation -> HITLRequest.
+
+    This is the ONE decision kind that may carry an IN-PLACE CORRECTION of the
+    run's own derived-calculation inputs, and it exists as a SEPARATE kind so
+    that no frozen action set is widened:
+
+    * the correction payload is a CHOICE among server-derived, already-authorized
+      candidates (resolution_options), never free text;
+    * it grants no authority, creates no definition, changes no canonicality and
+      carries no mode/capability/lifecycle field;
+    * modify is deliberately NOT offered - resolve is the single way to
+      correct, so there is no second, payload-less "change" action;
+    * when no role is bindable the request simply narrows to
+      confirm/reject/cancel instead of offering an unbounded action.
+
+    Every candidate set is caller-supplied and re-derived from the restored
+    plan/context at continuation time, so a tampered checkpoint cannot widen it.
+    """
+
+    normalized_codes = tuple(dict.fromkeys(code.strip() for code in issue_codes))
+    if not normalized_codes or any(not code for code in normalized_codes):
+        raise DecisionContractError(
+            "material decision request requires at least one non-blank issue code"
+        )
+    if re.fullmatch(r"^[0-9a-f]{64}$", policy_checksum) is None:
+        raise DecisionContractError(
+            "material decision request policy checksum is invalid"
+        )
+    options = tuple(resolution_options)
+    allowed_actions: tuple[DecisionAction, ...] = (
+        ("confirm", "resolve", "reject", "cancel")
+        if options
+        else ("confirm", "reject", "cancel")
+    )
+    identity = {
+        "decision_kind": "metric_plan_confirmation",
+        "version": version,
+        "plan_sha256": plan.checksum,
+        "context_checksum": context.checksum,
+        "policy_version": policy_version,
+        "policy_checksum": policy_checksum,
+        "issue_codes": list(normalized_codes),
+        "resolution_options": [item.model_dump(mode="json") for item in options],
+    }
+    return HITLRequest(
+        request_id="metric-" + _checksum(identity)[:32],
+        decision_kind="metric_plan_confirmation",
+        version=version,
+        allowed_actions=allowed_actions,
+        plan_sha256=plan.checksum,
+        context_checksum=context.checksum,
+        policy_version=policy_version,
+        policy_checksum=policy_checksum,
+        issue_codes=normalized_codes,
+        unresolved_slots=(),
+        resolution_options=options,
+        safe_summary=safe_summary,
+    )
+
+
 def resume_token(*, request: HITLRequest, decision: HITLDecision) -> ResumeToken:
     """Pure projection: a satisfied decision -> replay-bound ResumeToken."""
 
@@ -721,6 +1041,7 @@ def resume_token(*, request: HITLRequest, decision: HITLDecision) -> ResumeToken
 
 
 __all__ = [
+    "AuthorizedMetricId",
     "Checksum",
     "DecisionAction",
     "DecisionContractError",
@@ -730,6 +1051,9 @@ __all__ = [
     "HITLRequest",
     "IdempotencyKey",
     "IssueCode",
+    "MAX_METRIC_ID_LENGTH",
+    "MAX_RESOLUTION_CANDIDATES",
+    "MAX_RESOLUTION_OPTIONS",
     "MAX_SLOT_DECIMAL_ADJUSTED",
     "MAX_SLOT_DECIMAL_DIGITS",
     "MAX_SLOT_INT_MAGNITUDE",
@@ -737,14 +1061,18 @@ __all__ = [
     "MAX_SLOT_STRING_LENGTH",
     "RESERVED_SLOT_NAMES",
     "RequestId",
+    "ResolutionOption",
     "ResumeToken",
     "SCHEMA_VERSION",
     "SlotBinding",
     "SlotName",
     "SlotValue",
+    "business_confirmation_request",
     "clarification_request",
+    "metric_plan_confirmation_request",
     "resume_token",
     "revalidate_decision",
+    "risk_policy_decision_request",
     "revalidate_request",
     "revalidate_resume_token",
 ]

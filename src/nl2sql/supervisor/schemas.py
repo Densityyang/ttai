@@ -6,6 +6,8 @@ from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from src.nl2sql.contracts import DerivedOutputId
+
 
 class _PublicBlock(BaseModel):
     """Canonical Foundation-C block: strict and server serializable."""
@@ -85,7 +87,10 @@ class ClarificationBlock(_PublicBlock):
     type: Literal["clarification"] = "clarification"
     request_id: str = Field(min_length=1, max_length=128)
     decision_kind: Literal[
-        "clarification", "business_confirmation", "risk_policy_decision"
+        "clarification",
+        "business_confirmation",
+        "risk_policy_decision",
+        "metric_plan_confirmation",
     ]
     version: int = Field(ge=1, le=1_000_000)
     allowed_actions: tuple[
@@ -153,6 +158,10 @@ class ProvenanceAuthorityBlock(_PublicBlock):
     source_ids: tuple[str, ...] = Field(default=(), max_length=16)
     source_checkpoints: tuple[str, ...] = Field(default=(), max_length=16)
     semantic_signatures: tuple[str, ...] = Field(default=(), max_length=16)
+    # Manual-origin evidence identities live in their OWN field, never merged
+    # into source_ids: a human assertion must not be readable back as an
+    # automated receipt.  P7A requires the two to stay distinguishable.
+    manual_origin_ids: tuple[str, ...] = Field(default=(), max_length=16)
 
 
 class ProvenanceTimeRangeBlock(_PublicBlock):
@@ -164,7 +173,19 @@ class ProvenanceTimeRangeBlock(_PublicBlock):
 class ProvenanceBlock(_PublicBlock):
     type: Literal["provenance"] = "provenance"
     evidence_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
-    metric_keys: tuple[str, ...] = Field(min_length=1, max_length=16)
+    # Canonical metric identities this provenance attests.  A CANONICAL result
+    # still requires at least one (see validate_calculation_scope); only a
+    # noncanonical AD_HOC result may legitimately carry none, because its
+    # identity is the derived output below and never a fabricated metric key.
+    metric_keys: tuple[str, ...] = Field(default=(), max_length=16)
+    # NONCANONICAL derived-output identities (adhoc_<32 hex>).  They are
+    # deterministic spec+binding content ids: never a metric key, never a
+    # canonical/SAVED identity.
+    derived_output_ids: tuple[DerivedOutputId, ...] = Field(default=(), max_length=16)
+    # Which calculation scope this provenance describes.  "ad_hoc_noncanonical"
+    # makes a temporary run-scoped derivation impossible to mistake for a formal
+    # metric; absent/"canonical" keeps the pre-existing canonical meaning.
+    calculation_scope: Literal["canonical", "ad_hoc_noncanonical"] | None = None
     analysis_window: ProvenanceTimeRangeBlock
     data_as_of: datetime | None = None
     data_as_of_date: date | None = None
@@ -181,6 +202,31 @@ class ProvenanceBlock(_PublicBlock):
             raise ValueError("model provenance must provide provider and model together")
         return self
 
+    @model_validator(mode="after")
+    def validate_calculation_scope(self) -> "ProvenanceBlock":
+        """Keep canonical validation EXACTLY as strict as before.
+
+        A noncanonical AD_HOC result is identified by its derived outputs and
+        MAY have no metric key (it never fabricates one).  Every other
+        provenance keeps the original invariant that at least one metric key is
+        present, so relaxing the field default cannot weaken canonical
+        provenance.
+        """
+
+        if self.calculation_scope == "ad_hoc_noncanonical":
+            if not self.derived_output_ids:
+                raise ValueError(
+                    "noncanonical provenance requires at least one derived output id"
+                )
+            return self
+        if not self.metric_keys:
+            raise ValueError("canonical provenance requires at least one metric key")
+        if self.derived_output_ids:
+            raise ValueError(
+                "canonical provenance must not carry derived output ids"
+            )
+        return self
+
 
 class DefinitionBlock(_PublicBlock):
     type: Literal["definition"] = "definition"
@@ -191,6 +237,13 @@ class DefinitionBlock(_PublicBlock):
     retention: Literal["SESSION", "SAVED"]
     publication: Literal["UNPUBLISHED", "PUBLISHED"]
     certification: Literal["UNCERTIFIED", "CERTIFIED"]
+    # The governance PROPOSAL axis and the canonicality axis.  They are
+    # INDEPENDENT of the four axes above (no aggregate status exists), so the
+    # frontend can render them side by side instead of as lifecycle steps.
+    # A Custom Definition ORIGINAL OBJECT is always "noncanonical": formal
+    # governance creates or links a SEPARATE canonical identity.
+    governance: Literal["NONE", "GOVERNANCE_CANDIDATE", "UNDER_REVIEW"] = "NONE"
+    authority: Literal["noncanonical", "canonical"] = "noncanonical"
     semantic_closed: bool
     checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src.nl2sql.artifacts.custom_definition import utcnow
+from src.nl2sql.artifacts.custom_definition import DefinitionVersion, utcnow
 from src.nl2sql.artifacts.publication import (
     PublicationCatalogue,
     PublishedSemanticPackage,
@@ -33,6 +33,19 @@ class PublicationNotEligible(ValueError):
 
 class PublicationConflict(ValueError):
     """The exact version is already published (immutable)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class PublicationSourceUnresolved(ValueError):
+    """A published version's source definition cannot be resolved or verified.
+
+    This is the fail-closed answer to the HALF-persisted state: a publication
+    row whose source_definition_id does not resolve (or whose checksum no longer
+    matches) must never be served as if its provenance were provable.
+    """
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -115,6 +128,39 @@ class PublicationService:
         )
         return published
 
+    async def resolve_published_source(
+        self, *, identity_id: str, version: int
+    ) -> DefinitionVersion:
+        """Resolve and VERIFY the exact definition version a publication names.
+
+        A published semantic package carries source_definition_id/version/
+        checksum.  With durable definitions that reference must resolve, and the
+        resolved exact version's checksum must equal the published one.  When it
+        does not (a legacy or externally written row, or a lost definition
+        store) this FAILS CLOSED with a typed error instead of returning a
+        package whose provenance cannot be proved.
+        """
+
+        published = await self._catalogue.get(identity_id, version)
+        if published is None:
+            raise PublicationSourceUnresolved("publication_version_not_found")
+        package = published.semantic
+        if package is None:
+            raise PublicationSourceUnresolved("publication_semantic_package_missing")
+        try:
+            exact = await self._definitions.get_exact_version(
+                owner_user_id=published.owner_user_id,
+                definition_id=package.source_definition_id,
+                version=package.source_definition_version,
+            )
+        except DefinitionNotFound as exc:
+            raise PublicationSourceUnresolved(
+                "publication_source_definition_missing"
+            ) from exc
+        if exact.checksum != package.source_definition_checksum:
+            raise PublicationSourceUnresolved("publication_source_checksum_mismatch")
+        return exact
+
     async def project_certified(
         self, *, identity_id: str, version: int, owner_user_id: str
     ) -> None:
@@ -148,5 +194,6 @@ __all__ = [
     "PublicationConflict",
     "PublicationNotEligible",
     "PublicationService",
+    "PublicationSourceUnresolved",
     "build_publication_service",
 ]

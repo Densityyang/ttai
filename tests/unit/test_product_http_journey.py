@@ -69,6 +69,71 @@ async def _fake_get_engine(engine: _JourneyEngine) -> _JourneyEngine:
     return engine
 
 
+class _JourneyAuthorization:
+    async def current_authorization(self, **_: object) -> Any:
+        from src.nl2sql.artifacts.definition_revalidation import AuthorizationEvidence
+
+        return AuthorizationEvidence(authorization_revision="rev-current")
+
+
+class _JourneyRelease:
+    async def active_release(self, **_: object) -> Any:
+        from src.nl2sql.artifacts.definition_revalidation import ActiveReleaseEvidence
+
+        return ActiveReleaseEvidence(release_id="rel-current", release_checksum="b" * 64)
+
+
+class _JourneySnapshot:
+    async def data_snapshot(self, **_: object) -> Any:
+        from src.nl2sql.artifacts.definition_revalidation import DataSnapshotEvidence
+
+        return DataSnapshotEvidence(
+            snapshot_id="snap-current", snapshot_checksum="c" * 64
+        )
+
+
+class _JourneyBudget:
+    async def remaining_budget(self, **_: object) -> int:
+        return 5
+
+
+class _JourneyFreshness:
+    async def assess(self, **kwargs: object) -> Any:
+        from src.nl2sql.artifacts.definition_revalidation import InputFreshnessDQ
+
+        resolved = kwargs["resolved_inputs"]
+        assert isinstance(resolved, tuple)
+        return tuple(
+            InputFreshnessDQ(
+                role=item.role,
+                metric_key=item.metric_key,
+                freshness="fresh",
+                dq="pass",
+                data_as_of=item.data_as_of,
+            )
+            for item in resolved
+        )
+
+
+def _journey_revalidation() -> Any:
+    """Current-state evidence for the controlled journey app.
+
+    The stock container's revalidation wiring is deferred to the C1 follow-up;
+    this keeps the journey's execute path provable with explicit evidence.
+    """
+
+    from src.nl2sql.artifacts.definition_revalidation import DefinitionRevalidationGate
+
+    return DefinitionRevalidationGate(
+        authorization_provider=_JourneyAuthorization(),
+        active_release_provider=_JourneyRelease(),
+        data_snapshot_provider=_JourneySnapshot(),
+        freshness_dq_provider=_JourneyFreshness(),
+        budget_provider=_JourneyBudget(),
+        governed_metric_authority=lambda _key: True,
+    )
+
+
 @pytest.fixture()
 def journey(monkeypatch: pytest.MonkeyPatch) -> Any:
     """One app instance, one container, controlled auth, local-real profile."""
@@ -92,6 +157,17 @@ def journey(monkeypatch: pytest.MonkeyPatch) -> Any:
         container = client.app.state.container
         container._local_real_readiness = {"status": "ready"}
         container.get_engine = lambda: _fake_get_engine(engine)
+        from src.nl2sql.artifacts.custom_definition_execution_service import (
+            CustomDefinitionExecutionService,
+        )
+
+        container._custom_definition_execution_service = (
+            CustomDefinitionExecutionService(
+                definitions=container.custom_definition_service(),
+                input_resolver=container.calculation_input_resolver(),
+                revalidation=_journey_revalidation(),
+            )
+        )
         refs: dict[str, tuple[str, str]] = {}
         for user in (ALICE, BOB, CERT_ADMIN):
             thread_id = str(uuid4())

@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import secrets
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from typing import Any, Final, Literal, cast
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.provider import (
@@ -18,8 +23,19 @@ from src.core.auth.provider import (
     resolve_authorization_context,
 )
 from src.core.auth.types import AuthUser
+from src.core.settings import get_settings
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import ErrorEnvelope, RequestContext, RequestIdentity, StrictContract
+from src.nl2sql.hitl_action_claims import (
+    HITLActionClaimInput,
+    HITLActionClaimResult,
+    HITLActionClaimStore,
+    HITLActionResponseSummary,
+    HITLContinuationStatus,
+    hitl_action_payload_checksum,
+    hitl_idempotency_key_checksum,
+)
+from src.nl2sql.orchestration.ad_hoc_request import AdHocCalculationRequest
 from src.nl2sql.orchestration.decision_contract import (
     HITLDecision,
     HITLRequest,
@@ -46,6 +62,15 @@ from src.nl2sql.ownership import runtime_config
 MAX_MESSAGE_BYTES = 8 * 1024
 MAX_MESSAGES = 20
 MAX_REQUEST_BYTES = 32 * 1024
+HISTORY_DEFAULT_PAGE_SIZE = 20
+HISTORY_MAX_PAGE_SIZE = 100
+HISTORY_MAX_CURSOR_CHARS = 4096
+HISTORY_MAX_RESPONSE_BYTES = 512 * 1024
+HISTORY_MAX_SNAPSHOT_BYTES = 64 * 1024
+HISTORY_MAX_MESSAGES_PER_SNAPSHOT = 100
+HISTORY_MAX_MESSAGE_BYTES = 8 * 1024
+_HISTORY_CURSOR_KEY_CONTEXT = b"ttai-v2-history-cursor-key-v1"
+_DEV_HISTORY_CURSOR_KEY = secrets.token_bytes(32)
 
 
 class QueryMessage(StrictContract):
@@ -69,6 +94,13 @@ class QueryRequest(StrictContract):
     # Present only when the user ACCEPTS a mode-switch suggestion: a switch
     # starts a NEW run on the SAME thread, carrying the prior run for lineage.
     switched_from_run_id: str | None = Field(default=None, min_length=1, max_length=64)
+    # OPTIONAL explicit run-scoped AD_HOC calculation carrier.  It is a STRICT
+    # typed request (no authority/lifecycle/canonical field), never a mode: the
+    # effective mode still comes from requested_mode, and an AD_HOC carrier is
+    # only executable when the run's capability grants run_scoped_derivation.
+    # The server validates and resolves it against the run's authorized context
+    # and fails closed with a stable code otherwise.
+    ad_hoc_calculation: AdHocCalculationRequest | None = None
 
     @model_validator(mode="after")
     def validate_total_size(self) -> "QueryRequest":
@@ -102,11 +134,26 @@ class StateSnapshot(StrictContract):
     checkpoint_id: str
     messages: list[MessageItem]
     created_at: str | None = None
+    messages_truncated: bool = False
 
 
 class ThreadHistoryResponse(StrictContract):
     thread_id: UUID
     snapshots: list[StateSnapshot]
+    limit: int = Field(default=HISTORY_DEFAULT_PAGE_SIZE, ge=1, le=HISTORY_MAX_PAGE_SIZE)
+    has_more: bool = False
+    next_cursor: str | None = None
+
+
+class _HistoryCursor(StrictContract):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    version: Literal[1] = 1
+    thread_id: UUID
+    owner_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    page_size: int = Field(ge=1, le=HISTORY_MAX_PAGE_SIZE)
+    anchor_checkpoint_id: str = Field(min_length=1, max_length=256)
+    before_checkpoint_id: str = Field(min_length=1, max_length=256)
 
 
 class ThreadActionRequest(StrictContract):
@@ -149,21 +196,7 @@ class ThreadActionResponse(StrictContract):
         "rejected",
         "cancelled",
     ] | None = None
-    continuation_status: Literal[
-        "resolved_pending_revalidation",
-        "resolved_pending_current_authorization",
-        "resolved_continuing_current_authorization",
-        "current_authorization_unavailable",
-        "current_authorization_denied",
-        "continuation_execution_plan_denied",
-        "continuation_stopped",
-        "revalidation_denied",
-        "awaiting_decision",
-        "choose_recorded_no_continuation",
-        "rejected",
-        "cancelled",
-        "invalid",
-    ] | None = None
+    continuation_status: HITLContinuationStatus | None = None
 
 
 class FeedbackRequest(StrictContract):
@@ -438,8 +471,184 @@ def _snapshot(thread_id: UUID, state: Any) -> StateSnapshot:
     )
 
 
+def _truncate_utf8_prefix(value: str, max_bytes: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _history_snapshot(thread_id: UUID, state: Any) -> StateSnapshot:
+    from src.nl2sql.api import extract_messages
+
+    values = getattr(state, "values", {})
+    config = getattr(state, "config", {})
+    metadata = getattr(state, "metadata", {})
+    checkpoint_id = config.get("configurable", {}).get("checkpoint_id", "")
+    created_at = metadata.get("created_at") if metadata else None
+    raw_messages = list(extract_messages(values))
+    messages_truncated = len(raw_messages) > HISTORY_MAX_MESSAGES_PER_SNAPSHOT
+    raw_messages = raw_messages[-HISTORY_MAX_MESSAGES_PER_SNAPSHOT:]
+    messages: list[MessageItem] = []
+    for item in raw_messages:
+        message = MessageItem.model_validate(item)
+        content, truncated = _truncate_utf8_prefix(
+            message.content,
+            HISTORY_MAX_MESSAGE_BYTES,
+        )
+        messages_truncated = messages_truncated or truncated
+        messages.append(MessageItem(role=message.role, content=content))
+
+    while True:
+        snapshot = StateSnapshot(
+            thread_id=thread_id,
+            checkpoint_id=str(checkpoint_id),
+            messages=messages,
+            created_at=str(created_at) if created_at else None,
+            messages_truncated=messages_truncated,
+        )
+        if len(snapshot.model_dump_json().encode("utf-8")) <= HISTORY_MAX_SNAPSHOT_BYTES:
+            return snapshot
+        messages_truncated = True
+        if len(messages) > 1:
+            # Keep the most recent messages when bounding one checkpoint projection.
+            messages = messages[1:]
+            continue
+        if messages and messages[0].content:
+            content, _ = _truncate_utf8_prefix(
+                messages[0].content,
+                max(1, len(messages[0].content.encode("utf-8")) // 2),
+            )
+            messages = [MessageItem(role=messages[0].role, content=content)]
+            continue
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="history snapshot exceeds response limit",
+        )
+
+
+def _history_cursor_key() -> bytes:
+    """Derive a cross-replica cursor key without exposing database credentials."""
+
+    settings = get_settings()
+    key_material = settings.checkpoint_database_url or settings.control_database_url
+    if not key_material:
+        if settings.service_mode == "product":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="history pagination unavailable",
+            )
+        # Local single-process development has no shared database secret. This
+        # ephemeral key keeps test/dev cursors tamper-evident without implying
+        # cross-process durability in infra-dev.
+        return _DEV_HISTORY_CURSOR_KEY
+    return hmac.new(
+        key_material.encode("utf-8"),
+        _HISTORY_CURSOR_KEY_CONTEXT,
+        hashlib.sha256,
+    ).digest()
+
+
+def _owner_fingerprint(user_id: int | str) -> str:
+    return hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()
+
+
+def _b64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _encode_history_cursor(cursor: _HistoryCursor) -> str:
+    payload = json.dumps(
+        cursor.model_dump(mode="json"),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    encoded_payload = _b64url_encode(payload)
+    signature = _b64url_encode(
+        hmac.new(_history_cursor_key(), encoded_payload.encode("ascii"), hashlib.sha256).digest()
+    )
+    token = f"{encoded_payload}.{signature}"
+    if len(token) > HISTORY_MAX_CURSOR_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="history pagination unavailable",
+        )
+    return token
+
+
+def _decode_history_cursor(
+    token: str,
+    *,
+    thread_id: UUID,
+    owner_user_id: int | str,
+) -> _HistoryCursor:
+    if len(token) > HISTORY_MAX_CURSOR_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="invalid history cursor",
+        )
+    try:
+        encoded_payload, signature = token.split(".", maxsplit=1)
+        if not encoded_payload or not signature:
+            raise ValueError("invalid cursor shape")
+        expected = _b64url_encode(
+            hmac.new(
+                _history_cursor_key(),
+                encoded_payload.encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        )
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("invalid cursor signature")
+        padding = "=" * (-len(encoded_payload) % 4)
+        payload_json = base64.urlsafe_b64decode(encoded_payload + padding)
+        cursor = _HistoryCursor.model_validate_json(payload_json)
+    except (UnicodeError, ValueError, TypeError, ValidationError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="invalid history cursor",
+        ) from None
+    if cursor.thread_id != thread_id or cursor.owner_fingerprint != _owner_fingerprint(owner_user_id):
+        # Match the route's non-owner behavior; a cursor is never an authority.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
+    return cursor
+
+
+def _config_at_checkpoint(config: RunnableConfig, checkpoint_id: str) -> RunnableConfig:
+    result = dict(config)
+    configurable = dict(cast(Mapping[str, object], result.get("configurable", {})))
+    configurable["checkpoint_id"] = checkpoint_id
+    result["configurable"] = configurable
+    return cast(RunnableConfig, result)
+
+
+async def _require_history_checkpoint(
+    engine: Any,
+    config: RunnableConfig,
+    *,
+    thread_id: UUID,
+    checkpoint_id: str,
+) -> None:
+    state_value = await engine.aget_state(_config_at_checkpoint(config, checkpoint_id))
+    if not state_value or not getattr(state_value, "values", None):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="history cursor stale")
+    if _snapshot(thread_id, state_value).checkpoint_id != checkpoint_id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="history cursor stale")
+
+
+def _history_response_bytes(response: ThreadHistoryResponse) -> int:
+    return len(response.model_dump_json().encode("utf-8"))
+
+
 _TYPED_RECORDED_STATUS: Final[dict[str, str]] = {
     "resolve": "resolved_pending_revalidation",
+    # Confirm is the typed form of the legacy approve alias and MUST map here
+    # too: the engine records it as resolved_pending_revalidation, so omitting it
+    # made every typed confirm unrecordable over HTTP (409) the moment something
+    # actually produced a confirmation request.  The two maps are the SAME
+    # vocabulary and must stay in step.
+    "confirm": "resolved_pending_revalidation",
     "choose": "choose_recorded_no_continuation",
     "reject": "rejected",
     "cancel": "cancelled",
@@ -460,6 +669,9 @@ _TYPED_CONTINUATION_STATUSES: Final[frozenset[str]] = frozenset(
         "rejected",
         "cancelled",
         "invalid",
+        # The typed, fail-closed outcome of a rejected in-place correction: a
+        # stable product-visible status instead of a misleading fallback.
+        "metric_plan_correction_rejected",
     }
 )
 
@@ -499,10 +711,90 @@ def _validated_typed_ledger_entry(
     return stored_request, stored_decision, stored_token, recorded_status
 
 
-def _typed_continuation_status(value: object, *, fallback: str) -> str:
+def _typed_continuation_status(
+    value: object, *, fallback: str
+) -> HITLContinuationStatus:
     if isinstance(value, str) and value in _TYPED_CONTINUATION_STATUSES:
-        return value
-    return fallback
+        return cast(HITLContinuationStatus, value)
+    return cast(HITLContinuationStatus, fallback)
+
+
+def _hitl_action_claim_store_from_request(request: Request) -> HITLActionClaimStore:
+    container = getattr(request.app.state, "container", None)
+    accessor = getattr(container, "get_hitl_action_claim_store", None)
+    if not callable(accessor):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action claim store unavailable",
+        )
+    try:
+        store = accessor()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action claim store unavailable",
+        ) from exc
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action claim store unavailable",
+        )
+    return cast(HITLActionClaimStore, store)
+
+
+def _claim_http_response(
+    *,
+    thread_id: UUID,
+    summary: HITLActionResponseSummary,
+    idempotent: bool,
+) -> ThreadActionResponse:
+    return ThreadActionResponse(
+        thread_id=thread_id,
+        target_type=summary.target_type,
+        status=summary.status,
+        version=summary.version,
+        idempotent=idempotent,
+        decision_status=summary.decision_status,
+        continuation_status=summary.continuation_status,
+    )
+
+
+async def _lookup_hitl_claim(
+    store: HITLActionClaimStore, claim: HITLActionClaimInput
+) -> HITLActionClaimResult | None:
+    try:
+        return await store.lookup(claim=claim)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action claim store unavailable",
+        ) from exc
+
+
+async def _claim_hitl_action(
+    store: HITLActionClaimStore, claim: HITLActionClaimInput
+) -> HITLActionClaimResult:
+    try:
+        return await store.claim(claim=claim)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action claim store unavailable",
+        ) from exc
+
+
+async def _complete_hitl_action(
+    store: HITLActionClaimStore,
+    claim: HITLActionClaimInput,
+    response: HITLActionResponseSummary,
+) -> None:
+    try:
+        await store.complete(claim=claim, response=response)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="action result persistence unavailable",
+        ) from exc
 
 
 async def _stream_query(
@@ -578,13 +870,18 @@ def register_v2_routes(app: FastAPI) -> None:
             switched_from_run_id=body.switched_from_run_id,
             envelope=envelope,
         )
-        result = await engine.ainvoke(
-            {
-                "messages": [message.model_dump() for message in body.messages],
-                "run_envelope": envelope.model_dump(mode="json"),
-            },
-            config,
-        )
+        graph_input: dict[str, object] = {
+            "messages": [message.model_dump() for message in body.messages],
+            "run_envelope": envelope.model_dump(mode="json"),
+        }
+        if body.ad_hoc_calculation is not None:
+            # Server-validated, authority-free carrier.  The engine resolves it
+            # against the run's authorized context and fails closed on any
+            # missing/ambiguous/catalog-bound input.
+            graph_input["ad_hoc_calculation"] = body.ad_hoc_calculation.model_dump(
+                mode="json"
+            )
+        result = await engine.ainvoke(graph_input, config)
         return QueryResponse(
             thread_id=thread_id,
             blocks=extract_blocks(result),
@@ -612,23 +909,28 @@ def register_v2_routes(app: FastAPI) -> None:
             switched_from_run_id=body.switched_from_run_id,
             envelope=envelope,
         )
+        extra_input: dict[str, object] = {
+            "run_envelope": envelope.model_dump(mode="json"),
+            "stream_metadata": {
+                "thread_id": str(thread_id),
+                "run_id": envelope.run_id,
+                "requested_mode": envelope.requested_mode,
+                "effective_mode": envelope.effective_mode,
+                "switched_from_run_id": envelope.switched_from_run_id,
+                "authority_provenance": _authority_provenance(request),
+            },
+        }
+        if body.ad_hoc_calculation is not None:
+            extra_input["ad_hoc_calculation"] = body.ad_hoc_calculation.model_dump(
+                mode="json"
+            )
         return StreamingResponse(
             _stream_query(
                 engine,
                 [message.model_dump() for message in body.messages],
                 config,
                 thread_id,
-                {
-                    "run_envelope": envelope.model_dump(mode="json"),
-                    "stream_metadata": {
-                        "thread_id": str(thread_id),
-                        "run_id": envelope.run_id,
-                        "requested_mode": envelope.requested_mode,
-                        "effective_mode": envelope.effective_mode,
-                        "switched_from_run_id": envelope.switched_from_run_id,
-                        "authority_provenance": _authority_provenance(request),
-                    },
-                },
+                extra_input,
             ),
             media_type="text/event-stream",
             headers={
@@ -654,18 +956,142 @@ def register_v2_routes(app: FastAPI) -> None:
     async def get_history(
         thread_id: UUID,
         request: Request,
+        limit: int = Query(
+            default=HISTORY_DEFAULT_PAGE_SIZE,
+            ge=1,
+            le=HISTORY_MAX_PAGE_SIZE,
+        ),
+        cursor: str | None = Query(default=None, max_length=HISTORY_MAX_CURSOR_CHARS),
         auth_user: AuthUser = Depends(require_nl2sql_permission),
     ) -> ThreadHistoryResponse:
         context = _request_context(request, auth_user, thread_id)
-        snapshots = [
-            _snapshot(thread_id, state_value)
-            async for state_value in (await _engine_from_request(request)).aget_state_history(
-                runtime_config(context)
+        engine = await _engine_from_request(request)
+        config = cast(RunnableConfig, runtime_config(context))
+        cursor_value: _HistoryCursor | None = None
+        before_config: RunnableConfig | None = None
+        anchor_checkpoint_id: str | None = None
+        if cursor is not None:
+            cursor_value = _decode_history_cursor(
+                cursor,
+                thread_id=thread_id,
+                owner_user_id=auth_user.user_id,
             )
-        ]
-        if not snapshots:
+            if "limit" in request.query_params and limit != cursor_value.page_size:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="history cursor limit mismatch",
+                )
+            page_size = cursor_value.page_size
+            anchor_checkpoint_id = cursor_value.anchor_checkpoint_id
+            await _require_history_checkpoint(
+                engine,
+                config,
+                thread_id=thread_id,
+                checkpoint_id=cursor_value.anchor_checkpoint_id,
+            )
+            await _require_history_checkpoint(
+                engine,
+                config,
+                thread_id=thread_id,
+                checkpoint_id=cursor_value.before_checkpoint_id,
+            )
+            before_config = _config_at_checkpoint(
+                config,
+                cursor_value.before_checkpoint_id,
+            )
+        else:
+            page_size = limit
+
+        # LangGraph's checkpointers order checkpoint_id DESC (newest first) and
+        # support a bounded `limit` plus an exclusive `before` checkpoint.
+        # Fetch one lookahead item only; never materialize the full history.
+        state_values: list[Any] = []
+        async for state_value in engine.aget_state_history(
+            config,
+            before=before_config,
+            limit=page_size + 1,
+        ):
+            state_values.append(state_value)
+            if len(state_values) >= page_size + 1:
+                break
+        if not state_values:
+            if cursor_value is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="history cursor stale",
+                )
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
-        return ThreadHistoryResponse(thread_id=thread_id, snapshots=snapshots)
+
+        has_lookahead = len(state_values) > page_size
+        candidates = state_values[:page_size]
+        snapshots: list[StateSnapshot] = []
+        for index, state_value in enumerate(candidates):
+            snapshot = _history_snapshot(thread_id, state_value)
+            candidate_snapshots = [*snapshots, snapshot]
+            if anchor_checkpoint_id is None:
+                anchor_checkpoint_id = candidate_snapshots[0].checkpoint_id
+            candidate_has_more = index + 1 < len(candidates) or has_lookahead
+            candidate_cursor = (
+                _encode_history_cursor(
+                    _HistoryCursor(
+                        thread_id=thread_id,
+                        owner_fingerprint=_owner_fingerprint(auth_user.user_id),
+                        page_size=page_size,
+                        anchor_checkpoint_id=anchor_checkpoint_id,
+                        before_checkpoint_id=snapshot.checkpoint_id,
+                    )
+                )
+                if candidate_has_more
+                else None
+            )
+            candidate_response = ThreadHistoryResponse(
+                thread_id=thread_id,
+                snapshots=candidate_snapshots,
+                limit=page_size,
+                has_more=candidate_has_more,
+                next_cursor=candidate_cursor,
+            )
+            if _history_response_bytes(candidate_response) > HISTORY_MAX_RESPONSE_BYTES:
+                if not snapshots:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="history snapshot exceeds response limit",
+                    )
+                break
+            snapshots.append(snapshot)
+
+        if not snapshots:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="history snapshot exceeds response limit",
+            )
+        has_more = len(snapshots) < len(candidates) or has_lookahead
+        next_cursor = (
+            _encode_history_cursor(
+                _HistoryCursor(
+                    thread_id=thread_id,
+                    owner_fingerprint=_owner_fingerprint(auth_user.user_id),
+                    page_size=page_size,
+                    anchor_checkpoint_id=anchor_checkpoint_id or snapshots[0].checkpoint_id,
+                    before_checkpoint_id=snapshots[-1].checkpoint_id,
+                )
+            )
+            if has_more
+            else None
+        )
+        response = ThreadHistoryResponse(
+            thread_id=thread_id,
+            snapshots=snapshots,
+            limit=page_size,
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
+        if _history_response_bytes(response) > HISTORY_MAX_RESPONSE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="history page exceeds response limit",
+            )
+        return response
 
     @router.post(
         "/threads/{thread_id}/actions",
@@ -685,10 +1111,7 @@ def register_v2_routes(app: FastAPI) -> None:
         context = await _resume_request_context(request, auth_user, thread_id)
         engine = await _engine_from_request(request)
         config = _runtime_config(context)
-        state_value = await engine.aget_state(config)
-        if not state_value or not getattr(state_value, "values", None):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
-        values = cast(dict[str, object], state_value.values)
+        claim_store = _hitl_action_claim_store_from_request(request)
 
         if body.target_type == "typed_decision":
             try:
@@ -698,12 +1121,55 @@ def register_v2_routes(app: FastAPI) -> None:
                     status_code=status.HTTP_409_CONFLICT,
                     detail="typed decision is invalid",
                 ) from exc
+            claim = HITLActionClaimInput(
+                owner_user_id=str(auth_user.user_id),
+                thread_id=thread_id,
+                pending_version=body.expected_version,
+                idempotency_key_sha256=hitl_idempotency_key_checksum(
+                    incoming.idempotency_key
+                ),
+                payload_sha256=hitl_action_payload_checksum(
+                    {
+                        "target_type": "typed_decision",
+                        "expected_version": body.expected_version,
+                        "decision": incoming.model_dump(mode="json"),
+                    }
+                ),
+            )
+            previous_claim = await _lookup_hitl_claim(claim_store, claim)
+            if previous_claim is not None:
+                if previous_claim.outcome == "replay":
+                    assert previous_claim.response is not None
+                    return _claim_http_response(
+                        thread_id=thread_id,
+                        summary=previous_claim.response,
+                        idempotent=True,
+                    )
+                if previous_claim.outcome == "conflict":
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="typed decision claim conflicts",
+                    )
+
+            state_value = await engine.aget_state(config)
+            if not state_value or not getattr(state_value, "values", None):
+                if previous_claim is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="typed decision is already being processed",
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="thread not found"
+                )
+            values = cast(dict[str, object], state_value.values)
+
             ledger = values.get("decision_ledger")
             existing = (
                 ledger.get(incoming.idempotency_key)
                 if isinstance(ledger, Mapping)
                 else None
             )
+            recorded_summary: HITLActionResponseSummary | None = None
             if existing is not None:
                 try:
                     stored_request, _, _, recorded_status = (
@@ -721,14 +1187,59 @@ def register_v2_routes(app: FastAPI) -> None:
                 continuation = _typed_continuation_status(
                     values.get("decision_status"), fallback=recorded_status
                 )
-                return ThreadActionResponse(
-                    thread_id=thread_id,
+                recorded_summary = HITLActionResponseSummary(
                     target_type="typed_decision",
                     status="recorded",
                     version=stored_request.version,
-                    idempotent=True,
                     decision_status=cast(Any, recorded_status),
                     continuation_status=cast(Any, continuation),
+                )
+                if previous_claim is not None and previous_claim.outcome == "in_progress":
+                    # The graph checkpoint proves the claimed action was
+                    # applied, but Control-PG completion may have been
+                    # interrupted. Persist only its safe result projection.
+                    await _complete_hitl_action(
+                        claim_store, claim, recorded_summary
+                    )
+                    return _claim_http_response(
+                        thread_id=thread_id,
+                        summary=recorded_summary,
+                        idempotent=True,
+                    )
+                if previous_claim is None:
+                    # A typed checkpoint ledger carries checksummed request
+                    # and decision identities, so an exact pre-migration replay
+                    # can be adopted without invoking the graph again.
+                    created_claim = await _claim_hitl_action(claim_store, claim)
+                    if created_claim.outcome == "replay":
+                        assert created_claim.response is not None
+                        return _claim_http_response(
+                            thread_id=thread_id,
+                            summary=created_claim.response,
+                            idempotent=True,
+                        )
+                    if created_claim.outcome == "conflict":
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="typed decision claim conflicts",
+                        )
+                    await _complete_hitl_action(
+                        claim_store, claim, recorded_summary
+                    )
+                    return _claim_http_response(
+                        thread_id=thread_id,
+                        summary=recorded_summary,
+                        idempotent=True,
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="typed decision is already being processed",
+                )
+
+            if previous_claim is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="typed decision is already being processed",
                 )
 
             if values.get("decision_status") != "awaiting_decision":
@@ -757,8 +1268,36 @@ def register_v2_routes(app: FastAPI) -> None:
                     detail="typed decision is stale or conflicting",
                 )
 
+            created_claim = await _claim_hitl_action(claim_store, claim)
+            if created_claim.outcome == "replay":
+                assert created_claim.response is not None
+                return _claim_http_response(
+                    thread_id=thread_id,
+                    summary=created_claim.response,
+                    idempotent=True,
+                )
+            if created_claim.outcome == "conflict":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="typed decision claim conflicts",
+                )
+            if created_claim.outcome == "in_progress":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="typed decision is already being processed",
+                )
+
             result = await engine.ainvoke(
-                Command(resume=incoming.model_dump(mode="json")), config
+                # The engine's typed-decision boundary is DENY-BY-DEFAULT: it
+                # consumes exactly the fields below and rebuilds request identity
+                # from the STORED request, so a forged payload cannot escalate.
+                # schema_version is part of the wire contract but is NOT one of
+                # those fields, so sending it made every production resume fail
+                # with typed_decision_unknown_field and never be recorded.
+                Command(
+                    resume=incoming.model_dump(mode="json", exclude={"schema_version"})
+                ),
+                config,
             )
             if not isinstance(result, dict):
                 raise HTTPException(
@@ -785,13 +1324,18 @@ def register_v2_routes(app: FastAPI) -> None:
             continuation = _typed_continuation_status(
                 result.get("decision_status"), fallback=recorded_status
             )
-            return ThreadActionResponse(
-                thread_id=thread_id,
+            response_summary = HITLActionResponseSummary(
                 target_type="typed_decision",
                 status="recorded",
                 version=stored_request.version,
                 decision_status=cast(Any, recorded_status),
                 continuation_status=cast(Any, continuation),
+            )
+            await _complete_hitl_action(claim_store, claim, response_summary)
+            return _claim_http_response(
+                thread_id=thread_id,
+                summary=response_summary,
+                idempotent=False,
             )
 
         if body.action is None or body.idempotency_key is None:
@@ -799,24 +1343,102 @@ def register_v2_routes(app: FastAPI) -> None:
                 status_code=status.HTTP_409_CONFLICT,
                 detail="legacy action payload is invalid",
             )
+        claim = HITLActionClaimInput(
+            owner_user_id=str(auth_user.user_id),
+            thread_id=thread_id,
+            pending_version=body.expected_version,
+            idempotency_key_sha256=hitl_idempotency_key_checksum(
+                body.idempotency_key
+            ),
+            payload_sha256=hitl_action_payload_checksum(
+                {
+                    "target_type": "legacy_hitl",
+                    "action": body.action,
+                    "expected_version": body.expected_version,
+                    "feedback": body.feedback,
+                }
+            ),
+        )
+        previous_claim = await _lookup_hitl_claim(claim_store, claim)
+        if previous_claim is not None:
+            if previous_claim.outcome == "replay":
+                assert previous_claim.response is not None
+                return _claim_http_response(
+                    thread_id=thread_id,
+                    summary=previous_claim.response,
+                    idempotent=True,
+                )
+            if previous_claim.outcome == "conflict":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="legacy action claim conflicts",
+                )
+
+        state_value = await engine.aget_state(config)
+        if not state_value or not getattr(state_value, "values", None):
+            if previous_claim is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="legacy action is already being processed",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="thread not found"
+            )
+        values = cast(dict[str, object], state_value.values)
+
         applied_actions = values.get("applied_actions", {})
+        prior: object | None = None
         if isinstance(applied_actions, dict):
             prior = applied_actions.get(body.idempotency_key)
+        if previous_claim is not None and previous_claim.outcome == "in_progress":
             if isinstance(prior, dict):
                 prior_status = prior.get("status")
                 prior_version = prior.get("version")
-                if isinstance(prior_status, str) and isinstance(prior_version, int):
-                    return ThreadActionResponse(
+                if prior_status in {"approved", "modified", "rejected", "cancelled"} and isinstance(prior_version, int):
+                    summary = HITLActionResponseSummary(
+                        status=cast(Any, prior_status), version=prior_version
+                    )
+                    await _complete_hitl_action(claim_store, claim, summary)
+                    return _claim_http_response(
                         thread_id=thread_id,
-                        status=cast(Literal["approved", "modified", "rejected", "cancelled"], prior_status),
-                        version=prior_version,
+                        summary=summary,
                         idempotent=True,
                     )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="legacy action is already being processed",
+            )
+        if isinstance(prior, dict):
+            # Legacy checkpoints store no request digest, so a checkpoint from
+            # before durable claims cannot prove that the same key had the
+            # same feedback/action. Refuse a speculative replay.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="legacy action replay cannot be verified",
+            )
         if values.get("hitl_status") != "awaiting_action":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="thread is not awaiting an action")
         version = values.get("hitl_version")
         if version != body.expected_version:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="action version is stale")
+        created_claim = await _claim_hitl_action(claim_store, claim)
+        if created_claim.outcome == "replay":
+            assert created_claim.response is not None
+            return _claim_http_response(
+                thread_id=thread_id,
+                summary=created_claim.response,
+                idempotent=True,
+            )
+        if created_claim.outcome == "conflict":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="legacy action claim conflicts",
+            )
+        if created_claim.outcome == "in_progress":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="legacy action is already being processed",
+            )
         legacy_payload = {
             "action": body.action,
             "idempotency_key": body.idempotency_key,
@@ -826,12 +1448,27 @@ def register_v2_routes(app: FastAPI) -> None:
         result = await engine.ainvoke(Command(resume=legacy_payload), config)
         result_status = result.get("hitl_status") if isinstance(result, dict) else None
         result_version = result.get("hitl_version") if isinstance(result, dict) else None
-        if result_status not in {"approved", "modified", "rejected", "cancelled"} or not isinstance(result_version, int):
+        # An approval that revalidated CURRENT authorization and continued into
+        # governed execution reports "approved_continuing"; the legacy wire
+        # status stays "approved" so the response shape is unchanged.
+        response_status = (
+            "approved"
+            if result_status == "approved_continuing"
+            else result_status
+            if result_status in {"approved", "modified", "rejected", "cancelled"}
+            else None
+        )
+        if response_status is None or not isinstance(result_version, int):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="action was not applied")
-        return ThreadActionResponse(
-            thread_id=thread_id,
-            status=cast(Literal["approved", "modified", "rejected", "cancelled"], result_status),
+        response_summary = HITLActionResponseSummary(
+            status=cast(Literal["approved", "modified", "rejected", "cancelled"], response_status),
             version=result_version,
+        )
+        await _complete_hitl_action(claim_store, claim, response_summary)
+        return _claim_http_response(
+            thread_id=thread_id,
+            summary=response_summary,
+            idempotent=False,
         )
 
     @router.post("/feedback", status_code=status.HTTP_202_ACCEPTED)
@@ -889,13 +1526,27 @@ def register_v2_routes(app: FastAPI) -> None:
     # Bounded product routers: the Definition/Publication and Library product
     # surfaces are registered separately so this module does not become a
     # monolith.  Both use the SAME server-side permission dependency.
+    from src.nl2sql.artifacts.api_artifacts import register_artifact_routes
     from src.nl2sql.artifacts.api_conflicts import register_conflict_routes
     from src.nl2sql.artifacts.api_definitions import register_definition_routes
+    from src.nl2sql.artifacts.api_exploration_confirmations import (
+        register_exploration_confirmation_routes,
+    )
     from src.nl2sql.artifacts.api_library import register_library_routes
 
     register_definition_routes(app)
     register_library_routes(app)
     register_conflict_routes(app)
+    # The result-artifact surface is its OWN product router, mounted next to the
+    # others rather than inside the Definition router: saving a result artifact
+    # is an artifact operation (A3) and must never be reachable through the
+    # definition lifecycle.
+    register_artifact_routes(app)
+    # The run-scoped EXPLORATION confirmation surface is likewise its OWN product
+    # router: it is mounted here so the §8.16 P7B "an exploration confirmation
+    # never stands in for a definition confirmation" invariant is reachable by a
+    # real caller instead of being true only inside a unit test.
+    register_exploration_confirmation_routes(app)
 
 
 def register_v1_gone_routes(app: FastAPI) -> None:

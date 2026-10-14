@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, cast
 
 import pytest
@@ -62,12 +63,30 @@ class _Connection:
 
 
 class _UnavailableAudit:
-    async def record_sql_start(self, trace_id: str, sql: str) -> None:
-        del trace_id, sql
+    async def record_sql_start(
+        self,
+        trace_id: str,
+        sql: str,
+        *,
+        execution_id: str,
+    ) -> None:
+        del trace_id, sql, execution_id
         raise RuntimeError("control database down")
 
-    async def record_sql_result(self, **kwargs: Any) -> None:
-        del kwargs
+    async def record_sql_result(
+        self,
+        trace_id: str,
+        sql: str,
+        *,
+        execution_id: str,
+        accepted: bool,
+        row_count: int,
+        elapsed_ms: float,
+        error_code: str | None,
+        source_snapshot_fingerprint: str | None,
+    ) -> None:
+        del trace_id, sql, execution_id, accepted, row_count, elapsed_ms, error_code
+        del source_snapshot_fingerprint
 
 
 class _Pool:
@@ -89,18 +108,45 @@ async def test_control_audit_writes_event_and_outbox_without_raw_sql() -> None:
     connection = _Connection()
     store = ControlAuditStore(connection)
 
-    await store.record_sql_start("trace-1", "SELECT * FROM customers WHERE password = 'secret'")
+    await store.record_sql_start(
+        "trace-1",
+        "SELECT * FROM customers WHERE password = 'secret'",
+        execution_id="query-execution-1",
+    )
+    await store.record_sql_result(
+        "trace-1",
+        "SELECT * FROM customers WHERE password = 'secret'",
+        execution_id="query-execution-1",
+        accepted=True,
+        row_count=2,
+        elapsed_ms=3.5,
+        error_code=None,
+        source_snapshot_fingerprint="a" * 64,
+    )
 
-    assert len(connection.calls) == 2
-    event_args = connection.calls[0][1]
-    assert event_args[2] == "sql"
-    assert "SELECT" not in str(event_args)
+    assert len(connection.calls) == 4
+    start_args = connection.calls[0][1]
+    finish_args = connection.calls[2][1]
+    assert start_args[2] == finish_args[2] == "sql"
+    assert "SELECT" not in str(start_args)
+    assert "SELECT" not in str(finish_args)
+    start_payload = json.loads(cast(str, start_args[5]))
+    finish_payload = json.loads(cast(str, finish_args[5]))
+    assert start_payload["query_execution_id"] == "query-execution-1"
+    assert finish_payload["query_execution_id"] == "query-execution-1"
+    assert finish_payload["source_snapshot_fingerprint"] == "a" * 64
     assert connection.calls[1][1][3] == "nl2sql.trace"
-    # Both rows are written on one acquired connection inside one transaction.
-    assert connection.acquired == 1
-    assert connection.transactions == 1
+    assert connection.calls[3][1][3] == "nl2sql.trace"
+    # Each lifecycle event and its outbox row share one acquired connection.
+    assert connection.acquired == 2
+    assert connection.transactions == 2
     assert connection.rolled_back is False
-    assert connection.durable == ["audit_events", "audit_outbox"]
+    assert connection.durable == [
+        "audit_events",
+        "audit_outbox",
+        "audit_events",
+        "audit_outbox",
+    ]
 
 
 @pytest.mark.asyncio

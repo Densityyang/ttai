@@ -7,8 +7,10 @@ only through a validated typed plan after routing and budget selection.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Mapping
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -31,6 +33,7 @@ from src.nl2sql.contracts import (
     ModelRequest,
     PlanExecutionRecord,
     PlanValidationRecord,
+    ProductMode,
     QueryPlan,
     RequestIdentity,
     RouteName,
@@ -47,6 +50,12 @@ from src.nl2sql.infra.llm.gateway import (
 )
 from src.nl2sql.observability.content_policy import scrub_text, scrub_value
 from src.nl2sql.observability.trace import TraceEnvelope, TraceEvent, fingerprint
+from src.nl2sql.orchestration.ad_hoc_request import (
+    AdHocCalculationRequest,
+    AdHocRequestError,
+    ResolvedAdHocCalculation,
+    resolve_ad_hoc_request,
+)
 from src.nl2sql.orchestration.analysis_evidence import (
     AnalysisEvidenceError,
     AnalysisInterpretation,
@@ -63,10 +72,13 @@ from src.nl2sql.orchestration.budget import (
 )
 from src.nl2sql.orchestration.decision_contract import (
     FORBIDDEN_DECISION_FIELDS,
+    RESERVED_SLOT_NAMES,
     HITLDecision,
     HITLRequest,
+    ResolutionOption,
     ResumeToken,
     clarification_request,
+    metric_plan_confirmation_request,
     revalidate_decision,
     revalidate_request,
     revalidate_resume_token,
@@ -79,7 +91,11 @@ from src.nl2sql.orchestration.deterministic_query_plan import (
 )
 from src.nl2sql.orchestration.execution import PlanExecutor
 from src.nl2sql.orchestration.grounding import GroundedAnswer, ground_execution_answer
-from src.nl2sql.orchestration.mode_contract import ModeCapabilityOutcome, RunEnvelope
+from src.nl2sql.orchestration.mode_contract import (
+    ModeCapabilityOutcome,
+    RunEnvelope,
+    capabilities_for_mode,
+)
 from src.nl2sql.orchestration.planning import (
     ContextResolver,
     DeterministicQueryUnsupported,
@@ -97,6 +113,10 @@ from src.nl2sql.ownership import (
     authorization_context_from_config,
     evaluate_authorization,
 )
+from src.nl2sql.semantic.calculation_contract import (
+    CalculationExecutionBinding,
+    CalculationSpec,
+)
 from src.nl2sql.supervisor.schemas import (
     ProvenanceAuthorityBlock,
     ProvenanceBlock,
@@ -108,6 +128,17 @@ logger = logging.getLogger(__name__)
 
 _TRACE_SINK_TIMEOUT_SECONDS = 0.25
 _INVALID_REQUEST_ELAPSED_MS = 120_000
+
+
+def _utc_now() -> datetime:
+    """The single wall-clock read of the run/deadline/human-wait accounting.
+
+    Production always evaluates it to the real UTC clock.  It exists as a named
+    seam so the §4.3 human-wait accounting can be driven deterministically
+    (suspend, advance the clock past the deadline, resume) without sleeping.
+    """
+
+    return datetime.now(UTC)
 
 
 class V2EngineState(TypedDict):
@@ -180,16 +211,64 @@ class V2EngineState(TypedDict):
     # Set when a deterministic provider reported it cannot serve a QUERY request,
     # so after_plan routes to the capability node instead of failing the run.
     mode_capability_pending: NotRequired[bool]
+    # Server-validated, authority-free run-scoped AD_HOC calculation carrier.
+    # Present ONLY for an explicit noncanonical derivation request.  compile_node
+    # resolves it against the run's authorized context under an EXPLICIT
+    # run_scoped_derivation capability gate and fails closed with a stable code.
+    # It never enters the Custom Definition lifecycle (A4) and never grants
+    # canonical authority.  Declared here so the key survives graph state.
+    ad_hoc_calculation: NotRequired[dict[str, object] | None]
+    # Set once the EXPLICIT formula carrier has been confirmed BY THE USER for
+    # this run (decision_kind="metric_plan_confirmation").  The confirmation is
+    # required even when the formula and the question-resolved plan AGREE, so it
+    # is requested exactly once and a confirmed run never re-suspends.
+    ad_hoc_confirmation_satisfied: NotRequired[bool]
+    # --- §4.3 human-wait accounting -------------------------------------------
+    # Human waiting MUST NOT consume the calculation deadline.  The instant the
+    # run suspended for a human decision and the TOTAL wait already accumulated
+    # by this run are DECLARED state fields so LangGraph persists them across the
+    # checkpoint boundary (an undeclared key is silently dropped).  A missing or
+    # unparseable record deducts NOTHING - the stricter, un-deducted deadline
+    # applies (fail-closed).
+    human_wait_started_at: NotRequired[str | None]
+    human_wait_ms: NotRequired[int]
+    human_wait_last_resumed_at: NotRequired[str | None]
 
 
 class TraceSink(Protocol):
     async def append(self, event: TraceEvent) -> None: ...
 
 
+def _factory_accepts_capabilities(factory: Any) -> bool:
+    """Whether a runtime factory declares the capabilities parameter.
+
+    The engine passes THIS run's explicit capability set to a factory that
+    declares the parameter.  A factory that predates the parameter is invoked
+    exactly as before, so it can never be handed a fabricated capability set;
+    its runtime consequently injects no AD_HOC runner and an AD_HOC carrier
+    fails closed.  This is a signature compatibility seam only: it grants
+    nothing and it is never a substitute for the capability gate.
+    """
+
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        return False
+    if "capabilities" in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
 class TypedRuntimeFactory(Protocol):
     """Application-scoped CALLABLE; its output is constructed per request.
 
     The engine stores this callable (deployment-scoped) and nothing it returns.
+    capabilities is the effective mode's EXPLICIT capability set for THIS run:
+    a factory that declares it injects the AD_HOC runner only when the set
+    grants run_scoped_derivation.
     """
 
     async def __call__(
@@ -198,6 +277,7 @@ class TypedRuntimeFactory(Protocol):
         identity: RequestIdentity,
         authorization: AuthorizationContext | None,
         expected_revision: str | None,
+        capabilities: frozenset[str] = frozenset(),
     ) -> "TypedRuntimeBundle | TypedRuntimeUnavailable": ...
 
 
@@ -209,10 +289,13 @@ class _RequestTypedScope:
     authorization or compiler survives a request in AppContainer or the graph.
     """
 
-    __slots__ = ("_factory", "_resolved", "runtime")
+    __slots__ = ("_accepts_capabilities", "_factory", "_resolved", "runtime")
 
     def __init__(self, factory: TypedRuntimeFactory) -> None:
         self._factory = factory
+        # Computed ONCE per invocation: legacy factories are called without the
+        # capability set rather than being handed a fabricated one.
+        self._accepts_capabilities = _factory_accepts_capabilities(factory)
         self._resolved = False
         # Protocol-typed: the engine knows ONLY TypedRuntimeBundle, so a demo
         # runtime is accepted exactly like the production one.
@@ -224,16 +307,25 @@ class _RequestTypedScope:
         identity: RequestIdentity,
         authorization: AuthorizationContext | None,
         expected_revision: str | None,
+        capabilities: frozenset[str] = frozenset(),
     ) -> TypedRuntimeBundle | TypedRuntimeUnavailable:
         if self._resolved:
             assert self.runtime is not None
             return self.runtime
         self._resolved = True
-        self.runtime = await self._factory(
-            identity=identity,
-            authorization=authorization,
-            expected_revision=expected_revision,
-        )
+        if self._accepts_capabilities:
+            self.runtime = await self._factory(
+                identity=identity,
+                authorization=authorization,
+                expected_revision=expected_revision,
+                capabilities=capabilities,
+            )
+        else:
+            self.runtime = await self._factory(
+                identity=identity,
+                authorization=authorization,
+                expected_revision=expected_revision,
+            )
         return self.runtime
 
 
@@ -371,11 +463,117 @@ def create_v2_engine(
             return plan_executor
         return _request_runtime().plan_executor
 
+    async def _continuation_runtime(
+        state: V2EngineState,
+    ) -> tuple[
+        AuthorizationContext | None, TypedRuntimeBundle | None, str | None
+    ]:
+        """Rebuild the request-scoped typed runtime under CURRENT authorization.
+
+        A resume invocation never re-runs the ``typed_runtime`` node, so the
+        per-invocation memo cell is empty.  Continuation therefore resolves the
+        CURRENT trusted authorization from the server-side carrier and invokes
+        the SAME factory the initial request used with ``expected_revision=None``,
+        so a past authorization snapshot never grants future permission.  The
+        rebuilt runtime is memoized in this invocation's scope, which is what the
+        compile/execute nodes read afterwards.  Nothing from the client
+        participates.
+        """
+
+        if typed_runtime_factory is None:
+            return None, None, "current_authorization_runtime_missing"
+        current = _resolve_current_backend_authorization()
+        if current is None:
+            return None, None, "current_authorization_unavailable"
+        try:
+            identity = _request_identity()
+        except ValueError:
+            return current, None, "current_authorization_identity_invalid"
+        scope = _REQUEST_TYPED_SCOPE.get()
+        if scope is None:
+            return current, None, "current_authorization_runtime_missing"
+        runtime = await scope.resolve(
+            identity=identity,
+            authorization=current,
+            expected_revision=None,
+            capabilities=_state_capabilities(state),
+        )
+        if isinstance(runtime, TypedRuntimeUnavailable):
+            return current, None, runtime.reason
+        return current, runtime, None
+
+    async def _approved_continuation(
+        state: V2EngineState, result: dict[str, object]
+    ) -> dict[str, object]:
+        """Continue a legacy approval into governed execution when provable.
+
+        The recorded approval is only a decision; the RESULT must come from the
+        revalidated compile/execute path.  Continuation therefore requires a
+        restored, ALLOWED typed plan AND CURRENT authorization re-resolved from
+        the trusted server-side carrier - never the run-bound snapshot.  Every
+        unprovable case fails closed with NOTHING executed.
+        """
+
+        if not typed_pipeline_enabled or not _continuable_legacy_plan(state):
+            result["messages"] = [
+                AIMessage(
+                    content=(
+                        "The approval was recorded, but this deployment cannot "
+                        "continue into governed execution. No business operation "
+                        "was executed."
+                    )
+                )
+            ]
+            result["stop_reason"] = "continuation_unavailable"
+            result["degradation_flags"] = _degradation_flags(
+                state, "ContinuationUnavailable"
+            )
+            return result
+
+        def _stopped(reason: str) -> dict[str, object]:
+            result["messages"] = [
+                AIMessage(
+                    content=(
+                        "The approval was recorded, but current authorization "
+                        "does not permit continuation. Nothing was executed."
+                        if reason != "current_authorization_unavailable"
+                        else "The approval was recorded, but current "
+                        "authorization is unavailable. Nothing was executed."
+                    )
+                )
+            ]
+            result["stop_reason"] = reason
+            result["hitl_status"] = "approved"
+            result["needs_hitl"] = False
+            result["degradation_flags"] = _degradation_flags(
+                state, "ContinuationAuthorizationUnavailable"
+            )
+            return result
+
+        if typed_runtime_factory is not None:
+            current, runtime, failure = await _continuation_runtime(state)
+            if runtime is None:
+                return _stopped(failure or "current_authorization_unavailable")
+        else:
+            current = _resolve_current_backend_authorization()
+        if current is None:
+            # Defensive: neither branch may continue without CURRENT authority.
+            return _stopped("current_authorization_unavailable")
+        # The CURRENT revision (never the run-bound snapshot) is what the
+        # execution evidence must carry.
+        result["authorization_context"] = current.model_dump(mode="json")
+        result["authorization_revision"] = current.authorization_revision
+        result["hitl_status"] = "approved_continuing"
+        result["continuation_ready"] = True
+        # The pending plan text is NOT the result; compile/execute produce it.
+        result["messages"] = []
+        return result
+
     graph = StateGraph(V2EngineState)
 
     async def receive_node(state: V2EngineState) -> dict[str, object]:
         question = _question(state)
-        request_started_at = datetime.now(UTC).isoformat()
+        request_started_at = _utc_now().isoformat()
         trace = TraceEnvelope(trace_id=_trace_id(state))
         trace.record(
             "query",
@@ -426,6 +624,10 @@ def create_v2_engine(
             "continuation_ready": False,
             "trace_events": _events(trace),
             "request_started_at": request_started_at,
+            "ad_hoc_confirmation_satisfied": False,
+            "human_wait_started_at": None,
+            "human_wait_ms": 0,
+            "human_wait_last_resumed_at": None,
         }
 
     async def typed_runtime_node(state: V2EngineState) -> dict[str, object]:
@@ -463,6 +665,10 @@ def create_v2_engine(
                     identity=identity,
                     authorization=authorization,
                     expected_revision=_bound_authorization_revision(state),
+                    # EXPLICIT capability gate: the run's effective mode decides
+                    # whether the AD_HOC runner may be injected.  A missing or
+                    # unrecognized mode yields the empty set (fail closed).
+                    capabilities=_state_capabilities(state),
                 )
         if isinstance(runtime_or_unavailable, TypedRuntimeUnavailable):
             trace.record(
@@ -761,6 +967,9 @@ def create_v2_engine(
                     "decision_status": "awaiting_decision",
                     "decision_version": request.version,
                     "needs_hitl": False,
+                    # §4.3: the human-wait interval OPENS here and is closed (and
+                    # deducted from the calculation deadline) on resume.
+                    "human_wait_started_at": _utc_now().isoformat(),
                 }
             )
         elif validation.outcome != "allow":
@@ -887,21 +1096,143 @@ def create_v2_engine(
             route=route,
             policy=resolved_budget_policy,
         )
+        carrier_raw = state.get("ad_hoc_calculation")
+        if carrier_raw is not None:
+            # EXPLICIT capability gate.  This run's effective mode must confer
+            # run_scoped_derivation before an AD_HOC carrier is even parsed; a
+            # capability-less/unknown run fails closed HERE with nothing
+            # compiled and nothing executed.
+            if "run_scoped_derivation" not in _state_capabilities(state):
+                stop_reason = route_budget.halt(
+                    "ad_hoc_calculation_capability_denied"
+                )
+                trace.record(
+                    "policy",
+                    "ad_hoc_calculation_capability_denied",
+                    effective_mode=_effective_mode(state),
+                    route=route,
+                )
+                await _persist_new_events(trace_sink, trace.events[-1:])
+                return {
+                    "messages": [
+                        AIMessage(
+                            content=(
+                                "This run's mode does not permit a run-scoped "
+                                "derivation. Nothing was executed."
+                            )
+                        )
+                    ],
+                    "budget_record": route_budget.checkpoint_record().model_dump(
+                        mode="json"
+                    ),
+                    "stop_reason": stop_reason,
+                    "degradation_flags": _degradation_flags(
+                        state, "AdHocCalculationCapabilityDenied"
+                    ),
+                    "trace_events": _events(trace),
+                }
+            # The run-scoped SQL allowance is now committed: audit it ONCE so
+            # "why was this run allowed to fetch more than the route limit?" is
+            # traceable.  Validation and execution read the SAME ledger.
+            _record_ad_hoc_budget_allowance(
+                state, trace, route=route, budget=route_budget
+            )
         try:
             context = _context_bundle(state)
             query_plan = _query_plan(state)
             query_validation = _plan_validation(state, "query_plan_validation")
-            execution_plan = resolved_plan_compiler.compile(
-                plan=query_plan,
-                context=context,
-                validation=query_validation,
-            )
+            if carrier_raw is not None:
+                # The resolver already performs EVERY compile_ad_hoc
+                # precondition, so it is not repeated here: the carrier is
+                # validated/resolved against the SAME catalog the compiler owns
+                # and only then compiled.  A rejection is fail-closed.
+                carrier = AdHocCalculationRequest.model_validate(carrier_raw)
+                confirmation_satisfied = bool(
+                    state.get("ad_hoc_confirmation_satisfied")
+                )
+                resolved_ad_hoc, refusal = _resolve_ad_hoc_for_confirmation(
+                    carrier,
+                    context=context,
+                    plan=query_plan,
+                    catalog=resolved_plan_compiler.calculation_catalog,
+                )
+                if refusal is not None or (
+                    resolved_ad_hoc is None and confirmation_satisfied
+                ):
+                    # A structural / authority-class refusal - or an ALIGNMENT
+                    # refusal the user already confirmed - stays a fail-closed
+                    # stop BEFORE anything is compiled or executed.
+                    raise AdHocRequestError(refusal or _AD_HOC_SOURCE_PLAN_MISMATCH)
+                if not confirmation_satisfied:
+                    # P6-B: an EXPLICIT formula is confirmed BY THE USER exactly
+                    # once, even when it agrees with the question-resolved plan.
+                    # Nothing is compiled and nothing is executed yet; the
+                    # suspension runs through the EXISTING typed decision node.
+                    suspended = _ad_hoc_confirmation_suspended(
+                        state,
+                        trace,
+                        plan=query_plan,
+                        context=context,
+                        validation=query_validation,
+                        carrier=carrier,
+                        resolved=resolved_ad_hoc,
+                    )
+                    suspended["budget_record"] = (
+                        route_budget.checkpoint_record().model_dump(mode="json")
+                    )
+                    await _persist_new_events(trace_sink, trace.events[-1:])
+                    return suspended
+                assert resolved_ad_hoc is not None
+                execution_plan = resolved_plan_compiler.compile_ad_hoc(
+                    plan=query_plan,
+                    context=context,
+                    validation=query_validation,
+                    calculation_spec=resolved_ad_hoc.spec,
+                    execution_binding=resolved_ad_hoc.binding,
+                )
+            else:
+                execution_plan = resolved_plan_compiler.compile(
+                    plan=query_plan,
+                    context=context,
+                    validation=query_validation,
+                )
             execution_validation = resolved_plan_validator.validate_execution_plan(
                 execution_plan=execution_plan,
                 query_plan=query_plan,
                 context=context,
                 route_budget=route_budget.limits,
             )
+        except AdHocRequestError as exc:
+            # A stable request-entry rejection code goes STRAIGHT to stop_reason.
+            # This is the AD_HOC analogue of the compilation-failure branch and
+            # is deliberately not collapsed into it: the exact refusal is the
+            # product-visible reason and NOTHING is executed.
+            stop_reason = route_budget.halt(exc.code)
+            trace.record(
+                "policy",
+                "ad_hoc_calculation_rejected",
+                code=exc.code,
+                route=route,
+            )
+            await _persist_new_events(trace_sink, trace.events[-1:])
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "The run-scoped calculation request was not "
+                            "permitted. Nothing was executed."
+                        )
+                    )
+                ],
+                "budget_record": route_budget.checkpoint_record().model_dump(
+                    mode="json"
+                ),
+                "stop_reason": stop_reason,
+                "degradation_flags": _degradation_flags(
+                    state, "AdHocCalculationRejected"
+                ),
+                "trace_events": _events(trace),
+            }
         except Exception as exc:
             stop_reason = route_budget.halt("execution_plan_compilation_failed")
             trace.record(
@@ -978,24 +1309,51 @@ def create_v2_engine(
         return result
 
     async def execute_node(state: V2EngineState) -> dict[str, object]:
-        # Local name intentionally mirrors the static collaborator so the
-        # database-execution allowlist keeps one stable receiver (executor.execute
-        # would be a second, unlisted call site).
-        plan_executor = _typed_plan_executor()
         trace = _trace(state)
-        route = _route(state)
-        route_budget = _route_budget_from_state(
-            state,
-            route=route,
-            policy=resolved_budget_policy,
-        )
-        query_plan = _query_plan(state)
+        try:
+            # Local name intentionally mirrors the static collaborator so the
+            # database-execution allowlist keeps one stable receiver
+            # (executor.execute would be a second, unlisted call site).
+            plan_executor = _typed_plan_executor()
+            route = _route(state)
+            route_budget = _route_budget_from_state(
+                state,
+                route=route,
+                policy=resolved_budget_policy,
+            )
+        except (RuntimeError, ValueError):
+            # FAIL CLOSED: a missing route decision or an unavailable
+            # request-scoped runtime must never crash the graph.  Nothing is
+            # executed and the run stops with an explicit reason.
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "Execution could not continue because the active "
+                            "execution route is unavailable. Nothing was executed."
+                        )
+                    )
+                ],
+                "stop_reason": "active_execution_route_unavailable",
+                "degradation_flags": _degradation_flags(
+                    state, "ActiveExecutionRouteUnavailable"
+                ),
+            }
+        if state.get("ad_hoc_calculation") is not None:
+            # Execution re-derives the SAME ledger validation saw; audit the
+            # run-scoped allowance here too (idempotent: one event per run).
+            _record_ad_hoc_budget_allowance(
+                state, trace, route=route, budget=route_budget
+            )
         context = _context_bundle(state)
         execution_plan = _execution_plan(state)
         execution_validation = _plan_validation(
             state,
             "execution_plan_validation",
         )
+        # Continuation compiles against the RESOLVED plan, so execution must
+        # validate against that same active plan - never a stale original plan.
+        query_plan = _active_execution_query_plan(state, execution_validation)
         if (
             execution_validation.outcome != "allow"
             or execution_validation.query_plan_sha256 != query_plan.checksum
@@ -1083,17 +1441,41 @@ def create_v2_engine(
                         if receipt.source_checkpoint is not None
                     )
                 )
+                # A noncanonical run-scoped derivation is identified by an
+                # AD_HOC fact: no canonical metric key and a derived output id.
+                # Its provenance MUST name the noncanonical scope and the
+                # derived identities, and it may legitimately carry NO metric
+                # key.  The canonical path stays byte-identical to before.
+                ad_hoc_fact_present = any(
+                    fact.metric_key is None and fact.derived_output_id is not None
+                    for fact in grounded.facts
+                )
+                metric_keys = tuple(
+                    dict.fromkeys(
+                        fact.metric_key
+                        for fact in grounded.facts
+                        if fact.metric_key is not None
+                    )
+                )
                 response_blocks.append(
                     ProvenanceBlock(
                         evidence_checksum=fingerprint(
                             grounded.artifact.model_dump_json()
                         ),
-                        metric_keys=tuple(
-                            dict.fromkeys(
-                                fact.metric_key
-                                for fact in grounded.facts
-                                if fact.metric_key is not None
+                        metric_keys=metric_keys,
+                        derived_output_ids=(
+                            tuple(
+                                dict.fromkeys(
+                                    fact.derived_output_id
+                                    for fact in grounded.facts
+                                    if fact.derived_output_id is not None
+                                )
                             )
+                            if ad_hoc_fact_present
+                            else ()
+                        ),
+                        calculation_scope=(
+                            "ad_hoc_noncanonical" if ad_hoc_fact_present else None
                         ),
                         analysis_window=ProvenanceTimeRangeBlock(
                             start=query_plan.time_range.start.isoformat(),
@@ -1689,6 +2071,9 @@ def create_v2_engine(
                     "applied_actions": {},
                     "authorization_context": authorization_snapshot,
                     "authorization_revision": authorization_revision,
+                    # §4.3: the human-wait interval OPENS when the run suspends
+                    # for the approval and is closed on resume.
+                    "human_wait_started_at": _utc_now().isoformat(),
                 }
             )
         else:
@@ -1756,13 +2141,18 @@ def create_v2_engine(
         else:
             content = f"Request {action_status}. No business SQL was executed."
         applied_actions[idempotency_key] = {"status": action_status, "version": version + 1}
-        return {
+        result: dict[str, object] = {
             "messages": [AIMessage(content=content)],
             "hitl_status": action_status,
             "hitl_version": version + 1,
             "needs_hitl": False,
             "applied_actions": applied_actions,
         }
+        if action != "approve":
+            # ONLY an approval can continue.  modify/reject/cancel keep their
+            # terminal behavior and never execute business work.
+            return _human_wait_recorded(state, result)
+        return await _approved_continuation(state, _human_wait_recorded(state, result))
 
     async def decision_node(state: V2EngineState) -> dict[str, object]:
         """Typed clarification / decision suspension.
@@ -1796,6 +2186,14 @@ def create_v2_engine(
                 "allowed_actions": list(stored.allowed_actions),
                 "unresolved_slots": list(stored.unresolved_slots),
                 "issue_codes": list(stored.issue_codes),
+                # The correction surface, when this request has one: each
+                # bindable formula role plus the ALREADY-AUTHORIZED candidates it
+                # may be re-bound to.  Display + machine-readable, never
+                # authority: every choice is re-validated at continuation.
+                "resolution_options": [
+                    option.model_dump(mode="json")
+                    for option in stored.resolution_options
+                ],
                 "safe_summary": stored.safe_summary,
             }
             if failure is not None:
@@ -1807,10 +2205,175 @@ def create_v2_engine(
             entry = _typed_decision_ledger_entry(state, decision.idempotency_key)
             if entry is not None:
                 if _typed_decision_replays(entry, stored, decision):
-                    return _typed_decision_replay_result(state, entry, decision)
+                    return _human_wait_recorded(
+                        state, _typed_decision_replay_result(state, entry, decision)
+                    )
                 failure = "typed_decision_idempotency_conflict"
                 continue
-            return _record_typed_decision(state, stored, decision)
+            return _human_wait_recorded(
+                state, _record_typed_decision(state, stored, decision)
+            )
+
+    async def _ad_hoc_confirmation_continuation(
+        state: V2EngineState,
+        *,
+        stored: HITLRequest,
+        decision: HITLDecision,
+        token: ResumeToken,
+        context: ContextBundle,
+    ) -> dict[str, object]:
+        """Confirm -> CURRENT revalidation -> compile_ad_hoc -> execute, ONCE.
+
+        Reads EVERY trusted input from checkpoint state.  The suspended formula
+        is RE-RESOLVED against the restored plan/context, so a confirmation can
+        never override a request-entry refusal and a tampered checkpoint carrier
+        is refused exactly as at request entry.
+        """
+
+        active_plan = _active_query_plan(state, stored)
+        if active_plan is None:
+            return _continuation_stopped(
+                state, "typed_continuation_active_plan_invalid"
+            )
+        if _continuation_eligibility(
+            stored,
+            decision,
+            token,
+            active_plan,
+            context,
+            policy_version=resolved_plan_validator.policy_version,
+            policy_checksum=resolved_plan_validator.policy_checksum,
+        ):
+            return _continuation_stopped(state, "typed_continuation_not_eligible")
+        validation = _active_plan_validation(state, active_plan)
+        if validation is None:
+            return _continuation_stopped(
+                state, "typed_continuation_plan_validation_missing"
+            )
+        carrier_raw = state.get("ad_hoc_calculation")
+        if not isinstance(carrier_raw, dict):
+            return _continuation_stopped(state, "typed_continuation_state_invalid")
+        try:
+            carrier = AdHocCalculationRequest.model_validate(carrier_raw)
+        except Exception:
+            return _continuation_stopped(state, "typed_continuation_state_invalid")
+        trace = _trace(state)
+        if decision.action == "resolve":
+            # P7 IN-PLACE CORRECTION.  The user re-points formula roles at
+            # server-derived, already-authorized candidate metrics.  The
+            # candidate set is RE-DERIVED here from the restored plan/context
+            # (never trusted from the checkpoint request) and EVERY choice is
+            # checked against it; anything else fails closed with ZERO
+            # execution.  The corrected carrier then goes through the SAME
+            # governed resolver below, which re-checks authorization for every
+            # input, so no new fetch path is opened and no authority is granted.
+            corrected, correction_failure = _apply_metric_plan_correction(
+                carrier=carrier,
+                decision=decision,
+                plan=active_plan,
+                context=context,
+            )
+            if correction_failure is not None or corrected is None:
+                code = correction_failure or _METRIC_PLAN_CORRECTION_REJECTED
+                trace.record(
+                    "policy",
+                    "metric_plan_correction_rejected",
+                    code=code,
+                )
+                await _persist_new_events(trace_sink, trace.events[-1:])
+                return _metric_plan_correction_rejected(state, code)
+            trace.record(
+                "policy",
+                "metric_plan_corrected",
+                role_count=len(decision.slot_bindings),
+                roles=sorted(item.slot for item in decision.slot_bindings),
+            )
+            carrier = corrected
+        # From here on the run's carrier IS the corrected one: it is what the
+        # governed resolver accepted and what this run actually derives.
+        carrier_update: dict[str, object] = (
+            {"ad_hoc_calculation": carrier.model_dump(mode="json")}
+            if decision.action == "resolve"
+            else {}
+        )
+        try:
+            resolved_ad_hoc = resolve_ad_hoc_request(
+                request=carrier,
+                context=context,
+                query_plan=active_plan,
+                catalog=resolved_plan_compiler.calculation_catalog,
+            )
+        except AdHocRequestError as exc:
+            trace.record(
+                "policy",
+                "ad_hoc_calculation_confirmed_rejected",
+                code=exc.code,
+            )
+            await _persist_new_events(trace_sink, trace.events[-1:])
+            return _ad_hoc_confirmation_rejected(state, exc.code)
+        if typed_runtime_factory is None:
+            # No request-scoped runtime is configured: CURRENT authorization
+            # cannot be re-proven, so continuation fails closed unexecuted.
+            base: dict[str, object] = {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "The formula was confirmed and the plan revalidated, "
+                            "but this deployment has no typed runtime to "
+                            "revalidate continuation against. Nothing was "
+                            "executed."
+                        )
+                    )
+                ],
+                "pending_decision": None,
+                "decision_status": "resolved_pending_current_authorization",
+                "ad_hoc_confirmation_satisfied": True,
+                "needs_hitl": False,
+                **carrier_update,
+            }
+            return base
+        (
+            current_authorization,
+            continuation_runtime,
+            continuation_failure,
+        ) = await _continuation_runtime(state)
+        if continuation_runtime is None:
+            return _current_authorization_stopped(state, continuation_failure)
+        if current_authorization is None:
+            return _current_authorization_stopped(
+                state, "current_authorization_unavailable"
+            )
+        # RE-ROUTE the confirmed plan under the CURRENT policy.  Budget already
+        # consumed by this run is carried forward, never reset; human waiting
+        # time is never an allowance.
+        base = {
+            "ad_hoc_confirmation_satisfied": True,
+            "trace_events": _events(trace),
+            **carrier_update,
+        }
+        route_state: V2EngineState = cast(V2EngineState, {**state, **base})
+        routed = await route_node(route_state)
+        base["route_record"] = routed["route_record"]
+        base["budget_record"] = _carry_forward_budget(
+            state.get("budget_record"), routed["budget_record"]
+        )
+        base["trace_events"] = routed["trace_events"]
+        return await _continue_under_current_authorization(
+            state=cast(V2EngineState, {**state, **base}),
+            plan=active_plan,
+            validation=validation,
+            context=context,
+            authorization=current_authorization,
+            plan_compiler=resolved_plan_compiler,
+            plan_validator=resolved_plan_validator,
+            budget_policy=resolved_budget_policy,
+            base=base,
+            ad_hoc=resolved_ad_hoc,
+            # The AD_HOC compile-failure code is IDENTICAL on the direct and the
+            # confirmed path, so the product-visible refusal never depends on
+            # whether a confirmation happened.
+            compilation_failed_reason="execution_plan_compilation_failed",
+        )
 
     async def replan_node(state: V2EngineState) -> dict[str, object]:
         """Deterministic slot-bound replan + revalidation (V1: time/grain only).
@@ -1828,6 +2391,18 @@ def create_v2_engine(
         if stored is None or decision is None or token is None:
             return _continuation_stopped(state, "typed_continuation_state_invalid")
         context = _context_bundle(state)
+        if _is_ad_hoc_plan_confirmation(state, stored):
+            # P6-B: the suspension was THIS run's explicit-formula plan
+            # confirmation, so confirm continues into the governed AD_HOC
+            # compile/execute path exactly once and reject/cancel stop with
+            # zero execution (handled by the shared typed-decision machinery).
+            return await _ad_hoc_confirmation_continuation(
+                state,
+                stored=stored,
+                decision=decision,
+                token=token,
+                context=context,
+            )
         if context.unresolved_slots:
             # V1 reinjects PLAN slots only; a context slot cannot be resolved by
             # mutating the QueryPlan, so continuation fails closed here.
@@ -1846,6 +2421,21 @@ def create_v2_engine(
             policy_checksum=resolved_plan_validator.policy_checksum,
         ):
             return _continuation_stopped(state, "typed_continuation_not_eligible")
+        # CONTINUATION resolves the CURRENT environment.  A resume invocation
+        # never re-runs the typed_runtime node, so the request-scoped runtime is
+        # rebuilt HERE under CURRENT authorization and memoized in this
+        # invocation's scope for the compile/execute nodes.  A past
+        # authorization snapshot never grants future permission.
+        current_authorization: AuthorizationContext | None = None
+        continuation_runtime: TypedRuntimeBundle | None = None
+        if typed_runtime_factory is not None:
+            (
+                current_authorization,
+                continuation_runtime,
+                continuation_failure,
+            ) = await _continuation_runtime(state)
+            if continuation_runtime is None:
+                return _current_authorization_stopped(state, continuation_failure)
         provider = _typed_query_plan_provider()
         bound = getattr(provider, "replan_with_slot_bindings", None)
         if not callable(bound):
@@ -1899,6 +2489,40 @@ def create_v2_engine(
             "trace_events": _events(trace),
         }
         if validation.outcome == "allow":
+            carrier_raw = state.get("ad_hoc_calculation")
+            if carrier_raw is not None and not state.get(
+                "ad_hoc_confirmation_satisfied"
+            ):
+                # P6-B: the question itself has now been parsed (and, where it
+                # needed it, clarified).  Its result is confirmed against the
+                # EXPLICIT formula through the SAME typed confirmation before
+                # anything is compiled or executed.
+                try:
+                    carrier = AdHocCalculationRequest.model_validate(carrier_raw)
+                except Exception:
+                    return _continuation_stopped(
+                        state, "typed_continuation_state_invalid"
+                    )
+                resolved_ad_hoc, refusal = _resolve_ad_hoc_for_confirmation(
+                    carrier,
+                    context=context,
+                    plan=new_plan,
+                    catalog=resolved_plan_compiler.calculation_catalog,
+                )
+                if refusal is not None:
+                    return _ad_hoc_confirmation_rejected(state, refusal)
+                base.update(
+                    _ad_hoc_confirmation_suspended(
+                        state,
+                        trace,
+                        plan=new_plan,
+                        context=context,
+                        validation=validation,
+                        carrier=carrier,
+                        resolved=resolved_ad_hoc,
+                    )
+                )
+                return base
             # CONTINUATION revalidates the CURRENT environment.  A past
             # authorization snapshot NEVER grants future permission, so the
             # run-bound snapshot is not reused for execution.
@@ -1925,35 +2549,34 @@ def create_v2_engine(
                     }
                 )
                 return base
-            current_authorization = _resolve_current_backend_authorization()
+            # The runtime was rebuilt under CURRENT authorization above; the
+            # authorization cannot be absent here.
             if current_authorization is None:
-                # Unavailable current authority: STOP.  HITL is never asked to
-                # restore privilege and the old snapshot is never silently used.
-                base.update(
-                    {
-                        "messages": [
-                            AIMessage(
-                                content=(
-                                    "The clarification was applied and the plan "
-                                    "revalidated, but current authorization is "
-                                    "unavailable. Nothing was executed."
-                                )
-                            )
-                        ],
-                        "pending_decision": None,
-                        "decision_status": "current_authorization_unavailable",
-                        "stop_reason": "current_authorization_unavailable",
-                        "needs_hitl": False,
-                    }
+                return _current_authorization_stopped(
+                    state, "current_authorization_unavailable"
                 )
-                return base
+            # RE-ROUTE the RESOLVED plan under the CURRENT policy.  A
+            # clarification suspension never ran the route node, so this is the
+            # first real route/budget decision of the run: it is computed, never
+            # copied or fabricated.  Budget already consumed by this run is
+            # carried forward, never reset.
+            route_state: V2EngineState = cast(V2EngineState, {**state, **base})
+            route_state["query_plan"] = cast(
+                dict[str, object], query_plan_payload(new_plan)
+            )
+            route_state["query_plan_validation"] = validation.model_dump(mode="json")
+            routed = await route_node(route_state)
+            base["route_record"] = routed["route_record"]
+            base["budget_record"] = _carry_forward_budget(
+                state.get("budget_record"), routed["budget_record"]
+            )
+            base["trace_events"] = routed["trace_events"]
             continuation = await _continue_under_current_authorization(
-                state=state,
+                state=cast(V2EngineState, {**state, **base}),
                 plan=new_plan,
                 validation=validation,
                 context=context,
                 authorization=current_authorization,
-                typed_runtime_factory=typed_runtime_factory,
                 plan_compiler=resolved_plan_compiler,
                 plan_validator=resolved_plan_validator,
                 budget_policy=resolved_budget_policy,
@@ -1986,6 +2609,7 @@ def create_v2_engine(
                     "decision_status": "awaiting_decision",
                     "decision_version": new_request.version,
                     "needs_hitl": False,
+                    "human_wait_started_at": _utc_now().isoformat(),
                 }
             )
             return base
@@ -2083,8 +2707,19 @@ def create_v2_engine(
         # The API layer always supplies an envelope for executable runs.
         return "model"
 
-    def after_compile(state: V2EngineState) -> Literal["execute", "__end__"]:
-        return "__end__" if state.get("stop_reason") else "execute"
+    def after_compile(
+        state: V2EngineState,
+    ) -> Literal["execute", "decision", "__end__"]:
+        if state.get("stop_reason"):
+            return "__end__"
+        # P6-B: an explicit-formula confirmation suspends through the SAME typed
+        # decision node a clarification uses; compile/execute stay unreachable
+        # until the decision is recorded.
+        if state.get("decision_status") == "awaiting_decision" and state.get(
+            "pending_decision"
+        ):
+            return "decision"
+        return "execute"
 
     def after_execute(state: V2EngineState) -> Literal["analysis", "__end__"]:
         if state.get("stop_reason"):
@@ -2093,6 +2728,12 @@ def create_v2_engine(
 
     def after_model(state: V2EngineState) -> Literal["hitl", "__end__"]:
         return "hitl" if state.get("needs_hitl") else "__end__"
+
+    def after_hitl(state: V2EngineState) -> Literal["compile", "__end__"]:
+        # ONLY an approval that revalidated CURRENT authorization and restored a
+        # continuable typed plan proceeds.  modify/reject/cancel and every
+        # non-continuable approval terminate without executing.
+        return "compile" if state.get("continuation_ready") else "__end__"
 
     graph.add_node("receive", receive_node)
     if typed_runtime_factory is not None:
@@ -2145,7 +2786,7 @@ def create_v2_engine(
     graph.add_conditional_edges(
         "compile",
         after_compile,
-        {"execute": "execute", END: END},
+        {"execute": "execute", "decision": "decision", END: END},
     )
     graph.add_conditional_edges(
         "execute",
@@ -2154,6 +2795,14 @@ def create_v2_engine(
     )
     graph.add_edge("analysis", END)
     graph.add_conditional_edges("model", after_model, {"hitl": "hitl", END: END})
+    # Legacy HITL approval continuation: an approval that revalidated CURRENT
+    # authorization and restored a continuable typed plan continues into the
+    # SAME governed compile/execute path; every other action terminates.
+    graph.add_conditional_edges(
+        "hitl",
+        after_hitl,
+        {"compile": "compile", END: END},
+    )
     # Typed clarification decision node: suspends on interrupt() and records a
     # valid typed decision.  A resolve decision continues into deterministic
     # slot-bound replan + revalidation; compile/execute remains disabled and the
@@ -2231,6 +2880,24 @@ def _effective_mode(state: V2EngineState) -> str | None:
     return mode if isinstance(mode, str) else None
 
 
+def _state_capabilities(state: V2EngineState) -> frozenset[str]:
+    """The EXPLICIT capability set of THIS run's effective mode.
+
+    Read from the server-owned run envelope, never from the request.  An absent
+    or malformed envelope, or an unrecognized mode, yields the EMPTY set, so a
+    capability-less run never receives run_scoped_derivation and an AD_HOC
+    carrier fails closed.
+    """
+
+    mode = _effective_mode(state)
+    if mode is None:
+        return frozenset()
+    try:
+        return frozenset(capabilities_for_mode(cast(ProductMode, mode)))
+    except KeyError:
+        return frozenset()
+
+
 def _question(state: V2EngineState) -> str:
     for message in reversed(state.get("messages", [])):
         if getattr(message, "type", None) in {"human", "user"}:
@@ -2287,6 +2954,50 @@ def _optional_plan_validation(
     return PlanValidationRecord.model_validate(raw) if isinstance(raw, dict) else None
 
 
+def _active_execution_query_plan(
+    state: V2EngineState, validation: PlanValidationRecord
+) -> QueryPlan:
+    """The plan an execution validation was actually computed against.
+
+    Continuation compiles an ExecutionPlan for the RESOLVED plan while the
+    original (slot-bearing) plan stays in ``query_plan`` for lineage, so
+    execution must bind to the checksum the validation names.  A resolved plan
+    that does not match that checksum is never substituted.
+    """
+
+    resolved_raw = state.get("resolved_plan")
+    if isinstance(resolved_raw, dict):
+        try:
+            resolved = QueryPlan.model_validate(resolved_raw)
+        except Exception:
+            resolved = None
+        if resolved is not None and resolved.checksum == validation.query_plan_sha256:
+            return resolved
+    return _query_plan(state)
+
+
+def _active_plan_validation(
+    state: V2EngineState, plan: QueryPlan
+) -> PlanValidationRecord | None:
+    """The restored ALLOW validation that names THIS active plan, else None.
+
+    Confirmation continuation compiles the RESTORED plan, so it must bind to the
+    validation that was actually computed against that plan - never a stale one.
+    """
+
+    for key in ("resolved_plan_validation", "query_plan_validation"):
+        raw = state.get(key)
+        if not isinstance(raw, dict):
+            continue
+        try:
+            record = PlanValidationRecord.model_validate(raw)
+        except Exception:
+            continue
+        if record.outcome == "allow" and record.query_plan_sha256 == plan.checksum:
+            return record
+    return None
+
+
 def _route(state: V2EngineState) -> RouteName:
     record = state.get("route_record")
     route = record.get("route") if isinstance(record, dict) else None
@@ -2322,6 +3033,43 @@ def _request_deadline_ms(*, default: int) -> int:
     return default
 
 
+def _recorded_human_wait_ms(state: V2EngineState) -> int:
+    """The run's RECORDED accumulated human wait, or 0 when unavailable.
+
+    FAIL-CLOSED: a missing, malformed, negative or non-integer record yields 0,
+    i.e. NOTHING is deducted and the stricter un-deducted deadline applies.
+    """
+
+    raw = state.get("human_wait_ms")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return 0
+    return raw
+
+
+def _human_wait_delta_ms(started_at: object, resumed_at: str) -> int:
+    """The human-wait interval between two declared instants, or 0.
+
+    FAIL-CLOSED: if either instant is missing or unparseable the interval is
+    UNDETERMINED and 0 is returned, so the wait is NOT deducted.
+    """
+
+    if not isinstance(started_at, str):
+        return 0
+    try:
+        started = datetime.fromisoformat(started_at)
+        resumed = datetime.fromisoformat(resumed_at)
+    except ValueError:
+        return 0
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    if resumed.tzinfo is None:
+        resumed = resumed.replace(tzinfo=UTC)
+    delta_seconds = (resumed - started).total_seconds()
+    if delta_seconds <= 0:
+        return 0
+    return int(delta_seconds * 1000)
+
+
 def _request_elapsed_ms(state: V2EngineState) -> int:
     raw = state.get("request_started_at")
     if not isinstance(raw, str):
@@ -2332,10 +3080,17 @@ def _request_elapsed_ms(state: V2EngineState) -> int:
         return _INVALID_REQUEST_ELAPSED_MS
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=UTC)
-    elapsed_seconds = (datetime.now(UTC) - started_at).total_seconds()
+    elapsed_seconds = (_utc_now() - started_at).total_seconds()
     if elapsed_seconds < -1:
         return _INVALID_REQUEST_ELAPSED_MS
-    return max(0, int(elapsed_seconds * 1000))
+    wall_ms = max(0, int(elapsed_seconds * 1000))
+    # §4.3: HUMAN WAITING DOES NOT HOLD AN ACTIVE CALCULATION DEADLINE RUNNING.
+    # Every recorded suspended interval is deducted from the wall-clock elapsed
+    # time, while everything the run already CONSUMED stays consumed (the
+    # allowance is never reset and the counters are carried forward).  The
+    # deduction can never exceed the wall time actually observed, and an
+    # unavailable record deducts nothing (fail-closed).
+    return max(0, wall_ms - min(_recorded_human_wait_ms(state), wall_ms))
 
 
 def _remaining_route_deadline_ms(
@@ -2403,60 +3158,26 @@ async def _continue_under_current_authorization(
     validation: PlanValidationRecord,
     context: ContextBundle,
     authorization: AuthorizationContext,
-    typed_runtime_factory: TypedRuntimeFactory,
     plan_compiler: PlanCompiler,
     plan_validator: PlanValidator,
     budget_policy: RoutingBudgetPolicy,
     base: dict[str, object],
+    ad_hoc: ResolvedAdHocCalculation | None = None,
+    compilation_failed_reason: str = "continuation_compilation_failed",
 ) -> dict[str, object]:
-    """Revalidate the replanned request against CURRENT authorization, then run.
+    """Compile and validate the replanned request under CURRENT authorization.
 
     The suspended business state is restored from checkpoint state; the
-    ENVIRONMENT is revalidated fresh.  The continuation compiles and validates
-    an ExecutionPlan under the CURRENT snapshot and executes exactly once.  A
-    changed authorization revision is NOT itself a denial: if the new trusted
-    snapshot still legitimately authorizes the request, continuation proceeds
-    and the execution receipt carries the CURRENT revision.
+    ENVIRONMENT is revalidated fresh.  The caller rebuilt the request-scoped
+    runtime under the CURRENT snapshot (memoized in this invocation's scope for
+    the execute node) and re-routed the RESOLVED plan, so this function only
+    compiles/validates an ExecutionPlan under the CURRENT snapshot.  A changed
+    authorization revision is NOT itself a denial: if the new trusted snapshot
+    still legitimately authorizes the request, continuation proceeds and the
+    execution receipt carries the CURRENT revision.
 
     Anything that cannot be proven stops before execution.
     """
-
-    runtime = state.get("typed_runtime")
-    if not isinstance(runtime, dict):
-        return _continuation_stopped(state, "current_authorization_runtime_missing")
-    request_identity = runtime.get("request_identity")
-    try:
-        identity = RequestIdentity.model_validate(request_identity)
-    except Exception:
-        return _continuation_stopped(state, "current_authorization_identity_invalid")
-
-    # Revalidate under the CURRENT snapshot through the SAME request-scoped
-    # factory the initial request used.  The factory itself fails closed on
-    # authorization_context_missing / authorization_denied.
-    rebuilt = await typed_runtime_factory(
-        identity=identity,
-        authorization=authorization,
-        expected_revision=None,
-    )
-    if isinstance(rebuilt, TypedRuntimeUnavailable):
-        base.update(
-            {
-                "messages": [
-                    AIMessage(
-                        content=(
-                            "The clarification was applied and the plan "
-                            "revalidated, but current authorization does not "
-                            "permit continuation. Nothing was executed."
-                        )
-                    )
-                ],
-                "pending_decision": None,
-                "decision_status": "current_authorization_denied",
-                "stop_reason": rebuilt.reason,
-                "needs_hitl": False,
-            }
-        )
-        return base
 
     # The CURRENT revision is what the execution evidence must carry.
     base["authorization_context"] = authorization.model_dump(mode="json")
@@ -2467,11 +3188,23 @@ async def _continue_under_current_authorization(
     # Compile + validate the ExecutionPlan under the CURRENT snapshot, exactly
     # as the normal compile path does.  Nothing from the client participates.
     try:
-        execution_plan = plan_compiler.compile(
-            plan=plan,
-            context=context,
-            validation=validation,
-        )
+        if ad_hoc is None:
+            execution_plan = plan_compiler.compile(
+                plan=plan,
+                context=context,
+                validation=validation,
+            )
+        else:
+            # A confirmed explicit-formula run continues through the SAME
+            # AD_HOC compile dispatch the direct path uses - never a
+            # canonical fetch of a formula the user asked to derive.
+            execution_plan = plan_compiler.compile_ad_hoc(
+                plan=plan,
+                context=context,
+                validation=validation,
+                calculation_spec=ad_hoc.spec,
+                execution_binding=ad_hoc.binding,
+            )
         execution_validation = plan_validator.validate_execution_plan(
             execution_plan=execution_plan,
             query_plan=plan,
@@ -2483,7 +3216,7 @@ async def _continue_under_current_authorization(
             ).limits,
         )
     except Exception:
-        return _continuation_stopped(state, "continuation_compilation_failed")
+        return _continuation_stopped(state, compilation_failed_reason)
     if execution_validation.outcome != "allow":
         base.update(
             {
@@ -2634,6 +3367,9 @@ _TYPED_DECISION_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
 
 _TYPED_DECISION_STATUS: Final[dict[str, str]] = {
     "resolve": "resolved_pending_revalidation",
+    # Confirm is the typed form of the legacy approve alias: when the restored
+    # plan is already complete it continues into revalidated compile/execute.
+    "confirm": "resolved_pending_revalidation",
     # choose never auto-continues in V1: it is recorded but must not compile.
     "choose": "choose_recorded_no_continuation",
     "reject": "rejected",
@@ -2799,6 +3535,26 @@ def _record_typed_decision(
     return result
 
 
+def _human_wait_recorded(
+    state: V2EngineState, result: dict[str, object]
+) -> dict[str, object]:
+    """Close the run's OPEN human-wait interval onto a resuming decision result.
+
+    The interval runs from the instant the suspension was set up to NOW.  The
+    total is ACCUMULATED (repeated suspensions sum) so an already-consumed
+    budget is never reset, and the open interval is cleared.  Nothing is added
+    when the start instant is unavailable (fail-closed: the wait is not
+    deducted).
+    """
+
+    resumed_at = _utc_now().isoformat()
+    delta_ms = _human_wait_delta_ms(state.get("human_wait_started_at"), resumed_at)
+    result["human_wait_ms"] = _recorded_human_wait_ms(state) + delta_ms
+    result["human_wait_started_at"] = None
+    result["human_wait_last_resumed_at"] = resumed_at
+    return result
+
+
 def _resolved_decision(state: V2EngineState) -> HITLDecision | None:
     raw = state.get("resolved_decision")
     if not isinstance(raw, dict):
@@ -2862,10 +3618,17 @@ def _continuation_eligibility(
     policy_version: str,
     policy_checksum: str,
 ) -> tuple[str, ...]:
-    """V1 continuation eligibility: resolve-only, user-source, time/grain slots.
+    """Continuation eligibility: resolve/confirm, user-source, plan-slot scoping.
 
     The suspended request is re-verified against the RESTORED plan/context, so a
-    tampered or stale checkpoint request cannot drive the replan.
+    tampered or stale checkpoint request cannot drive the replan.  A Confirm
+    carries no slot bindings and may only continue a plan that is already
+    complete; a Resolve applies user-source time/grain bindings.
+
+    A metric_plan_confirmation is the ONE kind whose bindings are scoped to the
+    formula's declared roles instead of the V1 plan slots, so it takes its own
+    (strictly narrower) eligibility branch above; every other kind keeps the
+    exact V1 rules byte for byte.
     """
 
     failures: list[str] = []
@@ -2878,20 +3641,37 @@ def _continuation_eligibility(
         or stored.policy_checksum != policy_checksum
     ):
         failures.append("continuation_policy_mismatch")
-    if decision.action != "resolve":
+    if decision.action not in {"resolve", "confirm"}:
         failures.append("continuation_action_unsupported")
     if decision.validate_against(stored):
         failures.append("continuation_decision_mismatch")
     if token.validate_against(stored, decision):
         failures.append("continuation_token_mismatch")
-    if any(binding.source != "user" for binding in decision.slot_bindings):
+    if stored.decision_kind == _AD_HOC_PLAN_CONFIRMATION_KIND:
+        # The formula-plan correction binds the FORMULA's declared roles, not the
+        # V1 plan slots, so the V1 slot-scope rules below deliberately do NOT
+        # apply.  The chosen VALUES were validated by the contract against the
+        # request's candidates and are RE-validated against the re-derived
+        # candidate set inside the continuation itself, which is also where the
+        # governed resolver re-checks authorization for every input.
+        if any(binding.source != "user" for binding in decision.slot_bindings):
+            failures.append("continuation_slot_source_not_user")
+        return tuple(dict.fromkeys(failures))
+    if decision.action == "resolve":
+        if any(binding.source != "user" for binding in decision.slot_bindings):
+            failures.append("continuation_slot_source_not_user")
+        if not stored.unresolved_slots or not (
+            set(stored.unresolved_slots) <= _V1_CONTINUABLE_SLOTS
+        ):
+            failures.append("continuation_slot_unsupported")
+        if set(stored.unresolved_slots) != set(plan.unresolved_slots):
+            failures.append("continuation_slot_scope_mismatch")
+    elif decision.slot_bindings:
         failures.append("continuation_slot_source_not_user")
-    if not stored.unresolved_slots or not (
-        set(stored.unresolved_slots) <= _V1_CONTINUABLE_SLOTS
-    ):
-        failures.append("continuation_slot_unsupported")
-    if set(stored.unresolved_slots) != set(plan.unresolved_slots):
-        failures.append("continuation_slot_scope_mismatch")
+    elif plan.unresolved_slots:
+        # Confirm carries no slot bindings, so a plan that still has unresolved
+        # slots cannot be confirmed into execution.
+        failures.append("continuation_plan_incomplete")
     return tuple(dict.fromkeys(failures))
 
 
@@ -2935,6 +3715,152 @@ def _continuation_stopped(state: V2EngineState, reason: str) -> dict[str, object
     }
 
 
+def _ad_hoc_confirmation_rejected(state: V2EngineState, code: str) -> dict[str, object]:
+    """Fail closed AFTER a formula confirmation without executing anything.
+
+    A confirmation records a decision: it never overrides a request-entry
+    refusal.  The stable request-entry code stays product-visible.
+    """
+
+    return {
+        "messages": [
+            AIMessage(
+                content=(
+                    "The confirmed run-scoped calculation request was not "
+                    "permitted. Nothing was executed."
+                )
+            )
+        ],
+        "pending_decision": None,
+        "decision_status": "ad_hoc_confirmation_rejected",
+        "stop_reason": code,
+        "degradation_flags": _degradation_flags(state, "AdHocConfirmationRejected"),
+        "needs_hitl": False,
+    }
+
+
+def _metric_plan_correction_rejected(
+    state: V2EngineState, code: str
+) -> dict[str, object]:
+    """Fail closed AFTER a rejected in-place correction, executing NOTHING.
+
+    The code names the RULE that was broken (a role outside the request, a
+    value outside the role's authorized candidate set, a non-identity payload,
+    a duplicate metric, an unusable payload).  It NEVER echoes the attempted
+    value and never distinguishes "does not exist" from "not authorized", so
+    the refusal leaks nothing about the attempted metric.
+    """
+
+    return {
+        "messages": [
+            AIMessage(
+                content=(
+                    "The in-place correction was not accepted, so the "
+                    "calculation was not executed. Nothing was executed."
+                )
+            )
+        ],
+        "pending_decision": None,
+        "decision_status": "metric_plan_correction_rejected",
+        "stop_reason": code,
+        "degradation_flags": _degradation_flags(
+            state, "MetricPlanCorrectionRejected"
+        ),
+        "needs_hitl": False,
+    }
+
+
+def _continuable_legacy_plan(state: V2EngineState) -> bool:
+    """A legacy approval may continue only with a restored, ALLOWED typed plan.
+
+    The deep route keeps the generated plan at the checkpoint; continuation
+    reuses exactly that plan and its validation, never a client-supplied one.
+    """
+
+    if not isinstance(state.get("context_bundle"), dict):
+        return False
+    if not isinstance(state.get("query_plan"), dict):
+        return False
+    validation = state.get("query_plan_validation")
+    if not isinstance(validation, dict):
+        return False
+    return validation.get("outcome") == "allow"
+
+
+def _current_authorization_stopped(
+    state: V2EngineState, reason: str | None
+) -> dict[str, object]:
+    """Fail closed when CURRENT authorization cannot be proven at continuation.
+
+    No business work is executed and the pending typed request is cleared, so a
+    stopped continuation can never look like an active suspension.
+    """
+
+    if reason == "current_authorization_unavailable":
+        content = (
+            "The typed decision was recorded and the plan revalidated, but "
+            "current authorization is unavailable. Nothing was executed."
+        )
+        decision_status = "current_authorization_unavailable"
+        stop_reason = "current_authorization_unavailable"
+    else:
+        content = (
+            "The typed decision was recorded and the plan revalidated, but "
+            "current authorization does not permit continuation. Nothing was "
+            "executed."
+        )
+        decision_status = "current_authorization_denied"
+        stop_reason = reason or "current_authorization_denied"
+    return {
+        "messages": [AIMessage(content=content)],
+        "pending_decision": None,
+        "decision_status": decision_status,
+        "stop_reason": stop_reason,
+        "degradation_flags": _degradation_flags(state, "TypedContinuationStopped"),
+        "needs_hitl": False,
+    }
+
+
+def _carry_forward_budget(prior: object, fresh: object) -> object:
+    """Preserve a run's ALREADY-CONSUMED budget across a continuation re-route.
+
+    A resumed run never receives a fresh, unspent allowance: the NEW route's
+    limits apply, but every counter already consumed by this run is carried
+    forward.  Human waiting time does not reset an allowance, so this function
+    only ever raises the fresh counters to the consumed values, never lowers
+    them.
+    """
+
+    if not isinstance(fresh, dict) or not isinstance(prior, dict):
+        return fresh
+    prior_usage = prior.get("usage")
+    fresh_usage = fresh.get("usage")
+    if isinstance(prior_usage, dict) and isinstance(fresh_usage, dict):
+        for key in (
+            "model_calls",
+            "sql_candidates",
+            "sql_executions",
+            "join_hops",
+            "repairs",
+            "retryable_provider_errors",
+        ):
+            consumed = prior_usage.get(key)
+            current = fresh_usage.get(key)
+            if isinstance(consumed, int) and (
+                not isinstance(current, int) or consumed > current
+            ):
+                fresh_usage[key] = consumed
+    for key in ("sql_fingerprint_counts", "error_counts"):
+        prior_map = prior.get(key)
+        fresh_map = fresh.get(key)
+        if isinstance(prior_map, dict) and prior_map:
+            fresh[key] = {
+                **(fresh_map if isinstance(fresh_map, dict) else {}),
+                **prior_map,
+            }
+    return fresh
+
+
 def _trace(state: V2EngineState) -> TraceEnvelope:
     events = state.get("trace_events", [])
     trace = TraceEnvelope(trace_id=_trace_id(state))
@@ -2947,19 +3873,493 @@ def _events(trace: TraceEnvelope) -> list[dict[str, object]]:
     return [event.model_dump(mode="json") for event in trace.events]
 
 
+# An executable AD_HOC plan is exactly N dependency fetches + the calculation +
+# the verify step, and the plan compiler refuses any shape that would need more
+# than 16 steps (N + 2 > 16).  The carrier model itself bounds a declaration to
+# CalculationSpec.inputs max_length = 32, so the executable ceiling is the
+# tighter of the two.  The run-scoped SQL allowance is clamped to this ceiling:
+# a declared-but-uncompilable carrier can never widen the ledger beyond what any
+# AD_HOC plan could ever consume.
+_AD_HOC_MAX_DEPENDENCY_INPUTS = 14
+_AD_HOC_BUDGET_ALLOWANCE_EVENT = "ad_hoc_dependency_budget_allowance"
+
+
+def _ad_hoc_dependency_allowance(state: V2EngineState) -> tuple[int, int]:
+    """Return (declared_inputs, granted_allowance) for this run AD_HOC carrier.
+
+    (0, 0) means "no parsed AD_HOC carrier", so a plain query keeps its route
+    limits byte-for-byte.  The declared count comes ONLY from a fully parsed,
+    server-validated carrier - never from a raw client number - and the granted
+    allowance is additionally clamped to the executable AD_HOC plan ceiling.
+    """
+
+    raw = state.get("ad_hoc_calculation")
+    if raw is None:
+        return 0, 0
+    try:
+        carrier = AdHocCalculationRequest.model_validate(raw)
+    except Exception:
+        # A malformed carrier grants NOTHING; the compile path fails closed.
+        return 0, 0
+    declared = len(carrier.calculation_spec.inputs)
+    return declared, min(declared, _AD_HOC_MAX_DEPENDENCY_INPUTS)
+
+
 def _route_budget_from_state(
     state: V2EngineState,
     *,
     route: RouteName,
     policy: RoutingBudgetPolicy,
 ) -> RouteBudgetLedger:
+    """The ONE derivation point for this request route budget ledger.
+
+    Validation (compile) and execution (execute) both derive their ledger here,
+    so a run-scoped AD_HOC allowance can never be seen by one and not the other.
+    """
+
     record = state.get("budget_record")
     if isinstance(record, dict):
         ledger = RouteBudgetLedger.from_record(policy=policy, record=record)
         if ledger.route != route:
             raise ValueError("checkpoint route does not match the active route decision")
-        return ledger
-    return RouteBudgetLedger(route=route, policy=policy)
+    else:
+        ledger = RouteBudgetLedger(route=route, policy=policy)
+    _, allowance = _ad_hoc_dependency_allowance(state)
+    if allowance > 0:
+        ledger.grant_sql_allowance(allowance)
+    return ledger
+
+
+def _record_ad_hoc_budget_allowance(
+    state: V2EngineState,
+    trace: TraceEnvelope,
+    *,
+    route: RouteName,
+    budget: RouteBudgetLedger,
+) -> None:
+    """Audit ONE run-scoped SQL allowance per run, and only when it really raises.
+
+    It answers "why was this run allowed to fetch more than the route limit?".
+    A plain query never produces it, and a repeated derivation (compile then
+    execute) never duplicates it.
+    """
+
+    base = budget.policy.routes[route]
+    elevated = budget.limits
+    if elevated == base:
+        return
+    if any(
+        event.name == _AD_HOC_BUDGET_ALLOWANCE_EVENT for event in trace.events
+    ):
+        return
+    declared, _ = _ad_hoc_dependency_allowance(state)
+    trace.record(
+        "policy",
+        _AD_HOC_BUDGET_ALLOWANCE_EVENT,
+        route=route,
+        declared_inputs=declared,
+        granted_sql_candidates=elevated.max_sql_candidates,
+        granted_sql_executions=elevated.max_sql_executions,
+        base_sql_candidates=base.max_sql_candidates,
+        base_sql_executions=base.max_sql_executions,
+    )
+
+
+# --- P6-B/P7: explicit-formula plan confirmation + in-place correction -------
+#
+# Owner decision B: when the user supplies an EXPLICIT formula carrier the
+# question is STILL parsed normally, but the parsed result MUST be shown to the
+# user and confirmed once - even when the formula and the question-resolved plan
+# agree.  The frozen reason vocabulary already names this: the reasons list entry
+# CUSTOM_METRIC_PLAN_CONFIRMATION, carried here as an issue code.
+#
+# P7: the suspension is a decision_kind="metric_plan_confirmation" typed request,
+# the ONE kind that may carry an IN-PLACE CORRECTION of this run's own
+# derived-calculation inputs.  Its action set is
+# ("confirm", "resolve", "reject", "cancel"): modify is deliberately ABSENT so
+# there is exactly ONE way to correct, and resolve binds a FORMULA ROLE to one of
+# the server-derived, ALREADY-AUTHORIZED candidate metrics.  A confirmation
+# RECORDS a decision: it grants no authority, creates no definition, carries no
+# unresolved slot, is not a definition confirmation and never overrides a
+# request-entry refusal.
+_AD_HOC_PLAN_CONFIRMATION_ISSUE: Final[str] = "custom_metric_plan_confirmation"
+_AD_HOC_PLAN_CONFIRMATION_EVENT = "ad_hoc_calculation_confirmation_required"
+_AD_HOC_PLAN_CONFIRMATION_KIND: Final[str] = "metric_plan_confirmation"
+# The pre-P7 suspension was a business_confirmation carrying the SAME issue code.
+# A checkpoint written before the upgrade still resumes through the SAME
+# continuation (it can be confirmed/rejected); it simply cannot carry a
+# correction, because that frozen kind has no resolution options.
+_LEGACY_AD_HOC_PLAN_CONFIRMATION_KIND: Final[str] = "business_confirmation"
+# The ONE request-entry code that is an ALIGNMENT discrepancy between two
+# well-formed parses (the formula's declared inputs vs the question-resolved
+# plan), so it is CONFIRMABLE instead of a pre-confirmation hard stop.  Every
+# other request-entry code stays a fail-closed refusal BEFORE the user is asked
+# anything (see the boundary note in the module report/tests).
+_AD_HOC_SOURCE_PLAN_MISMATCH: Final[str] = "ad_hoc_request_source_plan_mismatch"
+_SAFE_SUMMARY_TOKEN_LIMIT: Final[int] = 64
+_SAFE_SUMMARY_MAX_LENGTH: Final[int] = 512
+# The role-name shape a SlotBinding can express.  A formula role outside it is
+# simply NOT bindable: it is never renamed, coerced or approximated.
+_SLOT_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# ONE stable, typed, non-leaking code for every rejected correction.  The engine
+# reports the RULE that was broken (see _apply_metric_plan_correction); it never
+# echoes the attempted value and never distinguishes "does not exist" from "not
+# authorized", so a refusal leaks nothing about the attempted metric.
+_METRIC_PLAN_CORRECTION_REJECTED: Final[str] = "metric_plan_correction_rejected"
+
+
+def _safe_summary_token(value: object, *, limit: int = _SAFE_SUMMARY_TOKEN_LIMIT) -> str:
+    """A bounded DISPLAY-ONLY token with control characters removed.
+
+    HITLRequest.safe_summary is excluded from the request checksum by
+    construction, so nothing here can change request identity.
+    """
+
+    text = str(value)
+    return "".join(
+        char for char in text if ord(char) >= 32 and ord(char) != 127
+    )[:limit]
+
+
+def _is_expressible_correction_candidate(metric_key: str) -> bool:
+    """Whether a metric identity can be expressed as a correction candidate.
+
+    A candidate the contract cannot express (empty, over-long, carrying control
+    characters or statement delimiters) is NOT offered: the role simply keeps
+    fewer choices and a correction that cannot reach the governed resolver
+    fails closed.
+    """
+
+    try:
+        ResolutionOption(slot="candidate", candidates=(metric_key,))
+    except Exception:
+        return False
+    return True
+
+
+def _metric_plan_resolution_options(
+    *,
+    carrier: AdHocCalculationRequest,
+    plan: QueryPlan,
+    context: ContextBundle,
+) -> tuple[ResolutionOption, ...]:
+    """The server-derived, ALREADY-AUTHORIZED candidate set of ONE correction.
+
+    A correction may only pick, for a formula role, one of the metrics this run
+    OWN question-resolved plan produced AND this run's authorized context
+    already admits.  That intersection is exactly the set the governed AD_HOC
+    resolver accepts for this run, so:
+
+    * a correction can never widen the accessible metric range - it can only
+      re-point a role at a metric that was ALREADY parsed and ALREADY
+      authorized for this run;
+    * naming the candidates leaks nothing unauthorized;
+    * the governed resolver keeps its OWN authorization check, so even a forged
+      candidate set cannot get an unauthorized metric fetched.
+
+    A role whose name a SlotBinding cannot express (uppercase / leading
+    underscore) or whose name is reserved control-plane vocabulary is NOT
+    bindable: it is never renamed or coerced, it is simply not offered.
+    """
+
+    authorized = set(context.asset_ids)
+    candidates = tuple(
+        metric_key
+        for metric_key in dict.fromkeys(plan.metric_keys)
+        if metric_key in authorized
+        and _is_expressible_correction_candidate(metric_key)
+    )
+    if not candidates:
+        return ()
+    options: list[ResolutionOption] = []
+    for item in carrier.calculation_spec.inputs:
+        if _SLOT_NAME_PATTERN.fullmatch(item.role) is None:
+            continue
+        if item.role in RESERVED_SLOT_NAMES:
+            continue
+        options.append(ResolutionOption(slot=item.role, candidates=candidates))
+    return tuple(options)
+
+
+def _ad_hoc_plan_confirmation_summary(
+    *,
+    declared_inputs: tuple[tuple[str, str | None], ...],
+    plan_metric_keys: tuple[str, ...],
+    aligned: bool,
+    resolution_options: tuple[ResolutionOption, ...] = (),
+) -> str:
+    """Name BOTH sides so a human can see at a glance whether they align.
+
+    Left  = the inputs the EXPLICIT formula declares (role -> metric).
+    Right = the inputs the QUESTION was parsed into (the query plan metrics).
+    When a correction is possible the bindable roles and their candidates are
+    named too - they are server-derived, already-authorized metrics, so this
+    leaks nothing the caller may not see.  The verdict is the LAST token and is
+    never truncated away.
+    """
+
+    declared = (
+        ", ".join(
+            f"{_safe_summary_token(role)}="
+            + (_safe_summary_token(metric) if metric else "unresolved")
+            for role, metric in declared_inputs
+        )
+        or "(none)"
+    )
+    question = (
+        ", ".join(_safe_summary_token(key) for key in plan_metric_keys) or "(none)"
+    )
+    verdict = "aligned" if aligned else "MISMATCH"
+    body = (
+        f"Formula-declared inputs (role=metric): {declared} | "
+        f"Question-resolved inputs: {question}"
+    )
+    if resolution_options:
+        correctable = ", ".join(
+            f"{_safe_summary_token(option.slot)} in "
+            + "{"
+            + ",".join(
+                _safe_summary_token(candidate) for candidate in option.candidates
+            )
+            + "}"
+            for option in resolution_options
+        )
+        body += (
+            " | Correctable roles (resolve: role -> one of these parsed, "
+            f"authorized metrics): {correctable}"
+        )
+    room = _SAFE_SUMMARY_MAX_LENGTH - len(verdict) - len(" | ")
+    return (body[:room] + " | " + verdict)[:_SAFE_SUMMARY_MAX_LENGTH]
+
+
+def _ad_hoc_plan_confirmation_request(
+    *,
+    plan: QueryPlan,
+    context: ContextBundle,
+    validation: PlanValidationRecord,
+    declared_inputs: tuple[tuple[str, str | None], ...],
+    aligned: bool,
+    version: int,
+    resolution_options: tuple[ResolutionOption, ...],
+) -> HITLRequest:
+    """The FROZEN producer for "confirm or correct this calculation's plan".
+
+    It reuses the shared HITLRequest validation instead of a second decision
+    interface, and it is the ONLY caller of the metric_plan_confirmation kind.
+    """
+
+    return metric_plan_confirmation_request(
+        plan=plan,
+        context=context,
+        policy_version=validation.policy_version,
+        policy_checksum=validation.policy_checksum,
+        issue_codes=(_AD_HOC_PLAN_CONFIRMATION_ISSUE,),
+        resolution_options=resolution_options,
+        version=version,
+        safe_summary=_ad_hoc_plan_confirmation_summary(
+            declared_inputs=declared_inputs,
+            plan_metric_keys=tuple(plan.metric_keys),
+            aligned=aligned,
+            resolution_options=resolution_options,
+        ),
+    )
+
+
+def _apply_metric_plan_correction(
+    *,
+    carrier: AdHocCalculationRequest,
+    decision: HITLDecision,
+    plan: QueryPlan,
+    context: ContextBundle,
+) -> tuple[AdHocCalculationRequest | None, str | None]:
+    """Rebuild this run's carrier with the user's AUTHORIZED role choices.
+
+    The candidate set is RE-DERIVED here from the RESTORED plan/context - never
+    trusted from the (possibly tampered) checkpoint request - and every binding
+    is checked against it BEFORE anything is rebuilt.  The rebuilt carrier then
+    crosses the NORMAL Pydantic boundary again (model_copy would bypass
+    extra="forbid" and every field pattern, so it is never used), and the
+    governed resolve_ad_hoc_request re-checks authorization for EVERY input, so
+    no new fetch path is opened and no authority is granted.
+
+    A breach returns ONE typed, non-leaking code: the rule that was broken,
+    never the attempted value and never whether the metric exists.
+    """
+
+    options = {
+        option.slot: set(option.candidates)
+        for option in _metric_plan_resolution_options(
+            carrier=carrier, plan=plan, context=context
+        )
+    }
+    if not options:
+        return None, "metric_plan_correction_not_bindable"
+    choices: dict[str, str] = {}
+    for item in decision.slot_bindings:
+        if item.source != "user":
+            return None, "metric_plan_correction_source_not_user"
+        if not isinstance(item.value, str):
+            # Free text, a number, a list: never a candidate identity.
+            return None, "metric_plan_correction_value_invalid"
+        allowed = options.get(item.slot)
+        if allowed is None:
+            return None, "metric_plan_correction_unknown_role"
+        if item.value not in allowed:
+            # IDENTICAL code whether the metric does not exist, is not
+            # authorized, or is merely not a candidate for this role.
+            return None, "metric_plan_correction_value_not_a_candidate"
+        choices[item.slot] = item.value
+    if len(set(choices.values())) != len(choices):
+        return None, "metric_plan_correction_duplicate_metric"
+    spec_payload = carrier.calculation_spec.model_dump(mode="json")
+    spec_payload["inputs"] = [
+        {
+            **item.model_dump(mode="json"),
+            "metric_key": choices.get(item.role, item.metric_key),
+        }
+        for item in carrier.calculation_spec.inputs
+    ]
+    try:
+        spec = CalculationSpec.model_validate(spec_payload)
+        binding = CalculationExecutionBinding.model_validate(
+            {
+                **carrier.execution_binding.model_dump(mode="json"),
+                "spec_checksum": spec.checksum,
+            }
+        )
+        corrected = AdHocCalculationRequest.model_validate(
+            {
+                "schema_version": carrier.schema_version,
+                "calculation_spec": spec.model_dump(mode="json"),
+                "execution_binding": binding.model_dump(mode="json"),
+            }
+        )
+    except Exception:
+        return None, "metric_plan_correction_payload_invalid"
+    return corrected, None
+
+
+def _is_ad_hoc_plan_confirmation(
+    state: V2EngineState, request: HITLRequest
+) -> bool:
+    """Whether a suspended typed request is THIS run's formula confirmation.
+
+    The issue code ALONE is not a sufficient discriminator:
+    custom_metric_plan_confirmation is the frozen reason for confirming a custom
+    metric's plan, and an ordinary business confirmation may carry it too.
+    THIS run's formula confirmation is identified by that reason AND the
+    presence of the run's EXPLICIT carrier.  The pre-P7 business_confirmation
+    form stays recognised so an in-flight checkpoint still resumes.
+    """
+
+    if request.decision_kind not in (
+        _AD_HOC_PLAN_CONFIRMATION_KIND,
+        _LEGACY_AD_HOC_PLAN_CONFIRMATION_KIND,
+    ):
+        return False
+    if _AD_HOC_PLAN_CONFIRMATION_ISSUE not in request.issue_codes:
+        return False
+    return isinstance(state.get("ad_hoc_calculation"), dict)
+
+
+def _resolve_ad_hoc_for_confirmation(
+    carrier: AdHocCalculationRequest,
+    *,
+    context: ContextBundle,
+    plan: QueryPlan,
+    catalog: object,
+) -> tuple[ResolvedAdHocCalculation | None, str | None]:
+    """Resolve a carrier for CONFIRMATION, separating refusals by class.
+
+    Returns (resolution, None) when the carrier resolves, or (None, None) for a
+    source-plan MISALIGNMENT - the ONE refusal that is an alignment discrepancy
+    between two well-formed parses and is therefore CONFIRMABLE.  Every other
+    request-entry refusal is returned as (None, code) and must remain a
+    fail-closed stop BEFORE the user is asked anything.
+    """
+
+    try:
+        return (
+            resolve_ad_hoc_request(
+                request=carrier,
+                context=context,
+                query_plan=plan,
+                catalog=cast(Any, catalog),
+            ),
+            None,
+        )
+    except AdHocRequestError as exc:
+        if exc.code == _AD_HOC_SOURCE_PLAN_MISMATCH:
+            return None, None
+        return None, exc.code
+
+
+def _ad_hoc_confirmation_suspended(
+    state: V2EngineState,
+    trace: TraceEnvelope,
+    *,
+    plan: QueryPlan,
+    context: ContextBundle,
+    validation: PlanValidationRecord,
+    carrier: AdHocCalculationRequest,
+    resolved: ResolvedAdHocCalculation | None,
+) -> dict[str, object]:
+    """Suspend an explicit-formula run as ONE typed plan confirmation.
+
+    It reuses the EXISTING typed request producer/node/resume machinery: no
+    second action interface is introduced, no slot is invented and nothing is
+    compiled or executed while suspended.
+    """
+
+    version = int(state.get("decision_version", 0)) + 1
+    declared = tuple(
+        (item.role, item.metric_key) for item in carrier.calculation_spec.inputs
+    )
+    # The correction surface is derived HERE, server-side, from the SAME restored
+    # plan/context the resolver uses.  It is re-derived again at continuation, so
+    # a tampered checkpoint can never widen it.
+    resolution_options = _metric_plan_resolution_options(
+        carrier=carrier,
+        plan=plan,
+        context=context,
+    )
+    request = _ad_hoc_plan_confirmation_request(
+        plan=plan,
+        context=context,
+        validation=validation,
+        declared_inputs=declared,
+        aligned=resolved is not None,
+        version=version,
+        resolution_options=resolution_options,
+    )
+    trace.record(
+        "policy",
+        _AD_HOC_PLAN_CONFIRMATION_EVENT,
+        issue_code=_AD_HOC_PLAN_CONFIRMATION_ISSUE,
+        decision_kind=request.decision_kind,
+        aligned=resolved is not None,
+        declared_input_count=len(declared),
+        plan_metric_count=len(plan.metric_keys),
+        correctable_role_count=len(resolution_options),
+    )
+    return {
+        "messages": [
+            AIMessage(
+                content=(
+                    "An explicit calculation formula was supplied. Confirm the "
+                    "parsed calculation plan before anything is executed."
+                )
+            )
+        ],
+        "pending_decision": request.model_dump(mode="json"),
+        "decision_status": "awaiting_decision",
+        "decision_version": version,
+        "needs_hitl": False,
+        # §4.3: the human-wait interval OPENS here and is closed (and deducted
+        # from the calculation deadline) when the decision node resumes.
+        "human_wait_started_at": _utc_now().isoformat(),
+        "trace_events": _events(trace),
+    }
 
 
 def _trace_id(state: V2EngineState) -> str:

@@ -24,6 +24,13 @@ from src.nl2sql.artifacts.build_run import BUILD_MODE_REQUIRED, require_build_ru
 from src.nl2sql.artifacts.custom_definition_execution_service import (
     CustomDefinitionExecutionService,
 )
+from src.nl2sql.artifacts.definition_revalidation import (
+    ActiveReleaseEvidence,
+    AuthorizationEvidence,
+    DataSnapshotEvidence,
+    DefinitionRevalidationGate,
+    InputFreshnessDQ,
+)
 from src.nl2sql.artifacts.service import CustomDefinitionService
 from src.nl2sql.contracts import RequestContext
 from src.nl2sql.orchestration.mode_contract import RunEnvelope
@@ -309,7 +316,10 @@ async def test_unnamed_chain_end_does_not_finalize() -> None:
         extra_input=_metadata_input(),
     )
     events = _sse_events(payload)
-    assert [name for name, _ in events] == ["metadata", "done"]
+    assert [name for name, _ in events] == ["metadata", "error"]
+    errors = [data for name, data in events if name == "error"]
+    assert len(errors) == 1
+    assert errors[0]["code"] == "stream_root_result_missing"
     assert "leak" not in payload
 
 
@@ -329,7 +339,10 @@ async def test_named_ordinary_child_does_not_finalize() -> None:
         extra_input=_metadata_input(),
     )
     events = _sse_events(payload)
-    assert [name for name, _ in events] == ["metadata", "done"]
+    assert [name for name, _ in events] == ["metadata", "error"]
+    errors = [data for name, data in events if name == "error"]
+    assert len(errors) == 1
+    assert errors[0]["code"] == "stream_root_result_missing"
     assert "leak" not in payload
 
 
@@ -349,7 +362,10 @@ async def test_root_named_event_with_parent_ids_does_not_finalize() -> None:
         extra_input=_metadata_input(),
     )
     events = _sse_events(payload)
-    assert [name for name, _ in events] == ["metadata", "done"]
+    assert [name for name, _ in events] == ["metadata", "error"]
+    errors = [data for name, data in events if name == "error"]
+    assert len(errors) == 1
+    assert errors[0]["code"] == "stream_root_result_missing"
     assert "leak" not in payload
 
 
@@ -815,10 +831,14 @@ async def test_close_disposes_resources_and_clears_cached_state(
         async def dispose(self) -> None:
             disposed.append(True)
 
-    container._local_real_resources = (_Engine(), object())  # type: ignore[assignment]
+    container._local_real_resources = (
+        _Engine(),
+        _Engine(),
+        object(),
+    )  # type: ignore[assignment]
     container._local_real_deployment = (1, 2, 3, 4)  # type: ignore[assignment]
     await container.close()
-    assert disposed == [True], "the created engine must be disposed"
+    assert disposed == [True, True], "both runtime engines must be disposed"
     assert container._local_real_resources is None
     assert container._local_real_deployment is None
     assert container._local_real_readiness is None
@@ -1194,6 +1214,57 @@ def _execute_spec() -> Any:
     )
 
 
+class _RevalidationAuthorization:
+    async def current_authorization(self, **_: object) -> AuthorizationEvidence:
+        return AuthorizationEvidence(authorization_revision="rev-current")
+
+
+class _RevalidationRelease:
+    async def active_release(self, **_: object) -> ActiveReleaseEvidence:
+        return ActiveReleaseEvidence(release_id="rel-current", release_checksum="b" * 64)
+
+
+class _RevalidationSnapshot:
+    async def data_snapshot(self, **_: object) -> DataSnapshotEvidence:
+        return DataSnapshotEvidence(
+            snapshot_id="snap-current", snapshot_checksum="c" * 64
+        )
+
+
+class _RevalidationBudget:
+    async def remaining_budget(self, **_: object) -> int:
+        return 5
+
+
+class _RevalidationFreshness:
+    async def assess(self, **kwargs: object) -> tuple[InputFreshnessDQ, ...]:
+        resolved = kwargs["resolved_inputs"]
+        assert isinstance(resolved, tuple)
+        return tuple(
+            InputFreshnessDQ(
+                role=item.role,
+                metric_key=item.metric_key,
+                freshness="fresh",
+                dq="pass",
+                data_as_of=item.data_as_of,
+            )
+            for item in resolved
+        )
+
+
+def _passing_revalidation() -> DefinitionRevalidationGate:
+    """Current-state evidence the controlled acceptance doubles can prove."""
+
+    return DefinitionRevalidationGate(
+        authorization_provider=_RevalidationAuthorization(),
+        active_release_provider=_RevalidationRelease(),
+        data_snapshot_provider=_RevalidationSnapshot(),
+        freshness_dq_provider=_RevalidationFreshness(),
+        budget_provider=_RevalidationBudget(),
+        governed_metric_authority=lambda _key: True,
+    )
+
+
 async def _execute_app(fetcher: Any) -> tuple[TestClient, str]:
     from src.nl2sql.artifacts.api_definitions import register_definition_routes
     from src.nl2sql.artifacts.service import CustomDefinitionService
@@ -1222,6 +1293,7 @@ async def _execute_app(fetcher: Any) -> tuple[TestClient, str]:
             return CustomDefinitionExecutionService(
                 definitions=definitions,
                 input_resolver=TypedMetricCalculationInputResolver(fetcher),
+                revalidation=_passing_revalidation(),
             )
 
     app = FastAPI()

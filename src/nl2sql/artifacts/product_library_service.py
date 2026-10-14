@@ -328,12 +328,18 @@ class ProductLibraryService:
             raise LibraryVersionNotFound("library_install_required")
         if published.semantic is None:
             raise PublicationNotForkable()
+        # Fork ONLY from a source definition that actually resolves and whose
+        # checksum matches the published package.  A dangling source fails closed
+        # instead of silently copying an unprovable semantic package.
+        source = await self._publications.resolve_published_source(
+            identity_id=identity_id, version=version
+        )
         return await self._definitions.create_fork(
             owner_user_id=user_id,
             title=title,
-            calculation=published.semantic.calculation,
-            source_definition_id=identity_id,
-            source_version=version,
+            calculation=source.calculation,
+            source_definition_id=source.definition_id,
+            source_version=source.version,
         )
 
     # --- local-demo certification ----------------------------------------

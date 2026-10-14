@@ -15,14 +15,19 @@ import logging
 import math
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import sqlglot
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+)
 from sqlglot import exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
@@ -49,6 +54,7 @@ class QueryErrorCode(StrEnum):
     ROWS_EXCEEDED = "rows_exceeded"
     CAPACITY_EXCEEDED = "capacity_exceeded"
     TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
     CONNECTION_ERROR = "connection_error"
     TRANSIENT_DATABASE_ERROR = "transient_database_error"
     PERMISSION_DENIED = "permission_denied"
@@ -63,6 +69,31 @@ class QueryError:
     code: QueryErrorCode
     message: str
     retryable: bool = False
+
+
+@dataclass(frozen=True)
+class QuerySourceSnapshot:
+    """Source and MVCC snapshot observed inside the query transaction."""
+
+    source_id: str
+    source_version: str
+    snapshot_id: str
+
+    @property
+    def fingerprint(self) -> str:
+        payload = json.dumps(
+            {
+                "schema_version": "query-source-snapshot-v1",
+                "source_id": self.source_id,
+                "source_version": self.source_version,
+                "snapshot_id": self.snapshot_id,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -98,6 +129,14 @@ class QueryReceipt:
     max_rows: int | None = None
     timeout_ms: int | None = None
     data_scope: tuple[str, ...] = ()
+    # Minted by QueryGateway for this execution and shared with its audit events.
+    execution_id: UUID | None = None
+    source_snapshot: QuerySourceSnapshot | None = None
+    result_columns: tuple[str, ...] = ()
+
+    @property
+    def source_snapshot_fingerprint(self) -> str | None:
+        return self.source_snapshot.fingerprint if self.source_snapshot is not None else None
 
     @property
     def policy_decision(self) -> PolicyDecision:
@@ -173,17 +212,25 @@ class _QueryDatabaseFailure(RuntimeError):
 
 
 class QueryAuditSink(Protocol):
-    async def record_sql_start(self, trace_id: str, sql: str) -> None: ...
+    async def record_sql_start(
+        self,
+        trace_id: str,
+        sql: str,
+        *,
+        execution_id: str,
+    ) -> None: ...
 
     async def record_sql_result(
         self,
         trace_id: str,
         sql: str,
         *,
+        execution_id: str,
         accepted: bool,
         row_count: int,
         elapsed_ms: float,
         error_code: str | None,
+        source_snapshot_fingerprint: str | None,
     ) -> None: ...
 
 
@@ -249,6 +296,12 @@ _SQLGLOT_STRING_EXPRESSIONS = (
     exp.RawString,
     exp.UnicodeString,
 )
+
+
+def is_sensitive_column_name(name: str) -> bool:
+    """Share the gateway's sensitive-column naming rule with data projections."""
+
+    return bool(_SENSITIVE_COLUMN.search(name))
 
 
 class PolicyEngine:
@@ -494,6 +547,7 @@ class QueryGateway:
         readonly_role: str = "business_reader",
         audit_sink: QueryAuditSink | None = None,
         concurrency_governor: ConcurrencyGovernor | None = None,
+        cancellation_engine: AsyncEngine | None = None,
     ) -> None:
         if schema and not _SAFE_IDENTIFIER.fullmatch(schema):
             raise ValueError("invalid schema identifier")
@@ -507,6 +561,11 @@ class QueryGateway:
         if max_plan_cost < 0 or max_plan_rows < 0 or max_result_bytes < 2:
             raise ValueError("query resource limits are invalid")
         self._session_factory = session_factory
+        bound_engine = getattr(session_factory, "kw", {}).get("bind")
+        self._engine: AsyncEngine | None = (
+            bound_engine if isinstance(bound_engine, AsyncEngine) else None
+        )
+        self._cancellation_engine = cancellation_engine or self._engine
         self._schema = schema
         self._timeout_seconds = timeout_seconds
         self._plan_timeout_ms = plan_timeout_ms
@@ -522,8 +581,26 @@ class QueryGateway:
         self._concurrency_governor = concurrency_governor
         self._policy = PolicyEngine(max_rows=max_rows, allowed_schema=schema)
 
-    def prepare(self, sql: str) -> PreparedQuery:
-        return self._policy.prepare(sql)
+    def prepare(
+        self,
+        sql: str,
+        *,
+        max_rows: int | None = None,
+        detect_row_truncation: bool = False,
+    ) -> PreparedQuery:
+        effective_rows = _bounded_integer_limit(
+            "max_rows",
+            max_rows,
+            ceiling=self._max_rows,
+            minimum=1,
+        )
+        query_rows = effective_rows + 1 if detect_row_truncation else effective_rows
+        if query_rows == self._max_rows:
+            return self._policy.prepare(sql)
+        return PolicyEngine(
+            max_rows=query_rows,
+            allowed_schema=self._schema,
+        ).prepare(sql)
 
     def _capacity_governor(self) -> ConcurrencyGovernor:
         if self._concurrency_governor is None:
@@ -580,45 +657,113 @@ class QueryGateway:
         params: dict[str, Any] | None = None,
         *,
         trace_id: str = "",
+        max_rows: int | None = None,
+        max_result_bytes: int | None = None,
+        max_plan_cost: float | None = None,
+        capture_source_snapshot: bool = False,
+        detect_row_truncation: bool = False,
     ) -> QueryReceipt:
         started = time.perf_counter()
+        execution_id = uuid4()
+        effective_rows = _bounded_integer_limit(
+            "max_rows",
+            max_rows,
+            ceiling=self._max_rows,
+            minimum=1,
+        )
+        effective_bytes = _bounded_integer_limit(
+            "max_result_bytes",
+            max_result_bytes,
+            ceiling=self._max_result_bytes,
+            minimum=2,
+        )
+        effective_cost = _bounded_cost_limit(max_plan_cost, self._max_plan_cost)
+        plan_row_limit: int | None = None
+        if detect_row_truncation:
+            plan_row_limit = effective_rows + 1
+        elif max_rows is not None:
+            plan_row_limit = effective_rows
+        plan_cost_limit = effective_cost if max_plan_cost is not None else None
         if self._audit_sink is not None:
             try:
-                await self._audit_sink.record_sql_start(trace_id, sql)
+                await self._audit_sink.record_sql_start(
+                    trace_id,
+                    sql,
+                    execution_id=str(execution_id),
+                )
             except Exception as exc:
                 self._log_internal_failure("audit_start", exc, _fingerprint(sql))
-                return self._rejected(
-                    sql,
-                    QueryErrorCode.AUDIT_UNAVAILABLE,
-                    "required query audit is unavailable",
-                    started,
+                return replace(
+                    self._rejected(
+                        sql,
+                        QueryErrorCode.AUDIT_UNAVAILABLE,
+                        "required query audit is unavailable",
+                        started,
+                    ),
+                    execution_id=execution_id,
                 )
 
         try:
             async with self._capacity_governor().acquire("sql"):
-                receipt = await self._execute_locked(sql, params, started=started)
+                receipt = await self._execute_locked(
+                    sql,
+                    params,
+                    started=started,
+                    max_rows=effective_rows,
+                    max_result_bytes=effective_bytes,
+                    max_plan_cost=plan_cost_limit,
+                    max_plan_rows=plan_row_limit,
+                    capture_source_snapshot=capture_source_snapshot,
+                    detect_row_truncation=detect_row_truncation,
+                )
+        except asyncio.CancelledError:
+            if self._audit_sink is not None:
+                try:
+                    await self._audit_sink.record_sql_result(
+                        trace_id,
+                        sql,
+                        execution_id=str(execution_id),
+                        accepted=False,
+                        row_count=0,
+                        elapsed_ms=_elapsed_ms(started),
+                        error_code=QueryErrorCode.CANCELLED,
+                        source_snapshot_fingerprint=None,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._log_internal_failure(
+                        "audit_cancelled", exc, _fingerprint(sql)
+                    )
+            raise
         except CapacityExceededError as exc:
             receipt = self._capacity_rejection(sql, exc, started)
+        receipt = replace(receipt, execution_id=execution_id)
 
         if self._audit_sink is not None:
             try:
                 await self._audit_sink.record_sql_result(
                     trace_id,
                     sql,
+                    execution_id=str(execution_id),
                     accepted=receipt.accepted,
                     row_count=receipt.row_count,
                     elapsed_ms=receipt.elapsed_ms,
                     error_code=receipt.error.code if receipt.error else None,
+                    source_snapshot_fingerprint=receipt.source_snapshot_fingerprint,
                 )
             except Exception as exc:
                 self._log_internal_failure("audit_result", exc, receipt.sql_fingerprint)
-                return self._rejected(
-                    "",
-                    QueryErrorCode.AUDIT_UNAVAILABLE,
-                    "required query audit result could not be recorded",
-                    started,
-                    fingerprint=receipt.sql_fingerprint,
-                    policy_outcome=receipt.policy_outcome,
+                return replace(
+                    self._rejected(
+                        "",
+                        QueryErrorCode.AUDIT_UNAVAILABLE,
+                        "required query audit result could not be recorded",
+                        started,
+                        fingerprint=receipt.sql_fingerprint,
+                        policy_outcome=receipt.policy_outcome,
+                    ),
+                    execution_id=execution_id,
                 )
         return receipt
 
@@ -628,18 +773,40 @@ class QueryGateway:
         params: dict[str, Any] | None = None,
         *,
         started: float | None = None,
+        max_rows: int,
+        max_result_bytes: int,
+        max_plan_cost: float | None,
+        max_plan_rows: int | None,
+        capture_source_snapshot: bool,
+        detect_row_truncation: bool,
     ) -> QueryReceipt:
         started = started if started is not None else time.perf_counter()
         try:
-            prepared = self.prepare(sql)
+            prepared = self.prepare(
+                sql,
+                max_rows=max_rows,
+                detect_row_truncation=detect_row_truncation,
+            )
             bound = self._policy.validate_params(prepared, params)
         except QueryPolicyError as exc:
             return self._rejected(sql, exc.code, str(exc), started)
 
         try:
-            cost, rows_estimate, rows, masked_columns = await self._plan_and_run(
+            (
+                cost,
+                rows_estimate,
+                rows,
+                masked_columns,
+                result_columns,
+                source_snapshot,
+            ) = await self._plan_and_run(
                 prepared,
                 bound,
+                max_result_bytes=max_result_bytes,
+                max_plan_cost=max_plan_cost,
+                max_plan_rows=max_plan_rows,
+                max_materialized_rows=max_rows,
+                capture_source_snapshot=capture_source_snapshot,
             )
         except QueryPolicyError as exc:
             return self._rejected_prepared(
@@ -649,6 +816,7 @@ class QueryGateway:
                 started,
                 estimated_cost=exc.estimated_cost,
                 estimated_rows=exc.estimated_rows,
+                max_rows=max_rows,
             )
         except _QueryDatabaseFailure as exc:
             return self._database_rejection(
@@ -658,6 +826,7 @@ class QueryGateway:
                 stage=exc.stage,
                 estimated_cost=exc.estimated_cost,
                 estimated_rows=exc.estimated_rows,
+                max_rows=max_rows,
             )
 
         return self._accepted_receipt(
@@ -667,6 +836,9 @@ class QueryGateway:
             estimated_cost=cost,
             estimated_rows=rows_estimate,
             masked_columns=tuple(sorted(masked_columns)),
+            result_columns=result_columns,
+            source_snapshot=source_snapshot,
+            max_rows=max_rows,
         )
 
     async def _plan(
@@ -675,39 +847,95 @@ class QueryGateway:
         params: dict[str, Any],
     ) -> tuple[float, int]:
         async with self._session_factory() as session:
+            cancelled = False
+            backend_identity: tuple[int, datetime] | None = None
+            driver_connection: Any | None = None
+            if self._engine is not None:
+                request_connection = await session.connection()
+                driver_connection = (
+                    await request_connection.get_raw_connection()
+                ).driver_connection
             try:
                 async with asyncio.timeout(self._timeout_seconds):
                     await self._begin_read_only(session)
+                    if self._engine is not None:
+                        backend_identity = await self._backend_identity(session)
                     return await self._plan_with_timeout(session, prepared, params)
+            except asyncio.CancelledError:
+                cancelled = True
+                await self._recover_cancelled_session(
+                    session, driver_connection, backend_identity
+                )
+                raise
             finally:
-                await session.rollback()
+                if not cancelled:
+                    await session.rollback()
 
     async def _plan_and_run(
         self,
         prepared: PreparedQuery,
         params: dict[str, Any],
-    ) -> tuple[float, int, list[dict[str, Any]], set[str]]:
+        *,
+        max_result_bytes: int | None = None,
+        max_plan_cost: float | None = None,
+        max_plan_rows: int | None = None,
+        max_materialized_rows: int | None = None,
+        capture_source_snapshot: bool = False,
+    ) -> tuple[
+        float,
+        int,
+        list[dict[str, Any]],
+        set[str],
+        tuple[str, ...],
+        QuerySourceSnapshot | None,
+    ]:
         stage: Literal["plan", "execute"] = "plan"
         cost: float | None = None
         rows_estimate: int | None = None
+        source_snapshot: QuerySourceSnapshot | None = None
+        result_columns: tuple[str, ...] = ()
         try:
             async with self._session_factory() as session:
+                cancelled = False
+                backend_identity: tuple[int, datetime] | None = None
+                driver_connection: Any | None = None
+                if self._engine is not None:
+                    request_connection = await session.connection()
+                    driver_connection = (
+                        await request_connection.get_raw_connection()
+                    ).driver_connection
                 try:
                     async with asyncio.timeout(self._timeout_seconds):
-                        await self._begin_read_only(session)
+                        source_snapshot = await self._begin_read_only(
+                            session,
+                            capture_source_snapshot=capture_source_snapshot,
+                        )
+                        if self._engine is not None:
+                            backend_identity = await self._backend_identity(session)
                         cost, rows_estimate = await self._plan_with_timeout(
                             session,
                             prepared,
                             params,
+                            max_plan_cost=max_plan_cost,
+                            max_plan_rows=max_plan_rows,
                         )
                         stage = "execute"
-                        rows, masked_columns = await self._stream_in_session(
+                        rows, masked_columns, result_columns = await self._stream_in_session(
                             session,
                             prepared,
                             params,
+                            max_result_bytes=max_result_bytes,
+                            max_materialized_rows=max_materialized_rows,
                         )
+                except asyncio.CancelledError:
+                    cancelled = True
+                    await self._recover_cancelled_session(
+                        session, driver_connection, backend_identity
+                    )
+                    raise
                 finally:
-                    await session.rollback()
+                    if not cancelled:
+                        await session.rollback()
         except QueryPolicyError as exc:
             if exc.estimated_cost is None:
                 exc.estimated_cost = cost
@@ -722,22 +950,149 @@ class QueryGateway:
                 estimated_rows=rows_estimate,
             ) from exc
         assert cost is not None and rows_estimate is not None
-        return cost, rows_estimate, rows, masked_columns
+        return cost, rows_estimate, rows, masked_columns, result_columns, source_snapshot
+
+    async def _backend_identity(
+        self, session: AsyncSession
+    ) -> tuple[int, datetime]:
+        """Capture the process ID and start time of this server-owned backend."""
+
+        result = await session.execute(
+            text(
+                "SELECT pid, backend_start FROM pg_stat_activity "
+                "WHERE pid = pg_backend_pid()"
+            )
+        )
+        identity = result.fetchone()
+        if identity is None:
+            raise RuntimeError("query gateway backend identity unavailable")
+        return int(identity[0]), identity[1]
+
+    async def _recover_cancelled_session(
+        self,
+        session: AsyncSession,
+        driver_connection: Any | None,
+        backend_identity: tuple[int, datetime] | None,
+    ) -> None:
+        """Cancel the matching server query, then roll back or discard its session.
+
+        The installed asyncpg driver exposes ``terminate`` but no public
+        per-query cancellation method. A fresh bounded pool connection requests
+        cancellation using the server-owned backend PID. If PostgreSQL does not
+        accept the signal, dispose of the request connection so an uncertain
+        transaction cannot return to the pool or continue in the background.
+        """
+
+        if backend_identity is None or self._cancellation_engine is None:
+            await self._invalidate_cancelled_session(session, driver_connection)
+            return
+        backend_pid, backend_start = backend_identity
+
+        backend_stopped = False
+        driver_pid_getter = getattr(driver_connection, "get_server_pid", None)
+        driver_pid = driver_pid_getter() if callable(driver_pid_getter) else None
+        if driver_pid is not None and driver_pid != backend_pid:
+            logger.warning(
+                "query gateway cancellation connection identity mismatch server_pid=%s driver_pid=%s",
+                backend_pid,
+                driver_pid,
+            )
+        try:
+            async with self._cancellation_engine.connect() as connection:
+                result = await connection.execute(
+                    text(
+                        "SELECT CASE WHEN pg_backend_pid() <> :pid AND EXISTS ("
+                        "SELECT 1 FROM pg_stat_activity WHERE pid = :pid "
+                        "AND backend_start = :backend_start) THEN "
+                        "CASE WHEN pg_cancel_backend(:pid) THEN TRUE "
+                        "ELSE pg_terminate_backend(:pid) END "
+                        "ELSE FALSE END AS stopped"
+                    ),
+                    {"pid": backend_pid, "backend_start": backend_start},
+                )
+                cancellation_result = result.mappings().one_or_none()
+                backend_stopped = (
+                    cancellation_result is not None
+                    and cancellation_result["stopped"] is True
+                )
+                if not backend_stopped:
+                    logger.warning(
+                        "query gateway backend signal was not accepted backend_pid=%s",
+                        backend_pid,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "query gateway backend cancel failed error_type=%s backend_pid=%s",
+                type(exc).__name__,
+                backend_pid,
+            )
+        if not backend_stopped:
+            logger.warning(
+                "query gateway backend cancellation unconfirmed; disposing connection backend_pid=%s",
+                backend_pid,
+            )
+            await self._invalidate_cancelled_session(session, driver_connection)
+            return
+
+        try:
+            await asyncio.shield(session.rollback())
+        except Exception as exc:
+            logger.warning(
+                "query gateway cancelled session rollback failed error_type=%s",
+                type(exc).__name__,
+            )
+            await self._invalidate_cancelled_session(session, driver_connection)
+
+    @staticmethod
+    async def _invalidate_cancelled_session(
+        session: AsyncSession, driver_connection: Any | None
+    ) -> None:
+        async def terminate_and_invalidate() -> None:
+            try:
+                terminate = getattr(driver_connection, "terminate", None)
+                if callable(terminate):
+                    terminate()
+            except Exception as exc:
+                logger.warning(
+                    "query gateway cancelled driver termination failed error_type=%s",
+                    type(exc).__name__,
+                )
+            await session.invalidate()
+
+        try:
+            await asyncio.shield(terminate_and_invalidate())
+        except Exception as exc:
+            logger.warning(
+                "query gateway cancellation invalidation failed error_type=%s",
+                type(exc).__name__,
+            )
 
     async def _plan_with_timeout(
         self,
         session: AsyncSession,
         prepared: PreparedQuery,
         params: dict[str, Any],
+        *,
+        max_plan_cost: float | None = None,
+        max_plan_rows: int | None = None,
     ) -> tuple[float, int]:
         async with asyncio.timeout(self._plan_timeout_ms / 1000):
-            return await self._plan_in_session(session, prepared, params)
+            return await self._plan_in_session(
+                session,
+                prepared,
+                params,
+                max_plan_cost=max_plan_cost,
+                max_plan_rows=max_plan_rows,
+            )
 
     async def _plan_in_session(
         self,
         session: AsyncSession,
         prepared: PreparedQuery,
         params: dict[str, Any],
+        *,
+        max_plan_cost: float | None = None,
+        max_plan_rows: int | None = None,
     ) -> tuple[float, int]:
         result = await session.execute(
             text(f"EXPLAIN (FORMAT JSON) {prepared.bind_sql}"),
@@ -746,17 +1101,30 @@ class QueryGateway:
         row = result.fetchone()
         plan = _parse_plan(row[0] if row is not None else None)
         cost, rows = _plan_metrics(plan)
-        if cost > self._max_plan_cost:
+        cost_limit = self._max_plan_cost if max_plan_cost is None else max_plan_cost
+        if cost > cost_limit:
             raise QueryPolicyError(
                 QueryErrorCode.COST_EXCEEDED,
-                f"estimated cost {cost:.0f} exceeds policy",
+                (
+                    f"estimated cost {cost:.0f} exceeds policy"
+                    if max_plan_cost is None
+                    else "estimated cost exceeds policy"
+                ),
                 estimated_cost=cost,
                 estimated_rows=rows,
             )
-        if rows > self._max_plan_rows:
+        row_limit = self._max_plan_rows if max_plan_rows is None else min(
+            self._max_plan_rows,
+            max_plan_rows,
+        )
+        if rows > row_limit:
             raise QueryPolicyError(
                 QueryErrorCode.ROWS_EXCEEDED,
-                f"estimated rows {rows} exceeds policy",
+                (
+                    f"estimated rows {rows} exceeds policy"
+                    if max_plan_rows is None
+                    else "estimated rows exceed policy"
+                ),
                 estimated_cost=cost,
                 estimated_rows=rows,
             )
@@ -767,15 +1135,26 @@ class QueryGateway:
         session: AsyncSession,
         prepared: PreparedQuery,
         params: dict[str, Any],
-    ) -> tuple[list[dict[str, Any]], set[str]]:
+        *,
+        max_result_bytes: int | None = None,
+        max_materialized_rows: int | None = None,
+    ) -> tuple[list[dict[str, Any]], set[str], tuple[str, ...]]:
         rows: list[dict[str, Any]] = []
         masked_columns: set[str] = set()
+        result_byte_limit = (
+            self._max_result_bytes if max_result_bytes is None else max_result_bytes
+        )
+        row_limit = (
+            prepared.max_rows
+            if max_materialized_rows is None
+            else min(prepared.max_rows, max_materialized_rows)
+        )
         encoded_size = 2  # JSON list brackets.
         result = await session.stream(text(prepared.bind_sql), params)
         keys = [str(key) for key in result.keys()]
         async for partition in result.partitions(32):
             for raw_row in partition:
-                if len(rows) >= prepared.max_rows:
+                if len(rows) >= row_limit:
                     raise QueryPolicyError(
                         QueryErrorCode.ROWS_EXCEEDED,
                         "query returned more rows than the policy limit",
@@ -789,20 +1168,30 @@ class QueryGateway:
                     ).encode("utf-8")
                 )
                 encoded_size += row_size + (2 if rows else 0)
-                if encoded_size > self._max_result_bytes:
+                if encoded_size > result_byte_limit:
                     raise QueryPolicyError(
                         QueryErrorCode.RESULT_TOO_LARGE,
-                        f"query result exceeds {self._max_result_bytes} bytes",
+                        "query result exceeds the byte budget",
                     )
                 rows.append(safe_row)
                 masked_columns.update(row_masked_columns)
-        return rows, masked_columns
+        return rows, masked_columns, tuple(keys)
 
-    async def _begin_read_only(self, session: AsyncSession) -> None:
+    async def _begin_read_only(
+        self,
+        session: AsyncSession,
+        *,
+        capture_source_snapshot: bool = False,
+    ) -> QuerySourceSnapshot | None:
         # This is deliberately the first statement on each fresh AsyncSession.
         # SQLAlchemy autobegin creates the transaction before PostgreSQL receives
-        # SET TRANSACTION, so no query can run before read-only mode is asserted.
-        await session.execute(text("SET TRANSACTION READ ONLY"))
+        # SET TRANSACTION, so no query can run before transaction policy is set.
+        transaction_mode = (
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+            if capture_source_snapshot
+            else "SET TRANSACTION READ ONLY"
+        )
+        await session.execute(text(transaction_mode))
         await session.execute(
             text(f"SET LOCAL statement_timeout = '{self._timeout_seconds * 1000}ms'")
         )
@@ -815,6 +1204,29 @@ class QueryGateway:
         )
         if self._schema:
             await session.execute(text(f"SET LOCAL search_path TO {self._schema}"))
+        if not capture_source_snapshot:
+            return None
+
+        result = await session.execute(
+            text(
+                "SELECT current_database(), "
+                "current_setting('server_version_num'), "
+                "txid_current_snapshot()::text"
+            )
+        )
+        row = result.fetchone()
+        if row is None or len(row) != 3:
+            raise RuntimeError("query source snapshot could not be observed")
+        database_name = str(row[0])
+        server_version_num = int(row[1])
+        snapshot_id = str(row[2])
+        if not database_name or not snapshot_id:
+            raise RuntimeError("query source snapshot could not be observed")
+        return QuerySourceSnapshot(
+            source_id=f"{self._datasource}:{database_name}",
+            source_version=f"postgres-{server_version_num // 10000}",
+            snapshot_id=snapshot_id,
+        )
 
     def _accepted_receipt(
         self,
@@ -825,6 +1237,9 @@ class QueryGateway:
         estimated_cost: float | None = None,
         estimated_rows: int | None = None,
         masked_columns: tuple[str, ...] = (),
+        result_columns: tuple[str, ...] = (),
+        source_snapshot: QuerySourceSnapshot | None = None,
+        max_rows: int | None = None,
     ) -> QueryReceipt:
         result_rows = rows or []
         return QueryReceipt(
@@ -840,9 +1255,11 @@ class QueryGateway:
             datasource=self._datasource,
             readonly_role=self._readonly_role,
             policy_outcome="allow",
-            max_rows=self._max_rows,
+            max_rows=prepared.max_rows if max_rows is None else max_rows,
             timeout_ms=self._timeout_seconds * 1000,
             data_scope=prepared.data_scope,
+            source_snapshot=source_snapshot,
+            result_columns=result_columns,
         )
 
     def _rejected_prepared(
@@ -854,6 +1271,7 @@ class QueryGateway:
         *,
         estimated_cost: float | None = None,
         estimated_rows: int | None = None,
+        max_rows: int | None = None,
     ) -> QueryReceipt:
         return self._rejected(
             prepared.sql,
@@ -865,6 +1283,7 @@ class QueryGateway:
             data_scope=prepared.data_scope,
             estimated_cost=estimated_cost,
             estimated_rows=estimated_rows,
+            max_rows=max_rows,
         )
 
     def _database_rejection(
@@ -876,6 +1295,7 @@ class QueryGateway:
         stage: Literal["plan", "execute"],
         estimated_cost: float | None = None,
         estimated_rows: int | None = None,
+        max_rows: int | None = None,
     ) -> QueryReceipt:
         code, safe_message, retryable = _classify_database_error(exc, stage=stage)
         self._log_internal_failure(stage, exc, prepared.fingerprint)
@@ -890,6 +1310,7 @@ class QueryGateway:
             data_scope=prepared.data_scope,
             estimated_cost=estimated_cost,
             estimated_rows=estimated_rows,
+            max_rows=prepared.max_rows if max_rows is None else max_rows,
         )
 
     def _capacity_rejection(
@@ -919,6 +1340,7 @@ class QueryGateway:
         data_scope: tuple[str, ...] = (),
         estimated_cost: float | None = None,
         estimated_rows: int | None = None,
+        max_rows: int | None = None,
     ) -> QueryReceipt:
         effective_scope = data_scope or ((self._schema,) if self._schema else ())
         return QueryReceipt(
@@ -932,7 +1354,7 @@ class QueryGateway:
             datasource=self._datasource,
             readonly_role=self._readonly_role,
             policy_outcome=policy_outcome,
-            max_rows=self._max_rows,
+            max_rows=self._max_rows if max_rows is None else max_rows,
             timeout_ms=self._timeout_seconds * 1000,
             data_scope=effective_scope,
         )
@@ -983,6 +1405,31 @@ def _render_postgres_with_sqlalchemy_binds(query: exp.Query) -> str:
         rendered = rendered.replace(marker, f":{name}")
     _validate_rendered_binds(rendered, {name for _, name in replacements})
     return rendered
+
+
+def _bounded_integer_limit(
+    name: str,
+    requested: int | None,
+    *,
+    ceiling: int,
+    minimum: int,
+) -> int:
+    if requested is None:
+        return ceiling
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested < minimum:
+        raise ValueError(f"{name} must be a positive integer")
+    return min(requested, ceiling)
+
+
+def _bounded_cost_limit(requested: float | None, ceiling: float) -> float:
+    if requested is None:
+        return ceiling
+    if isinstance(requested, bool) or not isinstance(requested, (int, float)):
+        raise ValueError("max_plan_cost must be a finite non-negative number")
+    value = float(requested)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("max_plan_cost must be a finite non-negative number")
+    return min(value, ceiling)
 
 
 def _escape_sqlalchemy_false_binds(query: exp.Query) -> None:
@@ -1097,7 +1544,7 @@ def _mask_row(keys: list[str], raw_row: Any) -> tuple[dict[str, Any], set[str]]:
     row = dict(zip(keys, raw_row, strict=False))
     masked_columns: set[str] = set()
     for key in tuple(row):
-        if _SENSITIVE_COLUMN.search(key):
+        if is_sensitive_column_name(key):
             row[key] = "[REDACTED]"
             masked_columns.add(key)
     return row, masked_columns

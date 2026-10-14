@@ -23,6 +23,10 @@ from src.nl2sql.contracts import (
     evaluate_authorization,
 )
 from src.nl2sql.infra.governance.query_gateway import QueryGateway, QueryReceipt
+from src.nl2sql.orchestration.approved_compute import (
+    ApprovedCalculationBinding,
+    ApprovedCalculationInput,
+)
 from src.nl2sql.orchestration.budget import RouteBudgetLedger
 from src.nl2sql.orchestration.candidates import rowset_sha256
 from src.nl2sql.orchestration.execution import PlanStepError, PreparedMetricStep
@@ -30,6 +34,7 @@ from src.nl2sql.orchestration.metric_query import (
     CompiledMetricQuery,
     EligibilityPolicy,
     GatewayMetricStepRunner,
+    aggregate_definition_checksum,
     metric_plan_executor,
 )
 from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
@@ -52,6 +57,26 @@ from tests.metric_fixtures import (
     ratio_contract,
     seed_contract,
 )
+
+
+def _single_input_calculation_binding(authority: MetricAuthority) -> ApprovedCalculationBinding:
+    assert authority.release is not None
+    return ApprovedCalculationBinding(
+        canonical_metric_key="metric.synthetic_calculation",
+        template_id="ratio",
+        template_version="1",
+        template_checksum="a" * 64,
+        inputs=(
+            ApprovedCalculationInput(
+                role="numerator",
+                metric_key=authority.metric.asset_id,
+                metric_contract_sha256=aggregate_definition_checksum(authority.metric),
+            ),
+        ),
+        binding_revision="synthetic-revision-1",
+        semantic_release_id=RELEASE_ID,
+        semantic_release_checksum=authority.release.checksum,
+    )
 
 
 def test_catalog_addition_requires_no_python_and_preserves_channels() -> None:
@@ -104,6 +129,66 @@ async def test_eligibility_half_open_leap_day_and_month(timestamptz: bool) -> No
     trend = await authority.compiler().compile(authority.plan(intent="trend", grain="month"), authority.context)
     assert "DATE_TRUNC('month'" in trend.sql
     assert ("AT TIME ZONE" in trend.sql) == timestamptz
+
+
+@pytest.mark.asyncio
+async def test_canonical_binding_matches_trusted_release_and_input_checksum() -> None:
+    authority = MetricAuthority()
+    binding = _single_input_calculation_binding(authority)
+    context = authority.context.model_copy(
+        update={
+            "asset_ids": (*authority.context.asset_ids, binding.canonical_metric_key)
+        }
+    )
+
+    compiled = await authority.compiler().compile(
+        authority.plan(),
+        context,
+        approved_calculation_binding=binding,
+    )
+
+    assert compiled.calculation_binding == binding
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mismatch", "error_code"),
+    [
+        ("input_hash", "metric_contract_checksum_mismatch"),
+        ("release_checksum", "metric_semantic_release_checksum_mismatch"),
+        ("release_id", "metric_dependency_release_mismatch"),
+    ],
+)
+async def test_canonical_binding_rejects_untrusted_release_or_input_hash(
+    mismatch: str, error_code: str
+) -> None:
+    authority = MetricAuthority()
+    binding = _single_input_calculation_binding(authority)
+    context = authority.context.model_copy(
+        update={
+            "asset_ids": (*authority.context.asset_ids, binding.canonical_metric_key)
+        }
+    )
+    if mismatch == "input_hash":
+        invalid_input = binding.inputs[0].model_copy(
+            update={"metric_contract_sha256": "f" * 64}
+        )
+        binding = binding.model_copy(update={"inputs": (invalid_input,)})
+    elif mismatch == "release_checksum":
+        binding = binding.model_copy(
+            update={"semantic_release_checksum": "f" * 64}
+        )
+    else:
+        binding = binding.model_copy(
+            update={"semantic_release_id": "stale-release-id"}
+        )
+
+    with pytest.raises(PlanStepError, match=error_code):
+        await authority.compiler().compile(
+            authority.plan(),
+            context,
+            approved_calculation_binding=binding,
+        )
 
 
 @pytest.mark.asyncio
