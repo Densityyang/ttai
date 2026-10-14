@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
@@ -11,9 +12,11 @@ from src.nl2sql.infra.governance.data_broker import (
     CompiledGovernedQuery,
     DataBrokerUnavailable,
     GovernedDataBroker,
+    SqlGlotGovernedDataCompiler,
     _parameter_binding_fingerprint,
     _validate_compiled_query,
 )
+from src.nl2sql.infra.governance.query_gateway import QueryGateway
 from src.nl2sql.orchestration.data_request import (
     AuthorizedDataScope,
     AuthorizedJoinScope,
@@ -102,6 +105,81 @@ def _authorization(
         ),
         authorized_joins=authorized_joins,
     )
+
+
+def test_deterministic_compiler_binds_owner_and_emits_typed_projection() -> None:
+    request = _request()
+    authorization = _authorization(request)
+    effective_scope = derive_effective_scope(request, authorization)
+    gateway = QueryGateway(MagicMock(), schema="analytics")
+
+    compiled = SqlGlotGovernedDataCompiler(
+        gateway,
+        source_id="test-source",
+        source_version="fixture-v1",
+    ).compile_request(request, authorization, effective_scope)
+
+    assert 'WHERE "source_row"."owner_id" = :owner_user_id' in compiled.sql
+    assert compiled.parameters == {"owner_user_id": "owner-7"}
+    assert compiled.candidate.compiler_id == "ttai-sqlglot-data-request-compiler"
+    assert compiled.candidate.source_snapshot == DataSourceSnapshot(
+        source_id="test-source",
+        source_version="fixture-v1",
+    )
+    assert compiled.projections == (
+        ReturnedColumnIdentity(
+            relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+            column_name="amount",
+            output_name="amount",
+        ),
+        ReturnedColumnIdentity(
+            relation=RelationIdentity(schema_name="analytics", relation_name="sales"),
+            column_name="region",
+            output_name="region",
+        ),
+    )
+
+
+def test_deterministic_compiler_rejects_ambiguous_authorized_join_shapes() -> None:
+    sales = RelationIdentity(schema_name="analytics", relation_name="sales")
+    customers = RelationIdentity(schema_name="analytics", relation_name="customers")
+    scope = RequestedDataScope(
+        relations=(
+            RelationColumnScope(relation=sales, columns=("amount", "customer_id")),
+            RelationColumnScope(relation=customers, columns=("customer_id", "name")),
+        )
+    )
+    request = _request(scope=scope)
+    joins = (
+        AuthorizedJoinScope(
+            left_relation=sales,
+            left_column="customer_id",
+            right_relation=customers,
+            right_column="customer_id",
+            join_type="inner",
+        ),
+        AuthorizedJoinScope(
+            left_relation=sales,
+            left_column="customer_id",
+            right_relation=customers,
+            right_column="customer_id",
+            join_type="left",
+        ),
+    )
+    authorization = _authorization(
+        request,
+        scope=AuthorizedDataScope(relations=scope.relations),
+        authorized_joins=joins,
+    )
+    effective_scope = derive_effective_scope(request, authorization)
+    compiler = SqlGlotGovernedDataCompiler(
+        QueryGateway(MagicMock(), schema="analytics"),
+        source_id="test-source",
+        source_version="fixture-v1",
+    )
+
+    with pytest.raises(DataRequestDenied):
+        compiler.compile_request(request, authorization, effective_scope)
 
 
 def _candidate(

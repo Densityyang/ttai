@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import quote
 
 import pytest
@@ -29,6 +29,7 @@ from src.nl2sql.infra.governance.data_broker import (
     CompiledGovernedQuery,
     GovernedDataBroker,
     QueryGatewayDataExecutor,
+    SqlGlotGovernedDataCompiler,
     _dataset_metadata_reserve,
     _parameter_binding_fingerprint,
 )
@@ -214,7 +215,8 @@ def gateway_postgres() -> Iterator[_GatewayPostgres]:
             (1, 101, 'owner-a', 12.50),
             (2, 101, 'owner-a', 5.25),
             (3, 102, 'owner-a', 8.00),
-            (4, 101, 'owner-b', 999.00);
+            (4, 101, 'owner-b', 999.00),
+            (5, 999, 'owner-a', 7.75);
         INSERT INTO ai_views.broker_customers VALUES
             ('owner-a', 101, 'Alice', 'alice-private'),
             ('owner-a', 102, 'Bob', 'bob-private'),
@@ -455,6 +457,9 @@ def _p5_broker_request(
 class _Pg17FixtureAuthority:
     """Test-only owner authority; it has no production wiring or credentials."""
 
+    def __init__(self, *, join_type: Literal["inner", "left"] = "inner") -> None:
+        self._join_type = join_type
+
     async def verify_request(
         self,
         request: DataRequest,
@@ -513,16 +518,16 @@ class _Pg17FixtureAuthority:
                         relation_name="broker_customers",
                     ),
                     right_column="customer_id",
-                    join_type="inner",
+                    join_type=self._join_type,
                 ),
             ),
         )
 
 
-class _Pg17FixtureCompiler:
-    """Fixed test query with no model-authored SQL or request SQL field."""
+class _Pg17CounterfactualCompiler:
+    """Test-only SQL override for pre-execution refusal counterfactuals."""
 
-    def __init__(self, gateway: QueryGateway, *, sql_override: str | None = None) -> None:
+    def __init__(self, gateway: QueryGateway, *, sql_override: str) -> None:
         self._gateway = gateway
         self._sql_override = sql_override
 
@@ -532,17 +537,7 @@ class _Pg17FixtureCompiler:
         authorization: VerifiedDataAuthorization,
         effective_scope: EffectiveDataScope,
     ) -> CompiledGovernedQuery:
-        sql = self._sql_override or (
-            "WITH owner_sales AS ("
-            "SELECT s.sale_id AS sale_key, s.customer_id AS customer_key, "
-            "s.amount AS amount FROM ai_views.broker_sales AS s "
-            "WHERE s.owner_id = :owner_user_id) "
-            "SELECT os.sale_key AS sale_id, os.amount AS amount, "
-            "c.display_name AS customer_name FROM owner_sales AS os "
-            "JOIN ai_views.broker_customers AS c "
-            "ON c.customer_id = os.customer_key "
-            "WHERE c.owner_id = :owner_user_id ORDER BY os.sale_key"
-        )
+        sql = self._sql_override
         parameters = {"owner_user_id": request.owner_user_id}
         prepared = self._gateway.prepare(
             sql,
@@ -614,7 +609,11 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
     )
     broker = GovernedDataBroker(
         authority=_Pg17FixtureAuthority(),
-        compiler=_Pg17FixtureCompiler(gateway),
+        compiler=SqlGlotGovernedDataCompiler(
+            gateway,
+            source_id="p5_local_test_only:ttai_gateway",
+            source_version="postgres-17",
+        ),
         executor=QueryGatewayDataExecutor(gateway),
     )
     try:
@@ -643,7 +642,10 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
         audit_counts_before_broker = (len(audit.starts), len(audit.results))
         counterfactual_broker = GovernedDataBroker(
             authority=_Pg17FixtureAuthority(),
-            compiler=_Pg17FixtureCompiler(gateway, sql_override=left_join_on_only_sql),
+                compiler=_Pg17CounterfactualCompiler(
+                    gateway,
+                    sql_override=left_join_on_only_sql,
+                ),
             executor=QueryGatewayDataExecutor(gateway),
         )
         with pytest.raises(DataRequestDenied):
@@ -671,7 +673,10 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
         audits_before_filtered_join_broker = (len(audit.starts), len(audit.results))
         filtered_join_broker = GovernedDataBroker(
             authority=_Pg17FixtureAuthority(),
-            compiler=_Pg17FixtureCompiler(gateway, sql_override=filtered_join_sql),
+                compiler=_Pg17CounterfactualCompiler(
+                    gateway,
+                    sql_override=filtered_join_sql,
+                ),
             executor=QueryGatewayDataExecutor(gateway),
         )
         with pytest.raises(DataRequestDenied):
@@ -698,7 +703,10 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
         audits_before_filtered_broker = (len(audit.starts), len(audit.results))
         filtered_broker = GovernedDataBroker(
             authority=_Pg17FixtureAuthority(),
-            compiler=_Pg17FixtureCompiler(gateway, sql_override=filtered_subset_sql),
+                compiler=_Pg17CounterfactualCompiler(
+                    gateway,
+                    sql_override=filtered_subset_sql,
+                ),
             executor=QueryGatewayDataExecutor(gateway),
         )
         with pytest.raises(DataRequestDenied):
@@ -708,7 +716,11 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
         offset_request = _p5_broker_request()
         offset_authorization = await _Pg17FixtureAuthority().verify_request(offset_request)
         offset_scope = derive_effective_scope(offset_request, offset_authorization)
-        base_compiled = _Pg17FixtureCompiler(gateway).compile_request(
+        base_compiled = SqlGlotGovernedDataCompiler(
+            gateway,
+            source_id="p5_local_test_only:ttai_gateway",
+            source_version="postgres-17",
+        ).compile_request(
             offset_request,
             offset_authorization,
             offset_scope,
@@ -725,7 +737,7 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
         audit_counts_before_offset_broker = (len(audit.starts), len(audit.results))
         offset_broker = GovernedDataBroker(
             authority=_Pg17FixtureAuthority(),
-            compiler=_Pg17FixtureCompiler(gateway, sql_override=offset_sql),
+                compiler=_Pg17CounterfactualCompiler(gateway, sql_override=offset_sql),
             executor=QueryGatewayDataExecutor(gateway),
         )
         with pytest.raises(DataRequestDenied):
@@ -748,7 +760,11 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
             metadata_probe_request,
             metadata_probe_authorization,
         )
-        metadata_probe_compiled = _Pg17FixtureCompiler(gateway).compile_request(
+        metadata_probe_compiled = SqlGlotGovernedDataCompiler(
+            gateway,
+            source_id="p5_local_test_only:ttai_gateway",
+            source_version="postgres-17",
+        ).compile_request(
             metadata_probe_request,
             metadata_probe_authorization,
             metadata_probe_scope,
@@ -788,10 +804,10 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
         ReturnedColumnIdentity(
             relation=RelationIdentity(
                 schema_name="ai_views",
-                relation_name="broker_sales",
+                relation_name="broker_customers",
             ),
-            column_name="sale_id",
-            output_name="sale_id",
+            column_name="display_name",
+            output_name="display_name",
         ),
         ReturnedColumnIdentity(
             relation=RelationIdentity(
@@ -804,18 +820,18 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
         ReturnedColumnIdentity(
             relation=RelationIdentity(
                 schema_name="ai_views",
-                relation_name="broker_customers",
+                relation_name="broker_sales",
             ),
-            column_name="display_name",
-            output_name="customer_name",
+            column_name="sale_id",
+            output_name="sale_id",
         ),
     )
     projection = dataset.to_sandbox_projection()
-    assert projection.column_names == ("sale_id", "amount", "customer_name")
+    assert projection.column_names == ("display_name", "amount", "sale_id")
     assert [row.values for row in projection.rows] == [
-        (1, "12.50", "Alice"),
-        (2, "5.25", "Alice"),
-        (3, "8.00", "Bob"),
+        ("Alice", "5.25", 2),
+        ("Alice", "12.50", 1),
+        ("Bob", "8.00", 3),
     ]
     assert all("owner-b" not in str(row.values) for row in projection.rows)
     assert dataset.source_snapshot.source_id == "p5_local_test_only:ttai_gateway"
@@ -828,6 +844,41 @@ async def test_pg17_test_only_broker_executes_owner_scoped_query_and_fails_close
     ).fingerprint
     assert audit.starts[0][1] == str(dataset.gateway_receipt_id)
     assert audit.results[0]["execution_id"] == str(dataset.gateway_receipt_id)
+
+
+@pytest.mark.asyncio
+async def test_pg17_broker_compiler_preserves_authorized_left_join_rows(
+    gateway_postgres: _GatewayPostgres,
+) -> None:
+    audit = _QueryAuditCapture()
+    engine, gateway = _gateway(
+        gateway_postgres.reader_url,
+        max_rows=200,
+        datasource="p5_local_test_only",
+        audit_sink=audit,
+    )
+    broker = GovernedDataBroker(
+        authority=_Pg17FixtureAuthority(join_type="left"),
+        compiler=SqlGlotGovernedDataCompiler(
+            gateway,
+            source_id="p5_local_test_only:ttai_gateway",
+            source_version="postgres-17",
+        ),
+        executor=QueryGatewayDataExecutor(gateway),
+    )
+    try:
+        dataset = await broker.request_dataset(_p5_broker_request())
+    finally:
+        await engine.dispose()
+
+    projection = dataset.to_sandbox_projection()
+    assert dataset.status == "complete"
+    assert dataset.row_count == 4
+    assert projection.column_names == ("display_name", "amount", "sale_id")
+    unmatched = next(row for row in projection.rows if row.values[2] == 5)
+    assert unmatched.values == (None, "7.75", 5)
+    assert all("owner-b" not in str(row.values) for row in projection.rows)
+    assert audit.results[-1]["execution_id"] == str(dataset.gateway_receipt_id)
 
 
 @pytest.mark.asyncio

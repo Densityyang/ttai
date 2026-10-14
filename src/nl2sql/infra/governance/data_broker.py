@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -82,6 +83,227 @@ class DeterministicDataCompiler(Protocol):
         authorization: VerifiedDataAuthorization,
         effective_scope: EffectiveDataScope,
     ) -> CompiledGovernedQuery: ...
+
+
+class SqlGlotGovernedDataCompiler:
+    """Compile a small, typed DataRequest subset without model-authored SQL.
+
+    The compiler supports one relation or two relations connected by exactly
+    one authority-approved join. Every physical relation is owner-filtered in
+    its own CTE before the optional join, so a LEFT JOIN preserves unmatched
+    rows. Ambiguous or larger join graphs fail closed until the request
+    contract can express their intended shape.
+    """
+
+    _COMPILER_ID = "ttai-sqlglot-data-request-compiler"
+    _COMPILER_VERSION = "1"
+
+    def __init__(
+        self,
+        gateway: QueryGateway,
+        *,
+        source_id: str,
+        source_version: str,
+    ) -> None:
+        self._gateway = gateway
+        self._source_snapshot = DataSourceSnapshot(
+            source_id=source_id,
+            source_version=source_version,
+        )
+
+    def compile_request(
+        self,
+        request: DataRequest,
+        authorization: VerifiedDataAuthorization,
+        effective_scope: EffectiveDataScope,
+    ) -> CompiledGovernedQuery:
+        if (
+            authorization.request_id != request.request_id
+            or authorization.request_checksum != request.request_checksum
+            or authorization.owner_user_id != request.owner_user_id
+            or derive_effective_scope(request, authorization) != effective_scope
+        ):
+            raise DataRequestDenied()
+
+        requested_relations = effective_scope.relations
+        if not 1 <= len(requested_relations) <= 2:
+            raise DataRequestDenied()
+
+        requested_keys = {
+            _relation_key(item.relation) for item in requested_relations
+        }
+        authorized_columns = {
+            _relation_key(item.relation): set(item.columns)
+            for item in authorization.authorized_scope.relations
+        }
+        owner_columns = {
+            _relation_key(item.relation): item.owner_column
+            for item in authorization.owner_row_scopes
+        }
+        for relation_scope in requested_relations:
+            key = _relation_key(relation_scope.relation)
+            if (
+                key not in authorized_columns
+                or key not in owner_columns
+                or not set(relation_scope.columns).issubset(authorized_columns[key])
+            ):
+                raise DataRequestDenied()
+
+        joins = effective_scope.authorized_joins
+        selected_join: AuthorizedJoinScope | None = None
+        if len(requested_relations) == 1:
+            if joins:
+                raise DataRequestDenied()
+        else:
+            if len(joins) != 1:
+                raise DataRequestDenied()
+            selected_join = joins[0]
+            if {
+                _relation_key(selected_join.left_relation),
+                _relation_key(selected_join.right_relation),
+            } != requested_keys:
+                raise DataRequestDenied()
+
+        relation_aliases = {
+            _relation_key(item.relation): f"r{index}"
+            for index, item in enumerate(requested_relations)
+        }
+        cte_names = {
+            _relation_key(item.relation): f"owner_scope_{index}"
+            for index, item in enumerate(requested_relations)
+        }
+        cte_sql: list[str] = []
+        for relation_scope in requested_relations:
+            key = _relation_key(relation_scope.relation)
+            needed_columns = set(relation_scope.columns)
+            needed_columns.add(owner_columns[key])
+            if selected_join is not None:
+                if key == _relation_key(selected_join.left_relation):
+                    needed_columns.add(selected_join.left_column)
+                if key == _relation_key(selected_join.right_relation):
+                    needed_columns.add(selected_join.right_column)
+            projected_columns = ", ".join(
+                f'"source_row".{_quote_sql_identifier(column)} '
+                f'AS {_quote_sql_identifier(column)}'
+                for column in sorted(needed_columns)
+            )
+            relation_sql = (
+                f"{_quote_sql_identifier(relation_scope.relation.schema_name)}."
+                f"{_quote_sql_identifier(relation_scope.relation.relation_name)}"
+            )
+            owner_column = _quote_sql_identifier(owner_columns[key])
+            cte_sql.append(
+                f"{_quote_sql_identifier(cte_names[key])} AS ("
+                f"SELECT {projected_columns} FROM {relation_sql} AS \"source_row\" "
+                f"WHERE \"source_row\".{owner_column} = :owner_user_id)"
+            )
+
+        projection_columns = [
+            (relation_scope, column)
+            for relation_scope in requested_relations
+            for column in relation_scope.columns
+        ]
+        name_counts: dict[str, int] = {}
+        for _, column in projection_columns:
+            name_counts[column] = name_counts.get(column, 0) + 1
+        output_names: list[str] = []
+        used_output_names: set[str] = set()
+        for index, (relation_scope, column) in enumerate(projection_columns):
+            output_name = column
+            if name_counts[column] > 1:
+                output_name = f"{relation_scope.relation.relation_name}_{column}"
+            if len(output_name) > 63 or output_name in used_output_names:
+                digest = hashlib.sha256(
+                    (
+                        f"{index}:{relation_scope.relation.schema_name}."
+                        f"{relation_scope.relation.relation_name}.{column}"
+                    ).encode("utf-8")
+                ).hexdigest()[:16]
+                output_name = f"c{index}_{digest}"
+            if output_name in used_output_names:
+                raise DataRequestDenied()
+            used_output_names.add(output_name)
+            output_names.append(output_name)
+
+        select_sql = ", ".join(
+            f"{_quote_sql_identifier(relation_aliases[_relation_key(item.relation)])}."
+            f"{_quote_sql_identifier(column)} AS {_quote_sql_identifier(output_name)}"
+            for (item, column), output_name in zip(
+                projection_columns,
+                output_names,
+                strict=True,
+            )
+        )
+        if selected_join is None:
+            relation_scope = requested_relations[0]
+            relation_key = _relation_key(relation_scope.relation)
+            from_sql = (
+                f"{_quote_sql_identifier(cte_names[relation_key])} AS "
+                f"{_quote_sql_identifier(relation_aliases[relation_key])}"
+            )
+        else:
+            left_key = _relation_key(selected_join.left_relation)
+            right_key = _relation_key(selected_join.right_relation)
+            join_keyword = "LEFT JOIN" if selected_join.join_type == "left" else "JOIN"
+            from_sql = (
+                f"{_quote_sql_identifier(cte_names[left_key])} AS "
+                f"{_quote_sql_identifier(relation_aliases[left_key])} {join_keyword} "
+                f"{_quote_sql_identifier(cte_names[right_key])} AS "
+                f"{_quote_sql_identifier(relation_aliases[right_key])} ON "
+                f"{_quote_sql_identifier(relation_aliases[left_key])}."
+                f"{_quote_sql_identifier(selected_join.left_column)} = "
+                f"{_quote_sql_identifier(relation_aliases[right_key])}."
+                f"{_quote_sql_identifier(selected_join.right_column)}"
+            )
+
+        order_sql = ", ".join(
+            f"{_quote_sql_identifier(relation_aliases[_relation_key(item.relation)])}."
+            f"{_quote_sql_identifier(column)}"
+            for item, column in projection_columns
+        )
+        sql = (
+            f"WITH {', '.join(cte_sql)} SELECT {select_sql} "
+            f"FROM {from_sql} ORDER BY {order_sql}"
+        )
+        parameters = {"owner_user_id": request.owner_user_id}
+        prepared = self._gateway.prepare(
+            sql,
+            max_rows=request.budget.max_rows,
+            detect_row_truncation=True,
+        )
+        candidate = GovernedSQLCandidate(
+            schema_version=(
+                "governed-sql-candidate-v2" if selected_join is not None
+                else "governed-sql-candidate-v1"
+            ),
+            request_id=request.request_id,
+            request_checksum=request.request_checksum,
+            authorization_checksum=authorization.authorization_checksum,
+            compiler_id=self._COMPILER_ID,
+            compiler_version=self._COMPILER_VERSION,
+            effective_scope=effective_scope,
+            source_snapshot=self._source_snapshot,
+            query_fingerprint=prepared.fingerprint,
+            parameter_binding_fingerprint=_parameter_binding_fingerprint(parameters),
+        )
+        projections = tuple(
+            ReturnedColumnIdentity(
+                relation=relation_scope.relation,
+                column_name=column,
+                output_name=output_name,
+            )
+            for (relation_scope, column), output_name in zip(
+                projection_columns,
+                output_names,
+                strict=True,
+            )
+        )
+        return CompiledGovernedQuery(
+            candidate=candidate,
+            sql=sql,
+            parameters=parameters,
+            projections=projections,
+        )
 
 
 class GovernedDataExecutor(Protocol):
@@ -710,6 +932,15 @@ def _canonical_binding_value(value: Any) -> Any:
             for key, item in sorted(value.items())
         }
     raise ValueError("query parameter value is unsupported")
+
+
+_SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+
+
+def _quote_sql_identifier(identifier: str) -> str:
+    if not _SQL_IDENTIFIER.fullmatch(identifier):
+        raise DataRequestDenied()
+    return f'"{identifier}"'
 
 
 def _relation_key(relation: RelationIdentity) -> tuple[str, str]:
