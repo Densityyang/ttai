@@ -26,6 +26,7 @@ from src.nl2sql.contracts import (
 from src.nl2sql.infra.llm.model_input_policy import (
     ModelInputPolicy,
     bootstrap_model_input_policy,
+    calibrated_model_input_policy,
 )
 from src.nl2sql.infra.llm.profiles import ModelProfile, ModelTarget
 from src.nl2sql.orchestration.budget import BudgetExceeded, CallBudget, should_stop
@@ -545,8 +546,21 @@ def build_model_gateway(
     config = get_agent_config()
     settings = get_settings()
     deepseek_key = _secret("DEEPSEEK_API_KEY") or settings.openai_api_key
+    # Deployments may use any OpenAI-compatible endpoint (for example
+    # DashScope/Qwen) through the existing OPENAI_* settings.  Keep the
+    # legacy DeepSeek defaults when no explicit endpoint is configured, but
+    # route an explicit OPENAI_BASE_URL to that endpoint instead of silently
+    # sending it to api.deepseek.com with a DeepSeek model name.
+    explicit_openai = bool(settings.openai_base_url and settings.openai_api_key)
     nvidia_key = _secret("NVIDIA_API_KEY")
     providers: dict[str, ProviderAdapter] = {}
+    if explicit_openai:
+        providers["openai"] = OpenAICompatibleProvider(
+            "openai",
+            settings.openai_base_url or "",
+            settings.openai_api_key,
+            structured_output_mode="json_object",
+        )
     if deepseek_key:
         providers["deepseek"] = OpenAICompatibleProvider(
             "deepseek",
@@ -569,34 +583,42 @@ def build_model_gateway(
     small: frozenset[ModelStage] = frozenset(
         {"classify", "retrieve", "generate_sql", "verify", "answer"}
     )
+    primary_provider = "openai" if explicit_openai else "deepseek"
+    primary_model = settings.model_name if explicit_openai else config.deepseek_flash_model
     profiles = {
         "fast.default": ModelProfile(
             "fast.default", config.model_profile_version, small,
-            ModelTarget("deepseek", config.deepseek_flash_model, "small"),
+            ModelTarget(primary_provider, primary_model, "small"),
             nvidia_fallback,
         ),
         "plan.standard": ModelProfile(
             "plan.standard", config.model_profile_version, frozenset({"plan"}),
-            ModelTarget("deepseek", config.deepseek_flash_model, "small"),
+            ModelTarget(primary_provider, primary_model, "small"),
             nvidia_fallback,
         ),
         "plan.pro": ModelProfile(
             "plan.pro", config.model_profile_version, frozenset({"plan"}),
-            ModelTarget("deepseek", config.deepseek_pro_model, "pro"),
-            ModelTarget("deepseek", config.deepseek_flash_model, "small"),
+            ModelTarget(primary_provider, settings.model_name if explicit_openai else config.deepseek_pro_model, "pro"),
+            ModelTarget(primary_provider, primary_model, "small"),
         ),
     }
     # R2: configured profile targets are DISPATCH configuration, not a security
-    # approval.  Without an explicitly injected deployment-approved policy this
-    # deployment runs a BOOTSTRAP policy derived from its known targets: the
-    # target/secret gate is still enforced for development dispatch, but the
-    # policy is never production-ready.  Never promote configured targets into a
+    # approval.  A deployment approves exact (provider, model) pairs out of band
+    # via MODEL_INPUT_POLICY_APPROVED_DESTINATIONS; only that explicit decision
+    # yields a calibrated policy.  Without either injection this deployment runs
+    # a BOOTSTRAP policy derived from its known targets: the target/secret gate
+    # is still enforced for development dispatch, but the policy is never
+    # production-ready.  Never promote configured targets into a
     # calibrated/approved production policy on their own.
-    policy = model_input_policy or bootstrap_model_input_policy(
-        _profile_targets(profiles),
-        secret_values=_configured_secret_values(
-            deepseek_key, nvidia_key, settings.openai_api_key
-        ),
+    secret_values = _configured_secret_values(
+        deepseek_key, nvidia_key, settings.openai_api_key
+    )
+    policy = (
+        model_input_policy
+        or _deployment_approved_policy(providers, secret_values)
+        or bootstrap_model_input_policy(
+            _profile_targets(profiles), secret_values=secret_values
+        )
     )
     if settings.service_mode == "product":
         # Required outcome: a production deployment must not silently run an
@@ -659,6 +681,41 @@ def _configured_secret_values(*candidates: str) -> tuple[str, ...]:
     """
 
     return tuple(value for value in candidates if value)
+
+
+def _deployment_approved_policy(
+    providers: dict[str, ProviderAdapter],
+    secret_values: tuple[str, ...],
+) -> ModelInputPolicy | None:
+    """Calibrated policy from deployment-approved exact (provider, model) pairs.
+
+    Env MODEL_INPUT_POLICY_APPROVED_DESTINATIONS carries the approval decision a
+    deployment makes OUTSIDE dispatch configuration, comma-separated entries of
+    the form ``provider:model``.  Every entry must name a CONFIGURED provider;
+    malformed entries or unknown providers raise instead of falling back, so a
+    typo can never silently downgrade a production deployment to the bootstrap
+    policy.
+    """
+
+    raw = os.environ.get("MODEL_INPUT_POLICY_APPROVED_DESTINATIONS", "").strip()
+    if not raw:
+        return None
+    targets: list[ModelTarget] = []
+    for item in raw.split(","):
+        entry = item.strip()
+        provider, separator, model = entry.partition(":")
+        provider = provider.strip()
+        model = model.strip()
+        if not separator or not provider or not model:
+            raise ValueError(
+                f"invalid MODEL_INPUT_POLICY_APPROVED_DESTINATIONS entry: {entry!r}"
+            )
+        if provider not in providers:
+            raise ValueError(
+                f"approved destination provider is not configured: {provider!r}"
+            )
+        targets.append(ModelTarget(provider, model, "small"))
+    return calibrated_model_input_policy(targets, secret_values=secret_values)
 
 
 def _cost(target: ModelTarget, input_tokens: int, output_tokens: int) -> float:

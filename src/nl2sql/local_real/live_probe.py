@@ -60,8 +60,16 @@ FROZEN_CASE_COUNT_COLUMN = "id"
 
 # The ONLY relations this frozen one-case lane may probe.  Arbitrary
 # caller-provided schema/table text never enters these probes.
+# Both entries denote the SAME approved published view (v_repair_service): the
+# stock schema (ai_views) and the coexist deployment's isolated schema
+# (ai_views_ttai).  Exact allow-list equality still holds; anything else is
+# refused before any probe SQL runs.
 ALLOWED_PROBE_RELATIONS: frozenset[str] = frozenset(
-    {PREFERRED_PUBLISHED_RELATION, FALLBACK_PHYSICAL_RELATION}
+    {
+        PREFERRED_PUBLISHED_RELATION,
+        FALLBACK_PHYSICAL_RELATION,
+        "ai_views_ttai.v_repair_service",
+    }
 )
 
 

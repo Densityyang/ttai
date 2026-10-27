@@ -99,7 +99,13 @@ class CallBudget:
         return max(0, self.deadline_ms - elapsed_ms)
 
     def reserve_ms(self) -> int:
-        return max(1, self.deadline_ms // 5)
+        default = max(1, self.deadline_ms // 5)
+        raw = os.environ.get("V2_RESERVE_MS")
+        try:
+            value = int(raw) if raw is not None else default
+        except (TypeError, ValueError):
+            return default
+        return value if 1 <= value < self.deadline_ms else default
 
     def can_charge(self, *, tokens: int, cost: float) -> bool:
         return (

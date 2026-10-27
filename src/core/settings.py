@@ -87,6 +87,12 @@ class Settings(BaseSettings):
         default="/vadmin/auth/user/profile",
         description="tt-api ????????????",
     )
+    # Trusted Backend authorization carrier: tt-api returns the Backend-owned
+    # effective authorization snapshot consumed verbatim as AuthorizationContext.
+    tt_api_agent_authorization_path: str = Field(
+        default="/vadmin/auth/agent/authorization",
+        description="tt-api ?????????????????",
+    )
     auth_verify_timeout_ms: int = Field(default=1500, description="????????????")
     auth_cache_ttl_seconds: int = Field(default=60, description="???? TTL???")
     auth_required_permission_invoke: str = Field(

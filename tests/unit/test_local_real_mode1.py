@@ -821,7 +821,11 @@ def test_probe_relation_allowlist_rejects_arbitrary_relations() -> None:
     )
 
     assert ALLOWED_PROBE_RELATIONS == frozenset(
-        {'ai_views.v_repair_service', 'public.silver_repair_service'}
+        {
+            'ai_views.v_repair_service',
+            'ai_views_ttai.v_repair_service',
+            'public.silver_repair_service',
+        }
     )
     assert _require_allowed_relation('ai_views.v_repair_service') == (
         'ai_views.v_repair_service'

@@ -9,6 +9,7 @@ provenance) at the seam that the engine actually calls.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
@@ -654,7 +655,11 @@ async def test_s1c_activated_deployment_factory_builds_a_runtime(
     async def _inputs() -> tuple[Any, Any, Any, Any]:
         return (_views(), deployment.read_active, deployment.read_snapshot, gateway)
 
+    async def _availability() -> tuple[Any, tuple[Any, ...]]:
+        return (date(2026, 1, 2), (date(2026, 1, 1), date(2026, 1, 2)))
+
     monkeypatch.setattr(container, "_typed_deployment_inputs", _inputs)
+    monkeypatch.setattr(container, "_typed_availability_probe", _availability)
     factory = container._configured_typed_runtime_factory()
     assert settings.typed_runtime_enabled is True
     assert factory is not None

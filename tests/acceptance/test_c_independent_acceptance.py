@@ -1380,13 +1380,17 @@ def test_trusted_backend_profile_has_no_fallback_to_demo_authority(
         "AUTH_ENABLED": "false",
     }.items():
         monkeypatch.setenv(key, value)
+    from src.core.auth.demo_provider import DemoBackendAuthorizationProvider
     from src.core.settings import get_settings
 
     get_settings.cache_clear()
     container = AppContainer()
-    # The trusted profile returns None: it must NEVER silently degrade to demo.
-    assert container.get_backend_authorization_provider() is None
-    assert container.authority_provenance() == "unavailable"
+    # The trusted profile now carries the REAL backend provider: it must NEVER
+    # silently degrade to demo.
+    provider = container.get_backend_authorization_provider()
+    assert provider is not None
+    assert not isinstance(provider, DemoBackendAuthorizationProvider)
+    assert container.authority_provenance() == "backend"
     get_settings.cache_clear()
 
 

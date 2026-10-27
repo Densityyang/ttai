@@ -6,12 +6,16 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from typing import Any, Final, Literal, cast
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 from pydantic import Field, model_validator
 
+from src.core.auth.backend_provider import (
+    bind_request_bearer_token,
+    extract_bearer_token,
+)
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.provider import (
     BackendAuthorizationProvider,
@@ -107,6 +111,9 @@ class StateSnapshot(StrictContract):
 class ThreadHistoryResponse(StrictContract):
     thread_id: UUID
     snapshots: list[StateSnapshot]
+    limit: int = Field(default=20, ge=1, le=100)
+    has_more: bool = False
+    next_cursor: str | None = None
 
 
 class ThreadActionRequest(StrictContract):
@@ -199,11 +206,17 @@ def _request_identity(request: Request, auth_user: AuthUser) -> RequestIdentity:
         request_id = UUID(raw_request_id) if raw_request_id else uuid4()
     except ValueError:
         request_id = uuid4()
+    raw_permissions = set(auth_user.permissions)
+    # tt-api 的超级权限表达 "*.*.*" 在 typed 契约中等价于 "*"——与认证边界
+    # _has_permission 的判定规则保持一致，在身份进入引擎的边界处归一化。
+    if "*.*.*" in raw_permissions:
+        raw_permissions.discard("*.*.*")
+        raw_permissions.add("*")
     return RequestIdentity(
         request_id=request_id,
         user_id=str(auth_user.user_id),
         roles=frozenset(auth_user.roles),
-        permissions=frozenset(auth_user.permissions),
+        permissions=frozenset(raw_permissions),
     )
 
 
@@ -250,6 +263,9 @@ def _authorization_provider_from_request(
         provider = accessor()
     except Exception:
         return None
+    # The trusted carrier authenticates to the Backend with the CALLER's token.
+    # Bind it in this request task only; the provider never stores it.
+    bind_request_bearer_token(extract_bearer_token(request.headers.get("Authorization")))
     return cast(BackendAuthorizationProvider | None, provider)
 
 
@@ -655,17 +671,35 @@ def register_v2_routes(app: FastAPI) -> None:
         thread_id: UUID,
         request: Request,
         auth_user: AuthUser = Depends(require_nl2sql_permission),
+        limit: int = Query(default=20, ge=1, le=100),
+        cursor: str | None = Query(default=None, min_length=1, max_length=256),
     ) -> ThreadHistoryResponse:
         context = _request_context(request, auth_user, thread_id)
-        snapshots = [
-            _snapshot(thread_id, state_value)
-            async for state_value in (await _engine_from_request(request)).aget_state_history(
-                runtime_config(context)
-            )
-        ]
-        if not snapshots:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="thread not found")
-        return ThreadHistoryResponse(thread_id=thread_id, snapshots=snapshots)
+        snapshots: list[StateSnapshot] = []
+        cursor_found = cursor is None
+        # Checkpoint IDs are opaque positions, never authorization. Always scan
+        # the owner-namespaced history, so foreign cursors cannot cross owners.
+        async for state_value in (await _engine_from_request(request)).aget_state_history(
+            runtime_config(context)
+        ):
+            snapshot = _snapshot(thread_id, state_value)
+            if not cursor_found:
+                cursor_found = snapshot.checkpoint_id == cursor
+                continue
+            snapshots.append(snapshot)
+            if len(snapshots) > limit:
+                break
+        if not cursor_found:
+            raise HTTPException(status_code=400, detail="history_cursor_invalid")
+        if not snapshots and cursor is None:
+            raise HTTPException(status_code=404, detail="thread not found")
+        has_more = len(snapshots) > limit
+        page = snapshots[:limit]
+        return ThreadHistoryResponse(
+            thread_id=thread_id, snapshots=page, limit=limit,
+            has_more=has_more,
+            next_cursor=page[-1].checkpoint_id if has_more else None,
+        )
 
     @router.post(
         "/threads/{thread_id}/actions",

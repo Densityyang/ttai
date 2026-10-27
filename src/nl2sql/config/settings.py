@@ -58,7 +58,9 @@ class AgentConfig(BaseSettings):
         description="Explicit v2 engine mode; shadow never executes business SQL.",
     )
     shadow_traffic_percent: int = Field(default=5, ge=0, le=5)
-    v2_request_deadline_ms: int = Field(default=30_000, ge=1, le=120_000)
+    # Local 27B Ollama deployments can need several minutes for a governed
+    # query plus structured analysis response.
+    v2_request_deadline_ms: int = Field(default=30_000, ge=1, le=600_000)
     v2_token_budget: int = Field(default=8_000, ge=1)
     v2_cost_budget: float = Field(default=1.0, ge=0)
     v2_max_model_attempts: int = Field(default=2, ge=1, le=2)

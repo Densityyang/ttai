@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,19 @@ from src.nl2sql.observability.control_audit import ControlAuditStore
 
 logger = logging.getLogger(__name__)
 
+# The trusted typed path resolves "最新可用日期" from a live, short-TTL-cached
+# probe so the answer follows business-day rollover instead of freezing at
+# process start (the local-real lane probes once per process by design).
+_TYPED_AVAILABILITY_TTL_SECONDS = 60.0
+
+# Exact allow-list of the ONE published view this deployment may probe, keyed by
+# the server-owned deployment schema.  Both names denote the same approved view
+# in two deployments; anything else fails closed before any probe SQL runs.
+_TYPED_PROBE_RELATION_BY_SCHEMA = {
+    "ai_views": "ai_views.v_repair_service",
+    "ai_views_ttai": "ai_views_ttai.v_repair_service",
+}
+
 
 class RuntimeDependencyUnavailable(RuntimeError):
     """A required runtime dependency is unavailable without exposing its secret details."""
@@ -68,6 +82,15 @@ class AppContainer:
         # compiler, executor, identity, authorization) are NEVER stored here.
         self._typed_deployment: tuple[Any, Any, Any, Any] | None = None
         self._typed_resources: tuple[Any, Any, Any] | None = None
+        self._typed_session_factory: Any | None = None
+        # Short-TTL cache of the live business-date probe that backs
+        # "最新可用日期" resolution on the trusted typed path.  Refreshed
+        # lazily so the authoritative date never goes stale across days, unlike
+        # the frozen local-real lane which probes once per process.
+        self._typed_availability_lock = asyncio.Lock()
+        self._typed_availability_cache: (
+            tuple[float, tuple[str, tuple[str, ...]]] | None
+        ) = None
         # Application-scoped product services.  These are DEMO/LOCAL and
         # NON-DURABLE: they live for the process lifetime only, deliberately so
         # for Foundation B, and state is LOST on restart.  A future Control-PG
@@ -188,10 +211,14 @@ class AppContainer:
             return LocalRealAuthorizationProvider()
 
         if activation == "trusted_backend_authorization":
-            # The concrete Backend endpoint/payload/revision contract does not
-            # exist yet, so this stays None and the typed runtime fails closed
-            # rather than synthesizing an authorization context.
-            return None
+            # The real Backend carrier: fetch the Backend-owned, already-resolved
+            # effective authorization snapshot per request and consume it
+            # verbatim.  Anything the Backend cannot resolve fails closed.
+            from src.core.auth.backend_provider import (
+                TrustedBackendAuthorizationProvider,
+            )
+
+            return TrustedBackendAuthorizationProvider()
 
         return None
 
@@ -687,6 +714,9 @@ class AppContainer:
             expected_revision: str | None,
         ) -> Any:
             from src.nl2sql.contracts import AuthorizationContext
+            from src.nl2sql.local_real.deployment import (
+                LOCAL_REAL_BOOTSTRAP_SCAN_MAX_ROWS,
+            )
             from src.nl2sql.orchestration.typed_runtime import (
                 TypedRuntimeUnavailable,
                 build_request_typed_runtime,
@@ -697,6 +727,12 @@ class AppContainer:
             deployment = await self._typed_deployment_inputs()
             if deployment is None:
                 return TypedRuntimeUnavailable(reason="typed_deployment_unavailable")
+            availability = await self._typed_availability_probe()
+            if availability is None:
+                # The live business date cannot be established, so "最新可用日期"
+                # can never resolve; fail closed instead of asking forever.
+                return TypedRuntimeUnavailable(reason="typed_deployment_unavailable")
+            latest_date, recent_dates = availability
             views, read_active, read_snapshot, gateway = deployment
             return await build_request_typed_runtime(
                 views=views,
@@ -705,10 +741,65 @@ class AppContainer:
                 gateway=gateway,
                 identity=identity,
                 authorization=authorization,
+                availability_window=lambda: recent_dates,
+                authoritative_date=lambda: latest_date,
+                count_column="id",
+                bootstrap_scan_max_rows=LOCAL_REAL_BOOTSTRAP_SCAN_MAX_ROWS,
                 expected_revision=expected_revision,
             )
 
         return factory
+
+    async def _typed_availability_probe(self) -> tuple[Any, tuple[Any, ...]] | None:
+        """Resolve the live authoritative business date and recent window.
+
+        Short-TTL cached (see _TYPED_AVAILABILITY_TTL_SECONDS): the probes are
+        bounded read-only scans over the ONE approved published view, and the
+        cached value must never outlive a business-day rollover.  Any probe
+        failure collapses to None, which fails the whole typed runtime closed.
+        """
+
+        from datetime import date
+
+        from src.nl2sql.config.settings import get_agent_config
+        from src.nl2sql.local_real.live_probe import (
+            resolve_latest_authoritative_date,
+            resolve_recent_authoritative_dates,
+        )
+
+        now = time.monotonic()
+        cached = self._typed_availability_cache
+        if cached is not None and now - cached[0] < _TYPED_AVAILABILITY_TTL_SECONDS:
+            return cached[1]
+        async with self._typed_availability_lock:
+            now = time.monotonic()
+            cached = self._typed_availability_cache
+            if cached is not None and now - cached[0] < _TYPED_AVAILABILITY_TTL_SECONDS:
+                return cached[1]
+            session_factory = self._typed_session_factory
+            if session_factory is None:
+                return None
+            probe_relation_id = _TYPED_PROBE_RELATION_BY_SCHEMA.get(
+                get_agent_config().nl2sql_db_schema
+            )
+            if probe_relation_id is None:
+                return None
+            latest = await resolve_latest_authoritative_date(
+                session_factory, relation_id=probe_relation_id
+            )
+            if not latest.resolved or latest.latest_date is None:
+                return None
+            recent = await resolve_recent_authoritative_dates(
+                session_factory, relation_id=probe_relation_id
+            )
+            if not recent.resolved or not recent.dates:
+                return None
+            value = (
+                date.fromisoformat(latest.latest_date),
+                tuple(date.fromisoformat(item) for item in recent.dates),
+            )
+            self._typed_availability_cache = (now, value)
+            return value
 
     def _local_real_typed_runtime_factory(self) -> Any:
         """Factory for local-real: the EXISTING typed pipeline, real gateway.
@@ -1059,6 +1150,7 @@ class AppContainer:
             return None
         self._typed_deployment = (views, publisher.read_active, snapshots.read, gateway)
         self._typed_resources = (publisher, snapshots, business_engine)
+        self._typed_session_factory = session_factory
         return self._typed_deployment
 
     async def close(self) -> None:
@@ -1071,6 +1163,8 @@ class AppContainer:
             publisher, snapshots, business_engine = self._typed_resources
             self._typed_resources = None
             self._typed_deployment = None
+            self._typed_session_factory = None
+            self._typed_availability_cache = None
             for resource in (snapshots, publisher):
                 try:
                     await resource.close()

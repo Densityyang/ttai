@@ -90,6 +90,40 @@ def derive_parameter_contract(calculation: CalculationSpec) -> ParameterContract
     return ParameterContract(parameters=tuple(calculation.parameters))
 
 
+class ExecutionApplicability(_StrictFrozenModel):
+    denominator: Literal["REQUIRED", "NOT_APPLICABLE"] | None = None
+    time_semantics: Literal["REQUIRED", "NOT_APPLICABLE"] | None = None
+    join_semantics: Literal["REQUIRED", "NOT_APPLICABLE"] | None = None
+
+
+SemanticText = Annotated[str, Field(min_length=1, max_length=4096)]
+
+
+class DefinitionSemantics(_StrictFrozenModel):
+    """Versioned business declarations; never an authorization grant."""
+
+    population: SemanticText | None = None
+    numerator: SemanticText | None = None
+    denominator: SemanticText | None = None
+    deduplication: Literal["none", "distinct_rows", "distinct_key"] | None = None
+    grain: SemanticText | None = None
+    scope: SemanticText | None = None
+    time_semantics: SemanticText | None = None
+    join_semantics: SemanticText | None = None
+    null_semantics: Literal["exclude", "include", "propagate"] | None = None
+    unit_precision: SemanticText | None = None
+    provenance: SemanticText | None = None
+    execution_applicability: ExecutionApplicability | None = None
+
+    @property
+    def declared_axes(self) -> tuple[str, ...]:
+        return tuple(sorted({
+            "numerator_denominator" if key in {"numerator", "denominator"} else key
+            for key in self.model_dump(exclude_none=True)
+            if key != "execution_applicability"
+        }))
+
+
 class DefinitionVersion(_StrictFrozenModel):
     """One IMMUTABLE definition version.  The version holds the semantics.
 
@@ -105,6 +139,7 @@ class DefinitionVersion(_StrictFrozenModel):
     calculation: CalculationSpec
     parameter_contract: ParameterContract = ParameterContract()
     title: str = Field(min_length=1, max_length=256)
+    semantics: DefinitionSemantics | None = None
     semantic_closed: bool = False
     # Fork lineage: the version this one was derived from, if any.
     derived_from_definition_id: DefinitionId | None = None
@@ -125,6 +160,8 @@ class DefinitionVersion(_StrictFrozenModel):
     def checksum(self) -> str:
         return _checksum(
             {
+                **({"semantics": self.semantics.model_dump(mode="json", exclude_none=True)}
+                   if self.semantics is not None else {}),
                 "schema_version": self.schema_version,
                 "definition_id": self.definition_id,
                 "version": self.version,

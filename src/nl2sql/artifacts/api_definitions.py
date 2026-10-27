@@ -21,6 +21,7 @@ from pydantic import Field, model_validator
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.types import AuthUser
 from src.nl2sql.artifacts.build_run import require_build_run
+from src.nl2sql.artifacts.custom_definition import DefinitionSemantics
 from src.nl2sql.artifacts.custom_definition_execution_service import (
     CalculationInputResolverUnavailable,
     CustomDefinitionExecutionService,
@@ -53,10 +54,11 @@ class CreateDefinitionRequest(StrictContract):
 
 
 class UpdateDraftRequest(StrictContract):
-    """A DRAFT edit.  There is deliberately NO client-editable contract field."""
+    """Typed declarations update the owned draft; confirmed versions require revision."""
 
     title: str | None = Field(default=None, min_length=1, max_length=256)
     calculation: CalculationSpec | None = None
+    semantics: DefinitionSemantics | None = None
 
 
 class ExecuteDefinitionRequest(StrictContract):
@@ -99,6 +101,8 @@ class DefinitionVersionView(StrictContract):
     calculation: CalculationSpec
     calculation_checksum: str
     parameter_contract_checksum: str
+    semantics: DefinitionSemantics | None = None
+    declared_axes: tuple[str, ...] = ()
     semantic_closed: bool
     checksum: str
     confirmation: str
@@ -119,6 +123,8 @@ class DefinitionView(StrictContract):
     title: str
     calculation: CalculationSpec
     parameter_contract_parameters: tuple[str, ...]
+    semantics: DefinitionSemantics | None = None
+    declared_axes: tuple[str, ...] = ()
     semantic_closed: bool
     checksum: str
     confirmation: str
@@ -149,6 +155,7 @@ class ExecuteDefinitionResponse(StrictContract):
     data_as_of: datetime | None = None
     time_range: TimeRange | None = None
     calculation_scope: Literal["reusable_custom_definition"]
+    degradations: tuple[str, ...] = ()
 
 
 def owner_identity(auth_user: AuthUser) -> str:
@@ -217,6 +224,8 @@ def _definition_view(definition: Any) -> DefinitionView:
         parameter_contract_parameters=tuple(
             parameter.name for parameter in current.parameter_contract.parameters
         ),
+        semantics=current.semantics,
+        declared_axes=current.semantics.declared_axes if current.semantics else (),
         semantic_closed=current.semantic_closed,
         checksum=current.checksum,
         confirmation=axes.confirmation,
@@ -314,6 +323,8 @@ def register_definition_routes(app: Any) -> None:
             calculation=exact.calculation,
             calculation_checksum=exact.calculation.checksum,
             parameter_contract_checksum=exact.parameter_contract.checksum,
+            semantics=exact.semantics,
+            declared_axes=exact.semantics.declared_axes if exact.semantics else (),
             semantic_closed=exact.semantic_closed,
             checksum=exact.checksum,
             confirmation=lifecycle.confirmation,
@@ -340,6 +351,7 @@ def register_definition_routes(app: Any) -> None:
                 definition_id=definition_id,
                 calculation=body.calculation,
                 title=body.title,
+                semantics=body.semantics,
             )
             definition = await service.get_owned_definition(
                 owner_user_id=owner_identity(auth_user), definition_id=definition_id
@@ -478,6 +490,8 @@ def register_definition_routes(app: Any) -> None:
             calculation=exact.calculation,
             calculation_checksum=exact.calculation.checksum,
             parameter_contract_checksum=exact.parameter_contract.checksum,
+            semantics=exact.semantics,
+            declared_axes=exact.semantics.declared_axes if exact.semantics else (),
             semantic_closed=exact.semantic_closed,
             checksum=exact.checksum,
             confirmation=lifecycle.confirmation,
@@ -533,6 +547,7 @@ def register_definition_routes(app: Any) -> None:
             data_as_of=result.data_as_of,
             time_range=result.time_range,
             calculation_scope=result.calculation_scope,
+            degradations=(),
         )
 
     app.include_router(router)

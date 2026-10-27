@@ -11,6 +11,7 @@ import json
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from src.core.database import DatabasePurpose, validate_application_database_url
@@ -59,8 +60,15 @@ class ControlAuditStore:
 
         validate_application_database_url(database_url, DatabasePurpose.CONTROL_APP)
         settings = get_settings()
+        # asyncpg 只接受 postgresql:// / postgres:// DSN；CONTROL_DATABASE_URL 通常
+        # 带 SQLAlchemy 驱动后缀（如 +asyncpg），这里在驱动边界处剥离
+        parsed = urlsplit(database_url)
+        scheme = parsed.scheme.split("+", maxsplit=1)[0]
+        if scheme not in {"postgres", "postgresql"}:
+            raise ValueError("control audit URL must use PostgreSQL")
+        asyncpg_dsn = urlunsplit((scheme, parsed.netloc, parsed.path, parsed.query, ""))
         pool = await asyncpg.create_pool(
-            database_url,
+            asyncpg_dsn,
             min_size=1,
             max_size=settings.database_pool_size + settings.database_max_overflow,
             timeout=settings.database_connect_timeout_seconds,

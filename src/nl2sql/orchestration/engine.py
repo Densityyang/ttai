@@ -418,6 +418,12 @@ def create_v2_engine(
             "authorization_context": authorization_context,
             "authorization_revision": authorization_revision,
             "typed_runtime_unavailable_reason": None,
+            # These are per-run capability markers.  Clear them explicitly when
+            # a thread starts a new run; otherwise a prior QUERY
+            # cannot_resolve outcome can leak into a subsequent ANALYZE/BUILD
+            # run restored from the same checkpoint.
+            "mode_capability_outcome": None,
+            "mode_capability_pending": False,
             # Persist the server-owned run envelope so the mode axis survives
             # into every later node, checkpoint and resume.  Re-validated here
             # so a malformed/missing envelope can never fake a mode.
@@ -1382,6 +1388,15 @@ def create_v2_engine(
             }
         except (ModelGatewayError, BudgetExceeded) as exc:
             code = exc.code if isinstance(exc, ModelGatewayError) else str(exc)
+            logger.exception(
+                "analysis model request failed: code=%s retryable=%s provider=%s status=%s causes=%s stop_reason=%s",
+                code,
+                getattr(exc, "retryable", None),
+                getattr(getattr(exc, "failure", None), "provider", None),
+                getattr(getattr(exc, "failure", None), "status_code", None),
+                list(getattr(getattr(exc, "failure", None), "causes", ()) or ()),
+                route_budget.stop_reason,
+            )
             if isinstance(exc, ModelGatewayError):
                 route_budget.record_error(
                     code,

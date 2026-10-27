@@ -1,0 +1,50 @@
+# 与 tt-intelligent 共存的覆盖层（deploy/coexist_deploy.sh 生成）：
+# - 复用 release 文件中的 external 业务网络（名字由 BUSINESS_EXTERNAL_NETWORK 决定）
+# - host.docker.internal 打通宿主机 ollama / Langfuse
+# - NL2SQL_DB_SCHEMA 指向隔离 schema ai_views_ttai
+# - LLM 走宿主机 ollama 的 OpenAI 兼容端点（deepseek/nvidia 两个 profile 都指向本地模型），
+#   MODEL_INPUT_POLICY_APPROVED_DESTINATIONS 是生产模式必需的“已批准模型目标”注入
+include:
+  - path: compose.release.yml
+
+x-ollama-api: &ollama-api
+  extra_hosts: ["host.docker.internal:host-gateway"]
+  # typed 运行时用 views 配置的 target_schema 限定关系名；线上视图发布在隔离
+  # schema ai_views_ttai（第 4 步生成的 var/ai_views_ttai.deploy.yaml），覆盖镜像
+  # 内仓库默认文件（schema: ai_views），否则语义发布的关系资产与运行时对不上
+  volumes:
+    - ../var/ai_views_ttai.deploy.yaml:/app/configs/semantic/ai_views.yaml:ro
+  environment:
+    EMBEDDING_BASE_URL: http://host.docker.internal:11434/v1
+    EMBEDDING_MODEL: mxbai-embed-large
+    NL2SQL_DB_SCHEMA: ai_views_ttai
+    DEEPSEEK_BASE_URL: http://host.docker.internal:11434/v1
+    DEEPSEEK_FLASH_MODEL: qwen3.8:27b-mtp-q4_K_M
+    DEEPSEEK_PRO_MODEL: qwen3.8:27b-mtp-q4_K_M
+    NVIDIA_NIM_BASE_URL: http://host.docker.internal:11434/v1
+    NVIDIA_NIM_MODEL_FAST: qwen3.8:27b-mtp-q4_K_M
+    MODEL_INPUT_POLICY_APPROVED_DESTINATIONS: deepseek:qwen3.8:27b-mtp-q4_K_M,nvidia:qwen3.8:27b-mtp-q4_K_M
+    # trusted 激活是 coexist 部署的显式选择：release 默认保持 disabled（见部署契约测试），
+    # 这里按部署显式打开 typed runtime 的 trusted backend 授权链
+    TYPED_RUNTIME_ACTIVATION: trusted_backend_authorization
+    # 本地 ollama 27B 推理延迟高（分析解释单次调用约 47s），放宽 governed 链路与
+    # 模型调用时限（默认 4s/10s/30s/30s 必然超时；60s 也会撞上 20% 预留红线）
+    V2_REQUEST_DEADLINE_MS: "300000"
+    V2_ROUTE_DEADLINE_FAST_MS: "300000"
+    V2_ROUTE_DEADLINE_STANDARD_MS: "300000"
+    V2_ROUTE_DEADLINE_DEEP_MS: "300000"
+    # 本地模型分析链路较长；只保留 5 秒用于收尾，避免 20% 保留策略
+    # 在模型已完成 SQL 后误报 deadline_reserve。
+    V2_RESERVE_MS: "5000"
+    # 分析解释只需要结构化摘要；限制输出预算，避免本地 27B 模型生成过久
+    V2_TOKEN_BUDGET: "12000"
+
+services:
+  api-a:
+    <<: *ollama-api
+  api-b:
+    <<: *ollama-api
+  # backup 容器默认以 root 写备份文件（umask 077），宿主侧 deploy.sh 的 test -s 会权限不足；
+  # 以调用者 uid/gid 运行，保证备份产物宿主侧可读
+  backup:
+    user: "${BACKUP_RUN_USER}"

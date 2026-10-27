@@ -12,6 +12,7 @@ from src.nl2sql.artifacts.custom_definition import (
     CustomDefinition,
     DefinitionAxes,
     DefinitionExecutionBinding,
+    DefinitionSemantics,
     DefinitionVersion,
     DefinitionVersionLifecycle,
     ParameterContract,
@@ -160,6 +161,7 @@ class CustomDefinitionService:
         calculation: CalculationSpec | None = None,
         parameter_contract: ParameterContract | None = None,
         title: str | None = None,
+        semantics: DefinitionSemantics | None = None,
     ) -> DefinitionVersion:
         current = await self._owned(
             owner_user_id=owner_user_id, definition_id=definition_id
@@ -189,6 +191,8 @@ class CustomDefinitionService:
         semantic_inputs_changed = calculation_changed or (
             new_parameter_contract.checksum != draft.parameter_contract.checksum
         )
+        new_semantics = semantics if semantics is not None else draft.semantics
+        semantic_inputs_changed = semantic_inputs_changed or new_semantics != draft.semantics
         new_closed = False if semantic_inputs_changed else draft.semantic_closed
         # Validate BEFORE storing, so a rejected update leaves no partial state.
         updated = DefinitionVersion(
@@ -198,6 +202,7 @@ class CustomDefinitionService:
             parameter_contract=new_parameter_contract,
             title=new_title,
             semantic_closed=new_closed,
+            semantics=new_semantics,
             derived_from_definition_id=draft.derived_from_definition_id,
             derived_from_version=draft.derived_from_version,
             created_at=draft.created_at,
@@ -385,6 +390,7 @@ class CustomDefinitionService:
             calculation=prior.calculation,
             parameter_contract=prior.parameter_contract,
             title=prior.title,
+            semantics=prior.semantics,
             semantic_closed=False,
             derived_from_definition_id=prior.definition_id,
             derived_from_version=prior.version,

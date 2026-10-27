@@ -369,17 +369,34 @@ def project_analysis_model_input(
         "statement text ONLY if that exact digit sequence appears verbatim in the "
         "value, unit, time_range, observed_at or data_as_of of one of the cited "
         "fact_ids. Do NOT write day counts, window lengths, percentages, years or "
-        "averages that are not literally present in the cited facts, and do not "
-        "reformat numbers (write 93.20, never 93.2 or 93.2%). When in doubt, cite "
-        "fewer facts and write fewer numbers. Return only the requested JSON object "
-        "whose exact required shape is: "
+        "averages that are not literally present in the cited facts. When in doubt, "
+        "cite fewer facts and write fewer numbers. Return only the requested JSON "
+        "object whose exact required shape is: "
         + schema
+        + "\n\n规则（与上文同等约束，必须遵守）："
+        "\n1. 只能依据 SOURCE FACTS 作答；禁止臆造数值、日期、占比或指标口径。"
+        "\n2. 每条 statement 必须在 fact_ids 里列出它依据的全部事实 id（照抄 SOURCE FACTS 里的 "
+        "fact_id 字段值）；fact_ids 为空的句子不得包含任何数字。"
+        "\n3. 文本中的每个数字都必须逐字出现在所引用事实的 value、unit、time_range 或 "
+        "data_as_of 中；不要改写数字格式，不要计算新数字（如占比、天数、平均值）。"
+        "\n4. 若 data_as_of 为 null，写“数据截止时间未在证据中提供”这类不含数字的说明，"
+        "并仍然引用相关 fact_id。"
+        "\n5. 只输出要求的 JSON 对象，不要输出多余文字。"
+        "\n\n参考示例（其中 fact_id 仅为格式示意，实际值以 SOURCE FACTS 为准）："
+        '\n{"summary":{"text":"报修服务归档及时率为 100.00%。","fact_ids":'
+        '["' + "a1b2c3d4" * 8 + '"]},"observations":[{"text":"该指标为全局口径，'
+        '数据截止时间未在证据中提供。","fact_ids":["' + "a1b2c3d4" * 8 + '"]}],'
+        '"caveats":[]}'
     )
     user = (
         "SOURCE FACTS\n"
         f"{source_facts}\n\n"
         "REQUESTED INTERPRETATION\n"
-        f"{goal}"
+        f"{goal}\n\n"
+        "REMEMBER\n"
+        "用中文回答；每条 statement 必须照抄 SOURCE FACTS 里的 fact_id 填进 fact_ids；"
+        "statement 文本里的每个数字必须逐字来自所引用事实的 value/unit/time_range/data_as_of；"
+        "只输出 JSON 对象。"
     )
     return AnalysisModelInput(
         evidence_checksum=bundle.checksum,

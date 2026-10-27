@@ -65,7 +65,7 @@ class RequestContext(StrictContract):
     deployment_scope: Literal["default"] = "default"
     thread_id: UUID
     trace_id: str = Field(min_length=1, max_length=256)
-    deadline_ms: int = Field(default=30_000, ge=1, le=120_000)
+    deadline_ms: int = Field(default=30_000, ge=1, le=600_000)
     # Optional carrier; absence must keep the pre-existing runtime-configurable
     # path unchanged.  When evaluated through the authorization enforcement
     # seam, a supplied, parseable context is always evaluated: a
@@ -911,7 +911,7 @@ class RouteBudget(StrictContract):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    deadline_ms: int = Field(ge=1, le=120_000)
+    deadline_ms: int = Field(ge=1, le=600_000)
     max_model_calls: int = Field(ge=0)
     max_sql_candidates: int = Field(ge=1)
     max_sql_executions: int = Field(ge=1)
@@ -1104,7 +1104,7 @@ class ModelRequest(StrictContract):
         default=None,
         description="JSON Schema for a requested structured model output.",
     )
-    deadline_ms: int = Field(ge=1, le=120_000)
+    deadline_ms: int = Field(ge=1, le=600_000)
     token_budget: int = Field(ge=1, le=1_000_000)
     cost_budget: float = Field(ge=0)
     data_classification: ModelDataClassification
