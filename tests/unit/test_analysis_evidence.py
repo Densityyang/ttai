@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 
 import pytest
 from pydantic import JsonValue
@@ -23,7 +23,7 @@ from src.nl2sql.orchestration.analysis_evidence import (
     project_analysis_model_input,
     validate_analysis_interpretation,
 )
-from src.nl2sql.orchestration.grounding import GroundedAnswer
+from src.nl2sql.orchestration.grounding import GroundedAnswer, conservative_data_as_of
 
 
 def _fact_id(
@@ -32,12 +32,15 @@ def _fact_id(
     status: str,
     value: object,
     time_range: TimeRange | None = None,
+    unit: str | None = None,
 ) -> str:
     payload_data: dict[str, object] = {
         "step_id": step_id,
         "metric_key": metric_key,
         "status": status,
         "value": value,
+        "unit": unit,
+        "fact_id_version": 2,
     }
     if time_range is not None:
         payload_data["time_range"] = time_range.model_dump(mode="json")
@@ -58,6 +61,7 @@ def _evidence(
     fact_source_id: str | None = "gold.repair.archive",
     receipt_source_id: str | None = "gold.repair.archive",
     time_range: TimeRange | None = None,
+    unit: str | None = "percent",
 ) -> tuple[GroundedAnswer, PlanExecutionRecord, TimeRange]:
     step_id = "fetch_archive_rate"
     metric_key = "repair_service_archive_rate_overall_day"
@@ -69,6 +73,7 @@ def _evidence(
         elapsed_ms=3,
         output_digest=output_digest,
         rowset_sha256="b" * 64,
+        unit=unit,
         data_as_of=data_as_of,
         freshness_status="fresh" if data_as_of else "unknown",
         source_kind="approved_aggregate",
@@ -79,12 +84,15 @@ def _evidence(
     )
     status = "unavailable" if value is None else "grounded"
     fact = AnswerFact(
-        fact_id=_fact_id(step_id, metric_key, status, value, time_range),
+        fact_id=_fact_id(
+            step_id, metric_key, status, value, time_range, unit=unit
+        ),
         step_id=step_id,
         metric_key=metric_key,
         status=status,
         value=value,
-        unit="percent",
+        unit=unit,
+        fact_id_version=2,
         time_range=time_range,
         rowset_sha256=receipt.rowset_sha256,
         output_digest=receipt.output_digest,
@@ -258,3 +266,350 @@ def test_structured_interpretation_requires_numeric_traceability() -> None:
         AnalysisEvidenceError, match="analysis_interpretation_numeric_fact_unproven"
     ):
         validate_analysis_interpretation(invalid, evidence=bundle)
+
+
+def test_date_year_cannot_authorize_a_metric_percentage() -> None:
+    grounded, record, window = _evidence(
+        value=42,
+        time_range=TimeRange(start=date(2026, 9, 20), end=date(2026, 9, 20)),
+    )
+    bundle = build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=record.execution_plan_checksum,
+        analysis_window=window,
+    )
+
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_interpretation_numeric_fact_unproven"
+    ):
+        validate_analysis_interpretation(
+            AnalysisInterpretation(
+                summary=AnalysisStatement(
+                    text="The rate is 2026%.", fact_ids=(bundle.facts[0].fact_id,)
+                )
+            ),
+            evidence=bundle,
+        )
+
+
+def test_numeric_value_requires_the_cited_unit() -> None:
+    grounded, record, window = _evidence(value=42)
+    bundle = build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=record.execution_plan_checksum,
+        analysis_window=window,
+    )
+
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_interpretation_numeric_unit_unproven"
+    ):
+        validate_analysis_interpretation(
+            AnalysisInterpretation(
+                summary=AnalysisStatement(
+                    text="The value is 42 count.", fact_ids=(bundle.facts[0].fact_id,)
+                )
+            ),
+            evidence=bundle,
+        )
+
+    grounded, record, window = _evidence(value=42, unit=None)
+    bundle = build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=record.execution_plan_checksum,
+        analysis_window=window,
+    )
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_interpretation_numeric_unit_unproven"
+    ):
+        validate_analysis_interpretation(
+            AnalysisInterpretation(
+                summary=AnalysisStatement(
+                    text="The value is 42%.", fact_ids=(bundle.facts[0].fact_id,)
+                )
+            ),
+            evidence=bundle,
+        )
+
+
+def test_decimal_representation_is_not_reformatted() -> None:
+    grounded, record, window = _evidence(value="93.20")
+    bundle = build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=record.execution_plan_checksum,
+        analysis_window=window,
+    )
+    fact_id = bundle.facts[0].fact_id
+
+    assert validate_analysis_interpretation(
+        AnalysisInterpretation(
+            summary=AnalysisStatement(text="The rate is 93.20%.", fact_ids=(fact_id,))
+        ),
+        evidence=bundle,
+    )
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_interpretation_numeric_fact_unproven"
+    ):
+        validate_analysis_interpretation(
+            AnalysisInterpretation(
+                summary=AnalysisStatement(text="The rate is 93.2%.", fact_ids=(fact_id,))
+            ),
+            evidence=bundle,
+        )
+
+
+def test_checkpoint_unit_is_ignored_without_authoritative_metadata() -> None:
+    grounded, record, window = _evidence(value=42)
+    tampered_fact = grounded.facts[0].model_copy(update={"unit": "count"})
+    grounded = GroundedAnswer(
+        answer_text=grounded.answer_text,
+        facts=(tampered_fact,),
+        artifact=AnswerArtifact(facts=(tampered_fact,)),
+    )
+    with pytest.raises(AnalysisEvidenceError, match="analysis_evidence_no_proven_facts"):
+        build_analysis_evidence(
+            grounded=grounded,
+            record=record,
+            execution_plan_checksum=record.execution_plan_checksum,
+            analysis_window=window,
+        )
+
+
+def test_checkpoint_unit_mutation_cannot_override_authoritative_metric_unit() -> None:
+    grounded, record, window = _evidence(value=42, unit="percent")
+    tampered_fact = grounded.facts[0].model_copy(
+        update={
+            "unit": "count",
+            "fact_id": _fact_id(
+                grounded.facts[0].step_id,
+                grounded.facts[0].metric_key or "",
+                grounded.facts[0].status,
+                grounded.facts[0].value,
+                grounded.facts[0].time_range,
+                unit="count",
+            ),
+        }
+    )
+    tampered = GroundedAnswer(
+        answer_text=grounded.answer_text,
+        facts=(tampered_fact,),
+        artifact=AnswerArtifact(facts=(tampered_fact,)),
+    )
+    with pytest.raises(AnalysisEvidenceError, match="analysis_evidence_no_proven_facts"):
+        build_analysis_evidence(
+            grounded=tampered,
+            record=record,
+            execution_plan_checksum=record.execution_plan_checksum,
+            analysis_window=window,
+            authoritative_units={
+                grounded.facts[0].metric_key or "": "percent",
+            },
+        )
+
+
+def test_free_text_receipt_unit_cannot_become_authority() -> None:
+    grounded, record, window = _evidence(value=42, unit="orders")
+    with pytest.raises(AnalysisEvidenceError, match="analysis_evidence_no_proven_facts"):
+        build_analysis_evidence(
+            grounded=grounded,
+            record=record,
+            execution_plan_checksum=record.execution_plan_checksum,
+            analysis_window=window,
+        )
+
+
+def test_authoritative_units_are_exact_and_parenthetical_units_are_checked() -> None:
+    grounded, record, window = _evidence(value=42, unit="count")
+    bundle = build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=record.execution_plan_checksum,
+        analysis_window=window,
+    )
+    fact_id = bundle.facts[0].fact_id
+    assert validate_analysis_interpretation(
+        AnalysisInterpretation(
+            summary=AnalysisStatement(text="42 (counts).", fact_ids=(fact_id,))
+        ),
+        evidence=bundle,
+    )
+    for text in ("42 (stores).", "42 orders.", "42 users.", "42 people."):
+        with pytest.raises(
+            AnalysisEvidenceError, match="analysis_interpretation_numeric_unit_unproven"
+        ):
+            validate_analysis_interpretation(
+                AnalysisInterpretation(
+                    summary=AnalysisStatement(text=text, fact_ids=(fact_id,))
+                ),
+                evidence=bundle,
+            )
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_interpretation_numeric_unit_unproven"
+    ):
+        validate_analysis_interpretation(
+            AnalysisInterpretation(
+                summary=AnalysisStatement(
+                    text="42 percentage points.", fact_ids=(fact_id,)
+                )
+            ),
+            evidence=bundle,
+        )
+
+
+@pytest.mark.parametrize(
+    "text",
+    ("42%.", "42 percent.", "42, percent.", "42: percent.", "42 (percent)."),
+)
+def test_percent_unit_punctuation_forms_bind_to_the_authoritative_unit(
+    text: str,
+) -> None:
+    grounded, record, window = _evidence(value=42, unit="percent")
+    bundle = build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=record.execution_plan_checksum,
+        analysis_window=window,
+    )
+    assert validate_analysis_interpretation(
+        AnalysisInterpretation(
+            summary=AnalysisStatement(text=text, fact_ids=(bundle.facts[0].fact_id,))
+        ),
+        evidence=bundle,
+    )
+
+
+def test_percentage_points_remain_distinct_from_percent() -> None:
+    grounded, record, window = _evidence(value=42, unit="percent")
+    bundle = build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=record.execution_plan_checksum,
+        analysis_window=window,
+    )
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_interpretation_numeric_unit_unproven"
+    ):
+        validate_analysis_interpretation(
+            AnalysisInterpretation(
+                summary=AnalysisStatement(
+                    text="42 percentage points.", fact_ids=(bundle.facts[0].fact_id,)
+                )
+            ),
+            evidence=bundle,
+        )
+
+
+def test_cny_prefix_requires_the_authoritative_currency_unit() -> None:
+    grounded, record, window = _evidence(value="93.20", unit="currency_cny")
+    bundle = build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=record.execution_plan_checksum,
+        analysis_window=window,
+    )
+    fact_id = bundle.facts[0].fact_id
+    assert validate_analysis_interpretation(
+        AnalysisInterpretation(
+            summary=AnalysisStatement(text="CNY 93.20.", fact_ids=(fact_id,))
+        ),
+        evidence=bundle,
+    )
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_interpretation_numeric_unit_unproven"
+    ):
+        validate_analysis_interpretation(
+            AnalysisInterpretation(
+                summary=AnalysisStatement(text="USD 93.20.", fact_ids=(fact_id,))
+            ),
+            evidence=bundle,
+        )
+
+
+def test_data_as_of_requires_the_complete_iso_reference() -> None:
+    grounded, record, window = _evidence(
+        data_as_of=datetime(2026, 9, 20, 12, 34, tzinfo=UTC)
+    )
+    bundle = build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=record.execution_plan_checksum,
+        analysis_window=window,
+    )
+    fact_id = bundle.facts[0].fact_id
+    complete = AnalysisInterpretation(
+        summary=AnalysisStatement(
+            text="The source watermark is 2026-09-20T12:34:00+00:00.",
+            fact_ids=(fact_id,),
+        )
+    )
+    assert validate_analysis_interpretation(complete, evidence=bundle) is complete
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_interpretation_date_fact_unproven"
+    ):
+        validate_analysis_interpretation(
+            AnalysisInterpretation(
+                summary=AnalysisStatement(
+                    text="The source watermark is 2026-09-20.", fact_ids=(fact_id,)
+                )
+            ),
+            evidence=bundle,
+        )
+    for text in (
+        "The source watermark is 12:34:00.",
+        "The source watermark is 2026-09-20T12:34:00Z.",
+    ):
+        with pytest.raises(
+            AnalysisEvidenceError, match="analysis_interpretation_date_fact_unproven"
+        ):
+            validate_analysis_interpretation(
+                AnalysisInterpretation(
+                    summary=AnalysisStatement(text=text, fact_ids=(fact_id,))
+                ),
+                evidence=bundle,
+            )
+
+
+def test_conservative_timestamp_aggregation_is_complete_or_none() -> None:
+    earlier = datetime(2026, 9, 19, tzinfo=UTC)
+    later = datetime(2026, 9, 20, tzinfo=UTC)
+    assert conservative_data_as_of((later, earlier)) == earlier
+    assert conservative_data_as_of(()) is None
+    assert conservative_data_as_of((earlier, None)) is None
+    assert conservative_data_as_of((earlier, datetime(2026, 9, 20))) is None
+
+    assert conservative_data_as_of(
+        (
+            datetime(2026, 9, 20, 3, tzinfo=UTC),
+            datetime(2026, 9, 20, 10, tzinfo=timezone(timedelta(hours=8))),
+        )
+    ) == datetime(2026, 9, 20, 2, tzinfo=UTC)
+
+    class _InvalidTimezone(tzinfo):
+        def utcoffset(self, _value: datetime | None):
+            return None
+
+    invalid = datetime(2026, 9, 20, tzinfo=_InvalidTimezone())
+    assert conservative_data_as_of((earlier, invalid)) is None
+
+
+def test_complete_date_reference_remains_valid_evidence() -> None:
+    grounded, record, window = _evidence(
+        time_range=TimeRange(start=date(2026, 9, 20), end=date(2026, 9, 20))
+    )
+    bundle = build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=record.execution_plan_checksum,
+        analysis_window=window,
+    )
+
+    interpretation = AnalysisInterpretation(
+        summary=AnalysisStatement(
+            text="The observation is dated 2026-09-20.",
+            fact_ids=(bundle.facts[0].fact_id,),
+        )
+    )
+    assert validate_analysis_interpretation(interpretation, evidence=bundle) is interpretation

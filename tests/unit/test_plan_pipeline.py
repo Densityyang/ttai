@@ -40,6 +40,10 @@ from src.nl2sql.infra.llm.gateway import (
 )
 from src.nl2sql.orchestration.budget import RouteBudgetLedger
 from src.nl2sql.orchestration.engine import create_v2_engine
+from src.nl2sql.orchestration.evidence_digest import (
+    canonical_json_digest,
+    canonical_rowset_digest,
+)
 from src.nl2sql.orchestration.execution import (
     MetricStepResult,
     PlanExecutor,
@@ -483,6 +487,84 @@ def test_plan_validator_and_compiler_are_permission_bound_and_replayable() -> No
     )
     assert denied.outcome == "deny"
     assert [issue.code for issue in denied.issues] == ["query_plan_permission_denied"]
+
+
+def _compiled_validation_plan() -> tuple[QueryPlan, ContextBundle, ExecutionPlan]:
+    context = _context()
+    plan = _query_plan()
+    query_validation = PlanValidator().validate_query_plan(
+        plan=plan,
+        context=context,
+        identity=_identity(),
+    )
+    return plan, context, PlanCompiler().compile(
+        plan=plan,
+        context=context,
+        validation=query_validation,
+    )
+
+
+def _validation_codes(
+    execution_plan: ExecutionPlan,
+    plan: QueryPlan,
+    context: ContextBundle,
+    *,
+    route: RouteName = "deep",
+) -> tuple[str, ...]:
+    record = PlanValidator().validate_execution_plan(
+        execution_plan=execution_plan,
+        query_plan=plan,
+        context=context,
+        route_budget=RouteBudgetLedger(route=route).limits,
+    )
+    return tuple(issue.code for issue in record.issues)
+
+
+def test_execution_plan_requires_one_terminal_verify_step_covering_all_steps() -> None:
+    plan, context, compiled = _compiled_validation_plan()
+    fetch = next(step for step in compiled.steps if isinstance(step, FetchMetricStep))
+    verify = next(step for step in compiled.steps if isinstance(step, VerifyStep))
+
+    missing = compiled.model_copy(update={"steps": (fetch,)})
+    assert "execution_plan_verify_missing" in _validation_codes(missing, plan, context)
+
+    duplicate = compiled.model_copy(
+        update={
+            "steps": (*compiled.steps, verify.model_copy(update={"step_id": "verify_2"}))
+        }
+    )
+    assert "execution_plan_verify_duplicate" in _validation_codes(
+        duplicate, plan, context
+    )
+
+    no_invariant = compiled.model_copy(
+        update={"steps": (fetch, verify.model_copy(update={"invariant_ids": ("other",)}))}
+    )
+    codes = _validation_codes(no_invariant, plan, context)
+    assert "execution_plan_verify_invariant_missing" in codes
+    assert "execution_plan_invariant_unregistered" in codes
+
+
+def test_execution_plan_verify_must_be_terminal_and_cover_transitive_dependencies() -> None:
+    plan, context, compiled = _compiled_validation_plan()
+    fetch = next(step for step in compiled.steps if isinstance(step, FetchMetricStep))
+    verify = next(step for step in compiled.steps if isinstance(step, VerifyStep))
+
+    trailing = FetchMetricStep(
+        step_id="fetch_trailing",
+        metric_keys=plan.metric_keys,
+        depends_on=(verify.step_id,),
+    )
+    non_terminal = compiled.model_copy(update={"steps": (fetch, verify, trailing)})
+    codes = _validation_codes(non_terminal, plan, context)
+    assert "execution_plan_verify_not_terminal" in codes
+    assert "execution_plan_verify_coverage_incomplete" in codes
+
+    orphan = FetchMetricStep(step_id="fetch_orphan", metric_keys=plan.metric_keys)
+    incomplete = compiled.model_copy(update={"steps": (fetch, orphan, verify)})
+    assert "execution_plan_verify_coverage_incomplete" in _validation_codes(
+        incomplete, plan, context
+    )
 
 
 def test_engine_rejects_a_model_backed_provider_before_route_selection() -> None:
@@ -1288,6 +1370,7 @@ def _succeeded_fetch_record(
     *,
     execution_plan: ExecutionPlan,
     step_id: str,
+    output: JsonValue | None = None,
     **receipt_overrides: object,
 ) -> PlanExecutionRecord:
     fields: dict[str, object] = {
@@ -1295,8 +1378,13 @@ def _succeeded_fetch_record(
         "kind": "fetch_metric",
         "status": "succeeded",
         "elapsed_ms": 1,
-        "output_digest": "b" * 64,
+        "output_digest": canonical_json_digest(output) if output is not None else "b" * 64,
     }
+    if isinstance(output, Mapping) and isinstance(output.get("rows"), list):
+        receipt_overrides.setdefault(
+            "rowset_sha256",
+            canonical_rowset_digest(cast("list[Mapping[str, Any]]", output["rows"])),
+        )
     fields.update(receipt_overrides)
     return PlanExecutionRecord(
         execution_plan_checksum=execution_plan.checksum,
@@ -1372,7 +1460,7 @@ def test_grounding_marks_no_data_unavailable_without_inventing_fields() -> None:
     record = _succeeded_fetch_record(
         execution_plan=execution_plan,
         step_id="fetch_metrics",
-        rowset_sha256="c" * 64,
+        output={"rows": [], "no_data": True},
         source_id="warehouse.revenue",
         semantic_signature="d" * 64,
         freshness_status="fresh",
@@ -1390,8 +1478,8 @@ def test_grounding_marks_no_data_unavailable_without_inventing_fields() -> None:
     fact = facts[0]
     assert fact.status == "unavailable"
     assert fact.value is None
-    assert fact.rowset_sha256 == "c" * 64
-    assert fact.output_digest == "b" * 64
+    assert fact.rowset_sha256 == canonical_rowset_digest([])
+    assert fact.output_digest == canonical_json_digest(outputs["fetch_metrics"])
     assert fact.source_id == "warehouse.revenue"
     assert fact.semantic_signature == "d" * 64
     assert fact.freshness_status == "fresh"
@@ -1414,6 +1502,10 @@ def test_grounded_renderer_keeps_raw_rows_out_and_marks_stale_freshness() -> Non
     record = _succeeded_fetch_record(
         execution_plan=execution_plan,
         step_id="fetch_metrics",
+        output={
+            "rows": [{"value": "87.30", "region_code": "east"}],
+            "no_data": False,
+        },
         freshness_status="stale",
         source_degradation=("aggregate_stale",),
     )

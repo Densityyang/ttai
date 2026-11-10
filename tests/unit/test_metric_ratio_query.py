@@ -331,10 +331,11 @@ async def test_decimal_result_hash_null_and_freshness(numerator: int, denominato
         result = await run_rows(rows)
     assert result.value == {"rows": [{**rows[0], "value": None if value is None else format(value, ".2f")}],
                             "no_data": status == "no_data"}
-    assert result.receipt.rowset_sha256 == rowset_sha256(rows)
+    serialized_rows = [{**rows[0], "value": None if value is None else format(value, ".2f")}]
+    assert result.receipt.rowset_sha256 == rowset_sha256(serialized_rows)
     assert result.receipt.freshness_status == "unknown" and result.receipt.data_as_of is None
     if value is not None:
-        assert rowset_sha256(rows) != rowset_sha256([{**rows[0], "value": str(value)}])
+        assert rowset_sha256(rows) != rowset_sha256(serialized_rows)
 
 
 @pytest.mark.asyncio

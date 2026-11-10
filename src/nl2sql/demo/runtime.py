@@ -16,6 +16,7 @@ from uuid import UUID
 from src.nl2sql.contracts import (
     AuthorizationDecision,
     ContextBundle,
+    ExecutionPlan,
     ExecutionReceipt,
     FetchMetricStep,
     QueryPlan,
@@ -166,8 +167,9 @@ class DemoMetricStepRunner:
         step: FetchMetricStep,
         query_plan: QueryPlan,
         context: ContextBundle,
+        execution_plan: ExecutionPlan | None = None,
     ) -> PreparedMetricStep:
-        del query_plan, context
+        del query_plan, context, execution_plan
         for metric_key in step.metric_keys:
             if metric_key not in DEMO_METRICS_BY_KEY:
                 raise ValueError("demo_metric_unknown")
@@ -184,8 +186,9 @@ class DemoMetricStepRunner:
         prepared: PreparedMetricStep,
         *,
         timeout_ms: int,
+        trace_id: str = "",
     ) -> MetricStepResult:
-        del timeout_ms
+        del timeout_ms, trace_id
         step_id, metric_keys = prepared.payload  # type: ignore[misc]
         values: dict[str, Any] = {}
         for metric_key in metric_keys:

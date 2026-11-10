@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 from fastapi import HTTPException
+from starlette.datastructures import URL
 from starlette.requests import Request
 
 from src.core.auth.dependencies import (
@@ -30,6 +31,14 @@ def _request(path: str, method: str = "GET") -> Request:
             "server": ("testserver", 80),
         }
     )
+
+
+class _ConflictingUrlPathRequest(Request):
+    """Expose a cached/reconstructed URL that disagrees with the ASGI path."""
+
+    @property
+    def url(self) -> URL:
+        return URL("http://testserver/api/v2/nl2sql/queries")
 
 
 def _user(permissions: Iterable[str]) -> AuthUser:
@@ -95,6 +104,20 @@ async def test_stream_v2_route_requires_stream_permission() -> None:
 
     user = _user(["nl2sql:stream"])
     assert await require_nl2sql_permission(request, user, _settings()) is user
+
+
+@pytest.mark.asyncio
+async def test_permission_uses_asgi_path_when_url_path_conflicts() -> None:
+    original = _request("/api/v2/nl2sql/queries/stream", method="POST")
+    request = _ConflictingUrlPathRequest(original.scope)
+    assert request.scope["path"] == "/api/v2/nl2sql/queries/stream"
+    assert request.url.path == "/api/v2/nl2sql/queries"
+
+    with pytest.raises(HTTPException) as denied:
+        await require_nl2sql_permission(request, _user(["nl2sql:invoke"]), _settings())
+
+    assert denied.value.status_code == 403
+    assert _detail_code(denied.value) == "AUTH_FORBIDDEN"
 
 
 @pytest.mark.asyncio

@@ -99,12 +99,14 @@ from src.nl2sql.contracts import (
     AuthorizationContext,
     AuthorizationDecision,
     ContextBundle,
+    ExecutionPlan,
     QueryPlan,
     RequestIdentity,
     RouteName,
     evaluate_authorization,
 )
 from src.nl2sql.infra.governance.query_gateway import QueryGateway
+from src.nl2sql.infra.governance.semantic_sql_validator import SemanticSQLValidator
 from src.nl2sql.infra.store.ai_views import (
     AIViewsConfig,
     ViewDefinition,
@@ -131,6 +133,7 @@ from src.nl2sql.semantic.context_compiler import (
     ContextCompiler,
     SemanticContextResolver,
 )
+from src.nl2sql.semantic.execution_manifest import build_expected_execution_manifest
 from src.nl2sql.semantic.metric_contract import MetricContract, Predicate
 from src.nl2sql.semantic.policy_evidence import (
     ActiveReleaseRegistry,
@@ -615,6 +618,7 @@ async def build_request_typed_runtime(
     bootstrap_scan_max_rows: int | None = None,
     expected_revision: str | None = None,
     capabilities: frozenset[Capability] | frozenset[str] = frozenset(),
+    validation_mode: Literal["shadow", "enforce"] = "enforce",
 ) -> RequestTypedRuntime | TypedRuntimeUnavailable:
     """Compose ONE request-scoped typed component set, or fail closed.
 
@@ -736,6 +740,73 @@ async def build_request_typed_runtime(
         clock=request_clock,
         expected_revision=expected_revision,
     )
+
+    def build_manifest_for_compiled_step(
+        *,
+        query: Any,
+        step: Any,
+        query_plan: QueryPlan,
+        context: ContextBundle,
+        execution_plan: ExecutionPlan | None,
+        root_query_plan: QueryPlan | None = None,
+    ) -> object:
+        if execution_plan is None:
+            raise ValueError("metric_semantic_execution_plan_missing")
+        selected_metrics = tuple(
+            metric for metric in metrics
+            if metric.asset_id in query_plan.metric_keys
+            or metric.metric_key in query_plan.metric_keys
+        )
+        if len(selected_metrics) != 1:
+            raise ValueError("metric_semantic_manifest_metric_ambiguity")
+        selected_sources = {metric.source_ref for metric in selected_metrics}
+        candidate_bindings = tuple(
+            binding for binding in bindings if binding.source_ref in selected_sources
+        )
+        if not candidate_bindings:
+            raise ValueError("metric_semantic_manifest_binding_missing")
+        selected_policy_ids = {metric.eligibility_policy_id for metric in selected_metrics}
+        selected_policies = tuple(
+            policy for policy in policies if policy.policy_id in selected_policy_ids
+        )
+        aggregate = next(
+            (item for item in candidate_bindings if item.aggregate is not None),
+            None,
+        )
+        query_source_kind = getattr(query, "source_kind", None)
+        expected_source_kind = (
+            query_source_kind
+            if query_source_kind in {"approved_aggregate", "approved_detail"}
+            else (
+                "approved_aggregate"
+                if query_plan.source_strategy == "aggregate_first" and aggregate is not None
+                else "approved_detail"
+            )
+        )
+        selected_bindings = tuple(
+            item
+            for item in candidate_bindings
+            if (item.aggregate is not None)
+            == (expected_source_kind == "approved_aggregate")
+        ) or candidate_bindings[:1]
+        return build_expected_execution_manifest(
+            query_plan=query_plan,
+            execution_plan=execution_plan,
+            context=context,
+            metric_contracts=selected_metrics,
+            relation_bindings=selected_bindings,
+            eligibility_policies=selected_policies,
+            schema_snapshot=snapshot,
+            semantic_release=release,
+            authorization_context=authorization,
+            compiler_identity="metric-query-compiler-v1",
+            actual_source_kind=expected_source_kind,
+            root_query_plan=root_query_plan,
+            freshness=getattr(query, "freshness", None),
+            source_step_id=getattr(step, "step_id", None),
+        )
+
+    semantic_validator = SemanticSQLValidator()
     return RequestTypedRuntime(
         release=release,
         snapshot=snapshot,
@@ -756,6 +827,9 @@ async def build_request_typed_runtime(
             ad_hoc_calculation_runner=ad_hoc_calculation_runner_for_capabilities(
                 capabilities
             ),
+            semantic_validator=semantic_validator,
+            manifest_builder=build_manifest_for_compiled_step,
+            validation_mode=validation_mode,
         ),
         gateway=gateway,
         identity=identity,

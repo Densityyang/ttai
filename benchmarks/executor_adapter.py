@@ -550,6 +550,15 @@ def production_gate_reason() -> str:
     from uuid import UUID
 
     try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        # Async experiment runs cannot use this synchronous probe. Fail closed
+        # without creating a coroutine that asyncio.run cannot consume.
+        return PRODUCTION_UNAVAILABLE_REASON
+
+    try:
         from src.nl2sql.contracts import RequestIdentity
         from src.nl2sql.orchestration.typed_runtime import (
             TypedRuntimeUnavailable,
@@ -571,7 +580,6 @@ def production_gate_reason() -> str:
     try:
         result = asyncio.run(_probe())
     except RuntimeError:
-        # Called from inside a running event loop; the documented reason stands.
         return PRODUCTION_UNAVAILABLE_REASON
     except Exception:  # noqa: BLE001
         return PRODUCTION_UNAVAILABLE_REASON

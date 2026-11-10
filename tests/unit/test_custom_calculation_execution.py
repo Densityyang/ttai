@@ -119,6 +119,25 @@ def test_same_definition_version_executes_with_different_parameter_values() -> N
     )
 
 
+def test_custom_result_watermark_fails_closed_for_missing_or_naive_input() -> None:
+    spec = _spec()
+    missing = _input(10).model_copy(update={"data_as_of": None})
+    assert (
+        execute_custom_calculation(
+            spec=spec, binding=_binding(spec, 20), inputs=(missing,)
+        ).data_as_of
+        is None
+    )
+
+    naive = _input(10).model_copy(update={"data_as_of": datetime(2026, 9, 20)})
+    assert (
+        execute_custom_calculation(
+            spec=spec, binding=_binding(spec, 20), inputs=(naive,)
+        ).data_as_of
+        is None
+    )
+
+
 def test_zero_actual_is_numeric_and_zero_target_is_undefined_not_no_data() -> None:
     spec = _spec()
 

@@ -202,7 +202,7 @@ def override_agent_config(overrides: dict[str, Any]):
         if hasattr(config, key):
             original_values[key] = getattr(config, key)
             object.__setattr__(config, key, value)
-            logger.info("Config override: %s = %r (was %r)", key, value, original_values[key])
+            logger.info("Config override applied: %s", key)
         else:
             logger.warning("Config field not found: %s, skipping", key)
 

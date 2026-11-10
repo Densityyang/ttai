@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from src.nl2sql.artifacts.custom_definition_execution_service import (
         CustomDefinitionExecutionService,
     )
+    from src.nl2sql.artifacts.definition_run_record import DefinitionRunRecordStore
     from src.nl2sql.artifacts.exploration_confirmation import (
         ExplorationConfirmationService,
     )
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
     from src.nl2sql.artifacts.publication_service import PublicationService
     from src.nl2sql.artifacts.repository import InMemoryArtifactRepository
     from src.nl2sql.artifacts.service import CustomDefinitionService
+    from src.nl2sql.hitl_action_claims import HITLActionClaimStore
     from src.nl2sql.orchestration.governed_calculation_inputs import (
         GovernedMetricInputFetcher,
         TypedMetricCalculationInputResolver,
@@ -47,6 +49,15 @@ from src.nl2sql.infra.memory.checkpointer import CheckpointerManager
 from src.nl2sql.observability.control_audit import ControlAuditStore
 
 logger = logging.getLogger(__name__)
+
+
+async def _run_shielded_cleanup(cleanup: Callable[[], Any]) -> None:
+    cleanup_task = asyncio.create_task(cleanup())
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        await cleanup_task
+        raise
 
 
 class RuntimeDependencyUnavailable(RuntimeError):
@@ -75,13 +86,13 @@ class AppContainer:
         # (registry, evidence provider, resolver, deterministic provider,
         # compiler, executor, identity, authorization) are NEVER stored here.
         self._typed_deployment: tuple[Any, Any, Any, Any] | None = None
-        self._typed_resources: tuple[Any, Any, Any] | None = None
+        self._typed_resources: tuple[Any, Any, Any, Any] | None = None
         # Application-scoped product services.  These are DEMO/LOCAL and
         # NON-DURABLE: they live for the process lifetime only, deliberately so
         # for Foundation B, and state is LOST on restart.  A future Control-PG
         # implementation must be swappable behind the same service interfaces.
         self._local_real_deployment: tuple[Any, Any, Any, Any] | None = None
-        self._local_real_resources: tuple[Any, Any] | None = None
+        self._local_real_resources: tuple[Any, Any, Any] | None = None
         self._local_real_probe_attempted = False
         self._local_real_readiness: dict[str, object] | None = None
         self._local_real_latest_authoritative_date: str | None = None
@@ -90,6 +101,8 @@ class AppContainer:
         self._local_real_source_watermark_checked_at: datetime | None = None
         self._local_real_count_column = "id"
         self._definition_store: DefinitionStorePort | None = None
+        self._definition_run_record_store: DefinitionRunRecordStore | None = None
+        self._hitl_action_claim_store: HITLActionClaimStore | None = None
         self._definition_service: CustomDefinitionService | None = None
         # The two server-owned confirmation records are SEPARATE stores: an
         # audit record is never a field of a definition, so it can never move a
@@ -167,6 +180,8 @@ class AppContainer:
                     # this definition" would silently stop being durable.
                     self._confirmation_audit_store_instance(),
                     self._exploration_confirmation_store_instance(),
+                    self._definition_run_record_store_instance(),
+                    self._hitl_action_claim_store_instance(),
                 ):
                     await store.ping()
                 self._product_store_ready = True
@@ -399,6 +414,54 @@ class AppContainer:
 
                 self._confirmation_audit_store = InMemoryConfirmationAuditStore()
         return self._confirmation_audit_store
+
+    def _definition_run_record_store_instance(self) -> DefinitionRunRecordStore:
+        """Build the backend-selected run store once per application container."""
+
+        if self._definition_run_record_store is None:
+            backend = self.product_store_backend
+            if backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.artifacts.definition_run_record_control_store import (
+                    ControlDefinitionRunRecordStore,
+                )
+
+                self._definition_run_record_store = ControlDefinitionRunRecordStore(
+                    get_settings().control_database_url or ""
+                )
+            else:
+                from src.nl2sql.artifacts.definition_run_record import (
+                    InMemoryDefinitionRunRecordStore,
+                )
+
+                self._definition_run_record_store = InMemoryDefinitionRunRecordStore()
+        return self._definition_run_record_store
+
+    def _hitl_action_claim_store_instance(self) -> HITLActionClaimStore:
+        """Return the backend-selected atomic HITL action claim store."""
+
+        if self._hitl_action_claim_store is None:
+            if self.product_store_backend == "control":
+                from src.core.settings import get_settings
+                from src.nl2sql.hitl_action_claim_control_store import (
+                    ControlHITLActionClaimStore,
+                )
+
+                self._hitl_action_claim_store = ControlHITLActionClaimStore(
+                    get_settings().control_database_url or ""
+                )
+            else:
+                from src.nl2sql.hitl_action_claims import (
+                    InMemoryHITLActionClaimStore,
+                )
+
+                self._hitl_action_claim_store = InMemoryHITLActionClaimStore()
+        return self._hitl_action_claim_store
+
+    def get_hitl_action_claim_store(self) -> HITLActionClaimStore:
+        """Return the one claim store shared by all requests in this process."""
+
+        return self._hitl_action_claim_store_instance()
 
     def _exploration_confirmation_store_instance(
         self,
@@ -722,6 +785,7 @@ class AppContainer:
             self._custom_definition_execution_service = CustomDefinitionExecutionService(
                 definitions=definitions,
                 input_resolver=self.calculation_input_resolver(),
+                run_records=self._definition_run_record_store_instance(),
                 revalidation=DefinitionRevalidationGate(
                     governed_metric_authority=definitions._is_governed_metric_key,
                     strict=get_settings().service_mode == "product",
@@ -886,6 +950,7 @@ class AppContainer:
             if deployment is None:
                 return TypedRuntimeUnavailable(reason="typed_deployment_unavailable")
             views, read_active, read_snapshot, gateway = deployment
+            from src.nl2sql.config.settings import get_agent_config
             return await build_request_typed_runtime(
                 views=views,
                 read_active=read_active,
@@ -895,6 +960,7 @@ class AppContainer:
                 authorization=authorization,
                 expected_revision=expected_revision,
                 capabilities=capabilities,
+                validation_mode=get_agent_config().validation_mode,
             )
 
         return factory
@@ -938,6 +1004,7 @@ class AppContainer:
                     reason="local_real_authoritative_window_unavailable"
                 )
             views, read_active, read_snapshot, gateway = deployment
+            from src.nl2sql.config.settings import get_agent_config
             return await build_request_typed_runtime(
                 views=views,
                 read_active=read_active,
@@ -954,6 +1021,7 @@ class AppContainer:
                 bootstrap_scan_max_rows=LOCAL_REAL_BOOTSTRAP_SCAN_MAX_ROWS,
                 expected_revision=expected_revision,
                 capabilities=capabilities,
+                validation_mode=get_agent_config().validation_mode,
             )
 
         return factory
@@ -976,7 +1044,7 @@ class AppContainer:
         watermark = self._local_real_source_watermark
         if watermark is None or resources is None:
             return None
-        deployment = resources[1]
+        deployment = resources[2]
         if watermark.tzinfo is None or watermark.utcoffset() is None:
             watermark = watermark.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
         watermark_utc = watermark.astimezone(UTC)
@@ -1025,6 +1093,17 @@ class AppContainer:
             return None
         self._local_real_probe_attempted = True
         business_engine: Any | None = None
+        cancellation_engine: Any | None = None
+
+        async def dispose_runtime_engines() -> None:
+            for engine in (cancellation_engine, business_engine):
+                if engine is None:
+                    continue
+                try:
+                    await engine.dispose()
+                except Exception:
+                    logger.error("local-real engine cleanup failed")
+
         try:
             from pathlib import Path
 
@@ -1066,10 +1145,23 @@ class AppContainer:
                 application_name="ttai-local-real-runtime",
                 settings=settings,
             )
+            cancellation_engine = create_runtime_async_engine(
+                settings.database_url,
+                purpose=DatabasePurpose.BUSINESS_READ_ONLY,
+                application_name="ttai-local-real-cancel",
+                settings=settings,
+                pool_size=1,
+                max_overflow=3,
+            )
             session_factory = async_sessionmaker(
                 business_engine, class_=AsyncSession, expire_on_commit=False
             )
-            gateway = QueryGateway(session_factory, schema=agent_config.nl2sql_db_schema)
+            gateway = QueryGateway(
+                session_factory,
+                schema=agent_config.nl2sql_db_schema,
+                audit_sink=self._audit_store,
+                cancellation_engine=cancellation_engine,
+            )
             # Probe the PREFERRED published view FIRST.  When it is absent this
             # deployment fails closed rather than silently switching to
             # direct-table metric SQL.
@@ -1078,22 +1170,22 @@ class AppContainer:
                 logger.error(
                     "local-real published view unavailable: %s", relation_probe.status
                 )
-                await business_engine.dispose()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             latest_date = await resolve_latest_authoritative_date(session_factory)
             recent_dates = await resolve_recent_authoritative_dates(session_factory)
             if not latest_date.resolved or latest_date.latest_date is None:
                 logger.error("local-real authoritative date unavailable")
-                await business_engine.dispose()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             if not recent_dates.resolved:
                 logger.error("local-real authoritative window unavailable")
-                await business_engine.dispose()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             source_watermark = await resolve_source_watermark(session_factory)
             if not source_watermark.resolved or source_watermark.data_as_of is None:
                 logger.error("local-real source watermark unavailable")
-                await business_engine.dispose()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             snapshot_candidate = await PostgresSchemaSnapshotCollector(
                 business_engine, max_relations=1
@@ -1123,7 +1215,7 @@ class AppContainer:
             )
             if frozen_view is None:
                 logger.error("local-real published view is not configured")
-                await business_engine.dispose()
+                await _run_shielded_cleanup(dispose_runtime_engines)
                 return None
             bundle = await self._build_local_real_semantics_async(
                 snapshot_candidate=snapshot_candidate,
@@ -1145,6 +1237,16 @@ class AppContainer:
                 },
                 count_column="id",
             )
+        except asyncio.CancelledError:
+            await _run_shielded_cleanup(dispose_runtime_engines)
+            self._local_real_probe_attempted = False
+            self._local_real_deployment = None
+            self._local_real_resources = None
+            self._local_real_latest_authoritative_date = None
+            self._local_real_recent_authoritative_dates = ()
+            self._local_real_source_watermark = None
+            self._local_real_source_watermark_checked_at = None
+            raise
         except Exception as exc:
             # Fail closed and dispose a partially constructed engine.  The
             # public readiness surface receives only a stable reason; detailed
@@ -1152,11 +1254,7 @@ class AppContainer:
             logger.error(
                 "local-real deployment unavailable: %s", type(exc).__name__
             )
-            if business_engine is not None:
-                try:
-                    await business_engine.dispose()
-                except Exception:
-                    logger.error("local-real engine cleanup failed")
+            await _run_shielded_cleanup(dispose_runtime_engines)
             self._local_real_deployment = None
             self._local_real_resources = None
             self._local_real_latest_authoritative_date = None
@@ -1170,7 +1268,11 @@ class AppContainer:
             deployment.read_snapshot,
             deployment.gateway,
         )
-        self._local_real_resources = (business_engine, deployment)
+        self._local_real_resources = (
+            business_engine,
+            cancellation_engine,
+            deployment,
+        )
         self._local_real_latest_authoritative_date = deployment.latest_authoritative_date
         self._local_real_recent_authoritative_dates = deployment.recent_authoritative_dates
         self._local_real_source_watermark = source_watermark.data_as_of
@@ -1212,6 +1314,25 @@ class AppContainer:
 
         if self._typed_deployment is not None:
             return self._typed_deployment
+        publisher: Any | None = None
+        snapshots: Any | None = None
+        business_engine: Any | None = None
+        cancellation_engine: Any | None = None
+
+        async def dispose_typed_resources() -> None:
+            for resource in (cancellation_engine, business_engine):
+                if resource is not None:
+                    try:
+                        await resource.dispose()
+                    except Exception:
+                        logger.error("typed engine cleanup failed")
+            for resource in (snapshots, publisher):
+                if resource is not None:
+                    try:
+                        await resource.close()
+                    except Exception:
+                        logger.error("typed resource close failed")
+
         try:
             from pathlib import Path
 
@@ -1241,18 +1362,44 @@ class AppContainer:
                 application_name="ttai-typed-runtime",
                 settings=settings,
             )
+            cancellation_engine = create_runtime_async_engine(
+                settings.database_url,
+                purpose=DatabasePurpose.BUSINESS_READ_ONLY,
+                application_name="ttai-typed-runtime-cancel",
+                settings=settings,
+                pool_size=1,
+                max_overflow=3,
+            )
             session_factory = async_sessionmaker(
                 business_engine, class_=AsyncSession, expire_on_commit=False
             )
-            gateway = QueryGateway(session_factory, schema=agent_config.nl2sql_db_schema)
+            gateway = QueryGateway(
+                session_factory,
+                schema=agent_config.nl2sql_db_schema,
+                audit_sink=self._audit_store,
+                cancellation_engine=cancellation_engine,
+            )
+        except asyncio.CancelledError:
+            await _run_shielded_cleanup(dispose_typed_resources)
+            raise
         except Exception as exc:
             logger.error("typed runtime deployment unavailable: %s", type(exc).__name__)
+            await _run_shielded_cleanup(dispose_typed_resources)
             return None
         self._typed_deployment = (views, publisher.read_active, snapshots.read, gateway)
-        self._typed_resources = (publisher, snapshots, business_engine)
+        assert cancellation_engine is not None
+        self._typed_resources = (
+            publisher,
+            snapshots,
+            business_engine,
+            cancellation_engine,
+        )
         return self._typed_deployment
 
     async def close(self) -> None:
+        await _run_shielded_cleanup(self._close_resources)
+
+    async def _close_resources(self) -> None:
         self._engine = None
         self._model_gateway = None
         if self._definition_store is not None:
@@ -1265,6 +1412,19 @@ class AppContainer:
                 logger.error("definition store close failed")
             self._definition_store = None
             self._definition_service = None
+        self._custom_definition_execution_service = None
+        if self._definition_run_record_store is not None:
+            try:
+                await self._definition_run_record_store.close()
+            except Exception:
+                logger.error("definition run record store close failed")
+            self._definition_run_record_store = None
+        if self._hitl_action_claim_store is not None:
+            try:
+                await self._hitl_action_claim_store.close()
+            except Exception:
+                logger.error("HITL action claim store close failed")
+            self._hitl_action_claim_store = None
         if self._confirmation_audit_store is not None:
             # Same engine-ownership rule as the definition store: a
             # control-backed audit store owns its engine, and the definition
@@ -1283,10 +1443,16 @@ class AppContainer:
             self._exploration_confirmation_store = None
             self._exploration_confirmation_service = None
         if self._audit_store is not None:
-            await self._audit_store.close()
-            self._audit_store = None
+            try:
+                await self._audit_store.close()
+            except Exception:
+                logger.error("control audit store close failed")
+            finally:
+                self._audit_store = None
         if self._typed_resources is not None:
-            publisher, snapshots, business_engine = self._typed_resources
+            publisher, snapshots, business_engine, cancellation_engine = (
+                self._typed_resources
+            )
             self._typed_resources = None
             self._typed_deployment = None
             for resource in (snapshots, publisher):
@@ -1298,14 +1464,24 @@ class AppContainer:
                 await business_engine.dispose()
             except Exception:
                 pass
+            try:
+                await cancellation_engine.dispose()
+            except Exception:
+                logger.error("typed cancellation engine close failed")
         if self._local_real_resources is not None:
-            business_engine, _deployment = self._local_real_resources
+            business_engine, cancellation_engine, _deployment = (
+                self._local_real_resources
+            )
             self._local_real_resources = None
             self._local_real_deployment = None
             try:
                 await business_engine.dispose()
             except Exception:
                 logger.error("local-real resource close failed")
+            try:
+                await cancellation_engine.dispose()
+            except Exception:
+                logger.error("local-real cancellation resource close failed")
         else:
             self._local_real_deployment = None
         self._local_real_probe_attempted = False

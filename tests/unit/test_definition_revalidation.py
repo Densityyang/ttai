@@ -11,6 +11,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -27,6 +28,10 @@ from src.nl2sql.artifacts.definition_revalidation import (
     DataSnapshotEvidence,
     DefinitionRevalidationGate,
     InputFreshnessDQ,
+)
+from src.nl2sql.artifacts.definition_run_record import (
+    DefinitionRunRecordConflict,
+    DefinitionRunRecordStoreUnavailable,
 )
 from src.nl2sql.artifacts.service import CustomDefinitionService
 from src.nl2sql.contracts import TimeRange
@@ -452,7 +457,7 @@ async def test_every_rerun_records_binding_plan_validation_and_receipt() -> None
     assert not isinstance(second, CustomDefinitionExecutionRefused)
 
     records = await rig.service.run_records.list_for_version(
-        definition_id=definition_id, version=1
+        owner_user_id="alice", definition_id=definition_id, version=1
     )
     assert len(records) == 2
     for record in records:
@@ -478,10 +483,53 @@ async def test_every_rerun_records_binding_plan_validation_and_receipt() -> None
     assert records[1].receipt.result.value == Decimal("60.00")
 
     fetched = await rig.service.run_records.get(
-        definition_id=definition_id, version=1, run_id=records[0].run_id
+        owner_user_id="alice",
+        definition_id=definition_id,
+        version=1,
+        run_id=records[0].run_id,
     )
     assert fetched is not None
     assert fetched.run_id == records[0].run_id
+    assert fetched.owner_user_id == "alice"
+    assert await rig.service.run_records.get(
+        owner_user_id="bob",
+        definition_id=definition_id,
+        version=1,
+        run_id=records[0].run_id,
+    ) is None
+
+    # Exact retries are idempotent, while the same owner-scoped identity may
+    # never be overwritten with a different immutable payload.
+    await rig.service.run_records.put(record=records[0])
+    with pytest.raises(DefinitionRunRecordConflict):
+        await rig.service.run_records.put(
+            record=records[0].model_copy(update={"degradations": ("changed",)})
+        )
+
+
+async def test_unavailable_run_record_store_blocks_before_input_fetch() -> None:
+    rig = _Rig(gate=_gate())
+    definition_id = await rig.saved()
+
+    class _UnavailableRunRecordStore:
+        async def ping(self) -> None:
+            raise RuntimeError("private database failure")
+
+    service = CustomDefinitionExecutionService(
+        definitions=rig.definitions,
+        input_resolver=TypedMetricCalculationInputResolver(rig.fetcher),
+        revalidation=_gate(),
+        run_records=_UnavailableRunRecordStore(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(DefinitionRunRecordStoreUnavailable):
+        await service.execute_revalidated(
+            owner_user_id="alice",
+            definition_id=definition_id,
+            version=1,
+            binding=_binding(rig.spec, 90),
+        )
+    assert rig.fetcher.calls == 0
 
 
 async def test_refused_rerun_is_also_recorded_without_a_receipt() -> None:
@@ -490,7 +538,10 @@ async def test_refused_rerun_is_also_recorded_without_a_receipt() -> None:
     refused = await rig.execute(90)
     assert isinstance(refused, CustomDefinitionExecutionRefused)
     record = await rig.service.run_records.get(
-        definition_id=definition_id, version=1, run_id=refused.run_id
+        owner_user_id="alice",
+        definition_id=definition_id,
+        version=1,
+        run_id=refused.run_id,
     )
     assert record is not None
     assert record.receipt is None

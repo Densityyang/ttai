@@ -71,12 +71,15 @@ def _fact_id(
     status: str,
     value: object,
     time_range: TimeRange | None = None,
+    unit: str | None = None,
 ) -> str:
     payload: dict[str, object] = {
         "step_id": step_id,
         "metric_key": metric_key,
         "status": status,
         "value": value,
+        "unit": unit,
+        "fact_id_version": 2,
     }
     if time_range is not None:
         payload["time_range"] = time_range.model_dump(mode="json")
@@ -107,6 +110,7 @@ def _bundle(
         elapsed_ms=3,
         output_digest=_OUTPUT_DIGEST,
         rowset_sha256=_ROWSET_SHA256,
+        unit="count",
         data_as_of=data_as_of,
         freshness_status="fresh" if data_as_of else "unknown",
         source_kind="approved_aggregate",
@@ -117,11 +121,14 @@ def _bundle(
     )
     status = "unavailable" if value is None else "grounded"
     fact = AnswerFact(
-        fact_id=_fact_id(_STEP_ID, _METRIC_KEY, status, value, time_range),
+        fact_id=_fact_id(
+            _STEP_ID, _METRIC_KEY, status, value, time_range, unit="count"
+        ),
         step_id=_STEP_ID,
         metric_key=_METRIC_KEY,
         status=status,
         value=value,
+        fact_id_version=2,
         unit="count",
         time_range=time_range,
         rowset_sha256=receipt.rowset_sha256,
@@ -366,6 +373,29 @@ def test_manual_origin_and_automated_basis_are_distinguishable() -> None:
         ),
     )
     assert validate_analysis_interpretation(as_manual, evidence=bundle) is as_manual
+
+
+def test_digits_in_manual_labels_do_not_authorize_numeric_claims() -> None:
+    manual = AnalysisManualOriginEvidence.create(
+        label="2026 staffing note",
+        value=None,
+        asserted_by_role="business_operator",
+        attestation_ref="manual.ops-note-numeric-label",
+    )
+    bundle = _bundle(manual_origin_evidence=(manual,))
+
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_interpretation_numeric_fact_unproven"
+    ):
+        validate_analysis_interpretation(
+            AnalysisInterpretation(
+                summary=AnalysisStatement(
+                    text="The staffing note references 2026.",
+                    manual_evidence_ids=(manual.evidence_id,),
+                )
+            ),
+            evidence=bundle,
+        )
 
 
 def test_manual_origin_identity_is_content_derived_and_deterministic() -> None:

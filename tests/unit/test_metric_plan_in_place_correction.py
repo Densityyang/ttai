@@ -57,6 +57,7 @@ from src.nl2sql.contracts import (
     TimeRange,
     evaluate_authorization,
 )
+from src.nl2sql.hitl_action_claims import InMemoryHITLActionClaimStore
 from src.nl2sql.infra.llm.gateway import (
     ModelGateway,
     ModelProfile,
@@ -1168,12 +1169,16 @@ class _ApiContainer:
     def __init__(self, engine: Any, provider: Any) -> None:
         self._engine = engine
         self._provider = provider
+        self._hitl_action_claim_store = InMemoryHITLActionClaimStore()
 
     async def get_engine(self) -> Any:
         return self._engine
 
     def get_backend_authorization_provider(self) -> Any:
         return self._provider
+
+    def get_hitl_action_claim_store(self) -> InMemoryHITLActionClaimStore:
+        return self._hitl_action_claim_store
 
 
 class _StaticAuthorizationProvider:

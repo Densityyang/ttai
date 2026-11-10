@@ -2,7 +2,7 @@
 
 The definition store is gated exactly like the other control-plane contracts:
 nothing runs unless TTAI_RUN_POSTGRES_INTEGRATION=1, and the container is
-created, migrated with 001..007 and torn down by this module alone.
+created, migrated with 001..009 and torn down by this module alone.
 
 What is proven here is the end of the HALF-persisted state:
 
@@ -30,14 +30,29 @@ import sys
 import time
 import uuid
 from collections.abc import Iterator
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from src.nl2sql.artifacts.custom_definition_execution_service import (
+    CustomDefinitionExecutionRefused,
+    CustomDefinitionExecutionService,
+)
 from src.nl2sql.artifacts.definition_control_store import (
     ControlDefinitionStore,
     DefinitionStoreIntegrityError,
+)
+from src.nl2sql.artifacts.definition_revalidation import DefinitionRevalidationGate
+from src.nl2sql.artifacts.definition_run_record import (
+    DefinitionRunRecordConflict,
+    new_run_id,
+)
+from src.nl2sql.artifacts.definition_run_record_control_store import (
+    ControlDefinitionRunRecordStore,
+    DefinitionRunRecordIntegrityError,
 )
 from src.nl2sql.artifacts.definition_semantics import (
     DefinitionSemantics,
@@ -47,7 +62,12 @@ from src.nl2sql.artifacts.publication_control_store import (
     ControlPublicationCatalogue,
 )
 from src.nl2sql.artifacts.publication_service import PublicationSourceUnresolved
+from src.nl2sql.contracts import TimeRange
+from src.nl2sql.orchestration.custom_calculation_execution import (
+    ResolvedCalculationInput,
+)
 from src.nl2sql.semantic.calculation_contract import (
+    CalculationExecutionBinding,
     CalculationInputSpec,
     CalculationSpec,
     LiteralOperand,
@@ -79,6 +99,8 @@ CONTROL_MIGRATIONS = (
     "005_product_artifacts.sql",
     "006_definition_store.sql",
     "007_confirmation_audit.sql",
+    "008_definition_run_records.sql",
+    "009_hitl_action_claims.sql",
 )
 GOVERNED_METRIC = "demo.revenue"
 CHECKSUM_A = "a" * 64
@@ -204,6 +226,7 @@ def _psql(
     stack: dict[str, Any],
     sql: str,
     *,
+    database: str = CONTROL_DATABASE,
     role: str = CONTROL_APP,
     password: str = CONTROL_APP_PASSWORD,
     check: bool = True,
@@ -220,7 +243,7 @@ def _psql(
         "--username",
         role,
         "--dbname",
-        CONTROL_DATABASE,
+        database,
         "--tuples-only",
         "--no-align",
         "--set",
@@ -232,13 +255,18 @@ def _psql(
 
 
 def _owner_psql(
-    stack: dict[str, Any], sql: str, *, check: bool = True
+    stack: dict[str, Any],
+    sql: str,
+    *,
+    database: str = CONTROL_DATABASE,
+    check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     return _psql(
         stack,
         sql,
         role=CONTROL_OWNER,
         password=CONTROL_OWNER_PASSWORD,
+        database=database,
         check=check,
     )
 
@@ -363,13 +391,31 @@ def _resolver(key: str) -> bool:
     return key == GOVERNED_METRIC
 
 
+class _RunRecordInputFetcher:
+    async def fetch_metric_input(self, **kwargs: object) -> ResolvedCalculationInput:
+        return ResolvedCalculationInput(
+            role=str(kwargs["role"]),
+            metric_key=str(kwargs["metric_key"]),
+            value=Decimal("1"),
+            unit="count",
+            data_as_of=datetime(2026, 10, 13, tzinfo=UTC),
+            time_range=TimeRange(
+                start=date(2026, 10, 13), end=date(2026, 10, 13)
+            ),
+            provenance="published_gold",
+            source_id="gold.control.fixture",
+            receipt_step_id="fetch_control_fixture",
+            fact_id="d" * 64,
+        )
+
+
 # --- cross-container durability -------------------------------------------------
 
 
 def test_definition_version_axes_and_lifecycle_survive_a_fresh_container(
     control_postgres: dict[str, Any], control_backend: None
 ) -> None:
-    async def scenario() -> tuple[str, str, str]:
+    async def scenario() -> tuple[str, str, str, str]:
         from src.nl2sql.container import AppContainer
 
         writer = AppContainer(governed_metric_key_resolver=_resolver)
@@ -1089,3 +1135,369 @@ def test_legacy_semantic_jsonb_without_applicability_loads_without_rewrite(
         f"WHERE definition_id = '{definition_id}' AND version = 1;",
     )
     assert stored_marker.stdout.strip() == "f"
+
+
+def test_control_alembic_chain_upgrades_008_then_009(
+    control_postgres: dict[str, Any],
+) -> None:
+    """Exercise the real 007 -> 008 -> 009 Alembic path on isolated PG17."""
+
+    database = "ttai_control_alembic"
+    _owner_psql(
+        control_postgres,
+        f"CREATE DATABASE {database};",
+        database="postgres",
+    )
+    container = str(control_postgres["container"])
+    for migration in CONTROL_MIGRATIONS[:7]:
+        source = ROOT / "docker/migrations/control" / migration
+        _docker("cp", str(source), f"{container}:/tmp/{migration}")
+        _docker(
+            "exec",
+            container,
+            "psql",
+            "-1",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-U",
+            CONTROL_OWNER,
+            "-d",
+            database,
+            "-q",
+            "-f",
+            f"/tmp/{migration}",
+            timeout=120,
+        )
+
+    environment = os.environ.copy()
+    environment["CONTROL_MIGRATOR_DATABASE_URL"] = (
+        f"postgresql+psycopg://{CONTROL_OWNER}:{CONTROL_OWNER_PASSWORD}"
+        f"@127.0.0.1:{control_postgres['port']}/{database}"
+    )
+    environment.pop("CONTROL_MIGRATOR_DATABASE_URL_FILE", None)
+
+    def alembic(*arguments: str) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "alembic",
+                "-c",
+                str(ROOT / "docker/alembic/control.ini"),
+                *arguments,
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert result.returncode == 0, (
+            f"Alembic {' '.join(arguments)} failed with exit {result.returncode}"
+        )
+
+    alembic("stamp", "007_confirmation_audit")
+    alembic("upgrade", "008_definition_run_records")
+    assert _owner_psql(
+        control_postgres,
+        "SELECT version_num FROM alembic_version;",
+        database=database,
+    ).stdout.strip() == "008_definition_run_records"
+    assert _owner_psql(
+        control_postgres,
+        "SELECT count(*) FROM schema_migrations "
+        "WHERE version = '008_definition_run_records';",
+        database=database,
+    ).stdout.strip() == "1"
+    assert _owner_psql(
+        control_postgres,
+        "SELECT to_regclass('public.hitl_action_claims') IS NULL;",
+        database=database,
+    ).stdout.strip() == "t"
+
+    alembic("upgrade", "009_hitl_action_claims")
+    assert _owner_psql(
+        control_postgres,
+        "SELECT version_num FROM alembic_version;",
+        database=database,
+    ).stdout.strip() == "009_hitl_action_claims"
+    assert _owner_psql(
+        control_postgres,
+        "SELECT count(*) FROM schema_migrations WHERE version IN ("
+        "'008_definition_run_records', '009_hitl_action_claims');",
+        database=database,
+    ).stdout.strip() == "2"
+    assert _owner_psql(
+        control_postgres,
+        "SELECT to_regclass('public.hitl_action_claims') IS NOT NULL;",
+        database=database,
+    ).stdout.strip() == "t"
+
+
+def test_definition_run_records_are_owner_scoped_immutable_and_durable(
+    control_postgres: dict[str, Any], control_backend: None
+) -> None:
+    from src.nl2sql.container import AppContainer
+
+    async def scenario() -> tuple[str, str, str]:
+        writer = AppContainer(
+            governed_metric_input_fetcher=_RunRecordInputFetcher(),
+            governed_metric_key_resolver=_resolver,
+        )
+        await writer.start()
+        try:
+            assert writer.product_store_available is True
+            definitions = writer.custom_definition_service()
+            draft = await definitions.create_draft(
+                owner_user_id="alice", title="Run record", calculation=_spec()
+            )
+            await definitions.mark_semantic_closed(
+                owner_user_id="alice", definition_id=draft.definition_id
+            )
+            await definitions.confirm(
+                owner_user_id="alice", definition_id=draft.definition_id
+            )
+            await definitions.save(
+                owner_user_id="alice", definition_id=draft.definition_id
+            )
+
+            outcome = await writer.custom_definition_execution_service().execute(
+                owner_user_id="alice",
+                definition_id=draft.definition_id,
+                version=1,
+                binding=CalculationExecutionBinding(
+                    calculation_id=_spec().calculation_id,
+                    spec_checksum=_spec().checksum,
+                    parameters=(),
+                ),
+            )
+            assert outcome.result.value == Decimal("1")
+
+            store = writer.custom_definition_execution_service().run_records
+            records = await store.list_for_version(
+                owner_user_id="alice", definition_id=draft.definition_id, version=1
+            )
+            assert len(records) == 1
+            record = records[0]
+            assert record.owner_user_id == "alice"
+            assert record.receipt is not None
+
+            # A strict gate with no current-authority evidence refuses before
+            # input resolution, but the refusal itself is durably queryable.
+            refused_service = CustomDefinitionExecutionService(
+                definitions=definitions,
+                input_resolver=writer.calculation_input_resolver(),
+                revalidation=DefinitionRevalidationGate(
+                    governed_metric_authority=definitions._is_governed_metric_key,
+                    strict=True,
+                ),
+                run_records=store,
+            )
+            refused = await refused_service.execute_revalidated(
+                owner_user_id="alice",
+                definition_id=draft.definition_id,
+                version=1,
+                binding=CalculationExecutionBinding(
+                    calculation_id=_spec().calculation_id,
+                    spec_checksum=_spec().checksum,
+                    parameters=(),
+                ),
+            )
+            assert isinstance(refused, CustomDefinitionExecutionRefused)
+            refused_record = await store.get(
+                owner_user_id="alice",
+                definition_id=draft.definition_id,
+                version=1,
+                run_id=refused.run_id,
+            )
+            assert refused_record is not None
+            assert refused_record.receipt is None
+            assert refused_record.validation.branch == "UNAVAILABLE"
+
+            # Exact retry is idempotent and does not add a second record.
+            await store.put(record=record)
+            assert len(
+                await store.list_for_version(
+                    owner_user_id="alice",
+                    definition_id=draft.definition_id,
+                    version=1,
+                )
+            ) == 2
+
+            with pytest.raises(DefinitionRunRecordConflict):
+                await store.put(
+                    record=record.model_copy(
+                        update={"degradations": ("changed",)}
+                    )
+                )
+            assert await store.get(
+                owner_user_id="bob",
+                definition_id=draft.definition_id,
+                version=1,
+                run_id=record.run_id,
+            ) is None
+
+            # Concurrent exact retries resolve to one immutable row.
+            concurrent = record.model_copy(update={"run_id": new_run_id()})
+            await asyncio.gather(
+                store.put(record=concurrent), store.put(record=concurrent)
+            )
+            assert len(
+                await store.list_for_version(
+                    owner_user_id="alice",
+                    definition_id=draft.definition_id,
+                    version=1,
+                )
+            ) == 3
+
+            # A foreign owner cannot insert a record for Alice's definition;
+            # the database FK rejects the write and the transaction leaves no row.
+            foreign = record.model_copy(
+                update={"owner_user_id": "bob", "run_id": new_run_id()}
+            )
+            with pytest.raises(DefinitionRunRecordConflict):
+                await store.put(record=foreign)
+            assert await store.get(
+                owner_user_id="bob",
+                definition_id=draft.definition_id,
+                version=1,
+                run_id=foreign.run_id,
+            ) is None
+
+            version_mismatch = record.model_copy(
+                update={"version": 2, "run_id": new_run_id()}
+            )
+            with pytest.raises(DefinitionRunRecordConflict):
+                await store.put(record=version_mismatch)
+            assert await store.get(
+                owner_user_id="alice",
+                definition_id=draft.definition_id,
+                version=2,
+                run_id=version_mismatch.run_id,
+            ) is None
+            return (
+                draft.definition_id,
+                record.run_id,
+                concurrent.run_id,
+                refused.run_id,
+            )
+        finally:
+            await writer.close()
+
+    definition_id, run_id, concurrent_run_id, refused_run_id = _run_async(
+        scenario()
+    )
+
+    async def restart_read() -> None:
+        reader = AppContainer(governed_metric_key_resolver=_resolver)
+        await reader.start()
+        try:
+            assert reader.product_store_available is True
+            records = await reader.custom_definition_execution_service().run_records.list_for_version(
+                owner_user_id="alice", definition_id=definition_id, version=1
+            )
+            assert {record.run_id for record in records} == {
+                run_id,
+                concurrent_run_id,
+                refused_run_id,
+            }
+            refused_after_restart = next(
+                record for record in records if record.run_id == refused_run_id
+            )
+            assert refused_after_restart.receipt is None
+            fetched = await reader.custom_definition_execution_service().run_records.get(
+                owner_user_id="alice",
+                definition_id=definition_id,
+                version=1,
+                run_id=run_id,
+            )
+            assert fetched is not None
+            assert fetched.owner_user_id == "alice"
+        finally:
+            await reader.close()
+
+    _run_async(restart_read())
+
+    indexes = _owner_psql(
+        control_postgres,
+        "SELECT string_agg(indexname, ',' ORDER BY indexname) "
+        "FROM pg_indexes WHERE schemaname = 'public' "
+        "AND indexname IN ("
+        "'custom_definitions_identity_owner_uidx', "
+        "'definition_run_records_identity', "
+        "'definition_run_records_version_created_idx');",
+    )
+    assert indexes.stdout.strip() == (
+        "custom_definitions_identity_owner_uidx,"
+        "definition_run_records_identity,"
+        "definition_run_records_version_created_idx"
+    )
+
+    blocked_update = _psql(
+        control_postgres,
+        "UPDATE definition_run_records "
+        "SET payload_checksum = payload_checksum "
+        "WHERE owner_user_id = 'alice' "
+        f"AND definition_id = '{definition_id}' AND version = 1 "
+        f"AND run_id = '{run_id}';",
+        check=False,
+    )
+    assert blocked_update.returncode != 0
+    assert "definition_run_record_append_only" in blocked_update.stderr
+
+    blocked_delete = _psql(
+        control_postgres,
+        "DELETE FROM definition_run_records "
+        "WHERE owner_user_id = 'alice' "
+        f"AND definition_id = '{definition_id}' AND version = 1 "
+        f"AND run_id = '{run_id}';",
+        check=False,
+    )
+    assert blocked_delete.returncode != 0
+    assert "definition_run_record_append_only" in blocked_delete.stderr
+    still_present = _owner_psql(
+        control_postgres,
+        "SELECT count(*) FROM definition_run_records "
+        "WHERE owner_user_id = 'alice' "
+        f"AND definition_id = '{definition_id}' AND version = 1 "
+        f"AND run_id = '{run_id}';",
+    )
+    assert still_present.stdout.strip() == "1"
+
+    # Simulate out-of-band corruption: one row gets a bad checksum and another
+    # remains JSON-shaped but no longer decodes as the declared strict model.
+    _owner_psql(
+        control_postgres,
+        "ALTER TABLE definition_run_records DISABLE TRIGGER "
+        "definition_run_records_append_only; "
+        "UPDATE definition_run_records SET payload_checksum = repeat('0', 64) "
+        f"WHERE run_id = '{run_id}'; "
+        "UPDATE definition_run_records SET "
+        "payload = jsonb_set(payload, '{validation}', 'null'::jsonb) "
+        f"WHERE run_id = '{concurrent_run_id}'; "
+        "ALTER TABLE definition_run_records ENABLE TRIGGER "
+        "definition_run_records_append_only;",
+    )
+
+    async def reject_corruption() -> None:
+        store = ControlDefinitionRunRecordStore(database_url=_async_dsn(control_postgres))
+        try:
+            with pytest.raises(DefinitionRunRecordIntegrityError):
+                await store.get(
+                    owner_user_id="alice",
+                    definition_id=definition_id,
+                    version=1,
+                    run_id=run_id,
+                )
+            with pytest.raises(DefinitionRunRecordIntegrityError):
+                await store.get(
+                    owner_user_id="alice",
+                    definition_id=definition_id,
+                    version=1,
+                    run_id=concurrent_run_id,
+                )
+        finally:
+            await store.close()
+
+    _run_async(reject_corruption())

@@ -33,6 +33,7 @@ from src.nl2sql.orchestration.p4q_acceptance import (
     P4QCaseRegistry,
     P4QCaseResult,
     P4QCaseSpec,
+    P4QGroundedAnswerCapture,
     P4QManifest,
     P4QOracleEvidence,
     P4QRealnessWitness,
@@ -644,17 +645,16 @@ def test_current_environment_cannot_produce_pass_without_realness() -> None:
 
 
 def test_pass_branch_is_only_contract_representability_not_a_real_pass() -> None:
-    # THIS IS CONTRACT REPRESENTABILITY ONLY.  IT IS NOT A REAL P4-Q PASS.
+    # Real evidence now also requires the trusted production capture.
     manifest = evaluate_p4q(_registry(), _evidence_all("real"), realness_witness=_witness())
-    assert manifest.verdict == "P4-Q-PASS"
-    assert manifest.readiness_gaps == ()
-    assert manifest.realness_witness_present is True
+    assert manifest.verdict == "P4-Q-FAIL"
+    assert any("trusted_render_capture_missing" in result.failures for result in manifest.case_results)
 
 
 def test_real_evidence_without_witness_is_contract_ready() -> None:
     manifest = evaluate_p4q(_registry(), _evidence_all("real"))
-    assert manifest.verdict == "P4-Q-CONTRACT_READY"
-    assert manifest.readiness_gaps == ("realness_witness_absent",)
+    assert manifest.verdict == "P4-Q-FAIL"
+    assert any("trusted_render_capture_missing" in result.failures for result in manifest.case_results)
 
 
 @pytest.mark.parametrize(
@@ -1057,6 +1057,44 @@ def test_answer_digest_mismatch_fails() -> None:
     manifest = _gold_manifest(observed_answer_sha256=OTHER)
     assert manifest.verdict == "P4-Q-FAIL"
     assert "answer_digest_mismatch" in manifest.case_results[0].failures
+
+
+def test_captured_answer_text_recomputes_observed_digest() -> None:
+    manifest = _gold_manifest(captured_answer_text="tampered answer")
+    assert manifest.verdict == "P4-Q-FAIL"
+    assert "answer_capture_digest_mismatch" in manifest.case_results[0].failures
+
+
+def test_trusted_grounded_capture_owns_observed_digests() -> None:
+    artifact = _artifact()
+    captured_text = "metric.a: 42"
+    plan = _plan()
+    record = _record(plan)
+    record_digest = hashlib.sha256(
+        json.dumps(record.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    capture = P4QGroundedAnswerCapture(
+        answer_text=captured_text,
+        facts=artifact.facts,
+        answer_sha256=hashlib.sha256(captured_text.encode("utf-8")).hexdigest(),
+        facts_sha256=_facts_sha256(artifact),
+        query_plan_sha256="a" * 64,
+        execution_plan_sha256=plan.checksum,
+        execution_record_sha256=record_digest,
+    )
+    answer_sha = hashlib.sha256(captured_text.encode("utf-8")).hexdigest()
+    facts_sha = _facts_sha256(artifact)
+    manifest = _gold_manifest(
+        captured_grounded_answer=capture,
+        observed_answer_sha256=OTHER,
+        observed_facts_sha256=OTHER,
+        oracle=_oracle(
+            "answered",
+            expected_answer_sha256=answer_sha,
+            expected_facts_sha256=facts_sha,
+        ),
+    )
+    assert manifest.case_results[0].passed is True
 
 
 def test_answer_grounded_without_a_value_fails() -> None:

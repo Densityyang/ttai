@@ -54,7 +54,7 @@ def _verifier(*candidates: Candidate) -> CandidateVerifier:
 
 
 def test_typed_rowset_hash_is_canonical_and_not_text_rendering() -> None:
-    assert rowset_sha256([{"amount": Decimal("1.20"), "name": "A"}]) == rowset_sha256(
+    assert rowset_sha256([{"amount": Decimal("1.20"), "name": "A"}]) != rowset_sha256(
         [{"name": "A", "amount": Decimal("1.2")}])
 
 

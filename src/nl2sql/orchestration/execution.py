@@ -8,7 +8,7 @@ the application and selected only by the step discriminator.
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import inspect
 import json
 from dataclasses import dataclass, field
 from time import perf_counter
@@ -35,7 +35,13 @@ from src.nl2sql.contracts import (
     TrustedCalculationStep,
     VerifyStep,
 )
+from src.nl2sql.orchestration.approved_compute import ApprovedCalculationCatalog
 from src.nl2sql.orchestration.budget import BudgetExceeded, RouteBudgetLedger
+from src.nl2sql.orchestration.evidence_digest import (
+    canonical_json_digest,
+    canonical_rowset_digest,
+)
+from src.nl2sql.orchestration.verification_policy import verify_execution_plan_policy
 from src.nl2sql.semantic.calculation_runtime import (
     CalculationRuntimeError,
     evaluate_calculation,
@@ -63,6 +69,13 @@ class PreparedMetricStep:
     # Request-local mode: True when this fetch serves one trusted calculation
     # input role and must project a typed scalar instead of a rowset.
     dependency_fetch: bool = False
+    # Optional request-local semantic evidence.  It is ephemeral and never
+    # serialized into the public response or checkpoint.
+    semantic_manifest: object | None = field(default=None, repr=False, compare=False)
+    semantic_record: object | None = field(default=None, repr=False, compare=False)
+    semantic_step: object | None = field(default=None, repr=False, compare=False)
+    semantic_execution_plan: object | None = field(default=None, repr=False, compare=False)
+    semantic_root_query_plan: object | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if (
@@ -89,6 +102,7 @@ class MetricStepRunner(Protocol):
         step: FetchMetricStep,
         query_plan: QueryPlan,
         context: ContextBundle,
+        execution_plan: ExecutionPlan | None = None,
     ) -> PreparedMetricStep: ...
 
     async def execute(
@@ -96,6 +110,7 @@ class MetricStepRunner(Protocol):
         prepared: PreparedMetricStep,
         *,
         timeout_ms: int,
+        trace_id: str = "",
     ) -> MetricStepResult: ...
 
 
@@ -218,6 +233,58 @@ class PlanExecutionResult:
     outputs: dict[str, JsonValue]
 
 
+def validate_execution_record_against_plan(
+    execution_plan: ExecutionPlan,
+    execution_record: PlanExecutionRecord,
+) -> None:
+    """Validate checkpoint-safe receipts against the actual execution plan.
+
+    This is the single plan-bound receipt gate.  Failed and deadline-exceeded
+    records may be partial, but every receipt they do carry must still belong
+    to this plan and have the plan-declared step kind.  A successful record is
+    complete and must include a successful terminal verification receipt.
+    """
+
+    if execution_record.execution_plan_checksum != execution_plan.checksum:
+        raise PlanStepError("execution_record_plan_checksum_mismatch")
+
+    plan_steps = {step.step_id: step for step in execution_plan.steps}
+    receipts = tuple(execution_record.step_receipts)
+    receipt_ids = tuple(receipt.step_id for receipt in receipts)
+    if len(receipt_ids) != len(set(receipt_ids)):
+        raise PlanStepError("execution_record_step_coverage_mismatch")
+
+    for receipt in receipts:
+        step = plan_steps.get(receipt.step_id)
+        if step is None:
+            raise PlanStepError("execution_record_unknown_step")
+        if receipt.kind != step.kind:
+            raise PlanStepError("execution_record_step_kind_mismatch")
+
+    if execution_record.status != "succeeded":
+        return
+
+    policy_failures = verify_execution_plan_policy(execution_plan)
+    if policy_failures:
+        raise PlanStepError(policy_failures[0])
+
+    verify_steps = [step for step in execution_plan.steps if isinstance(step, VerifyStep)]
+    if len(verify_steps) != 1:
+        raise PlanStepError("execution_record_verify_missing")
+    verify_receipt = next(
+        (receipt for receipt in receipts if receipt.step_id == verify_steps[0].step_id),
+        None,
+    )
+    if verify_receipt is None or verify_receipt.status != "succeeded":
+        raise PlanStepError("execution_record_verify_missing")
+
+    required_ids = set(plan_steps)
+    if set(receipt_ids) != required_ids or any(
+        receipt.status != "succeeded" for receipt in receipts
+    ):
+        raise PlanStepError("execution_record_step_coverage_mismatch")
+
+
 class PlanExecutor:
     def __init__(
         self,
@@ -226,6 +293,7 @@ class PlanExecutor:
         trusted_calculation_runner: TrustedCalculationRunner | None = None,
         ad_hoc_calculation_runner: AdHocCalculationRunner | None = None,
         result_verifier: ResultVerifier | None = None,
+        calculation_catalog: ApprovedCalculationCatalog | None = None,
     ) -> None:
         self._metric_runner = metric_runner
         self._trusted_calculation_runner = trusted_calculation_runner
@@ -233,6 +301,8 @@ class PlanExecutor:
         # production arithmetic runner is separately authorized.
         self._ad_hoc_calculation_runner = ad_hoc_calculation_runner
         self._result_verifier = result_verifier or TypedResultVerifier()
+        if calculation_catalog is not None:
+            self._calculation_catalog = calculation_catalog
 
     async def execute(
         self,
@@ -245,6 +315,7 @@ class PlanExecutor:
         expected_policy_checksum: str,
         budget: RouteBudgetLedger,
         deadline_ms: int,
+        trace_id: str = "",
     ) -> PlanExecutionResult:
         # Deep snapshots close mutation windows in nested JSON filter/ref values.
         from src.nl2sql.contracts import query_plan_payload
@@ -306,8 +377,10 @@ class PlanExecutor:
                             query_plan=query_plan,
                             context=context,
                             outputs=outputs,
+                            execution_plan=execution_plan,
                             budget=budget,
                             timeout_ms=timeout_ms,
+                            trace_id=trace_id,
                             gateway_receipts=gateway_receipts,
                         )
                     except asyncio.CancelledError:
@@ -315,7 +388,8 @@ class PlanExecutor:
                     except BudgetExceeded as exc:
                         code = budget.stop_reason or budget.halt(str(exc))
                         receipts.append(_failed_step(current_step, current_started, code))
-                        return PlanExecutionResult(
+                        return _validated_result(
+                            execution_plan=execution_plan,
                             record=PlanExecutionRecord(
                                 execution_plan_checksum=execution_plan.checksum,
                                 status="failed",
@@ -328,7 +402,8 @@ class PlanExecutor:
                     except PlanStepError as exc:
                         code = budget.halt(exc.code)
                         receipts.append(_failed_step(current_step, current_started, code))
-                        return PlanExecutionResult(
+                        return _validated_result(
+                            execution_plan=execution_plan,
                             record=PlanExecutionRecord(
                                 execution_plan_checksum=execution_plan.checksum,
                                 status="failed",
@@ -341,7 +416,8 @@ class PlanExecutor:
                     except Exception:
                         code = budget.halt("plan_step_failed")
                         receipts.append(_failed_step(current_step, current_started, code))
-                        return PlanExecutionResult(
+                        return _validated_result(
+                            execution_plan=execution_plan,
                             record=PlanExecutionRecord(
                                 execution_plan_checksum=execution_plan.checksum,
                                 status="failed",
@@ -373,6 +449,24 @@ class PlanExecutor:
                         }
                     else:
                         calculation = {}
+                    trusted_unit: str | None = None
+                    if isinstance(current_step, TrustedCalculationStep):
+                        calculation_catalog = getattr(self, "_calculation_catalog", None)
+                        if current_step.output_metric_key is not None and calculation_catalog is not None:
+                            binding = calculation_catalog.binding_for(current_step.output_metric_key)
+                            if binding is None or binding.unit is None:
+                                raise PlanStepError("trusted_calculation_unit_missing")
+                            trusted_unit = binding.unit
+                        elif any(
+                            item is not None
+                            for item in (
+                                current_step.template_version,
+                                current_step.template_checksum,
+                                current_step.binding_checksum,
+                                current_step.output_metric_key,
+                            )
+                        ):
+                            raise PlanStepError("trusted_calculation_unit_authority_missing")
                     receipts.append(
                         PlanStepReceipt(
                             step_id=current_step.step_id,
@@ -381,7 +475,47 @@ class PlanExecutor:
                             elapsed_ms=_elapsed_ms(current_started),
                             output_digest=_json_digest(output),
                             **calculation,
-                            rowset_sha256=gateway_receipt.rowset_sha256 if gateway_receipt else None,
+                            rowset_sha256=(
+                                gateway_receipt.rowset_sha256
+                                if gateway_receipt is not None
+                                and gateway_receipt.rowset_sha256 is not None
+                                else _output_rowset_digest(output)
+                            ),
+                            unit=(
+                                gateway_receipt.unit
+                                if gateway_receipt is not None
+                                else (
+                                    current_step.calculation_spec.custom_unit_id
+                                    if isinstance(current_step, AdHocCalculationStep)
+                                    and current_step.calculation_spec.custom_unit_id
+                                    is not None
+                                    else (
+                                        current_step.calculation_spec.unit
+                                        if isinstance(current_step, AdHocCalculationStep)
+                                        else trusted_unit
+                                    )
+                                )
+                            ),
+                            execution_id=gateway_receipt.execution_id if gateway_receipt else None,
+                            trace_id=gateway_receipt.trace_id if gateway_receipt else None,
+                            sql_fingerprint=gateway_receipt.sql_fingerprint if gateway_receipt else None,
+                            source_version=gateway_receipt.source_version if gateway_receipt else None,
+                            source_snapshot_id=(
+                                gateway_receipt.source_snapshot_id
+                                if gateway_receipt
+                                else None
+                            ),
+                            source_snapshot_fingerprint=(
+                                gateway_receipt.source_snapshot_fingerprint
+                                if gateway_receipt
+                                else None
+                            ),
+                            result_columns=gateway_receipt.result_columns if gateway_receipt else (),
+                            parameter_binding_fingerprint=(
+                                gateway_receipt.parameter_binding_fingerprint
+                                if gateway_receipt
+                                else None
+                            ),
                             data_as_of=gateway_receipt.data_as_of if gateway_receipt else None,
                             freshness_status=gateway_receipt.freshness_status if gateway_receipt else "unknown",
                             source_kind=gateway_receipt.source_kind if gateway_receipt else None,
@@ -390,6 +524,31 @@ class PlanExecutor:
                             source_degradation=gateway_receipt.source_degradation if gateway_receipt else (),
                             source_checkpoint=gateway_receipt.source_checkpoint if gateway_receipt else None,
                             semantic_signature=gateway_receipt.semantic_signature if gateway_receipt else None,
+                            semantic_validation_outcome=(
+                                gateway_receipt.semantic_validation_outcome
+                                if gateway_receipt
+                                else None
+                            ),
+                            semantic_validator_version=(
+                                gateway_receipt.semantic_validator_version
+                                if gateway_receipt
+                                else None
+                            ),
+                            semantic_manifest_checksum=(
+                                gateway_receipt.semantic_manifest_checksum
+                                if gateway_receipt
+                                else None
+                            ),
+                            semantic_denial_codes=(
+                                gateway_receipt.semantic_denial_codes
+                                if gateway_receipt
+                                else ()
+                            ),
+                            semantic_validation_identity=(
+                                gateway_receipt.semantic_validation_identity
+                                if gateway_receipt
+                                else None
+                            ),
                         )
                     )
         except TimeoutError:
@@ -398,7 +557,8 @@ class PlanExecutor:
                 receipt.step_id == current_step.step_id for receipt in receipts
             ):
                 receipts.append(_failed_step(current_step, current_started, code))
-            return PlanExecutionResult(
+            return _validated_result(
+                execution_plan=execution_plan,
                 record=PlanExecutionRecord(
                     execution_plan_checksum=execution_plan.checksum,
                     status="deadline_exceeded",
@@ -409,7 +569,27 @@ class PlanExecutor:
                 outputs=outputs,
             )
 
-        return PlanExecutionResult(
+        snapshot_fingerprints = {
+            receipt.source_snapshot_fingerprint
+            for receipt in gateway_receipts.values()
+            if receipt.source_snapshot_fingerprint is not None
+        }
+        if len(snapshot_fingerprints) > 1:
+            code = budget.halt("execution_plan_mixed_source_snapshots")
+            return _validated_result(
+                execution_plan=execution_plan,
+                record=PlanExecutionRecord(
+                    execution_plan_checksum=execution_plan.checksum,
+                    status="failed",
+                    step_receipts=tuple(receipts),
+                    output_step_ids=tuple(outputs),
+                    stop_reason=code,
+                ),
+                outputs=outputs,
+            )
+
+        return _validated_result(
+            execution_plan=execution_plan,
             record=PlanExecutionRecord(
                 execution_plan_checksum=execution_plan.checksum,
                 status="succeeded",
@@ -426,22 +606,34 @@ class PlanExecutor:
         query_plan: QueryPlan,
         context: ContextBundle,
         outputs: dict[str, JsonValue],
+        execution_plan: ExecutionPlan,
         budget: RouteBudgetLedger,
         timeout_ms: int,
+        trace_id: str,
         gateway_receipts: dict[str, ExecutionReceipt],
     ) -> JsonValue:
         if isinstance(step, FetchMetricStep):
-            prepared = await self._metric_runner.prepare(
-                step=step,
-                query_plan=query_plan,
-                context=context,
-            )
+            prepare_kwargs: dict[str, Any] = {
+                "step": step,
+                "query_plan": query_plan,
+                "context": context,
+            }
+            if _supports_keyword(self._metric_runner.prepare, "execution_plan"):
+                prepare_kwargs["execution_plan"] = execution_plan
+            prepared = await self._metric_runner.prepare(**prepare_kwargs)
             stop_reason = budget.record_sql_candidate(prepared.sql_fingerprint)
             if stop_reason is not None:
                 raise BudgetExceeded(stop_reason)
             budget.observe_join_hops(prepared.join_hops)
             budget.begin_sql_execution()
-            result = await self._metric_runner.execute(prepared, timeout_ms=timeout_ms)
+            if trace_id and _supports_trace_id(self._metric_runner.execute):
+                result = await self._metric_runner.execute(
+                    prepared, timeout_ms=timeout_ms, trace_id=trace_id
+                )
+            else:
+                result = await self._metric_runner.execute(
+                    prepared, timeout_ms=timeout_ms
+                )
             if result.receipt.sql_fingerprint != prepared.sql_fingerprint:
                 raise PlanStepError("execution_receipt_fingerprint_mismatch")
             if not result.receipt.policy_version.strip():
@@ -497,6 +689,32 @@ class PlanExecutor:
             return _json_value(output)
 
         raise PlanStepError("execution_plan_step_unregistered")
+
+
+def _supports_trace_id(callable_obj: object) -> bool:
+    """Preserve compatibility with injected runners from older contracts."""
+
+    try:
+        parameters = inspect.signature(cast(Any, callable_obj)).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "trace_id"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _supports_keyword(callable_obj: object, name: str) -> bool:
+    try:
+        parameters = inspect.signature(cast(Any, callable_obj)).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == name
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def _execution_validation_mismatch(
@@ -587,14 +805,21 @@ def _json_value(value: object) -> JsonValue:
 
 
 def _json_digest(value: JsonValue) -> str:
-    payload = json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return canonical_json_digest(value)
+
+
+def _output_rowset_digest(value: JsonValue) -> str | None:
+    if not isinstance(value, dict) or "rows" not in value:
+        return None
+    rows = value.get("rows")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        return None
+    try:
+        return canonical_rowset_digest(
+            cast("list[dict[str, Any]]", rows)
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _failed_step(step: PlanStep, started: float, code: str) -> PlanStepReceipt:
@@ -613,7 +838,8 @@ def _failed_result(
     *,
     status: Literal["failed", "deadline_exceeded"] = "failed",
 ) -> PlanExecutionResult:
-    return PlanExecutionResult(
+    return _validated_result(
+        execution_plan=execution_plan,
         record=PlanExecutionRecord(
             execution_plan_checksum=execution_plan.checksum,
             status=status,
@@ -621,6 +847,16 @@ def _failed_result(
         ),
         outputs={},
     )
+
+
+def _validated_result(
+    *,
+    execution_plan: ExecutionPlan,
+    record: PlanExecutionRecord,
+    outputs: dict[str, JsonValue],
+) -> PlanExecutionResult:
+    validate_execution_record_against_plan(execution_plan, record)
+    return PlanExecutionResult(record=record, outputs=outputs)
 
 
 def _elapsed_ms(started: float) -> int:

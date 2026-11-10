@@ -777,6 +777,19 @@ class PlanStepReceipt(StrictContract):
     elapsed_ms: int = Field(ge=0)
     output_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    unit: str | None = Field(default=None, min_length=1, max_length=64)
+    execution_id: UUID | None = None
+    trace_id: str | None = Field(default=None, min_length=1, max_length=256)
+    sql_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source_version: str | None = Field(default=None, min_length=1, max_length=128)
+    source_snapshot_id: str | None = Field(default=None, min_length=1, max_length=256)
+    source_snapshot_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    result_columns: tuple[str, ...] = Field(default=(), max_length=64)
+    parameter_binding_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     data_as_of: datetime | None = None
     freshness_status: Literal["fresh", "stale", "unknown"] = "unknown"
     source_kind: Literal["approved_aggregate", "approved_detail"] | None = None
@@ -785,6 +798,11 @@ class PlanStepReceipt(StrictContract):
     source_degradation: tuple[SourceDegradation, ...] = ()
     source_checkpoint: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
     semantic_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    semantic_validation_outcome: Literal["allow", "shadow_denied"] | None = None
+    semantic_validator_version: str | None = Field(default=None, min_length=1, max_length=128)
+    semantic_manifest_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    semantic_denial_codes: tuple[str, ...] = Field(default=(), max_length=16)
+    semantic_validation_identity: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     # Calculation provenance (secret-free; no raw SQL, rowsets or values).
     template_id: str | None = Field(default=None, min_length=1, max_length=128)
     template_version: str | None = Field(default=None, min_length=1, max_length=64)
@@ -1006,6 +1024,18 @@ class ExecutionReceipt(StrictContract):
         max_length=256,
     )
     rowset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    unit: str | None = Field(default=None, min_length=1, max_length=64)
+    execution_id: UUID | None = None
+    trace_id: str | None = Field(default=None, min_length=1, max_length=256)
+    source_version: str | None = Field(default=None, min_length=1, max_length=128)
+    source_snapshot_id: str | None = Field(default=None, min_length=1, max_length=256)
+    source_snapshot_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    result_columns: tuple[str, ...] = Field(default=(), max_length=64)
+    parameter_binding_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     data_as_of: datetime | None = None
     freshness_status: Literal["fresh", "stale", "unknown"] = "unknown"
     source_kind: Literal["approved_aggregate", "approved_detail"] | None = None
@@ -1014,21 +1044,28 @@ class ExecutionReceipt(StrictContract):
     source_degradation: tuple[SourceDegradation, ...] = ()
     source_checkpoint: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
     semantic_signature: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    semantic_validation_outcome: Literal["allow", "shadow_denied"] | None = None
+    semantic_validator_version: str | None = Field(default=None, min_length=1, max_length=128)
+    semantic_manifest_checksum: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    semantic_denial_codes: tuple[str, ...] = Field(default=(), max_length=16)
+    semantic_validation_identity: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class AnswerFact(StrictContract):
     """One grounded value projected from request-local execution evidence.
 
     Only fields proven by a successful step receipt or the request-local step
-    output are populated.  Descriptive fields (unit, time range, dimension,
-    quality, freshness explanation, confidence) default to absent: no scope,
-    unit, time, dimension, category, quality or provenance plumbing is added in
-    this slice, and nothing may be fabricated to satisfy the schema.
+    output are populated.  Descriptive fields (time range, dimension, quality,
+    freshness explanation, confidence) default to absent.  A unit is copied
+    only when the execution receipt carries the server-resolved authority; no
+    scope, time, dimension, category, quality or provenance value is fabricated
+    to satisfy the schema.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     fact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    fact_id_version: Literal[1, 2] | None = None
     step_id: PlanStepId
     # Exactly one result identity: a canonical metric_key OR a NONCANONICAL
     # derived_output_id, never both and never neither.

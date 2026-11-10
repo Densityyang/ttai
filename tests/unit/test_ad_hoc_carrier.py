@@ -28,12 +28,19 @@ from src.nl2sql.contracts import (
     VerifyStep,
 )
 from src.nl2sql.orchestration.budget import RouteBudgetLedger
+from src.nl2sql.orchestration.evidence_digest import canonical_json_digest
 from src.nl2sql.orchestration.execution import (
     MetricStepResult,
     PlanExecutor,
+    PlanStepError,
     PreparedMetricStep,
+    validate_execution_record_against_plan,
 )
-from src.nl2sql.orchestration.grounding import build_answer_facts, render_grounded_answer
+from src.nl2sql.orchestration.grounding import (
+    GroundingIntegrityError,
+    build_answer_facts,
+    render_grounded_answer,
+)
 from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
 from src.nl2sql.semantic.calculation_contract import (
     AggregateOperand,
@@ -616,7 +623,7 @@ def _adhoc_receipt(
         "kind": "ad_hoc_calculation",
         "status": "succeeded",
         "elapsed_ms": 1,
-        "output_digest": "a" * 64,
+        "output_digest": canonical_json_digest(2.5),
         "calculation_spec_checksum": spec.checksum,
         "execution_binding_checksum": binding.checksum,
         "derived_output_id": derived_output_id(spec, binding),
@@ -684,10 +691,13 @@ def test_ad_hoc_grounding_rebinds_the_receipt_to_the_real_step() -> None:
 
     # 7. missing request-local output -> no derived fact
     good = _adhoc_receipt(spec, binding)
-    assert build_answer_facts(
-        query_plan=query_plan, execution_plan=plan,
-        record=_record(plan, good), outputs={},
-    ) == ()
+    with pytest.raises(GroundingIntegrityError, match="grounding_output_missing"):
+        build_answer_facts(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=_record(plan, good),
+            outputs={},
+        )
 
     # 6. the matching receipt still grounds exactly once
     facts = build_answer_facts(
@@ -736,18 +746,13 @@ def test_canonical_provenance_mismatch_is_reported_as_a_grounding_mismatch() -> 
 
     query_plan, context, plan = _trusted_plan()
     record = _record(plan, _trusted_receipt(template_version="9.9"))
-    answer = ground_execution_answer(
-        query_plan=query_plan,
-        execution_plan=plan,
-        record=record,
-        outputs={"calculate_ratio": 2.5},
-    )
-    # still fail-closed: no fact
-    assert answer.facts == ()
-    # but the refusal is operator-visible through the existing evidence channel
-    assert "grounding_execution_mismatch" in answer.artifact.degradation_flags
-    # and the execution record is NOT reclassified
-    assert record.status == "succeeded"
+    with pytest.raises(GroundingIntegrityError, match="execution_record_verify_missing"):
+        ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=record,
+            outputs={"calculate_ratio": 2.5},
+        )
 
 
 def test_matching_canonical_receipt_has_no_mismatch_flag() -> None:
@@ -755,14 +760,13 @@ def test_matching_canonical_receipt_has_no_mismatch_flag() -> None:
 
     query_plan, context, plan = _trusted_plan()
     record = _record(plan, _trusted_receipt())
-    answer = ground_execution_answer(
-        query_plan=query_plan,
-        execution_plan=plan,
-        record=record,
-        outputs={"calculate_ratio": 2.5},
-    )
-    assert len(answer.facts) == 1
-    assert "grounding_execution_mismatch" not in answer.artifact.degradation_flags
+    with pytest.raises(GroundingIntegrityError, match="execution_record_verify_missing"):
+        ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=record,
+            outputs={"calculate_ratio": 2.5},
+        )
 
 
 def test_ad_hoc_provenance_mismatch_is_reported_as_a_grounding_mismatch() -> None:
@@ -774,14 +778,13 @@ def test_ad_hoc_provenance_mismatch_is_reported_as_a_grounding_mismatch() -> Non
     context = _context()
     plan = _execution_plan(query_plan, context, spec, binding)
     bad = _adhoc_receipt(spec, binding, derived_output_id="adhoc_" + "0" * 32)
-    answer = ground_execution_answer(
-        query_plan=query_plan,
-        execution_plan=plan,
-        record=_record(plan, bad),
-        outputs={"calculate_adhoc": 2.5},
-    )
-    assert answer.facts == ()
-    assert "grounding_execution_mismatch" in answer.artifact.degradation_flags
+    with pytest.raises(GroundingIntegrityError, match="execution_record_verify_missing"):
+        ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=_record(plan, bad),
+            outputs={"calculate_adhoc": 2.5},
+        )
 
 
 def test_matching_ad_hoc_receipt_has_no_mismatch_flag() -> None:
@@ -793,14 +796,13 @@ def test_matching_ad_hoc_receipt_has_no_mismatch_flag() -> None:
     context = _context()
     plan = _execution_plan(query_plan, context, spec, binding)
     good = _adhoc_receipt(spec, binding)
-    answer = ground_execution_answer(
-        query_plan=query_plan,
-        execution_plan=plan,
-        record=_record(plan, good),
-        outputs={"calculate_adhoc": 2.5},
-    )
-    assert len(answer.facts) == 1
-    assert "grounding_execution_mismatch" not in answer.artifact.degradation_flags
+    with pytest.raises(GroundingIntegrityError, match="execution_record_verify_missing"):
+        ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=_record(plan, good),
+            outputs={"calculate_adhoc": 2.5},
+        )
 
 
 def test_missing_or_wrong_kind_calculation_step_is_also_a_mismatch() -> None:
@@ -812,23 +814,22 @@ def test_missing_or_wrong_kind_calculation_step_is_also_a_mismatch() -> None:
     query_plan, context, plan = _trusted_plan()
     # (a) missing step: the receipt names a step_id that is not in the plan
     orphan = _trusted_receipt(step_id="ghost_calc")
-    answer = ground_execution_answer(
-        query_plan=query_plan,
-        execution_plan=plan,
-        record=_record(plan, orphan),
-        outputs={"ghost_calc": 2.5},
-    )
-    assert answer.facts == ()
-    assert "grounding_execution_mismatch" in answer.artifact.degradation_flags
+    with pytest.raises(GroundingIntegrityError, match="execution_record_unknown_step"):
+        ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=_record(plan, orphan),
+            outputs={"ghost_calc": 2.5},
+        )
     # (b) wrong step kind: a calculation receipt matched to a fetch step id
     wrong_kind = _trusted_receipt(step_id="fetch_numerator")
-    answer2 = ground_execution_answer(
-        query_plan=query_plan,
-        execution_plan=plan,
-        record=_record(plan, wrong_kind),
-        outputs={"fetch_numerator": 2.5},
-    )
-    assert "grounding_execution_mismatch" in answer2.artifact.degradation_flags
+    with pytest.raises(GroundingIntegrityError, match="execution_record_step_kind_mismatch"):
+        ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=_record(plan, wrong_kind),
+            outputs={"fetch_numerator": 2.5},
+        )
 
 
 def test_internal_dependency_fetch_and_nodata_are_not_mismatches() -> None:
@@ -845,25 +846,26 @@ def test_internal_dependency_fetch_and_nodata_are_not_mismatches() -> None:
         kind="fetch_metric",
         status="succeeded",
         elapsed_ms=1,
-        output_digest="a" * 64,
+        output_digest=canonical_json_digest(5),
     )
-    flagged = ground_execution_answer(
-        query_plan=query_plan,
-        execution_plan=plan,
-        record=_record(plan, dep),
-        outputs={"fetch_numerator": 5},
-    )
-    assert "grounding_execution_mismatch" not in flagged.artifact.degradation_flags
+    with pytest.raises(GroundingIntegrityError, match="execution_record_verify_missing"):
+        ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=_record(plan, dep),
+            outputs={"fetch_numerator": 5},
+        )
     # a legitimate unavailable/no-data result is NOT a mismatch either
-    good = _adhoc_receipt(spec, binding)
-    nodata = ground_execution_answer(
-        query_plan=query_plan,
-        execution_plan=plan,
-        record=_record(plan, good),
-        outputs={"calculate_adhoc": None},
+    good = _adhoc_receipt(
+        spec, binding, output_digest=canonical_json_digest(None)
     )
-    assert len(nodata.facts) == 1
-    assert "grounding_execution_mismatch" not in nodata.artifact.degradation_flags
+    with pytest.raises(GroundingIntegrityError, match="execution_record_verify_missing"):
+        ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=_record(plan, good),
+            outputs={"calculate_adhoc": None},
+        )
 
 
 def test_grounding_requires_a_successful_execution_record() -> None:
@@ -931,7 +933,7 @@ def test_canonical_metric_grounding_is_unchanged() -> None:
         kind="fetch_metric",
         status="succeeded",
         elapsed_ms=1,
-        output_digest="a" * 64,
+        output_digest=canonical_json_digest({"value": 7}),
     )
     facts = build_answer_facts(
         query_plan=query_plan,
@@ -1186,7 +1188,9 @@ def test_grounding_presence_is_key_based_not_none_based() -> None:
     spec = _spec()
     binding = _binding(spec)
     plan = _execution_plan(_query_plan(), _context(), spec, binding)
-    good = _adhoc_receipt(spec, binding)
+    good = _adhoc_receipt(
+        spec, binding, output_digest=canonical_json_digest(None)
+    )
     # present key with JSON null is PRESENT for the trust check
     present_null = build_answer_facts(
         query_plan=_query_plan(),
@@ -1197,13 +1201,13 @@ def test_grounding_presence_is_key_based_not_none_based() -> None:
     assert len(present_null) == 1
     assert present_null[0].status == "unavailable"
     # missing key produces no derived fact at all
-    missing = build_answer_facts(
-        query_plan=_query_plan(),
-        execution_plan=plan,
-        record=_record(plan, good),
-        outputs={},
-    )
-    assert missing == ()
+    with pytest.raises(GroundingIntegrityError, match="grounding_output_missing"):
+        build_answer_facts(
+            query_plan=_query_plan(),
+            execution_plan=plan,
+            record=_record(plan, good),
+            outputs={},
+        )
 
 
 def test_validator_binds_ad_hoc_inputs_to_the_query_plan_source_set() -> None:
@@ -1308,7 +1312,7 @@ def _trusted_receipt(**overrides: object) -> PlanStepReceipt:
         "kind": "trusted_calculation",
         "status": "succeeded",
         "elapsed_ms": 1,
-        "output_digest": "a" * 64,
+        "output_digest": canonical_json_digest(2.5),
         "template_id": "ratio",
         "template_version": "1.0",
         "binding_checksum": "c" * 64,
@@ -1316,6 +1320,233 @@ def _trusted_receipt(**overrides: object) -> PlanStepReceipt:
     }
     base.update(overrides)
     return PlanStepReceipt(**base)
+
+
+def _complete_trusted_record(plan: ExecutionPlan) -> PlanExecutionRecord:
+    receipts = (
+        PlanStepReceipt(
+            step_id="fetch_numerator",
+            kind="fetch_metric",
+            status="succeeded",
+            elapsed_ms=1,
+            output_digest="a" * 64,
+        ),
+        PlanStepReceipt(
+            step_id="fetch_denominator",
+            kind="fetch_metric",
+            status="succeeded",
+            elapsed_ms=1,
+            output_digest="b" * 64,
+        ),
+        _trusted_receipt(),
+        PlanStepReceipt(
+            step_id="verify_result",
+            kind="verify",
+            status="succeeded",
+            elapsed_ms=1,
+            output_digest="d" * 64,
+        ),
+    )
+    return PlanExecutionRecord(
+        execution_plan_checksum=plan.checksum,
+        status="succeeded",
+        step_receipts=receipts,
+        output_step_ids=tuple(receipt.step_id for receipt in receipts),
+    )
+
+
+def test_execution_record_is_bound_to_plan_and_terminal_verify() -> None:
+    _query_plan_value, _context_value, plan = _trusted_plan()
+    record = _complete_trusted_record(plan)
+    assert validate_execution_record_against_plan(plan, record) is None
+
+
+def test_receipt_validation_rejects_nonterminal_verify_plan() -> None:
+    _query_plan_value, _context_value, plan = _trusted_plan()
+    trailing = FetchMetricStep(
+        step_id="fetch_trailing",
+        metric_keys=("metric.extra",),
+        depends_on=("verify_result",),
+    )
+    malformed = plan.model_copy(update={"steps": (*plan.steps, trailing)})
+    record = _complete_trusted_record(malformed).model_copy(
+        update={
+            "step_receipts": (
+                *_complete_trusted_record(malformed).step_receipts,
+                PlanStepReceipt(
+                    step_id="fetch_trailing",
+                    kind="fetch_metric",
+                    status="succeeded",
+                    elapsed_ms=1,
+                    output_digest="e" * 64,
+                ),
+            ),
+            "output_step_ids": (
+                *_complete_trusted_record(malformed).output_step_ids,
+                "fetch_trailing",
+            ),
+        }
+    )
+    with pytest.raises(PlanStepError, match="execution_plan_verify_not_terminal"):
+        validate_execution_record_against_plan(malformed, record)
+
+
+def test_receipt_validation_rejects_incomplete_verify_input_coverage() -> None:
+    _query_plan_value, _context_value, plan = _trusted_plan()
+    verify = next(step for step in plan.steps if isinstance(step, VerifyStep))
+    malformed = plan.model_copy(
+        update={
+            "steps": tuple(
+                verify.model_copy(
+                    update={
+                        "depends_on": ("fetch_numerator", "fetch_denominator"),
+                        "input_refs": ("fetch_numerator",),
+                    }
+                )
+                if step is verify
+                else step
+                for step in plan.steps
+            )
+        }
+    )
+    with pytest.raises(PlanStepError, match="execution_plan_verify_coverage_incomplete"):
+        validate_execution_record_against_plan(
+            malformed, _complete_trusted_record(malformed)
+        )
+
+
+def test_receipt_validation_rejects_uncovered_successful_step() -> None:
+    _query_plan_value, _context_value, plan = _trusted_plan()
+    orphan = FetchMetricStep(
+        step_id="fetch_orphan",
+        metric_keys=("metric.extra",),
+    )
+    malformed = plan.model_copy(update={"steps": (*plan.steps[:-1], orphan, plan.steps[-1])})
+    base = _complete_trusted_record(malformed)
+    record = base.model_copy(
+        update={
+            "step_receipts": (
+                *base.step_receipts,
+                PlanStepReceipt(
+                    step_id="fetch_orphan",
+                    kind="fetch_metric",
+                    status="succeeded",
+                    elapsed_ms=1,
+                    output_digest="e" * 64,
+                ),
+            ),
+            "output_step_ids": (*base.output_step_ids, "fetch_orphan"),
+        }
+    )
+    with pytest.raises(PlanStepError, match="execution_plan_verify_coverage_incomplete"):
+        validate_execution_record_against_plan(malformed, record)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        (
+            lambda plan, record: record.model_copy(
+                update={"execution_plan_checksum": "0" * 64}
+            ),
+            "execution_record_plan_checksum_mismatch",
+        ),
+        (
+            lambda plan, record: record.model_copy(
+                update={
+                    "step_receipts": (
+                        *record.step_receipts,
+                        PlanStepReceipt(
+                            step_id="ghost_step",
+                            kind="verify",
+                            status="succeeded",
+                            elapsed_ms=1,
+                            output_digest="e" * 64,
+                        ),
+                    ),
+                    "output_step_ids": (*record.output_step_ids, "ghost_step"),
+                }
+            ),
+            "execution_record_unknown_step",
+        ),
+        (
+            lambda plan, record: record.model_copy(
+                update={
+                    "step_receipts": (
+                        record.step_receipts[0].model_copy(
+                            update={"kind": "trusted_calculation"}
+                        ),
+                        *record.step_receipts[1:],
+                    )
+                }
+            ),
+            "execution_record_step_kind_mismatch",
+        ),
+        (
+            lambda plan, record: record.model_copy(
+                update={
+                    "step_receipts": (
+                        record.step_receipts[0].model_copy(update={"status": "failed"}),
+                        *record.step_receipts[1:],
+                    )
+                }
+            ),
+            "execution_record_step_coverage_mismatch",
+        ),
+        (
+            lambda plan, record: record.model_copy(
+                update={
+                    "step_receipts": record.step_receipts[:-1],
+                    "output_step_ids": record.output_step_ids[:-1],
+                }
+            ),
+            "execution_record_verify_missing",
+        ),
+        (
+            lambda plan, record: record.model_copy(
+                update={
+                    "step_receipts": (*record.step_receipts, record.step_receipts[0]),
+                    "output_step_ids": (*record.output_step_ids, record.output_step_ids[0]),
+                }
+            ),
+            "execution_record_step_coverage_mismatch",
+        ),
+    ],
+)
+def test_execution_record_mutations_fail_closed(mutation, code: str) -> None:
+    _query_plan_value, _context_value, plan = _trusted_plan()
+    record = _complete_trusted_record(plan)
+    mutated = mutation(plan, record)
+    with pytest.raises(PlanStepError, match=code):
+        validate_execution_record_against_plan(plan, mutated)
+
+
+def test_failed_partial_record_is_allowed_but_unknown_receipt_is_not() -> None:
+    _query_plan_value, _context_value, plan = _trusted_plan()
+    partial = PlanExecutionRecord(
+        execution_plan_checksum=plan.checksum,
+        status="failed",
+        step_receipts=(
+            PlanStepReceipt(
+                step_id="fetch_numerator",
+                kind="fetch_metric",
+                status="failed",
+                elapsed_ms=1,
+                error_code="query_failed",
+            ),
+        ),
+        stop_reason="query_failed",
+    )
+    assert validate_execution_record_against_plan(plan, partial) is None
+    unknown = partial.model_copy(
+        update={
+            "step_receipts": (
+                partial.step_receipts[0].model_copy(update={"step_id": "ghost_step"}),
+            )
+        }
+    )
+    with pytest.raises(PlanStepError, match="execution_record_unknown_step"):
+        validate_execution_record_against_plan(plan, unknown)
 
 
 def test_grounding_refuses_a_record_from_another_execution_plan() -> None:
@@ -1360,7 +1591,7 @@ def test_orphan_fetch_receipt_grounds_nothing() -> None:
     query_plan, _context_bundle, plan = _trusted_plan()
     orphan = PlanStepReceipt(
         step_id="ghost_fetch", kind="fetch_metric", status="succeeded",
-        elapsed_ms=1, output_digest="a" * 64,
+        elapsed_ms=1, output_digest=canonical_json_digest({"value": 999}),
     )
     record = PlanExecutionRecord(
         execution_plan_checksum=plan.checksum, status="succeeded",
@@ -1373,7 +1604,7 @@ def test_orphan_fetch_receipt_grounds_nothing() -> None:
     # a fetch receipt naming a real non-fetch step must not fall back either
     wrong_kind = PlanStepReceipt(
         step_id="calculate_ratio", kind="fetch_metric", status="succeeded",
-        elapsed_ms=1, output_digest="a" * 64,
+        elapsed_ms=1, output_digest=canonical_json_digest({"value": 999}),
     )
     record2 = PlanExecutionRecord(
         execution_plan_checksum=plan.checksum, status="succeeded",

@@ -57,6 +57,10 @@ class AgentConfig(BaseSettings):
         default="v2",
         description="Explicit v2 engine mode; shadow never executes business SQL.",
     )
+    validation_mode: Literal["shadow", "enforce"] = Field(
+        default="enforce",
+        description="Validation-layer rollout mode; enforce is required for canonical typed metrics.",
+    )
     shadow_traffic_percent: int = Field(default=5, ge=0, le=5)
     v2_request_deadline_ms: int = Field(default=30_000, ge=1, le=120_000)
     v2_token_budget: int = Field(default=8_000, ge=1)

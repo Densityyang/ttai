@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.nl2sql.contracts import PlanStepId, TimeRange
+from src.nl2sql.orchestration.grounding import conservative_data_as_of
 from src.nl2sql.semantic.calculation_contract import (
     CalculationExecutionBinding,
     CalculationSpec,
@@ -199,7 +200,9 @@ def execute_custom_calculation(
         value=evaluated.value,
         unit=spec.custom_unit_id if spec.custom_unit_id is not None else spec.unit,
         input_provenance=provenance_tuple,
-        data_as_of=_conservative_data_as_of(provenance_tuple),
+        data_as_of=conservative_data_as_of(
+            item.data_as_of for item in provenance_tuple
+        ),
         time_range=_common_time_range(provenance_tuple),
     )
 
@@ -220,15 +223,6 @@ def _project_provenance(
         fact_id=resolved.fact_id,
         input_checksum=resolved.checksum,
     )
-
-
-def _conservative_data_as_of(
-    inputs: tuple[CalculationInputProvenance, ...],
-) -> datetime | None:
-    values = tuple(item.data_as_of for item in inputs)
-    if any(value is None or value.tzinfo is None for value in values):
-        return None
-    return min(value.astimezone(UTC) for value in values if value is not None)
 
 
 def _common_time_range(

@@ -4,7 +4,7 @@
 - 单数据集评测
 - A/B/C 对照实验
 - 结果报告生成（JSON + Markdown）
-- 显著性检验
+- identity-verified paired descriptive comparisons
 
 Usage:
     python -m benchmarks.runner --dataset bird --max-cases 50
@@ -33,6 +33,7 @@ from benchmarks.adapters import (
 )
 from benchmarks.agent_bridge import execute_case, override_agent_config
 from benchmarks.assertions import assert_privacy_redaction
+from benchmarks.comparison import compare_reports
 from benchmarks.executor_adapter import (
     ExecutorAdapter,
     UnavailableTypedExecutor,
@@ -45,7 +46,6 @@ from benchmarks.metrics import (
     CaseResult,
     adjudicate_case_result,
     generate_report,
-    statistical_significance,
 )
 from benchmarks.registry import (
     ASSERTION_VERSION,
@@ -71,8 +71,6 @@ from benchmarks.typed_receipts import (
     BudgetExceeded,
     BudgetGate,
     TypedAnswerReceipt,
-    mcnemar_exact,
-    paired_bootstrap_interval,
     validate_receipt,
 )
 
@@ -487,7 +485,12 @@ async def run_typed_benchmark(
     return report
 
 
-def save_report(report: BenchmarkReport, output_dir: Path | None = None) -> Path:
+def save_report(
+    report: BenchmarkReport,
+    output_dir: Path | None = None,
+    *,
+    include_sample_ids: bool = True,
+) -> Path:
     """保存评测报告为 JSON + Markdown。"""
     out_dir = output_dir or RESULTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -497,7 +500,11 @@ def save_report(report: BenchmarkReport, output_dir: Path | None = None) -> Path
     report_dict = report.to_dict()
     report_dict["case_details"] = [
         {
-            "sample_id": _redacted_sample_id(r.case_id),
+            **(
+                {"sample_id": _redacted_sample_id(r.case_id)}
+                if include_sample_ids
+                else {}
+            ),
             "layer": r.layer,
             "domain": r.domain,
             "mode": r.mode,
@@ -538,7 +545,10 @@ def save_report(report: BenchmarkReport, output_dir: Path | None = None) -> Path
 
     # Markdown 报告
     md_path = out_dir / f"{report.run_id}.md"
-    md_path.write_text(_generate_markdown_report(report), encoding="utf-8")
+    md_path.write_text(
+        _generate_markdown_report(report, include_sample_ids=include_sample_ids),
+        encoding="utf-8",
+    )
 
     logger.info("报告已保存: %s, %s", json_path, md_path)
     return json_path
@@ -577,7 +587,9 @@ def _redacted_sample_id(case_id: str) -> str:
     return redacted_sample_id(case_id)
 
 
-def _generate_markdown_report(report: BenchmarkReport) -> str:
+def _generate_markdown_report(
+    report: BenchmarkReport, *, include_sample_ids: bool = True
+) -> str:
     """生成 Markdown 格式的评测报告。"""
     ex_display = _accuracy_display(report)
     lines: list[str] = [
@@ -761,12 +773,25 @@ def _generate_markdown_report(report: BenchmarkReport) -> str:
         lines.extend([
             "## Failed Cases (Top 20)",
             "",
-            "| Sample ID | Layer | Error code |",
-            "|-----------|-------|------------|",
+            (
+                "| Sample ID | Layer | Error code |"
+                if include_sample_ids
+                else "| Layer | Error code |"
+            ),
+            (
+                "|-----------|-------|------------|"
+                if include_sample_ids
+                else "|-------|------------|"
+            ),
         ])
         for r in failed[:20]:
             error_code = _safe_error_code(r.execution_error) or "unknown"
-            lines.append(f"| {_redacted_sample_id(r.case_id)} | {r.layer} | {error_code} |")
+            if include_sample_ids:
+                lines.append(
+                    f"| {_redacted_sample_id(r.case_id)} | {r.layer} | {error_code} |"
+                )
+            else:
+                lines.append(f"| {r.layer} | {error_code} |")
         if len(failed) > 20:
             lines.append(f"| ... | ... | {len(failed) - 20} more |")
         lines.append("")
@@ -779,16 +804,18 @@ async def run_experiment(
     dataset: str = "enterprise",
     max_cases: int | None = None,
     use_stub: bool = False,
+    typed_runtime: str = "production",
 ) -> dict[str, BenchmarkReport]:
-    """执行 A/B/C 对照实验。
+    """执行 A/B/C 对照实验并保留可验证的用例配对身份。
 
     Args:
-        use_stub: True 时使用桩实现（离线框架验证）
+        use_stub: compatibility alias for a no-receipt typed run.
+        typed_runtime: production, demo, or none; production is fail-closed.
 
     对照实验流程:
-    1. 加载统一 case 集
-    2. 对每组配置：临时覆写 AgentConfig → 运行评测 → 恢复
-    3. 生成对照比较报告 + 显著性检验
+    1. 对统一 case 集生成一个固定、可校验的选择计划
+    2. 每个变体执行同一组 case，并把选择身份绑定到实际结果
+    3. 只生成精确配对的描述性比较；没有身份时明确拒绝
     """
     if experiment_name not in EXPERIMENT_CONFIGS:
         raise ValueError(
@@ -797,31 +824,166 @@ async def run_experiment(
         )
 
     configs = EXPERIMENT_CONFIGS[experiment_name]
-    cases = load_cases(dataset, max_cases=max_cases)
-    if not cases:
+    source_cases = load_cases(dataset, max_cases=None)
+    if not source_cases:
         raise RuntimeError(f"数据集 {dataset} 为空")
+    source_eval_cases = to_eval_cases(source_cases)
+    _validate_eval_case_identities(source_eval_cases)
+    plan = select_cases(
+        source_eval_cases,
+        seed=0,
+        repetitions=1,
+        max_cases=max_cases,
+    )
+    _validate_selection_plan_for_execution(plan, source_cases=source_eval_cases)
+    if use_stub:
+        # The old text stub cannot produce typed evidence. Keep its explicit
+        # offline switch fail-closed instead of routing an experiment through
+        # the legacy evaluator.
+        typed_runtime = "none"
 
     reports: dict[str, BenchmarkReport] = {}
 
     for config in configs:
         name = config["name"]
         overrides = config.get("overrides", {})
-        logger.info("运行实验组: %s (%s) overrides=%s", name, config["description"], overrides)
+        logger.info("运行实验组: %s (%s)", name, config["description"])
 
         run_id = f"{experiment_name}-{name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-        if use_stub or not overrides:
-            report = await run_benchmark(cases, run_id=run_id, use_stub=use_stub)
+        async def execute_typed_variant() -> BenchmarkReport:
+            executor = build_typed_executor(typed_runtime)
+            runtime_config_checksum = _effective_runtime_config_sha256()
+            manifest = build_manifest(
+                run_id=run_id,
+                plan=plan,
+                dataset=dataset,
+            )
+            manifest = manifest.model_copy(
+                update={
+                    "model_profile_version": f"typed-ab-{name}",
+                    "matrix": (name,),
+                    "legacy_extras": {
+                        **manifest.legacy_extras,
+                        "experiment": experiment_name,
+                        "variant_name": name,
+                        "override_fields": sorted(overrides),
+                        "effective_runtime_config_sha256": runtime_config_checksum,
+                        "typed_runtime": typed_runtime,
+                    },
+                }
+            )
+            report = await _execute_typed_selection_plan(
+                plan,
+                source_cases=source_eval_cases,
+                manifest=manifest,
+                executor=executor,
+                budget=BudgetGate(
+                    max_total_cost=DEFAULT_BUDGET_COST,
+                    max_calls=DEFAULT_BUDGET_CALLS,
+                ),
+            )
+            expected_occurrences = sum(len(run.case_keys) for run in plan.runs)
+            identities_complete = (
+                report.execution_status == "COMPLETE"
+                and len(report.results) == expected_occurrences
+                and all(
+                    result.case_identity_sha256
+                    and result.selection_checksum == plan.checksum
+                    and result.repetition_index is not None
+                    and result.repetition_seed is not None
+                    and result.repetition_checksum
+                    and result.execution_run_id
+                    for result in report.results
+                )
+            )
+            report.execution_evidence["pair_identity_state"] = (
+                "VALID" if identities_complete else "UNAVAILABLE"
+            )
+            return report
+
+        if not overrides:
+            report = await execute_typed_variant()
         else:
             with override_agent_config(overrides):
-                report = await run_benchmark(cases, run_id=run_id, use_stub=use_stub)
+                report = await execute_typed_variant()
 
         reports[name] = report
-        save_report(report)
 
     _generate_comparison_report(experiment_name, reports)
 
+    # Per-case identities exist only long enough to make the exact comparison.
+    # Persisted run reports keep aggregate selection provenance, not the
+    # per-case pseudonymous keys that could be guessed from a known dataset.
+    for report in reports.values():
+        _scrub_experiment_pair_identity(report)
+        save_report(report, include_sample_ids=False)
+
     return reports
+
+
+def _effective_runtime_config_sha256() -> str:
+    """Fingerprint effective dispatch settings and provider availability safely."""
+
+    import os
+
+    from src.core.settings import get_settings
+    from src.nl2sql.config.settings import get_agent_config
+
+    config = get_agent_config()
+    settings = get_settings()
+    payload = config.model_dump(mode="json")
+    if not isinstance(payload, dict):
+        raise TypeError("effective agent configuration must serialize to an object")
+    for field_name in getattr(type(config), "model_fields", {}):
+        value = getattr(config, field_name, None)
+        secret_value = getattr(value, "get_secret_value", None)
+        if callable(secret_value):
+            raw = secret_value()
+            payload[field_name] = {"configured": bool(raw and raw != "not-needed")}
+    deepseek_configured = bool(
+        os.environ.get("DEEPSEEK_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY_FILE")
+        or settings.openai_api_key
+    )
+    nvidia_configured = bool(
+        os.environ.get("NVIDIA_API_KEY")
+        or os.environ.get("NVIDIA_API_KEY_FILE")
+    )
+    payload["provider_dispatch"] = {
+        "deepseek": {
+            "configured": deepseek_configured,
+            "base_url": config.deepseek_base_url,
+            "fast_model": config.deepseek_flash_model,
+            "pro_model": config.deepseek_pro_model,
+        },
+        "nvidia": {
+            "configured": nvidia_configured,
+            "base_url": config.nvidia_nim_base_url,
+            "fast_model": config.nvidia_nim_model_fast,
+        },
+        "legacy_openai_compatible": {
+            "configured": bool(settings.openai_api_key),
+            "base_url": settings.openai_base_url,
+            "model": settings.model_name,
+        },
+    }
+    return sha256_hex(canonical_json(payload))
+
+
+def _scrub_experiment_pair_identity(report: BenchmarkReport) -> None:
+    for result in report.results:
+        result.case_identity_sha256 = ""
+        result.selection_checksum = ""
+        result.repetition_index = None
+        result.repetition_seed = None
+        result.repetition_checksum = ""
+        result.execution_run_id = ""
+    runs = report.execution_evidence.get("runs")
+    if isinstance(runs, list):
+        for run in runs:
+            if isinstance(run, dict):
+                run.pop("unexecuted_occurrence_sha256", None)
 
 
 def _generate_comparison_report(
@@ -839,14 +1001,27 @@ def _generate_comparison_report(
         "",
         "## Results",
         "",
-        "| Variant | EX Acc | DM S@1 | SQL Fail | P95 Lat | Safety |",
-        "|---------|--------|--------|----------|---------|--------|",
+        "| Variant | Evidence Kind | Run State | Accuracy Evidence | EX Acc | DM S@1 | SQL Fail | P95 Lat | Safety |",
+        "|---------|---------------|-----------|-------------------|--------|--------|----------|---------|--------|",
     ]
 
     for name, report in reports.items():
+        ex_accuracy = (
+            f"{report.execution_accuracy:.2%}"
+            if report.accuracy_established
+            else "unavailable"
+        )
+        accuracy_evidence = (
+            "MEASURED"
+            if report.accuracy_established
+            else report.accuracy_evidence_state
+        )
         lines.append(
             f"| {name} "
-            f"| {report.execution_accuracy:.2%} "
+            f"| {report.evidence_kind} "
+            f"| {report.execution_status} "
+            f"| {accuracy_evidence} "
+            f"| {ex_accuracy} "
             f"| {report.dynamic_metric_success_at_1:.2%} "
             f"| {report.sql_failure_rate:.2%} "
             f"| {report.p95_latency_ms:.0f}ms "
@@ -855,45 +1030,69 @@ def _generate_comparison_report(
 
     lines.append("")
 
-    # 显著性检验（如果有 >= 2 组）
     report_list = list(reports.items())
-    if len(report_list) >= 2:
-        baseline_name, baseline_report = report_list[0]
-        baseline_scores = [
-            1.0 if r.execution_success else 0.0
-            for r in baseline_report.results
-        ]
-
-        lines.extend([
-            f"## Statistical Significance (vs {baseline_name})",
+    comparison_entries: list[dict[str, Any]] = []
+    lines.extend(
+        [
+            "## Keyed paired descriptive comparison",
             "",
-            "| Variant | Mean Diff | McNemar p | Paired bootstrap 95% CI |",
-            "|---------|-----------|-----------|-------------------------|",
-        ])
-
+            "No statistical significance, calibration, or release claim is made.",
+            "",
+            "| Variant | Status | Pairs | Adjudicated | Unknown | Mean paired pass delta | Reason |",
+            "|---------|--------|-------|-------------|---------|------------------------|--------|",
+        ]
+    )
+    if len(report_list) >= 2:
+        _baseline_name, baseline_report = report_list[0]
         for name, report in report_list[1:]:
-            exp_scores = [
-                1.0 if r.execution_success else 0.0
-                for r in report.results
-            ]
-            sig = statistical_significance(baseline_scores, exp_scores)
-            mcnemar = mcnemar_exact(
-                [bool(score) for score in baseline_scores],
-                [bool(score) for score in exp_scores],
+            paired = compare_reports(baseline_report, report)
+            comparison_entries.append(
+                {
+                    "variant": name,
+                    "evidence_kind": report.evidence_kind,
+                    **paired.to_dict(),
+                }
             )
-            low, high = paired_bootstrap_interval(baseline_scores, exp_scores)
+            mean_delta = (
+                f"{paired.mean_paired_pass_delta:+.6f}"
+                if paired.mean_paired_pass_delta is not None
+                else "unavailable"
+            )
             lines.append(
-                f"| {name} "
-                f"| {sig['mean_diff']:+.4f} "
-                f"| {mcnemar['p_value']:.4f} "
-                f"| [{low:+.4f}, {high:+.4f}] |"
+                f"| {name} | {paired.status} | {paired.pair_count} "
+                f"| {paired.adjudicated_pair_count} | {paired.unknown_pair_count} "
+                f"| {mean_delta} | {paired.reason or ''} |"
             )
-
-        lines.append("")
+    else:
+        lines.append("| — | REFUSED | 0 | 0 | 0 | unavailable | no_candidate_variant |")
+    lines.append("")
 
     md_path = out_dir / f"comparison-{experiment_name}.md"
     md_path.write_text("\n".join(lines), encoding="utf-8")
+    comparison_path = out_dir / f"comparison-{experiment_name}.json"
+    comparison_payload = {
+        "schema_version": "1.0",
+        "experiment": experiment_name,
+        "baseline_run_id": report_list[0][1].run_id if report_list else None,
+        "variants": [
+            {
+                "name": name,
+                "run_id": report.run_id,
+                "evidence_kind": report.evidence_kind,
+                "accuracy_established": report.accuracy_established,
+                "accuracy_evidence_state": report.accuracy_evidence_state,
+            }
+            for name, report in report_list
+        ],
+        "comparisons": comparison_entries,
+    }
+    comparison_path.write_text(
+        json.dumps(comparison_payload, ensure_ascii=False, sort_keys=True, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
     logger.info("对照报告已生成: %s", md_path)
+    logger.info("paired comparison manifest 已生成: %s", comparison_path)
 
 
 # ── P9A typed default path ──────────────────────────────────────────────────
@@ -1343,9 +1542,20 @@ def main() -> None:
             dataset=args.dataset,
             max_cases=args.max_cases,
             use_stub=args.stub,
+            typed_runtime=("none" if args.stub else args.typed_runtime),
         ))
         for name, report in reports.items():
-            print(f"\n{name}: EX={report.execution_accuracy:.2%}, P95={report.p95_latency_ms:.0f}ms")
+            accuracy = (
+                f"{report.execution_accuracy:.2%}"
+                if report.accuracy_established
+                else "not established"
+            )
+            print(
+                f"\n{name}: accuracy={accuracy}, "
+                f"evidence={report.accuracy_evidence_state}, "
+                f"evidence_kind={report.evidence_kind}, "
+                f"P95={report.p95_latency_ms:.0f}ms"
+            )
         return
 
     if args.legacy_bridge:

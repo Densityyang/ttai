@@ -33,9 +33,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+import math
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any, cast
 
 from pydantic import JsonValue
@@ -52,10 +53,19 @@ from src.nl2sql.contracts import (
     TimeRange,
     TrustedCalculationStep,
 )
+from src.nl2sql.orchestration.evidence_digest import (
+    canonical_json_digest,
+    canonical_rowset_digest,
+)
+from src.nl2sql.orchestration.execution import (
+    PlanStepError,
+    validate_execution_record_against_plan,
+)
 
 __all__ = [
     "GroundedAnswer",
     "build_answer_facts",
+    "conservative_data_as_of",
     "ground_execution_answer",
     "receipt_degradation_flags",
     "render_grounded_answer",
@@ -78,6 +88,39 @@ class GroundedAnswer:
     artifact: AnswerArtifact
 
 
+class GroundingIntegrityError(RuntimeError):
+    """Stable refusal when request-local output evidence disagrees with receipts."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+def conservative_data_as_of(
+    values: Iterable[datetime | None],
+) -> datetime | None:
+    """Return a complete aggregate watermark only when every fact has one.
+
+    A missing or naive timestamp makes the aggregate incomplete.  The earliest
+    aware timestamp is the safe watermark for a multi-fact answer.
+    """
+
+    timestamps = tuple(values)
+    if not timestamps:
+        return None
+    normalized: list[datetime] = []
+    for value in timestamps:
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            return None
+        try:
+            if value.utcoffset() is None:
+                return None
+            normalized.append(value.astimezone(UTC))
+        except (OverflowError, TypeError, ValueError):
+            return None
+    return min(normalized) if normalized else None
+
+
 def ground_execution_answer(
     *,
     query_plan: QueryPlan,
@@ -86,6 +129,11 @@ def ground_execution_answer(
     outputs: Mapping[str, JsonValue],
 ) -> GroundedAnswer:
     """Build grounded facts, render them, and package the request-local artifact."""
+
+    try:
+        validate_execution_record_against_plan(execution_plan, record)
+    except PlanStepError as exc:
+        raise GroundingIntegrityError(exc.code) from exc
 
     facts, grounding_flags = _build_answer_facts_with_flags(
         query_plan=query_plan,
@@ -150,6 +198,7 @@ def _build_answer_facts_with_flags(
         # A record from another execution plan must never ground facts against
         # the supplied plan.
         return (), ()
+    _validate_output_evidence(record=record, outputs=outputs)
     steps_by_id = {step.step_id: step for step in execution_plan.steps}
     facts: list[AnswerFact] = []
     flags: list[str] = []
@@ -174,6 +223,8 @@ def _build_answer_facts_with_flags(
             # is never a grounded answer fact for the requested metric.
             continue
         output = outputs.get(receipt.step_id)
+        if isinstance(step, FetchMetricStep):
+            _validate_typed_fetch_output(output)
         for metric_key in step.metric_keys:
             if query_plan.intent == "trend":
                 points = _trend_points(output)
@@ -194,6 +245,7 @@ def _build_answer_facts_with_flags(
                                     end=period,
                                     timezone="Asia/Shanghai",
                                 ),
+                                unit=receipt.unit,
                             )
                         )
                     continue
@@ -204,6 +256,7 @@ def _build_answer_facts_with_flags(
                     metric_key=metric_key,
                     status=status,
                     value=value,
+                    unit=receipt.unit,
                 )
             )
     for receipt in record.step_receipts:
@@ -243,6 +296,7 @@ def _build_answer_facts_with_flags(
                 metric_key=metric_key,
                 status=status,
                 value=value,
+                unit=receipt.unit,
             )
         )
     for receipt in record.step_receipts:
@@ -284,6 +338,7 @@ def _build_answer_facts_with_flags(
                 derived_output_id=derived_output_id,
                 status=status,
                 value=value,
+                unit=receipt.unit,
             )
         )
     return tuple(facts), tuple(dict.fromkeys(flags))
@@ -307,6 +362,134 @@ def receipt_degradation_flags(record: PlanExecutionRecord) -> tuple[str, ...]:
         elif receipt.freshness_status == "unknown":
             flags.append(_UNKNOWN_FRESHNESS_FLAG)
     return tuple(dict.fromkeys(flag for flag in flags if flag.strip()))
+
+
+def _validate_output_evidence(
+    *, record: PlanExecutionRecord, outputs: Mapping[str, JsonValue]
+) -> None:
+    for receipt in record.step_receipts:
+        if receipt.status != "succeeded":
+            continue
+        if receipt.step_id not in outputs:
+            raise GroundingIntegrityError("grounding_output_missing")
+        output = outputs[receipt.step_id]
+        if receipt.output_digest is None:
+            raise GroundingIntegrityError("grounding_output_digest_missing")
+        if canonical_json_digest(output) != receipt.output_digest:
+            raise GroundingIntegrityError("grounding_output_digest_mismatch")
+        if receipt.kind != "fetch_metric":
+            continue
+        if output is None:
+            raise GroundingIntegrityError("grounding_malformed_output")
+        _validate_snapshot_evidence(record)
+        if not isinstance(output, Mapping):
+            continue
+        rows = output.get("rows")
+        # Scalar metric runners may project a value directly.  Rowset
+        # integrity is required whenever the fetch actually exposes rows;
+        # a scalar projection has no rowset digest to validate.
+        if rows is None and "rows" not in output:
+            continue
+        if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
+            raise GroundingIntegrityError("grounding_rowset_digest_mismatch")
+        if receipt.rowset_sha256 is None:
+            raise GroundingIntegrityError("grounding_rowset_digest_missing")
+        try:
+            digest = canonical_rowset_digest(
+                cast("list[Mapping[str, Any]]", rows),
+                result_columns=receipt.result_columns or None,
+            )
+        except (TypeError, ValueError):
+            raise GroundingIntegrityError("grounding_rowset_digest_mismatch") from None
+        if digest != receipt.rowset_sha256:
+            raise GroundingIntegrityError("grounding_rowset_digest_mismatch")
+
+def _validate_typed_fetch_output(output: JsonValue) -> None:
+    """Reject missing/null/malformed fetch results before projection."""
+
+    if output is None:
+        raise GroundingIntegrityError("grounding_malformed_output")
+    if not isinstance(output, Mapping):
+        # Older injected metric runners return the already-projected scalar.
+        # It is still typed evidence when it is a finite JSON scalar; malformed
+        # containers and null remain fail-closed.
+        if isinstance(output, (str, int, bool)) or (
+            isinstance(output, float) and math.isfinite(output)
+        ):
+            return
+        raise GroundingIntegrityError("grounding_malformed_output")
+    if "no_data" in output:
+        no_data = output.get("no_data")
+        rows = output.get("rows")
+        if not isinstance(no_data, bool) or not isinstance(rows, list):
+            raise GroundingIntegrityError("grounding_malformed_output")
+        if no_data:
+            if rows and any(
+                not isinstance(row, Mapping)
+                or row.get("status") not in {"no_data", None}
+                for row in rows
+            ):
+                raise GroundingIntegrityError("grounding_malformed_output")
+            return
+        if not rows or any(
+            not isinstance(row, Mapping)
+            or "value" not in row
+            or row.get("value") is None
+            for row in rows
+        ):
+            raise GroundingIntegrityError("grounding_malformed_output")
+        return
+    if "value" in output:
+        if output.get("value") is None:
+            raise GroundingIntegrityError("grounding_malformed_output")
+        return
+    # Legacy typed runners may use the metric's short name as the sole key.
+    # Keep that bounded projection compatible while rejecting arbitrary
+    # multi-field or null mappings.
+    if len(output) == 1:
+        only = next(iter(output.values()))
+        if only is not None and _is_scalar(only):
+            return
+    raise GroundingIntegrityError("grounding_malformed_output")
+
+
+def _validate_snapshot_evidence(record: PlanExecutionRecord) -> None:
+    fetches = [
+        receipt
+        for receipt in record.step_receipts
+        if receipt.status == "succeeded" and receipt.kind == "fetch_metric"
+    ]
+    if not fetches:
+        return
+    has_any = any(
+        receipt.source_snapshot_id is not None
+        or receipt.source_snapshot_fingerprint is not None
+        for receipt in fetches
+    )
+    # Production fetch receipts carry a typed source identity.  Once that
+    # identity is present, a snapshot is part of the same authority tuple and
+    # cannot silently disappear at the grounding boundary.  Legacy scalar
+    # fixtures with no source identity remain snapshot-neutral.
+    requires_snapshot = any(
+        receipt.source_version is not None
+        for receipt in fetches
+    )
+    if not has_any and not requires_snapshot:
+        return
+    if not has_any:
+        raise GroundingIntegrityError("grounding_snapshot_evidence_missing")
+    if any(
+        receipt.source_snapshot_id is None
+        or receipt.source_snapshot_fingerprint is None
+        for receipt in fetches
+    ):
+        raise GroundingIntegrityError("grounding_snapshot_evidence_missing")
+    pairs = {
+        (receipt.source_snapshot_id, receipt.source_snapshot_fingerprint)
+        for receipt in fetches
+    }
+    if len(pairs) != 1:
+        raise GroundingIntegrityError("grounding_mixed_source_snapshots")
 
 
 def render_grounded_answer(
@@ -352,6 +535,7 @@ def _answer_fact(
     status: str,
     value: JsonValue,
     time_range: TimeRange | None = None,
+    unit: str | None = None,
 ) -> AnswerFact:
     return AnswerFact(
         fact_id=_fact_id(
@@ -360,11 +544,14 @@ def _answer_fact(
             status=status,
             value=value,
             time_range=time_range,
+            unit=unit,
         ),
+        fact_id_version=2,
         step_id=receipt.step_id,
         metric_key=metric_key,
         status=cast("Any", status),
         value=value,
+        unit=unit,
         rowset_sha256=receipt.rowset_sha256,
         output_digest=receipt.output_digest,
         source_id=receipt.source_id,
@@ -384,6 +571,7 @@ def _adhoc_answer_fact(
     derived_output_id: str,
     status: str,
     value: JsonValue,
+    unit: str | None = None,
 ) -> AnswerFact:
     return AnswerFact(
         fact_id=_derived_fact_id(
@@ -391,12 +579,15 @@ def _adhoc_answer_fact(
             derived_output_id=derived_output_id,
             status=status,
             value=value,
+            unit=unit,
         ),
+        fact_id_version=2,
         step_id=receipt.step_id,
         derived_output_id=derived_output_id,
         calculation_scope="ad_hoc_noncanonical",
         status=cast("Any", status),
         value=value,
+        unit=unit,
         rowset_sha256=receipt.rowset_sha256,
         output_digest=receipt.output_digest,
         source_id=receipt.source_id,
@@ -410,7 +601,12 @@ def _adhoc_answer_fact(
 
 
 def _derived_fact_id(
-    *, step_id: str, derived_output_id: str, status: str, value: JsonValue
+    *,
+    step_id: str,
+    derived_output_id: str,
+    status: str,
+    value: JsonValue,
+    unit: str | None,
 ) -> str:
     """Deterministic NONCANONICAL fact identity (separate from _fact_id)."""
 
@@ -420,6 +616,8 @@ def _derived_fact_id(
             "derived_output_id": derived_output_id,
             "status": status,
             "value": value,
+            "unit": unit,
+            "fact_id_version": 2,
         },
         ensure_ascii=False,
         allow_nan=False,
@@ -502,6 +700,7 @@ def _fact_id(
     status: str,
     value: JsonValue,
     time_range: TimeRange | None = None,
+    unit: str | None = None,
 ) -> str:
     """Deterministic fact identity: a digest over grounded evidence only."""
 
@@ -510,6 +709,8 @@ def _fact_id(
         "metric_key": metric_key,
         "status": status,
         "value": value,
+        "unit": unit,
+        "fact_id_version": 2,
     }
     if time_range is not None:
         payload["time_range"] = time_range.model_dump(mode="json")

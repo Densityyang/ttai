@@ -664,6 +664,7 @@ def test_local_real_freshness_uses_observed_watermark_not_business_midnight() ->
     container = AppContainer()
     container._local_real_resources = (
         object(),
+        object(),
         SimpleNamespace(release=bundle.release, snapshot=bundle.snapshot),
     )
     container._local_real_latest_authoritative_date = "2026-09-18"

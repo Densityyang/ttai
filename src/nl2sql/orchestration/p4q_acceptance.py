@@ -22,12 +22,13 @@ import math
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Final, Literal
+from typing import Any, Final, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from src.nl2sql.contracts import (
     AnswerArtifact,
+    AnswerFact,
     ExecutionPlan,
     ExecutionReceipt,
     PlanExecutionRecord,
@@ -139,7 +140,11 @@ def _canonical_value(value: object) -> object:
 
 
 def _facts_sha256(artifact: AnswerArtifact) -> str:
-    payload = [_canonical_value(fact.model_dump(mode="python")) for fact in artifact.facts]
+    return _facts_sha256_from_facts(artifact.facts)
+
+
+def _facts_sha256_from_facts(facts: Sequence[AnswerFact]) -> str:
+    payload = [_canonical_value(fact.model_dump(mode="python")) for fact in facts]
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -261,6 +266,67 @@ class P4QRealnessWitness(_StrictFrozenModel):
         return value
 
 
+class P4QGroundedAnswerCapture(_StrictFrozenModel):
+    """Transient trusted-harness capture of the production GroundedAnswer."""
+
+    answer_text: str = Field(min_length=1, max_length=32_000)
+    facts: tuple[AnswerFact, ...] = Field(max_length=64)
+    renderer_version: str = Field(default="grounded-renderer-v1", min_length=1, max_length=128)
+    answer_sha256: str | None = Field(default=None, pattern=_SHA256)
+    facts_sha256: str | None = Field(default=None, pattern=_SHA256)
+    query_plan_sha256: str | None = Field(default=None, pattern=_SHA256)
+    execution_plan_sha256: str | None = Field(default=None, pattern=_SHA256)
+    execution_record_sha256: str | None = Field(default=None, pattern=_SHA256)
+
+    @classmethod
+    def from_grounded_answer(
+        cls,
+        grounded: object,
+        *,
+        query_plan: object | None = None,
+        execution_plan: object | None = None,
+        execution_record: object | None = None,
+    ) -> "P4QGroundedAnswerCapture":
+        answer_text = str(getattr(grounded, "answer_text"))
+        facts = tuple(getattr(grounded, "facts"))
+        if query_plan is not None:
+            from src.nl2sql.orchestration.grounding import render_grounded_answer
+
+            if render_grounded_answer(query_plan=cast(Any, query_plan), facts=facts) != answer_text:
+                raise ValueError("grounded answer is not canonical renderer output")
+        record_checksum = None
+        if execution_record is not None:
+            record_checksum = hashlib.sha256(
+                json.dumps(cast(Any, execution_record).model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        return cls(
+            answer_text=answer_text,
+            facts=facts,
+            answer_sha256=hashlib.sha256(answer_text.replace("\r\n", "\n").encode("utf-8")).hexdigest(),
+            facts_sha256=_facts_sha256_from_facts(facts),
+            query_plan_sha256=getattr(query_plan, "checksum", None),
+            execution_plan_sha256=getattr(execution_plan, "checksum", None),
+            execution_record_sha256=record_checksum,
+        )
+
+
+def capture_grounded_answer(
+    grounded: object,
+    *,
+    query_plan: object | None = None,
+    execution_plan: object | None = None,
+    execution_record: object | None = None,
+) -> P4QGroundedAnswerCapture:
+    """Capture a request-local production GroundedAnswer for P4-Q."""
+
+    return P4QGroundedAnswerCapture.from_grounded_answer(
+        grounded,
+        query_plan=query_plan,
+        execution_plan=execution_plan,
+        execution_record=execution_record,
+    )
+
+
 class P4QCaseEvidence(_StrictFrozenModel):
     schema_version: Literal["1.0"] = P4Q_SCHEMA_VERSION
     case_id: str = Field(min_length=1, max_length=128)
@@ -279,6 +345,11 @@ class P4QCaseEvidence(_StrictFrozenModel):
     gateway_receipt: ExecutionReceipt | None = None
     published_read_outcome: PublishedMetricReadOutcome | None = None
     answer_artifact: AnswerArtifact | None = None
+    captured_grounded_answer: P4QGroundedAnswerCapture | None = None
+    # Optional harness capture from the rendered production response.  When
+    # present, the observed answer digest is recomputed from this value; the
+    # legacy digest-only field remains accepted for older fixture evidence.
+    captured_answer_text: str | None = Field(default=None, max_length=32_000)
     observed_answer_sha256: str | None = Field(default=None, pattern=_SHA256)
     observed_facts_sha256: str | None = Field(default=None, pattern=_SHA256)
     oracle: P4QOracleEvidence
@@ -380,6 +451,14 @@ def _plan_record_structure_failures(evidence: P4QCaseEvidence) -> list[str]:
     plan = evidence.execution_plan
     if plan is None:
         return ["execution_plan_record_mismatch"]
+    if any(step.kind == "verify" for step in plan.steps) or evidence.evidence_origin == "real":
+        try:
+            from src.nl2sql.orchestration.execution import validate_execution_record_against_plan
+
+            validate_execution_record_against_plan(plan, record)
+        except Exception as exc:
+            code = getattr(exc, "code", "execution_plan_record_mismatch")
+            return [str(code)]
     kinds = {step.step_id: step.kind for step in plan.steps}
     failures: list[str] = []
     for receipt in record.step_receipts:
@@ -477,18 +556,61 @@ def _grounding_failures(evidence: P4QCaseEvidence) -> list[str]:
 
 def _answer_oracle_failures(evidence: P4QCaseEvidence) -> list[str]:
     failures: list[str] = []
-    artifact = evidence.answer_artifact
-    if artifact is not None:
+    capture = evidence.captured_grounded_answer
+    if capture is not None:
+        captured_text = capture.answer_text.replace("\r\n", "\n")
+        answer_digest = hashlib.sha256(captured_text.encode("utf-8")).hexdigest()
         try:
-            derived = _facts_sha256(artifact)
+            facts_digest = _facts_sha256_from_facts(capture.facts)
         except (ValueError, _FactDigestError):
             failures.append("facts_digest_invalid")
-        else:
-            if evidence.observed_facts_sha256 != derived:
-                failures.append("facts_digest_mismatch")
-    if evidence.observed_facts_sha256 != evidence.oracle.expected_facts_sha256:
+            facts_digest = None
+        # Caller supplied hashes are ignored when a trusted capture exists.
+        artifact = evidence.answer_artifact
+        if artifact is not None and tuple(artifact.facts) != tuple(capture.facts):
+            failures.append("captured_facts_mismatch")
+        if capture.answer_sha256 != answer_digest or capture.facts_sha256 != facts_digest:
+            failures.append("capture_digest_mismatch")
+        if evidence.execution_plan is not None and capture.execution_plan_sha256 != evidence.execution_plan.checksum:
+            failures.append("capture_execution_plan_mismatch")
+        if (
+            evidence.execution_plan is not None
+            and capture.query_plan_sha256 != evidence.execution_plan.query_plan_sha256
+        ):
+            failures.append("capture_query_plan_mismatch")
+        if evidence.execution_record is not None:
+            record_digest = hashlib.sha256(
+                json.dumps(
+                    evidence.execution_record.model_dump(mode="json"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if capture.execution_record_sha256 != record_digest:
+                failures.append("capture_execution_record_mismatch")
+    elif evidence.captured_answer_text is not None:
+        captured_text = evidence.captured_answer_text.replace("\r\n", "\n")
+        answer_digest = hashlib.sha256(captured_text.encode("utf-8")).hexdigest()
+        if evidence.observed_answer_sha256 != answer_digest:
+            failures.append("answer_capture_digest_mismatch")
+        answer_digest = evidence.observed_answer_sha256
+        try:
+            facts_digest = _facts_sha256(evidence.answer_artifact) if evidence.answer_artifact is not None else evidence.observed_facts_sha256
+        except (ValueError, _FactDigestError):
+            failures.append("facts_digest_invalid")
+            facts_digest = None
+    else:
+        answer_digest = evidence.observed_answer_sha256
+        try:
+            facts_digest = _facts_sha256(evidence.answer_artifact) if evidence.answer_artifact is not None else evidence.observed_facts_sha256
+        except (ValueError, _FactDigestError):
+            failures.append("facts_digest_invalid")
+            facts_digest = None
+        if evidence.answer_artifact is not None and evidence.observed_facts_sha256 != facts_digest:
+            failures.append("facts_digest_mismatch")
+    if facts_digest != evidence.oracle.expected_facts_sha256:
         failures.append("facts_digest_mismatch")
-    if evidence.observed_answer_sha256 != evidence.oracle.expected_answer_sha256:
+    if answer_digest != evidence.oracle.expected_answer_sha256:
         failures.append("answer_digest_mismatch")
     return list(dict.fromkeys(failures))
 
@@ -650,6 +772,17 @@ def _case_failures(case: P4QCaseSpec, evidence: P4QCaseEvidence) -> list[str]:
     if evidence.oracle.expected_terminal != case.expected_terminal:
         failures.append("oracle_invalid")
     failures.extend(_plan_record_structure_failures(evidence))
+    if evidence.execution_record is not None and any(
+        receipt.semantic_validation_outcome == "shadow_denied"
+        for receipt in evidence.execution_record.step_receipts
+    ):
+        failures.append("not_certified")
+    if evidence.evidence_origin == "real" and case.kind in {
+        "published_gold",
+        "approved_compute",
+        "clarification_resume",
+    } and evidence.captured_grounded_answer is None:
+        failures.append("trusted_render_capture_missing")
     if case.kind == "published_gold":
         failures.extend(_execution_binding_failures(evidence, require_receipt=True))
         failures.extend(_gold_failures(evidence))
@@ -793,6 +926,7 @@ __all__ = [
     "P4QCaseRegistry",
     "P4QCaseResult",
     "P4QCaseSpec",
+    "P4QGroundedAnswerCapture",
     "P4QEvidenceOrigin",
     "P4QManifest",
     "P4QObservedMode",
@@ -801,5 +935,6 @@ __all__ = [
     "P4QRealnessWitness",
     "P4QTerminal",
     "P4QVerdict",
+    "capture_grounded_answer",
     "evaluate_p4q",
 ]

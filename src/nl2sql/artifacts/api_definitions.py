@@ -34,6 +34,8 @@ from src.nl2sql.artifacts.definition_run_record import (
     DefinitionRunPlan,
     DefinitionRunReceipt,
     DefinitionRunRecord,
+    DefinitionRunRecordConflict,
+    DefinitionRunRecordStoreUnavailable,
     DefinitionRunValidation,
 )
 from src.nl2sql.artifacts.definition_semantics import (
@@ -826,6 +828,13 @@ def register_definition_routes(app: Any) -> None:
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=exc.code,
             ) from exc
+        except DefinitionRunRecordStoreUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=exc.code,
+            ) from exc
+        except DefinitionRunRecordConflict as exc:
+            raise _conflict(exc.reason) from exc
         except CustomCalculationExecutionError as exc:
             raise _conflict(exc.code) from exc
         except ValueError as exc:
@@ -874,9 +883,19 @@ def register_definition_routes(app: Any) -> None:
             )
         except DefinitionNotFound as exc:
             raise _not_found() from exc
-        records = await definition_execution_service(
-            request
-        ).run_records.list_for_version(definition_id=definition_id, version=version)
+        try:
+            records = await definition_execution_service(
+                request
+            ).run_records.list_for_version(
+                owner_user_id=owner_identity(auth_user),
+                definition_id=definition_id,
+                version=version,
+            )
+        except DefinitionRunRecordStoreUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=exc.code,
+            ) from exc
         return DefinitionRunRecordListResponse(
             definition_id=definition_id,
             version=version,
@@ -905,9 +924,18 @@ def register_definition_routes(app: Any) -> None:
             )
         except DefinitionNotFound as exc:
             raise _not_found() from exc
-        record = await definition_execution_service(request).run_records.get(
-            definition_id=definition_id, version=version, run_id=run_id
-        )
+        try:
+            record = await definition_execution_service(request).run_records.get(
+                owner_user_id=owner_identity(auth_user),
+                definition_id=definition_id,
+                version=version,
+                run_id=run_id,
+            )
+        except DefinitionRunRecordStoreUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=exc.code,
+            ) from exc
         if record is None:
             raise _run_not_found()
         return _run_record_view(record)

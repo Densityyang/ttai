@@ -128,8 +128,61 @@ class AuthorizedDataScope(_DataScope):
     """Relations and columns returned by a trusted server authority."""
 
 
+class AuthorizedJoinScope(ImmutableDataContract):
+    """One authority-approved relation key and preserved-side join shape."""
+
+    left_relation: RelationIdentity
+    left_column: _IDENTIFIER
+    right_relation: RelationIdentity
+    right_column: _IDENTIFIER
+    join_type: Literal["inner", "left"]
+
+    @model_validator(mode="after")
+    def validate_distinct_relations(self) -> AuthorizedJoinScope:
+        if self.left_relation == self.right_relation:
+            raise ValueError("authorized join relations must be distinct")
+        return self
+
+
 class EffectiveDataScope(_DataScope):
-    """Requested scope after complete authorization; partial grants are denied."""
+    """Requested fields and only the joins granted by trusted authority."""
+
+    authorized_joins: tuple[AuthorizedJoinScope, ...] = ()
+
+    @field_validator("authorized_joins")
+    @classmethod
+    def validate_authorized_joins(
+        cls,
+        value: tuple[AuthorizedJoinScope, ...],
+    ) -> tuple[AuthorizedJoinScope, ...]:
+        keys = [
+            (
+                item.left_relation.schema_name,
+                item.left_relation.relation_name,
+                item.left_column,
+                item.right_relation.schema_name,
+                item.right_relation.relation_name,
+                item.right_column,
+                item.join_type,
+            )
+            for item in value
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("effective join scopes are invalid")
+        return tuple(
+            sorted(
+                value,
+                key=lambda item: (
+                    item.left_relation.schema_name,
+                    item.left_relation.relation_name,
+                    item.left_column,
+                    item.right_relation.schema_name,
+                    item.right_relation.relation_name,
+                    item.right_column,
+                    item.join_type,
+                ),
+            )
+        )
 
 
 class DataRequestBudget(ImmutableDataContract):
@@ -205,31 +258,127 @@ def bind_data_request_owner(
         raise DataRequestValidationError() from None
 
 
-class VerifiedDataAuthorization(ImmutableDataContract):
-    """Typed authority output; no production producer is wired in this slice."""
+class OwnerRowScope(ImmutableDataContract):
+    """Trusted owner column for one relation; its value comes from request binding."""
 
-    schema_version: Literal["data-authorization-v1"]
+    relation: RelationIdentity
+    owner_column: _IDENTIFIER
+
+
+class VerifiedDataAuthorization(ImmutableDataContract):
+    """Typed, owner-bound authority output; no production producer is wired."""
+
+    schema_version: Literal["data-authorization-v1", "data-authorization-v2"]
     request_id: UUID
     request_checksum: _SHA256
     owner_user_id: _OWNER_ID
     authority_id: _OPAQUE_TOKEN
     authorization_revision: _OPAQUE_TOKEN
     authorized_scope: AuthorizedDataScope
+    owner_row_scopes: tuple[OwnerRowScope, ...]
+    authorized_joins: tuple[AuthorizedJoinScope, ...] = ()
+
+    @field_validator("owner_row_scopes")
+    @classmethod
+    def validate_owner_row_scopes(
+        cls,
+        value: tuple[OwnerRowScope, ...],
+    ) -> tuple[OwnerRowScope, ...]:
+        keys = [
+            (item.relation.schema_name, item.relation.relation_name)
+            for item in value
+        ]
+        if not value or len(keys) != len(set(keys)):
+            raise ValueError("owner row scopes are invalid")
+        return tuple(
+            sorted(
+                value,
+                key=lambda item: (
+                    item.relation.schema_name,
+                    item.relation.relation_name,
+                ),
+            )
+        )
+
+    @field_validator("authorized_joins")
+    @classmethod
+    def validate_authorized_joins(
+        cls,
+        value: tuple[AuthorizedJoinScope, ...],
+    ) -> tuple[AuthorizedJoinScope, ...]:
+        keys = [
+            (
+                item.left_relation.schema_name,
+                item.left_relation.relation_name,
+                item.left_column,
+                item.right_relation.schema_name,
+                item.right_relation.relation_name,
+                item.right_column,
+                item.join_type,
+            )
+            for item in value
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("authorized join scopes are invalid")
+        return tuple(
+            sorted(
+                value,
+                key=lambda item: (
+                    item.left_relation.schema_name,
+                    item.left_relation.relation_name,
+                    item.left_column,
+                    item.right_relation.schema_name,
+                    item.right_relation.relation_name,
+                    item.right_column,
+                    item.join_type,
+                ),
+            )
+        )
+
+    @model_validator(mode="after")
+    def validate_join_columns(self) -> VerifiedDataAuthorization:
+        if self.schema_version == "data-authorization-v1" and self.authorized_joins:
+            raise ValueError("authorization v1 cannot declare joins")
+        columns_by_relation = {
+            (item.relation.schema_name, item.relation.relation_name): set(item.columns)
+            for item in self.authorized_scope.relations
+        }
+        for join in self.authorized_joins:
+            left_key = (
+                join.left_relation.schema_name,
+                join.left_relation.relation_name,
+            )
+            right_key = (
+                join.right_relation.schema_name,
+                join.right_relation.relation_name,
+            )
+            if (
+                join.left_column not in columns_by_relation.get(left_key, set())
+                or join.right_column not in columns_by_relation.get(right_key, set())
+            ):
+                raise ValueError("authorized join columns are outside the grant")
+        return self
 
     @computed_field(return_type=str)
     @property
     def authorization_checksum(self) -> str:
-        return _sha256(
-            {
-                "schema_version": self.schema_version,
-                "request_id": str(self.request_id),
-                "request_checksum": self.request_checksum,
-                "owner_user_id": self.owner_user_id,
-                "authority_id": self.authority_id,
-                "authorization_revision": self.authorization_revision,
-                "authorized_scope": self.authorized_scope.model_dump(mode="json"),
-            }
-        )
+        payload = {
+            "schema_version": self.schema_version,
+            "request_id": str(self.request_id),
+            "request_checksum": self.request_checksum,
+            "owner_user_id": self.owner_user_id,
+            "authority_id": self.authority_id,
+            "authorization_revision": self.authorization_revision,
+            "authorized_scope": self.authorized_scope.model_dump(mode="json"),
+            "owner_row_scopes": [
+                item.model_dump(mode="json") for item in self.owner_row_scopes
+            ],
+        }
+        if self.schema_version == "data-authorization-v2":
+            payload["authorized_joins"] = [
+                item.model_dump(mode="json") for item in self.authorized_joins
+            ]
+        return _sha256(payload)
 
 
 class DataRequestDenied(ValueError):
@@ -256,26 +405,49 @@ def derive_effective_scope(
         (item.relation.schema_name, item.relation.relation_name): set(item.columns)
         for item in authorization.authorized_scope.relations
     }
+    owner_scopes = {
+        (item.relation.schema_name, item.relation.relation_name)
+        for item in authorization.owner_row_scopes
+    }
+    if owner_scopes != set(authorized):
+        raise DataRequestDenied()
     for requested in request.requested_scope.relations:
         key = (requested.relation.schema_name, requested.relation.relation_name)
         if not set(requested.columns).issubset(authorized.get(key, set())):
             raise DataRequestDenied()
 
-    return EffectiveDataScope(relations=request.requested_scope.relations)
+    requested_keys = {
+        (item.relation.schema_name, item.relation.relation_name)
+        for item in request.requested_scope.relations
+    }
+    effective_joins = tuple(
+        join
+        for join in authorization.authorized_joins
+        if {
+            (join.left_relation.schema_name, join.left_relation.relation_name),
+            (join.right_relation.schema_name, join.right_relation.relation_name),
+        }.issubset(requested_keys)
+    )
+    return EffectiveDataScope(
+        relations=request.requested_scope.relations,
+        authorized_joins=effective_joins,
+    )
 
 
 class DataSourceSnapshot(ImmutableDataContract):
-    """Required source and snapshot version supplied by a future trusted adapter."""
+    """Trusted source identity plus its observed database snapshot when available."""
 
     source_id: _OPAQUE_TOKEN
     source_version: _OPAQUE_TOKEN
-    snapshot_id: _OPAQUE_TOKEN
+    # A compiler may bind the expected source/version before execution. The
+    # QueryGateway supplies the actual transaction snapshot after it connects.
+    snapshot_id: _OPAQUE_TOKEN | None = None
 
 
 class GovernedSQLCandidate(ImmutableDataContract):
     """Compiler evidence only; intentionally contains no SQL text or bind values."""
 
-    schema_version: Literal["governed-sql-candidate-v1"]
+    schema_version: Literal["governed-sql-candidate-v1", "governed-sql-candidate-v2"]
     request_id: UUID
     request_checksum: _SHA256
     authorization_checksum: _SHA256
@@ -286,10 +458,20 @@ class GovernedSQLCandidate(ImmutableDataContract):
     query_fingerprint: _SHA256
     parameter_binding_fingerprint: _SHA256
 
+    @model_validator(mode="after")
+    def validate_scope_version(self) -> GovernedSQLCandidate:
+        if (
+            self.schema_version == "governed-sql-candidate-v1"
+            and self.effective_scope.authorized_joins
+        ):
+            raise ValueError("candidate v1 cannot bind authorized joins")
+        return self
+
 
 class ReturnedColumnIdentity(ImmutableDataContract):
     relation: RelationIdentity
     column_name: _IDENTIFIER
+    output_name: _IDENTIFIER
 
 
 class FrozenRow(ImmutableDataContract):
@@ -303,6 +485,7 @@ class QueryGatewayReceiptReference(ImmutableDataContract):
     query_fingerprint: _SHA256
     policy_version: _OPAQUE_TOKEN
     policy_outcome: Literal["allow", "deny"]
+    source_snapshot_id: _OPAQUE_TOKEN | None = None
 
 
 class TrustedExecutionResult(ImmutableDataContract):
@@ -328,7 +511,7 @@ class TrustedExecutionResult(ImmutableDataContract):
 class FrozenDataset(ImmutableDataContract):
     """Complete immutable rowset plus the provenance required for future replay."""
 
-    schema_version: Literal["frozen-dataset-v1"]
+    schema_version: Literal["frozen-dataset-v1", "frozen-dataset-v2"]
     request_id: UUID
     request_checksum: _SHA256
     owner_user_id: _OWNER_ID
@@ -336,10 +519,17 @@ class FrozenDataset(ImmutableDataContract):
     authority_id: _OPAQUE_TOKEN
     authorization_revision: _OPAQUE_TOKEN
     authorized_scope: AuthorizedDataScope
+    owner_row_scopes: tuple[OwnerRowScope, ...]
+    authorization_schema_version: Literal[
+        "data-authorization-v1", "data-authorization-v2"
+    ] = "data-authorization-v1"
+    authorized_joins: tuple[AuthorizedJoinScope, ...] = ()
     effective_scope: EffectiveDataScope
     source_snapshot: DataSourceSnapshot
     query_fingerprint: _SHA256
     gateway_receipt_id: UUID
+    gateway_receipt_query_fingerprint: _SHA256
+    gateway_receipt_snapshot_id: _OPAQUE_TOKEN
     gateway_policy_version: _OPAQUE_TOKEN
     gateway_policy_outcome: Literal["allow"]
     budget: DataRequestBudget
@@ -349,6 +539,17 @@ class FrozenDataset(ImmutableDataContract):
 
     @model_validator(mode="after")
     def validate_complete_rows(self) -> FrozenDataset:
+        if (
+            self.schema_version == "frozen-dataset-v1"
+            and (
+                self.authorization_schema_version != "data-authorization-v1"
+                or self.authorized_joins
+            )
+        ) or (
+            self.schema_version == "frozen-dataset-v2"
+            and self.authorization_schema_version != "data-authorization-v2"
+        ):
+            raise ValueError("frozen dataset authorization version is invalid")
         try:
             bound_request = DataRequest(
                 schema_version="data-request-v1",
@@ -360,20 +561,29 @@ class FrozenDataset(ImmutableDataContract):
                 budget=self.budget,
             )
             bound_authorization = VerifiedDataAuthorization(
-                schema_version="data-authorization-v1",
+                schema_version=self.authorization_schema_version,
                 request_id=self.request_id,
                 request_checksum=self.request_checksum,
                 owner_user_id=self.owner_user_id,
                 authority_id=self.authority_id,
                 authorization_revision=self.authorization_revision,
                 authorized_scope=self.authorized_scope,
+                owner_row_scopes=self.owner_row_scopes,
+                authorized_joins=self.authorized_joins,
             )
+            derived_scope = derive_effective_scope(bound_request, bound_authorization)
         except ValidationError:
+            raise ValueError("frozen dataset identity is invalid") from None
+        except DataRequestDenied:
             raise ValueError("frozen dataset identity is invalid") from None
         if (
             bound_request.request_checksum != self.request_checksum
             or bound_authorization.authorization_checksum != self.authorization_checksum
+            or derived_scope != self.effective_scope
+            or self.gateway_receipt_query_fingerprint != self.query_fingerprint
+            or self.gateway_receipt_snapshot_id != self.source_snapshot.snapshot_id
             or self.estimated_cost > self.budget.max_cost
+            or self.source_snapshot.snapshot_id is None
         ):
             raise ValueError("frozen dataset identity is invalid")
 
@@ -397,12 +607,18 @@ class FrozenDataset(ImmutableDataContract):
             )
             for column in self.returned_columns
         ]
+        output_names = [column.output_name for column in self.returned_columns]
         expected = {
             (item.relation.schema_name, item.relation.relation_name, name)
             for item in self.effective_scope.relations
             for name in item.columns
         }
-        if not column_keys or len(column_keys) != len(set(column_keys)) or set(column_keys) != expected:
+        if (
+            not column_keys
+            or len(column_keys) != len(set(column_keys))
+            or len(output_names) != len(set(output_names))
+            or set(column_keys) != expected
+        ):
             raise ValueError("frozen dataset columns are invalid")
         if len(self.rows) > self.budget.max_rows:
             raise ValueError("frozen dataset exceeds row budget")
@@ -464,6 +680,31 @@ class FrozenDataset(ImmutableDataContract):
     def status(self) -> Literal["complete"]:
         return "complete"
 
+    def to_sandbox_projection(self) -> SandboxDatasetProjection:
+        """Return only column labels and scalar rows to an isolated sandbox."""
+
+        return SandboxDatasetProjection(
+            column_names=tuple(column.output_name for column in self.returned_columns),
+            rows=self.rows,
+        )
+
+
+class SandboxDatasetProjection(ImmutableDataContract):
+    """Data-only value object; contains no owner, SQL, receipt, or DB capability."""
+
+    column_names: tuple[_IDENTIFIER, ...]
+    rows: tuple[FrozenRow, ...]
+
+    @model_validator(mode="after")
+    def validate_projection_shape(self) -> SandboxDatasetProjection:
+        if (
+            not self.column_names
+            or len(self.column_names) != len(set(self.column_names))
+            or any(len(row.values) != len(self.column_names) for row in self.rows)
+        ):
+            raise ValueError("sandbox dataset projection is invalid")
+        return self
+
 
 def build_frozen_dataset(
     *,
@@ -475,27 +716,45 @@ def build_frozen_dataset(
     """Issue a dataset only when all typed authority and execution evidence agrees."""
 
     effective_scope = derive_effective_scope(request, authorization)
+    expected_source = candidate.source_snapshot
     if (
         candidate.request_id != request.request_id
         or candidate.request_checksum != request.request_checksum
         or candidate.authorization_checksum != authorization.authorization_checksum
         or candidate.effective_scope != effective_scope
-        or execution.source_snapshot != candidate.source_snapshot
         or execution.status != "complete"
         or execution.query_fingerprint != candidate.query_fingerprint
-        or execution.source_snapshot is None
-        or execution.gateway_receipt is None
-        or execution.gateway_receipt.query_fingerprint != candidate.query_fingerprint
-            or execution.gateway_receipt.policy_outcome != "allow"
         or execution.row_count != len(execution.rows)
         or execution.row_count > request.budget.max_rows
         or execution.estimated_cost > request.budget.max_cost
     ):
         raise DataRequestDenied()
+    actual_source = execution.source_snapshot
+    gateway_receipt = execution.gateway_receipt
+    if (
+        actual_source is None
+        or actual_source.snapshot_id is None
+        or actual_source.source_id != expected_source.source_id
+        or actual_source.source_version != expected_source.source_version
+        or (
+            expected_source.snapshot_id is not None
+            and actual_source.snapshot_id != expected_source.snapshot_id
+        )
+        or gateway_receipt is None
+        or gateway_receipt.query_fingerprint != candidate.query_fingerprint
+        or gateway_receipt.policy_outcome != "allow"
+        or gateway_receipt.source_snapshot_id is None
+        or gateway_receipt.source_snapshot_id != actual_source.snapshot_id
+    ):
+        raise DataRequestDenied()
 
     try:
         dataset = FrozenDataset(
-            schema_version="frozen-dataset-v1",
+            schema_version=(
+                "frozen-dataset-v2"
+                if authorization.schema_version == "data-authorization-v2"
+                else "frozen-dataset-v1"
+            ),
             request_id=request.request_id,
             request_checksum=request.request_checksum,
             owner_user_id=request.owner_user_id,
@@ -503,12 +762,17 @@ def build_frozen_dataset(
             authority_id=authorization.authority_id,
             authorization_revision=authorization.authorization_revision,
             authorized_scope=authorization.authorized_scope,
+            owner_row_scopes=authorization.owner_row_scopes,
+            authorization_schema_version=authorization.schema_version,
+            authorized_joins=authorization.authorized_joins,
             effective_scope=effective_scope,
-            source_snapshot=execution.source_snapshot,
+            source_snapshot=actual_source,
             query_fingerprint=candidate.query_fingerprint,
-            gateway_receipt_id=execution.gateway_receipt.receipt_id,
-            gateway_policy_version=execution.gateway_receipt.policy_version,
-            gateway_policy_outcome=execution.gateway_receipt.policy_outcome,
+            gateway_receipt_id=gateway_receipt.receipt_id,
+            gateway_receipt_query_fingerprint=gateway_receipt.query_fingerprint,
+            gateway_receipt_snapshot_id=gateway_receipt.source_snapshot_id,
+            gateway_policy_version=gateway_receipt.policy_version,
+            gateway_policy_outcome=gateway_receipt.policy_outcome,
             budget=request.budget,
             estimated_cost=execution.estimated_cost,
             returned_columns=execution.returned_columns,

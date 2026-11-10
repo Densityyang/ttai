@@ -14,6 +14,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from src.core.auth.dependencies import require_nl2sql_permission
 from src.core.auth.types import AuthUser
 from src.nl2sql.contracts import (
+    AnswerArtifact,
+    AnswerFact,
     ProductMode,
     QueryPlan,
     RequestContext,
@@ -23,6 +25,10 @@ from src.nl2sql.contracts import (
     TimeRange,
 )
 from src.nl2sql.infra.llm.gateway import ProviderResponse, ProviderUnavailable
+from src.nl2sql.orchestration.analysis_evidence import (
+    AnalysisEvidenceError,
+    validate_grounded_answer_checkpoint,
+)
 from src.nl2sql.orchestration.engine import V2EngineState, create_v2_engine
 from src.nl2sql.orchestration.metric_query import SourceFreshnessRecord
 from src.nl2sql.orchestration.mode_contract import RunEnvelope
@@ -509,6 +515,36 @@ def test_analysis_checkpoint_state_has_no_request_local_evidence_or_raw_payload(
     assert "raw_execution_rows" not in annotations
     assert "grounded_answer_artifact" in annotations
     assert "grounded_answer_text" in annotations
+
+
+def test_analyze_checkpoint_answer_text_mismatch_fails_closed() -> None:
+    authority = MetricAuthority()
+    query_plan = authority.plan()
+    with pytest.raises(AnalysisEvidenceError, match="analysis_grounded_answer_mismatch"):
+        validate_grounded_answer_checkpoint(
+            query_plan, AnswerArtifact(), "tampered checkpoint text"
+        )
+
+
+def test_analyze_checkpoint_artifact_tamper_fails_and_unchanged_artifact_passes() -> None:
+    query_plan = MetricAuthority().plan()
+    fact = AnswerFact(
+        fact_id="a" * 64,
+        step_id="fetch_archive_rate",
+        metric_key="controlled.metric",
+        status="grounded",
+        value=7,
+    )
+    artifact = AnswerArtifact(facts=(fact,))
+    valid = validate_grounded_answer_checkpoint(
+        query_plan, artifact, "controlled.metric: 7"
+    )
+    assert valid.facts == (fact,)
+    tampered = artifact.model_copy(
+        update={"facts": (fact.model_copy(update={"value": 8}),)}
+    )
+    with pytest.raises(AnalysisEvidenceError, match="analysis_grounded_answer_mismatch"):
+        validate_grounded_answer_checkpoint(query_plan, tampered, valid.answer_text)
 
 
 @pytest.mark.asyncio

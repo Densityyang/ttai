@@ -28,6 +28,7 @@ from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationCatalog,
     declares_canonical_binding,
 )
+from src.nl2sql.orchestration.verification_policy import verify_execution_plan_policy
 from src.nl2sql.semantic.calculation_contract import (
     CalculationExecutionBinding,
     CalculationSpec,
@@ -449,6 +450,16 @@ class PlanValidator:
                         )
                     )
 
+        for code in verify_execution_plan_policy(execution_plan):
+            deny.append(
+                _issue(
+                    code,
+                    "execution_plan.steps",
+                    "The execution plan does not contain one terminal verification "
+                    "step covering every executable step.",
+                )
+            )
+
         issues = tuple(deny or approval)
         outcome = "deny" if deny else "approval" if approval else "allow"
         return PlanValidationRecord(
@@ -460,7 +471,6 @@ class PlanValidator:
             execution_plan_sha256=execution_plan.checksum,
             issues=issues,
         )
-
 
 class PlanCompiler:
     """Compile one validated proposal into the registered SQL-plus-verify DAG."""

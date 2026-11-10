@@ -230,7 +230,9 @@ def upcast_manifest_file(path: Path) -> tuple[BenchmarkManifest, str]:
 def paired_bootstrap_interval(
     baseline: list[float], experiment: list[float], *, samples: int = 1_000, seed: int = 0
 ) -> tuple[float, float]:
-    n = min(len(baseline), len(experiment))
+    if len(baseline) != len(experiment):
+        raise ValueError("paired score arrays must have equal lengths")
+    n = len(baseline)
     if n == 0:
         return 0.0, 0.0
     rng = random.Random(seed)
@@ -243,7 +245,9 @@ def paired_bootstrap_interval(
 
 
 def mcnemar_exact(baseline: list[bool], experiment: list[bool]) -> dict[str, float | int]:
-    n = min(len(baseline), len(experiment))
+    if len(baseline) != len(experiment):
+        raise ValueError("paired outcome arrays must have equal lengths")
+    n = len(baseline)
     better = sum(1 for i in range(n) if not baseline[i] and experiment[i])
     worse = sum(1 for i in range(n) if baseline[i] and not experiment[i])
     discordant = better + worse

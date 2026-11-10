@@ -12,21 +12,28 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Iterable
-from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from collections.abc import Iterable, Mapping
+from datetime import date, datetime, time
 from typing import Final, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.nl2sql.contracts import (
+    AnswerArtifact,
     AnswerFact,
     PlanExecutionRecord,
     PlanStepId,
+    QueryPlan,
     SourceDegradation,
     TimeRange,
 )
-from src.nl2sql.orchestration.grounding import GroundedAnswer
+from src.nl2sql.orchestration.execution import PlanStepError, validate_execution_record_against_plan
+from src.nl2sql.orchestration.grounding import (
+    GroundedAnswer,
+    conservative_data_as_of,
+    render_grounded_answer,
+)
+from src.nl2sql.semantic.metric_contract import MetricContract
 
 __all__ = [
     "AnalysisAuthorityProvenance",
@@ -46,13 +53,64 @@ __all__ = [
     "SamplingScope",
     "build_analysis_evidence",
     "project_analysis_model_input",
+    "validate_grounded_answer_checkpoint",
     "validate_analysis_interpretation",
 ]
 
 MAX_ANALYSIS_FACTS = 16
 MAX_ANALYSIS_GOAL_LENGTH = 1_024
 _CHECKSUM_PATTERN = r"^[0-9a-f]{64}$"
-_NUMBER_PATTERN = re.compile(r"(?<![A-Za-z0-9_])[-+]?\d+(?:\.\d+)?(?![A-Za-z0-9_])")
+_NUMBER_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_])[-+]?[0-9]+(?:\.[0-9]+)?(?![A-Za-z0-9_])"
+)
+_DATE_TIME_PATTERN = re.compile(
+    r"(?<![0-9])(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})"
+    r"(?:[Tt ](?P<time>[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?)"
+    r"(?P<zone>Z|[+-][0-9]{2}:[0-9]{2})?)?(?![0-9])"
+)
+_CLOCK_TIME_PATTERN = re.compile(
+    r"(?<![0-9])[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?![0-9])"
+)
+_UNIT_STOP_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "a", "about", "above", "after", "and", "are", "as", "at", "below",
+        "by", "for", "from", "in", "is", "less", "more", "of", "on", "or",
+        "over", "per", "than", "the", "to", "under", "was", "were", "with",
+        "today", "yesterday", "tomorrow", "now", "overall", "total",
+        "approximately", "roughly", "respectively", "higher", "lower",
+        "increased", "decreased", "point", "points", "observed", "value",
+    }
+)
+_PUNCTUATION_UNITS: Final[dict[str, str]] = {
+    "%": "percent",
+    "％": "percent",
+    "¥": "currency_cny",
+}
+_UNIT_ALIASES: Final[dict[str, str]] = {
+    "percentage points": "percentage_points",
+    "percentage point": "percentage_points",
+    "percent": "percent",
+    "percentage": "percent",
+    "%": "percent",
+    "％": "percent",
+    "counts": "count",
+    "count": "count",
+    "orders": "order_count",
+    "order": "order_count",
+    "stores": "store_count",
+    "store": "store_count",
+    "users": "user_count",
+    "user": "user_count",
+    "people": "person_count",
+    "person": "person_count",
+    "cny": "currency_cny",
+    "currency_cny": "currency_cny",
+    "¥": "currency_cny",
+}
+_UNIT_ALIASES_LONGEST: Final[tuple[str, ...]] = tuple(
+    sorted(_UNIT_ALIASES, key=len, reverse=True)
+)
+_UNIT_WORD_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]*|^[\u3400-\u9fff]{1,16}")
 
 AnalysisScalar = str | bool | int | float | None
 
@@ -498,6 +556,43 @@ class _AnalysisGoal(_StrictFrozenModel):
         return normalized
 
 
+def validate_grounded_answer_checkpoint(
+    query_plan: QueryPlan,
+    artifact: AnswerArtifact | dict[str, object],
+    answer_text: str,
+    *,
+    execution_plan: object | None = None,
+    execution_record: PlanExecutionRecord | None = None,
+) -> GroundedAnswer:
+    """Rebind checkpoint answer text to a validated deterministic artifact."""
+
+    validated_artifact = AnswerArtifact.model_validate(artifact)
+    canonical = render_grounded_answer(
+        query_plan=query_plan,
+        facts=validated_artifact.facts,
+    )
+    if answer_text != canonical:
+        raise AnalysisEvidenceError("analysis_grounded_answer_mismatch")
+    if (execution_plan is None) != (execution_record is None):
+        raise AnalysisEvidenceError("analysis_execution_evidence_missing")
+    if execution_plan is not None and execution_record is not None:
+        try:
+            validate_execution_record_against_plan(execution_plan, execution_record)  # type: ignore[arg-type]
+        except PlanStepError as exc:
+            raise AnalysisEvidenceError(exc.code) from exc
+        _validate_checkpoint_fact_bindings(
+            query_plan=query_plan,
+            execution_plan=execution_plan,
+            execution_record=execution_record,
+            facts=validated_artifact.facts,
+        )
+    return GroundedAnswer(
+        answer_text=canonical,
+        facts=validated_artifact.facts,
+        artifact=validated_artifact,
+    )
+
+
 def build_analysis_evidence(
     *,
     grounded: GroundedAnswer,
@@ -507,6 +602,10 @@ def build_analysis_evidence(
     scope_provenance: AnalysisScopeProvenance | None = None,
     manual_origin_evidence: tuple[AnalysisManualOriginEvidence, ...] = (),
     causal_support: tuple[AnalysisCausalSupport, ...] = (),
+    authoritative_units: Mapping[str, str | None] | None = None,
+    query_plan: QueryPlan | None = None,
+    execution_plan: object | None = None,
+    metric_contracts: Mapping[str, MetricContract] | None = None,
 ) -> AnalysisEvidenceBundle:
     """Rebind grounded facts to successful execution receipts and bound them.
 
@@ -523,6 +622,11 @@ def build_analysis_evidence(
         or record.execution_plan_checksum != execution_plan_checksum
     ):
         raise AnalysisEvidenceError("analysis_execution_plan_mismatch")
+    if execution_plan is not None:
+        try:
+            validate_execution_record_against_plan(execution_plan, record)  # type: ignore[arg-type]
+        except PlanStepError as exc:
+            raise AnalysisEvidenceError(exc.code) from exc
     if grounded.artifact.facts != grounded.facts:
         raise AnalysisEvidenceError("analysis_grounded_artifact_mismatch")
     if len(grounded.facts) > MAX_ANALYSIS_FACTS:
@@ -533,6 +637,24 @@ def build_analysis_evidence(
     flags = list(grounded.artifact.degradation_flags)
     for fact in grounded.facts:
         receipt = receipts.get(fact.step_id)
+        authoritative_unit = _lookup_authoritative_unit(
+            authoritative_units, fact.metric_key
+        )
+        unit_authority_mismatch = (
+            authoritative_units is not None
+            and fact.metric_key is not None
+            and (
+                authoritative_unit is None
+                and fact.metric_key not in authoritative_units
+                and fact.metric_key.removeprefix("metric.") not in authoritative_units
+            )
+        ) or (
+            authoritative_units is not None
+            and receipt is not None
+            and receipt.unit != authoritative_unit
+        )
+        # Receipt units are server-side identifiers. A free-text alias must
+        # never become authority merely by surviving a checkpoint round trip.
         if (
             fact.metric_key is None
             or fact.derived_output_id is not None
@@ -543,12 +665,27 @@ def build_analysis_evidence(
             or fact.rowset_sha256 != receipt.rowset_sha256
             or fact.source_id != receipt.source_id
             or fact.semantic_signature != receipt.semantic_signature
+            or fact.unit != receipt.unit
+            or unit_authority_mismatch
+            or (
+                receipt.unit is not None
+                and _canonical_unit(receipt.unit) != receipt.unit
+            )
             or fact.data_as_of != receipt.data_as_of
             or fact.freshness_status != receipt.freshness_status
             or fact.source_kind != receipt.source_kind
             or fact.source_degradation != receipt.source_degradation
             or fact.fact_id != _grounded_fact_id(fact)
             or not _is_scalar(fact.value)
+            or (
+                execution_plan is not None
+                and not _fact_matches_execution_plan(
+                    fact=fact,
+                    execution_plan=execution_plan,
+                    query_plan=query_plan,
+                    metric_contracts=metric_contracts,
+                )
+            )
         ):
             flags.append("analysis_fact_omitted_unproven")
             continue
@@ -559,7 +696,7 @@ def build_analysis_evidence(
                 metric_key=fact.metric_key,
                 status=fact.status,
                 value=cast("AnalysisScalar", fact.value),
-                unit=fact.unit,
+                unit=receipt.unit,
                 time_range=fact.time_range,
                 # Grounding exposes no independent observed_at evidence.
                 observed_at=None,
@@ -580,7 +717,7 @@ def build_analysis_evidence(
     if len({fact.fact_id for fact in facts}) != len(facts):
         raise AnalysisEvidenceError("analysis_evidence_duplicate_fact")
 
-    data_as_of = _conservative_data_as_of(tuple(facts))
+    data_as_of = conservative_data_as_of(fact.data_as_of for fact in facts)
     if data_as_of is None:
         flags.append("analysis_data_as_of_incomplete")
     for fact in facts:
@@ -634,6 +771,78 @@ def build_analysis_evidence(
     )
 
 
+def _fact_matches_execution_plan(
+    *,
+    fact: AnswerFact,
+    execution_plan: object,
+    query_plan: QueryPlan | None,
+    metric_contracts: Mapping[str, MetricContract] | None,
+) -> bool:
+    steps = getattr(execution_plan, "steps", ())
+    step = next((item for item in steps if getattr(item, "step_id", None) == fact.step_id), None)
+    if step is None:
+        return False
+    if fact.metric_key is not None:
+        if getattr(step, "kind", None) == "fetch_metric":
+            keys = tuple(getattr(step, "metric_keys", ()))
+            if fact.metric_key not in keys:
+                return False
+        elif getattr(step, "kind", None) == "trusted_calculation":
+            if fact.metric_key != getattr(step, "output_metric_key", None):
+                return False
+        else:
+            return False
+        if query_plan is not None:
+            if fact.time_range is not None and query_plan.intent != "trend" and fact.time_range != query_plan.time_range:
+                return False
+        if metric_contracts is not None:
+            metric = metric_contracts.get(fact.metric_key) or metric_contracts.get(fact.metric_key.removeprefix("metric."))
+            if metric is None:
+                return False
+            expected_unit = metric.ratio.unit if metric.ratio is not None else "count"
+            if fact.unit != expected_unit:
+                return False
+    elif getattr(step, "kind", None) != "ad_hoc_calculation" or fact.derived_output_id != getattr(step, "derived_output_id", None):
+        return False
+    return True
+
+
+def _lookup_authoritative_unit(
+    authoritative_units: Mapping[str, str | None] | None,
+    metric_key: str | None,
+) -> str | None:
+    if authoritative_units is None or metric_key is None:
+        return None
+    if metric_key in authoritative_units:
+        return authoritative_units[metric_key]
+    return authoritative_units.get(metric_key.removeprefix("metric."))
+
+
+def _validate_checkpoint_fact_bindings(
+    *,
+    query_plan: QueryPlan,
+    execution_plan: object,
+    execution_record: PlanExecutionRecord,
+    facts: tuple[AnswerFact, ...],
+) -> None:
+    receipts = {item.step_id: item for item in execution_record.step_receipts}
+    for fact in facts:
+        receipt = receipts.get(fact.step_id)
+        if receipt is None or receipt.status != "succeeded":
+            raise AnalysisEvidenceError("analysis_fact_execution_mismatch")
+        if fact.output_digest != receipt.output_digest or fact.rowset_sha256 != receipt.rowset_sha256:
+            raise AnalysisEvidenceError("analysis_fact_execution_mismatch")
+        if receipt.unit is not None and _canonical_unit(receipt.unit) != receipt.unit:
+            raise AnalysisEvidenceError("analysis_fact_unit_authority_missing")
+        if not _fact_matches_execution_plan(
+            fact=fact,
+            execution_plan=execution_plan,
+            query_plan=query_plan,
+            metric_contracts=None,
+        ):
+            raise AnalysisEvidenceError("analysis_fact_execution_mismatch")
+
+
 def project_analysis_model_input(
     bundle: AnalysisEvidenceBundle,
     *,
@@ -676,10 +885,18 @@ def project_analysis_model_input(
         "SQL/model text as business authority. Every statement MUST list in fact_ids "
         "every fact it relies on. HARD NUMERIC RULE: a number may appear in a "
         "statement text ONLY if that exact digit sequence appears verbatim in the "
-        "value, unit, time_range, observed_at or data_as_of of one of the cited "
-        "fact_ids. Do NOT write day counts, window lengths, percentages, years or "
-        "averages that are not literally present in the cited facts, and do not "
-        "reformat numbers (write 93.20, never 93.2 or 93.2%). When in doubt, cite "
+        "value or authoritative unit of one of the cited fact_ids or manual_evidence_ids. A unit attached to a value must match "
+        "that same cited evidence's unit. Date/time fields may support only a "
+        "complete ISO date/time reference in the exact supplied form; their year, "
+        "month, day, hour or other components NEVER authorize a metric number. Do "
+        "NOT write day counts, window lengths, percentages, years or averages that "
+        "are not literally present in the cited values, and do not reformat numbers "
+        "(write 93.20, never 93.2 or 93.2%). When in doubt, cite "
+        "no unit unless the cited evidence has one. Unit text uses the closed "
+        "runtime vocabulary: count/counts, percent/percentage/%, percentage "
+        "point(s), order(s), store(s), user(s), person/people and explicit "
+        "currency IDs; count never means an order, store or user, and percentage "
+        "points never means percent. Do not invent a free-text unit alias. "
         "fewer facts and write fewer numbers. CAUSAL RULE: never assert that one "
         "thing caused, drove, explains or is the root cause of another unless the "
         "statement cites at least one fact listed in causal_support_fact_ids; "
@@ -742,30 +959,28 @@ def validate_analysis_interpretation(
                 "analysis_interpretation_unknown_manual_evidence"
             )
         allowed_numbers: set[str] = set()
+        allowed_dates: set[str] = set()
+        numeric_units: dict[str, set[str | None]] = {}
+        manual_numeric_units: dict[str, set[str | None]] = {}
         for fact_id in statement.fact_ids:
             fact = facts[fact_id]
-            traceable = {
-                "value": fact.value,
-                "unit": fact.unit,
-                "time_range": (
-                    fact.time_range.model_dump(mode="json") if fact.time_range else None
-                ),
-                "observed_at": fact.observed_at.isoformat() if fact.observed_at else None,
-                "data_as_of": fact.data_as_of.isoformat() if fact.data_as_of else None,
-            }
-            allowed_numbers.update(_numeric_tokens(_canonical_json(traceable)))
+            value_numbers = _numeric_tokens(_scalar_text(fact.value))
+            allowed_numbers.update(value_numbers)
+            allowed_dates.update(_fact_date_tokens(fact))
+            for token in value_numbers:
+                numeric_units.setdefault(token, set()).add(_canonical_unit(fact.unit))
         for evidence_id in statement.manual_evidence_ids:
             item = manual_evidence[evidence_id]
-            traceable = {
-                "value": item.value,
-                "unit": item.unit,
-                "label": item.label,
-                "asserted_at": (
-                    item.asserted_at.isoformat() if item.asserted_at else None
-                ),
-            }
-            allowed_numbers.update(_numeric_tokens(_canonical_json(traceable)))
+            value_numbers = _numeric_tokens(_scalar_text(item.value))
+            allowed_numbers.update(value_numbers)
+            for token in value_numbers:
+                manual_numeric_units.setdefault(token, set()).add(
+                    _canonical_unit(item.unit)
+                )
         actual = _numeric_tokens(statement.text)
+        actual_dates = _date_tokens(statement.text)
+        if not actual_dates <= allowed_dates:
+            raise AnalysisEvidenceError("analysis_interpretation_date_fact_unproven")
         if not actual <= allowed_numbers:
             import logging as _logging
             _logging.getLogger(__name__).warning(
@@ -775,6 +990,14 @@ def validate_analysis_interpretation(
                 list(statement.fact_ids),
             )
             raise AnalysisEvidenceError("analysis_interpretation_numeric_fact_unproven")
+        for token, unit in _statement_numeric_units(statement.text):
+            if unit is None:
+                continue
+            proven_units = numeric_units.get(token, set()) | manual_numeric_units.get(
+                token, set()
+            )
+            if unit not in proven_units:
+                raise AnalysisEvidenceError("analysis_interpretation_numeric_unit_unproven")
         if _causal_markers(statement.text):
             if not statement.fact_ids:
                 raise AnalysisEvidenceError(
@@ -801,6 +1024,12 @@ def _grounded_fact_id(fact: AnswerFact) -> str:
         "status": fact.status,
         "value": fact.value,
     }
+    if fact.fact_id_version in (None, 1):
+        # Historical facts omitted both unit and version from their identity.
+        pass
+    elif fact.fact_id_version == 2:
+        payload["unit"] = fact.unit
+        payload["fact_id_version"] = 2
     if fact.time_range is not None:
         payload["time_range"] = fact.time_range.model_dump(mode="json")
     return _checksum(payload)
@@ -828,28 +1057,143 @@ def _manual_evidence_id(
     )
 
 
-def _conservative_data_as_of(
-    facts: tuple[AnalysisEvidenceFact, ...],
-) -> datetime | None:
-    values = tuple(fact.data_as_of for fact in facts)
-    if any(value is None or value.tzinfo is None for value in values):
-        return None
-    return min(value.astimezone(UTC) for value in values if value is not None)
-
-
 def _unique_present(values: Iterable[str | None]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(value for value in values if isinstance(value, str)))
 
 
 def _numeric_tokens(text: str) -> set[str]:
+    masked = _mask_date_time(text)
+    return {match.group(0) for match in _NUMBER_PATTERN.finditer(masked)}
+
+
+def _scalar_text(value: AnalysisScalar) -> str:
+    """Serialize only the scalar value; labels and provenance are not authority."""
+
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _fact_date_tokens(fact: AnalysisEvidenceFact) -> set[str]:
+    values: list[str] = list(_date_tokens(_scalar_text(fact.value)))
+    if fact.time_range is not None:
+        values.extend(
+            (fact.time_range.start.isoformat(), fact.time_range.end.isoformat())
+        )
+    for value in (fact.observed_at, fact.data_as_of):
+        if value is not None:
+            values.append(value.isoformat())
+    return set(values)
+
+
+def _date_tokens(text: str) -> set[str]:
     tokens: set[str] = set()
-    for match in _NUMBER_PATTERN.finditer(text):
-        try:
-            number = Decimal(match.group(0))
-        except InvalidOperation:  # pragma: no cover - regex only admits decimals
-            continue
-        tokens.add(format(number.normalize(), "f"))
+    covered: list[tuple[int, int]] = []
+    for match in _DATE_TIME_PATTERN.finditer(text):
+        token = match.group(0)
+        if _is_complete_date_or_time(token):
+            tokens.add(token)
+        covered.append(match.span())
+    for pattern in (_DATE_TIME_PATTERN, _CLOCK_TIME_PATTERN):
+        for match in pattern.finditer(text):
+            if any(start <= match.start() < end for start, end in covered):
+                continue
+            token = match.group(0)
+            if _is_complete_date_or_time(token):
+                tokens.add(token)
     return tokens
+
+
+def _is_complete_date_or_time(value: str) -> bool:
+    if _DATE_TIME_PATTERN.fullmatch(value):
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                return False
+            return True
+        return True
+    if _CLOCK_TIME_PATTERN.fullmatch(value):
+        try:
+            time.fromisoformat(value)
+        except ValueError:
+            return False
+        return True
+    return False
+
+
+def _mask_date_time(text: str) -> str:
+    chars = list(text)
+    spans = [match.span() for match in _DATE_TIME_PATTERN.finditer(text)]
+    spans.extend(match.span() for match in _CLOCK_TIME_PATTERN.finditer(text))
+    for start, end in spans:
+        chars[start:end] = " " * (end - start)
+    return "".join(chars)
+
+
+def _canonical_unit(unit: str | None) -> str | None:
+    if unit is None:
+        return None
+    normalized = " ".join(unit.strip().lower().split())
+    return _PUNCTUATION_UNITS.get(
+        normalized, _UNIT_ALIASES.get(normalized, normalized)
+    )
+
+
+def _match_unit_text(text: str, *, from_end: bool = False) -> str | None:
+    normalized = text.lower().strip(" \t,:=()[]{}\"'")
+    aliases = _UNIT_ALIASES_LONGEST
+    if from_end:
+        for alias in aliases:
+            if not normalized.endswith(alias):
+                continue
+            start = len(normalized) - len(alias)
+            if start == 0 or not normalized[start - 1].isalnum():
+                return _canonical_unit(alias)
+    else:
+        for alias in aliases:
+            if not normalized.startswith(alias):
+                continue
+            end = len(alias)
+            if end == len(normalized) or not normalized[end].isalnum():
+                return _canonical_unit(alias)
+    match = (
+        re.search(
+            r"(?:[A-Za-z][A-Za-z0-9_.:-]*|[\u3400-\u9fff]{1,16})$",
+            normalized,
+        )
+        if from_end
+        else _UNIT_WORD_PATTERN.search(normalized)
+    )
+    if match is None:
+        return None
+    raw = match.group(0)
+    if raw in _UNIT_STOP_WORDS:
+        return None
+    return _canonical_unit(raw)
+
+
+def _statement_numeric_units(text: str) -> tuple[tuple[str, str | None], ...]:
+    masked = _mask_date_time(text)
+    result: list[tuple[str, str | None]] = []
+    for match in _NUMBER_PATTERN.finditer(masked):
+        token = match.group(0)
+        suffix = masked[match.end() : match.end() + 64].lstrip(" \t,:=([{\"")
+        unit: str | None = None
+        if suffix:
+            unit = _match_unit_text(suffix)
+        if unit is None and match.start() > 0:
+            prefix_text = masked[max(0, match.start() - 64) : match.start()].rstrip(
+                " \t,:=([{"
+            )
+            if prefix_text:
+                unit = _match_unit_text(prefix_text, from_end=True)
+        result.append((token, unit))
+    return tuple(result)
 
 
 def _causal_markers(text: str) -> tuple[str, ...]:

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import re
 from dataclasses import dataclass, field, replace
@@ -13,6 +11,7 @@ from typing import Any, Literal, Mapping, Sequence
 
 from src.nl2sql.contracts import ExecutionReceipt, RouteBudget
 from src.nl2sql.infra.governance.query_gateway import PolicyEngine, QueryPolicyError
+from src.nl2sql.orchestration.evidence_digest import canonical_rowset_digest
 
 Route = Literal["fast", "standard", "deep"]
 
@@ -119,17 +118,19 @@ class CandidateDecision:
 
 
 def rowset_sha256(rowset: Sequence[dict[str, Any]]) -> str:
-    """Hash a canonical, typed rowset rather than a natural-language rendering."""
-    if any(not isinstance(row, dict) or any(not isinstance(key, str) for key in row) for row in rowset):
+    """Hash typed columns and rows in the exact returned order."""
+    if any(
+        not isinstance(row, dict)
+        or any(not isinstance(key, str) for key in row)
+        for row in rowset
+    ):
         raise ValueError("rowset must contain string-keyed rows")
     if rowset and any(set(row) != set(rowset[0]) for row in rowset):
         raise ValueError("rowset columns must be consistent")
-    normalized = sorted(
-        (_normalize_value(row) for row in rowset),
-        key=lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-    )
-    payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    try:
+        return canonical_rowset_digest(rowset)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rowset contains non-canonical evidence") from exc
 
 
 def candidate_capacity(*, count: int, route: Route, budget: RouteBudget,

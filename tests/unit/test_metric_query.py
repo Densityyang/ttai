@@ -119,6 +119,7 @@ def test_duplicate_catalog_and_deployment_definitions_fail() -> None:
 async def test_eligibility_half_open_leap_day_and_month(timestamptz: bool) -> None:
     authority = MetricAuthority(timestamptz=timestamptz)
     query = await authority.compiler().compile(authority.plan(), authority.context)
+    assert query.unit == "count"
     assert '"is_valid_for_metrics" IS TRUE' in query.sql
     assert '"has_valid_bandwidth" IS TRUE' in query.sql
     assert '"completion_time" IS NULL' in query.sql
@@ -233,6 +234,7 @@ async def test_trusted_count_column_compiles_count_id_not_count_star() -> None:
     ratio_query = await ratio_authority.compiler(
         bindings=(ratio_binding,)
     ).compile(ratio_authority.plan(), ratio_authority.context)
+    assert ratio_query.unit == "percent"
     assert 'COUNT("id") FILTER' in ratio_query.sql or "COUNT(*)" not in ratio_query.sql
 
 
@@ -437,9 +439,11 @@ def test_canonical_rows_order_duplicates_null_precision_and_timestamps() -> None
     instant = datetime(2024, 3, 1, tzinfo=UTC)
     shanghai = instant.astimezone(timezone(timedelta(hours=8)))
     a = {"n": Decimal("123456789012345678901234567890.1200"), "t": instant, "x": None}
-    b = {"x": None, "t": shanghai, "n": Decimal("123456789012345678901234567890.12")}
-    c = {"x": "x", "t": shanghai, "n": Decimal("0")}
-    assert rowset_sha256([a, c, a]) == rowset_sha256([b, b, c])
+    b = {"n": Decimal("123456789012345678901234567890.12"), "t": shanghai, "x": None}
+    c = {"n": Decimal("0"), "t": shanghai, "x": "x"}
+    # Row order and returned column order are evidence: equivalent values in a
+    # different order must not collapse to the same receipt digest.
+    assert rowset_sha256([a, c, a]) != rowset_sha256([b, b, c])
     assert rowset_sha256([a, a]) != rowset_sha256([a])
     assert rowset_sha256([{"v": 0}]) != rowset_sha256([])
     assert rowset_sha256([{"v": None}]) != rowset_sha256([{"v": "null"}])
@@ -847,6 +851,29 @@ async def test_recompilation_detects_an_authorization_change() -> None:
         await runner.execute(prepared, timeout_ms=1000)
     gateway.execute.assert_not_called()
 
+
+@pytest.mark.asyncio
+async def test_recompilation_detects_a_prepared_unit_mutation() -> None:
+    authority = MetricAuthority()
+    compiler = authority.compiler()
+    gateway = QueryGateway(async_sessionmaker(), schema="ai_views")
+    runner = GatewayMetricStepRunner(compiler, gateway)
+    plan = authority.plan()
+    prepared = await runner.prepare(
+        step=FetchMetricStep(step_id="fetch", metric_keys=plan.metric_keys),
+        query_plan=plan,
+        context=authority.context,
+    )
+    query = prepared.payload
+    assert isinstance(query, CompiledMetricQuery)
+    assert query.unit == "count"
+    tampered = replace(query, unit="percent")
+    prepared = replace(prepared, payload=tampered)
+    gateway.execute = AsyncMock()
+    with pytest.raises(PlanStepError, match="prepared_query_changed"):
+        await runner.execute(prepared, timeout_ms=1000)
+    gateway.execute.assert_not_called()
+
 @pytest.mark.asyncio
 async def test_no_authorization_city_company_dimension_still_compiles() -> None:
     # B. NO authorization + a city_company dimension compiles exactly as before,
@@ -971,6 +998,8 @@ async def test_authorized_receipt_is_stamped_from_the_allow_decision() -> None:
         authority.compiler(authorization=_auth("area", ("area-1",)))
     )
     assert authorized_query.authorization_revision == "rev-1"
+    assert authorized_query.unit == "count"
+    assert authorized_receipt.unit == "count"
     assert authorized_receipt.authorization_revision == "rev-1"
     assert "rev-1" in authorized_receipt.model_dump_json()
 

@@ -26,7 +26,6 @@ from langgraph.types import interrupt
 
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import (
-    AnswerArtifact,
     AuthorizationContext,
     ContextBundle,
     ExecutionPlan,
@@ -62,6 +61,7 @@ from src.nl2sql.orchestration.analysis_evidence import (
     build_analysis_evidence,
     project_analysis_model_input,
     validate_analysis_interpretation,
+    validate_grounded_answer_checkpoint,
 )
 from src.nl2sql.orchestration.budget import (
     BudgetExceeded,
@@ -90,12 +90,17 @@ from src.nl2sql.orchestration.deterministic_query_plan import (
     normalize_frozen_real_question,
 )
 from src.nl2sql.orchestration.execution import PlanExecutor
-from src.nl2sql.orchestration.grounding import GroundedAnswer, ground_execution_answer
+from src.nl2sql.orchestration.grounding import (
+    GroundingIntegrityError,
+    conservative_data_as_of,
+    ground_execution_answer,
+)
 from src.nl2sql.orchestration.mode_contract import (
     ModeCapabilityOutcome,
     RunEnvelope,
     capabilities_for_mode,
 )
+from src.nl2sql.orchestration.p4q_acceptance import capture_grounded_answer
 from src.nl2sql.orchestration.planning import (
     ContextResolver,
     DeterministicQueryUnsupported,
@@ -1382,6 +1387,7 @@ def create_v2_engine(
             expected_policy_version=resolved_plan_validator.policy_version,
             expected_policy_checksum=resolved_plan_validator.policy_checksum,
             budget=route_budget,
+            trace_id=_trace_id(state),
             deadline_ms=_remaining_route_deadline_ms(
                 state,
                 route=route,
@@ -1414,33 +1420,65 @@ def create_v2_engine(
         if record.status == "succeeded":
             # The raw outputs remain request-local.  Only the bounded grounded
             # artifact and its deterministic text may cross the checkpoint.
-            grounded = ground_execution_answer(
+            try:
+                grounded = ground_execution_answer(
+                    query_plan=query_plan,
+                    execution_plan=execution_plan,
+                    record=record,
+                    outputs=outputs,
+                )
+            except GroundingIntegrityError as exc:
+                stop_reason = route_budget.halt(exc.code)
+                return {
+                    "messages": [
+                        AIMessage(
+                            content="Typed execution evidence failed integrity validation."
+                        )
+                    ],
+                    "execution_record": record.model_dump(mode="json"),
+                    "budget_record": route_budget.checkpoint_record().model_dump(
+                        mode="json"
+                    ),
+                    "stop_reason": stop_reason,
+                    "degradation_flags": _degradation_flags(
+                        state, "GroundingEvidenceInvalid"
+                    ),
+                    "response_blocks": [],
+                }
+            # The P4-Q capture is produced from the same canonical renderer and
+            # the same request-local execution record that produced the
+            # response.  It is audit/trace evidence only; the public response
+            # shape remains unchanged.
+            trusted_capture = capture_grounded_answer(
+                grounded,
                 query_plan=query_plan,
                 execution_plan=execution_plan,
-                record=record,
-                outputs=outputs,
+                execution_record=record,
             )
             response_blocks: list[dict[str, object]] = [
                 TextBlock(text=grounded.answer_text).model_dump(mode="json")
             ]
             if grounded.facts:
+                grounded_data_as_of = conservative_data_as_of(
+                    fact.data_as_of for fact in grounded.facts
+                )
                 receipt_by_step = {
                     receipt.step_id: receipt for receipt in record.step_receipts
                 }
+                grounded_step_ids = tuple(dict.fromkeys(fact.step_id for fact in grounded.facts))
                 source_ids = tuple(
                     dict.fromkeys(
-                        receipt.source_id
-                        for receipt in receipt_by_step.values()
-                        if receipt.source_id is not None
+                        fact.source_id
+                        for fact in grounded.facts
+                        if fact.source_id is not None
                     )
                 )
-                source_checkpoints = tuple(
-                    dict.fromkeys(
-                        receipt.source_checkpoint
-                        for receipt in receipt_by_step.values()
-                        if receipt.source_checkpoint is not None
-                    )
-                )
+                source_checkpoint_values: list[str] = []
+                for step_id in grounded_step_ids:
+                    receipt = receipt_by_step.get(step_id)
+                    if receipt is not None and receipt.source_checkpoint is not None:
+                        source_checkpoint_values.append(receipt.source_checkpoint)
+                source_checkpoints = tuple(dict.fromkeys(source_checkpoint_values))
                 # A noncanonical run-scoped derivation is identified by an
                 # AD_HOC fact: no canonical metric key and a derived output id.
                 # Its provenance MUST name the noncanonical scope and the
@@ -1482,23 +1520,13 @@ def create_v2_engine(
                             end=query_plan.time_range.end.isoformat(),
                             timezone=query_plan.time_range.timezone,
                         ),
-                        data_as_of=next(
-                            (
-                                fact.data_as_of
-                                for fact in grounded.facts
-                                if fact.data_as_of is not None
-                            ),
-                            None,
-                        ),
-                        data_as_of_date=next(
-                            (
-                                fact.data_as_of.astimezone(
-                                    ZoneInfo("Asia/Shanghai")
-                                ).date()
-                                for fact in grounded.facts
-                                if fact.data_as_of is not None
-                            ),
-                            None,
+                        data_as_of=grounded_data_as_of,
+                        data_as_of_date=(
+                            grounded_data_as_of.astimezone(
+                                ZoneInfo("Asia/Shanghai")
+                            ).date()
+                            if grounded_data_as_of is not None
+                            else None
                         ),
                         source_ids=source_ids,
                         source_checkpoints=source_checkpoints,
@@ -1524,6 +1552,11 @@ def create_v2_engine(
                 "answer",
                 "typed_execution_completed",
                 answer_hash=fingerprint(grounded.answer_text),
+                capture_answer_sha256=trusted_capture.answer_sha256,
+                capture_facts_sha256=trusted_capture.facts_sha256,
+                capture_query_plan_sha256=trusted_capture.query_plan_sha256,
+                capture_execution_plan_sha256=trusted_capture.execution_plan_sha256,
+                capture_execution_record_sha256=trusted_capture.execution_record_sha256,
                 execution_plan_checksum=record.execution_plan_checksum,
                 route=route,
                 model_calls=route_budget.model_calls,
@@ -1570,20 +1603,23 @@ def create_v2_engine(
             answer_text = state.get("grounded_answer_text")
             if not isinstance(artifact_raw, dict) or not isinstance(answer_text, str):
                 raise AnalysisEvidenceError("analysis_grounded_answer_missing")
-            artifact = AnswerArtifact.model_validate(artifact_raw)
-            grounded = GroundedAnswer(
-                answer_text=answer_text,
-                facts=artifact.facts,
-                artifact=artifact,
-            )
-            record = PlanExecutionRecord.model_validate(state.get("execution_record"))
             query_plan = _query_plan(state)
+            record = PlanExecutionRecord.model_validate(state.get("execution_record"))
             execution_plan = _execution_plan(state)
+            grounded = validate_grounded_answer_checkpoint(
+                query_plan,
+                artifact_raw,
+                answer_text,
+                execution_plan=execution_plan,
+                execution_record=record,
+            )
             evidence = build_analysis_evidence(
                 grounded=grounded,
                 record=record,
                 execution_plan_checksum=execution_plan.checksum,
                 analysis_window=query_plan.time_range,
+                query_plan=query_plan,
+                execution_plan=execution_plan,
             )
             projection = project_analysis_model_input(
                 evidence,

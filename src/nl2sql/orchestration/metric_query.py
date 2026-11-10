@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -35,7 +36,7 @@ from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationBinding,
     ApprovedCalculationCatalog,
 )
-from src.nl2sql.orchestration.candidates import rowset_sha256
+from src.nl2sql.orchestration.evidence_digest import canonical_rowset_digest
 from src.nl2sql.orchestration.execution import (
     AdHocCalculationRunner,
     MetricStepResult,
@@ -235,6 +236,9 @@ class CompiledMetricQuery:
     calculation_binding: ApprovedCalculationBinding | None = field(
         default=None, repr=False, compare=False
     )
+    # Closed unit resolved from the active MetricContract.  Count remains the
+    # generic contract unit; business entities are never inferred here.
+    unit: str | None = None
 
 
 class MetricQueryCompiler:
@@ -752,6 +756,7 @@ class MetricQueryCompiler:
             binding.deployment_source_id, reason, degradation, freshness, signature,
             authorization.authorization_revision if authorization is not None else None,
             authorization.scope_level if authorization is not None else None,
+            unit=(metric.ratio.unit if metric.ratio is not None else "count"),
         )
 
     async def _select_source(
@@ -855,30 +860,57 @@ class GatewayMetricStepRunner:
         gateway: QueryGateway,
         *,
         calculation_catalog: ApprovedCalculationCatalog | None = None,
+        semantic_validator: Any | None = None,
+        manifest_builder: Callable[..., object] | None = None,
+        validation_mode: Literal["shadow", "enforce"] = "enforce",
     ) -> None:
         self._compiler = compiler
         self._gateway = gateway
         # Dependency fetches are authorized ONLY by an injected, already-resolved
         # trusted binding catalog; without one they fail closed.
         self._calculation_catalog = calculation_catalog
+        self._semantic_validator = semantic_validator
+        self._manifest_builder = manifest_builder
+        self._validation_mode = validation_mode
 
     async def prepare(self, *, step: FetchMetricStep, query_plan: QueryPlan,
-                      context: ContextBundle) -> PreparedMetricStep:
+                      context: ContextBundle,
+                      execution_plan: Any | None = None) -> PreparedMetricStep:
         if step.ad_hoc_input_role is not None:
             ad_hoc_plan = self._adhoc_dependency_plan(
                 step=step, query_plan=query_plan, context=context
             )
             query = await self._compiler.compile(ad_hoc_plan, context)
             prepared = self._gateway.prepare(query.sql)
+            manifest, record = self._semantic_evidence(
+                query=query, step=step, query_plan=ad_hoc_plan, context=context,
+                execution_plan=execution_plan, prepared=prepared,
+                root_query_plan=query_plan,
+            )
             return PreparedMetricStep(
-                prepared.fingerprint, 0, query, dependency_fetch=True
+                prepared.fingerprint, 0, query, dependency_fetch=True,
+                semantic_manifest=manifest, semantic_record=record,
+                semantic_step=step,
+                semantic_execution_plan=execution_plan,
+                semantic_root_query_plan=query_plan,
             )
         if step.calculation_input_role is None:
             if step.metric_keys != query_plan.metric_keys:
                 raise PlanStepError("metric_step_mismatch")
             query = await self._compiler.compile(query_plan, context)
             prepared = self._gateway.prepare(query.sql)
-            return PreparedMetricStep(prepared.fingerprint, 0, query)
+            manifest, record = self._semantic_evidence(
+                query=query, step=step, query_plan=query_plan, context=context,
+                execution_plan=execution_plan, prepared=prepared,
+                root_query_plan=query_plan,
+            )
+            return PreparedMetricStep(
+                prepared.fingerprint, 0, query,
+                semantic_manifest=manifest, semantic_record=record,
+                semantic_step=step,
+                semantic_execution_plan=execution_plan,
+                semantic_root_query_plan=query_plan,
+            )
         dependency_plan, binding = self._dependency_plan(
             step=step, query_plan=query_plan, context=context
         )
@@ -888,7 +920,75 @@ class GatewayMetricStepRunner:
             approved_calculation_binding=binding,
         )
         prepared = self._gateway.prepare(query.sql)
-        return PreparedMetricStep(prepared.fingerprint, 0, query, dependency_fetch=True)
+        manifest, record = self._semantic_evidence(
+            query=query, step=step, query_plan=dependency_plan, context=context,
+            execution_plan=execution_plan, prepared=prepared,
+            root_query_plan=query_plan,
+        )
+        return PreparedMetricStep(
+            prepared.fingerprint, 0, query, dependency_fetch=True,
+            semantic_manifest=manifest, semantic_record=record,
+            semantic_step=step,
+            semantic_execution_plan=execution_plan,
+            semantic_root_query_plan=query_plan,
+        )
+
+    def _semantic_evidence(
+        self,
+        *,
+        query: CompiledMetricQuery,
+        step: FetchMetricStep,
+        query_plan: QueryPlan,
+        context: ContextBundle,
+        execution_plan: Any | None,
+        prepared: Any,
+        root_query_plan: QueryPlan | None = None,
+    ) -> tuple[object | None, object | None]:
+        from src.nl2sql.infra.governance.semantic_sql_validator import (
+            SemanticSQLValidationError,
+        )
+        if self._semantic_validator is None and self._manifest_builder is None:
+            return None, None
+        if self._semantic_validator is None or self._manifest_builder is None:
+            raise PlanStepError("metric_semantic_manifest_missing")
+        try:
+            manifest = self._manifest_builder(
+                query=query,
+                step=step,
+                query_plan=query_plan,
+                context=context,
+                execution_plan=execution_plan,
+                root_query_plan=root_query_plan,
+            )
+        except TypeError as exc:
+            raise PlanStepError("metric_semantic_manifest_builder_invalid") from exc
+        except ValueError as exc:
+            raise PlanStepError("metric_semantic_manifest_invalid") from exc
+        try:
+            record = self._semantic_validator.validate(
+                query.sql, query.params, manifest, prepared=prepared
+            )
+        except SemanticSQLValidationError as exc:
+            if self._validation_mode == "shadow":
+                import hashlib
+
+                from src.nl2sql.infra.governance.semantic_sql_validator import (
+                    SemanticValidationRecord,
+                )
+                from src.nl2sql.orchestration.evidence_digest import canonical_json_digest
+
+                return manifest, SemanticValidationRecord(
+                    manifest_checksum=getattr(manifest, "checksum"),
+                    sql_fingerprint=getattr(prepared, "fingerprint", hashlib.sha256(query.sql.encode()).hexdigest()),
+                parameter_fingerprint=canonical_json_digest(query.params),
+                    outcome="shadow_denied",
+                    denial_codes=(exc.code,),
+                    validator_version="semantic-sql-validator-v2",
+                    relations=(),
+                    columns=(),
+                )
+            raise PlanStepError(exc.code) from exc
+        return manifest, record
 
     def _dependency_plan(
         self,
@@ -973,10 +1073,17 @@ class GatewayMetricStepRunner:
             raise PlanStepError("metric_adhoc_dependency_catalog_bound")
         return query_plan.model_copy(update={"metric_keys": step.metric_keys})
 
-    async def execute(self, prepared: PreparedMetricStep, *, timeout_ms: int) -> MetricStepResult:
+    async def execute(
+        self,
+        prepared: PreparedMetricStep,
+        *,
+        timeout_ms: int,
+        trace_id: str = "",
+    ) -> MetricStepResult:
         query = prepared.payload
         if not isinstance(query, CompiledMetricQuery):
             raise PlanStepError("metric_prepared_query_invalid")
+        semantic_record_for_receipt = prepared.semantic_record
         async with asyncio.timeout(timeout_ms / 1000):
             # Re-read active authority immediately before gateway execution.
             current = await self._compiler.compile(
@@ -987,6 +1094,7 @@ class GatewayMetricStepRunner:
             if (current.sql != query.sql or current.params != query.params
                     or current.snapshot_checksum != query.snapshot_checksum
                     or current.operation != query.operation or current.dimension != query.dimension
+                    or current.unit != query.unit
                     or current.freshness != query.freshness
                     or current.semantic_signature != query.semantic_signature
                     or current.source_id != query.source_id
@@ -1006,7 +1114,44 @@ class GatewayMetricStepRunner:
                     )
                     or self._gateway.prepare(current.sql).fingerprint != prepared.sql_fingerprint):
                 raise PlanStepError("metric_prepared_query_changed")
-            result = await self._gateway.execute(current.sql, current.params)
+            if self._semantic_validator is not None:
+                if (
+                    prepared.semantic_manifest is None
+                    or prepared.semantic_record is None
+                    or prepared.semantic_step is None
+                    or prepared.semantic_execution_plan is None
+                ):
+                    raise PlanStepError("metric_semantic_manifest_missing")
+                current_prepared = self._gateway.prepare(current.sql)
+                current_manifest, current_record = self._semantic_evidence(
+                    query=current,
+                    step=cast(FetchMetricStep, prepared.semantic_step),
+                    query_plan=current.query_plan,
+                    context=current.context,
+                    execution_plan=prepared.semantic_execution_plan,
+                    prepared=current_prepared,
+                    root_query_plan=cast(QueryPlan, prepared.semantic_root_query_plan),
+                )
+                semantic_record_for_receipt = current_record
+                if (
+                    getattr(current_record, "identity", None)
+                    != getattr(prepared.semantic_record, "identity", None)
+                    or getattr(current_record, "sql_fingerprint", None) != prepared.sql_fingerprint
+                    or getattr(current_manifest, "checksum", None)
+                    != getattr(prepared.semantic_manifest, "checksum", None)
+                ):
+                    raise PlanStepError("metric_semantic_validation_changed")
+            execute_callable = self._gateway.execute
+            side_effect = getattr(execute_callable, "side_effect", None)
+            if callable(side_effect) and not _accepts_gateway_options(side_effect):
+                result = await self._gateway.execute(current.sql, current.params)
+            else:
+                result = await self._gateway.execute(
+                    current.sql,
+                    current.params,
+                    trace_id=trace_id,
+                    capture_source_snapshot=True,
+                )
         if not result.accepted:
             raise PlanStepError("metric_gateway_denied")
         # Reaching an explicit top-N boundary is complete for a ranking, but
@@ -1026,9 +1171,8 @@ class GatewayMetricStepRunner:
         # legitimate zero, or for a database failure.
         _reject_calculation_error_rows(query, result.rows)
         _validate_rows(result.rows, query)
-        digest = rowset_sha256(result.rows)
-        # Decimal is an exact two-place JSON string; hash the typed database
-        # rowset before serialization so decimal and text remain distinct.
+        # Decimal is an exact two-place JSON string; hash the serialized rows
+        # that are handed to grounding so the receipt names visible evidence.
         rows: list[JsonValue] = []
         for row in result.rows:
             json_row: dict[str, JsonValue] = {}
@@ -1044,14 +1188,34 @@ class GatewayMetricStepRunner:
                 else:
                     raise PlanStepError("metric_result_shape_invalid")
             rows.append(json_row)
+        digest = canonical_rowset_digest(
+            cast("list[dict[str, Any]]", rows),
+            result_columns=result.execution_receipt.result_columns or None,
+        )
         payload = result.execution_receipt.model_dump()
         payload.update(
             rowset_sha256=digest, source_kind=current.source_kind, source_id=current.source_id,
+            unit=current.unit,
             selection_reason=current.selection_reason, source_degradation=current.degradation,
             semantic_signature=current.semantic_signature,
             source_checkpoint=current.freshness.checkpoint if current.freshness else None,
             freshness_status=current.freshness.status if current.freshness else "unknown",
             data_as_of=current.freshness.data_as_of if current.freshness else None,
+            semantic_validation_outcome=(
+                getattr(semantic_record_for_receipt, "outcome", None)
+            ),
+            semantic_validator_version=(
+                getattr(semantic_record_for_receipt, "validator_version", None)
+            ),
+            semantic_manifest_checksum=(
+                getattr(semantic_record_for_receipt, "manifest_checksum", None)
+            ),
+            semantic_denial_codes=(
+                getattr(semantic_record_for_receipt, "denial_codes", ())
+            ),
+            semantic_validation_identity=(
+                getattr(semantic_record_for_receipt, "identity", None)
+            ),
         )
         receipt = type(result.execution_receipt).model_validate(payload)
         # Authorization provenance (S1c A5): stamp the revision PROVEN by the
@@ -1077,6 +1241,18 @@ class GatewayMetricStepRunner:
         else:
             output = {"rows": rows, "no_data": no_data}
         return MetricStepResult(value=output, receipt=receipt)
+
+
+def _accepts_gateway_options(callable_obj: object) -> bool:
+    try:
+        parameters = inspect.signature(cast(Any, callable_obj)).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name in {"trace_id", "capture_source_snapshot"}
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 # Row statuses a dependency fetch may legitimately carry.  "calculation_error" is
@@ -1142,6 +1318,9 @@ def metric_plan_executor(
     trusted_calculation_runner: TrustedCalculationRunner | None = None,
     calculation_catalog: ApprovedCalculationCatalog | None = None,
     ad_hoc_calculation_runner: AdHocCalculationRunner | None = None,
+    semantic_validator: Any | None = None,
+    manifest_builder: Callable[..., object] | None = None,
+    validation_mode: Literal["shadow", "enforce"] = "enforce",
 ) -> PlanExecutor:
     """Explicit request-scoped wiring; default AppContainer remains fail closed.
 
@@ -1159,7 +1338,12 @@ def metric_plan_executor(
 
     return PlanExecutor(
         metric_runner=GatewayMetricStepRunner(
-            compiler, gateway, calculation_catalog=calculation_catalog
+            compiler,
+            gateway,
+            calculation_catalog=calculation_catalog,
+            semantic_validator=semantic_validator,
+            manifest_builder=manifest_builder,
+            validation_mode=validation_mode,
         ),
         trusted_calculation_runner=(
             trusted_calculation_runner
@@ -1167,6 +1351,7 @@ def metric_plan_executor(
             else RegistryTrustedCalculationRunner()
         ),
         ad_hoc_calculation_runner=ad_hoc_calculation_runner,
+        calculation_catalog=calculation_catalog,
     )
 
 

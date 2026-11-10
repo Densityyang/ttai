@@ -382,7 +382,7 @@ async def test_non_strict_missing_providers_execute_with_exact_degradations() ->
 
     # The audit record is the authoritative landing point for the same codes.
     records = await rig.service.run_records.list_for_version(
-        definition_id=definition_id, version=1
+        owner_user_id="alice", definition_id=definition_id, version=1
     )
     assert len(records) == 1
     assert set(records[0].degradations) == set(_UNCONFIGURED_CHECKS)
