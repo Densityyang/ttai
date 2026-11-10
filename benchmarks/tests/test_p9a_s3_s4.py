@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -58,9 +59,20 @@ from benchmarks.typed_receipts import (
     BudgetGate,
     TypedAnswerReceipt,
 )
+from src.core.settings import get_settings
 
 _SHA = "a" * 64
 _DEMO_DATASET = "p9a_typed"
+
+
+@pytest.fixture(autouse=True)
+def _checkpoint_seal_key(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    with monkeypatch.context() as env:
+        env.setenv("AUTH_ENABLED", "false")
+        env.setenv("CHECKPOINT_EVIDENCE_SEAL_KEY", "benchmark-fixture-seal-key-" * 2)
+        get_settings.cache_clear()
+        yield
+    get_settings.cache_clear()
 
 
 def _manifest(**overrides: object) -> BenchmarkManifest:

@@ -262,6 +262,8 @@ def build_demo_runtime(
         plan_executor=PlanExecutor(
             metric_runner=runner,
             ad_hoc_calculation_runner=ad_hoc_calculation_runner,
+            # Demo fixtures have no published metric unit authority.
+            allow_legacy_unitless_grounding=True,
         ),
         identity=identity,
         authorization=authorization,
