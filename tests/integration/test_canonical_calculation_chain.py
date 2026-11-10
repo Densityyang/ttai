@@ -569,6 +569,9 @@ class _ChainAuthority:
             template_id="ratio",
             template_version=metadata.version,
             template_checksum=metadata.checksum,
+            # The execution receipt must carry the server-resolved metric unit;
+            # checkpoint or template text cannot supply this authority.
+            unit="percent",
             inputs=(
                 ApprovedCalculationInput(
                     role="numerator",

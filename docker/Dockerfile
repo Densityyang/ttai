@@ -47,6 +47,7 @@ RUN apt-get update \
         gzip \
         libpcre2-8-0 \
         libsqlite3-0 \
+        zlib1g \
     && python -m pip install --no-cache-dir --upgrade "setuptools>=78.1.1" \
     && python -m pip uninstall --yes pip \
     && rm -rf /var/lib/apt/lists/* \
