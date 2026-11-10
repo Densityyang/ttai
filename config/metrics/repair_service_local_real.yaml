@@ -13,7 +13,8 @@ schema_version: 1
 # canonical source remains the sole semantic authority.
 metrics:
   # Numerator: 归档及时工单数, business time report_time,
-  # filters is_archive_on_time = true AND completion_receipt_time IS NOT NULL.
+  # numerator-only condition is is_archive_on_time = true; denominator
+  # population conditions are inherited from the ratio's denominator set.
   - metric_key: repair_service_archive_on_time_count_overall_day
     display_name: 报修服务归档及时工单数（全局-日）
     release_status: pending_source
@@ -69,7 +70,6 @@ metrics:
         - {field: completion_receipt_time, operator: is_not_null}
       numerator_predicates:
         - {field: is_archive_on_time, operator: is_true}
-        - {field: completion_receipt_time, operator: is_not_null}
       unit: percent
       value_scale: "0_100"
       decimal_places: 2

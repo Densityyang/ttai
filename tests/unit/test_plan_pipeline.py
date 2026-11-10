@@ -28,6 +28,7 @@ from src.nl2sql.contracts import (
     RequestContext,
     RequestIdentity,
     RouteName,
+    RoutePolicy,
     TimeRange,
     TrustedCalculationStep,
     VerifyStep,
@@ -46,6 +47,7 @@ from src.nl2sql.orchestration.evidence_digest import (
 )
 from src.nl2sql.orchestration.execution import (
     MetricStepResult,
+    PlanExecutionResult,
     PlanExecutor,
     PreparedMetricStep,
     RegistryTrustedCalculationRunner,
@@ -504,6 +506,65 @@ def _compiled_validation_plan() -> tuple[QueryPlan, ContextBundle, ExecutionPlan
     )
 
 
+def test_multi_metric_compilation_has_exact_per_metric_fetch_ownership() -> None:
+    plan, context, _ = _compiled_validation_plan()
+    multi_plan = plan.model_copy(
+        update={"metric_keys": ("metric.revenue", "metric.margin")}
+    )
+    multi_context = context.model_copy(
+        update={"asset_ids": ("metric.revenue", "metric.margin")}
+    )
+    validator = PlanValidator()
+    query_validation = validator.validate_query_plan(
+        plan=multi_plan,
+        context=multi_context,
+        identity=_identity(),
+    )
+    assert query_validation.outcome == "allow"
+    execution_plan = PlanCompiler().compile(
+        plan=multi_plan,
+        context=multi_context,
+        validation=query_validation,
+    )
+    fetches = tuple(
+        step for step in execution_plan.steps if isinstance(step, FetchMetricStep)
+    )
+    verify = next(step for step in execution_plan.steps if isinstance(step, VerifyStep))
+    assert tuple(step.metric_keys for step in fetches) == (
+        ("metric.revenue",),
+        ("metric.margin",),
+    )
+    assert verify.depends_on == tuple(step.step_id for step in fetches)
+    assert verify.input_refs == tuple(step.step_id for step in fetches)
+    assert _validation_codes(execution_plan, multi_plan, multi_context, route="deep") == ()
+
+    duplicated = execution_plan.model_copy(
+        update={
+            "steps": (
+                fetches[0],
+                fetches[1].model_copy(update={"metric_keys": ("metric.revenue",)}),
+                verify,
+            )
+        }
+    )
+    assert "execution_plan_metric_ownership_mismatch" in _validation_codes(
+        duplicated, multi_plan, multi_context, route="deep"
+    )
+
+    single_fetch_verify = verify.model_copy(
+        update={
+            "depends_on": (fetches[0].step_id,),
+            "input_refs": (fetches[0].step_id,),
+        }
+    )
+    missing = execution_plan.model_copy(
+        update={"steps": (fetches[0], single_fetch_verify)}
+    )
+    assert "execution_plan_metric_ownership_mismatch" in _validation_codes(
+        missing, multi_plan, multi_context, route="deep"
+    )
+
+
 def _validation_codes(
     execution_plan: ExecutionPlan,
     plan: QueryPlan,
@@ -576,7 +637,7 @@ def test_engine_rejects_a_model_backed_provider_before_route_selection() -> None
             model_gateway=_model_gateway(provider),
             context_resolver=_StaticContextResolver(_context()),
             query_plan_provider=_ModelBackedQueryPlanProvider(_query_plan()),
-            plan_executor=PlanExecutor(metric_runner=_MetricRunner()),
+            plan_executor=PlanExecutor(metric_runner=_MetricRunner(), allow_legacy_unitless_grounding=True, ),
         )
 
     assert provider.calls == 0
@@ -626,7 +687,7 @@ async def test_plan_executor_refuses_a_validation_record_for_another_plan() -> N
     execution_plan = PlanCompiler().compile(plan=plan, context=context, validation=validation)
     other_plan = _alt_execution_plan(plan, context)
     runner = _MetricRunner()
-    result = await PlanExecutor(metric_runner=runner).execute(
+    result = await PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ).execute(
         query_plan=plan,
         context=context,
         execution_plan=execution_plan,
@@ -659,7 +720,7 @@ async def test_plan_executor_refuses_a_foreign_policy_identity() -> None:
         ),
     ):
         runner = _MetricRunner()
-        result = await PlanExecutor(metric_runner=runner).execute(
+        result = await PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ).execute(
             query_plan=plan,
             context=context,
             execution_plan=execution_plan,
@@ -715,7 +776,7 @@ async def test_plan_executor_refuses_a_non_allow_or_mismatched_validation() -> N
         (stale_context, "execution_plan_context_hash_mismatch"),
     ):
         runner = _MetricRunner()
-        result = await PlanExecutor(metric_runner=runner).execute(
+        result = await PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ).execute(
             query_plan=plan,
             context=context,
             execution_plan=execution_plan,
@@ -747,7 +808,7 @@ async def test_plan_executor_charges_before_execution_and_checkpoints_only_recei
     runner = _MetricRunner()
     ledger = RouteBudgetLedger(route="fast")
 
-    result = await PlanExecutor(metric_runner=runner).execute(
+    result = await PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ).execute(
         query_plan=plan,
         context=context,
         execution_plan=execution_plan,
@@ -788,7 +849,7 @@ async def test_plan_executor_preserves_the_response_deadline_reserve() -> None:
     runner = _MetricRunner()
     ledger = RouteBudgetLedger(route="fast")
 
-    result = await PlanExecutor(metric_runner=runner).execute(
+    result = await PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ).execute(
         query_plan=plan,
         context=context,
         execution_plan=execution_plan,
@@ -822,7 +883,7 @@ async def test_plan_executor_rejects_non_json_step_output() -> None:
         validation=validation,
     )
 
-    result = await PlanExecutor(metric_runner=_MetricRunner(float("nan"))).execute(
+    result = await PlanExecutor(metric_runner=_MetricRunner(float("nan")), allow_legacy_unitless_grounding=True, ).execute(
         query_plan=plan,
         context=context,
         execution_plan=execution_plan,
@@ -897,6 +958,7 @@ async def test_trusted_calculation_step_uses_only_the_approved_registry() -> Non
     result = await PlanExecutor(
         metric_runner=_MetricRunner({"numerator": 6, "denominator": 3}),
         trusted_calculation_runner=RegistryTrustedCalculationRunner(),
+        allow_legacy_unitless_grounding=True,
     ).execute(
         query_plan=plan,
         context=context,
@@ -993,7 +1055,7 @@ async def test_plan_executor_propagates_request_cancellation() -> None:
     )
     runner = _BlockingMetricRunner()
     task = asyncio.create_task(
-        PlanExecutor(metric_runner=runner).execute(
+        PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ).execute(
             query_plan=plan,
             context=context,
             execution_plan=execution_plan,
@@ -1062,7 +1124,7 @@ async def test_engine_uses_zero_model_fast_path_for_a_validated_typed_plan() -> 
         model_gateway=_model_gateway(provider),
         context_resolver=context_resolver,
         query_plan_provider=plan_provider,
-        plan_executor=PlanExecutor(metric_runner=metric_runner),
+        plan_executor=PlanExecutor(metric_runner=metric_runner, allow_legacy_unitless_grounding=True, ),
     )
     request_context = RequestContext(
         identity=_identity(),
@@ -1129,6 +1191,183 @@ async def test_engine_uses_zero_model_fast_path_for_a_validated_typed_plan() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mutate_unit", [False, True])
+async def test_engine_rebinds_trusted_calculation_unit_before_grounding_and_capture(
+    monkeypatch: pytest.MonkeyPatch, mutate_unit: bool
+) -> None:
+    from src.nl2sql.agents.dynamic_calc.trusted_templates import (
+        trusted_template_registry,
+    )
+    from src.nl2sql.orchestration.approved_compute import (
+        ApprovedCalculationBinding,
+        ApprovedCalculationCatalog,
+        ApprovedCalculationInput,
+    )
+    from src.nl2sql.orchestration.mode_contract import RunEnvelope
+
+    class DependencyRunner:
+        async def prepare(
+            self,
+            *,
+            step: FetchMetricStep,
+            query_plan: QueryPlan,
+            context: ContextBundle,
+        ) -> PreparedMetricStep:
+            del query_plan, context
+            metric_key = step.metric_keys[0]
+            return PreparedMetricStep(
+                sql_fingerprint=canonical_json_digest(metric_key),
+                join_hops=0,
+                payload={"metric_key": metric_key},
+            )
+
+        async def execute(
+            self,
+            prepared: PreparedMetricStep,
+            *,
+            timeout_ms: int,
+        ) -> MetricStepResult:
+            del timeout_ms
+            payload = cast(dict[str, str], prepared.payload)
+            value = 8 if payload["metric_key"] == "metric.revenue" else 2
+            return MetricStepResult(
+                value={"value": value},
+                receipt=ExecutionReceipt(
+                    datasource="synthetic",
+                    readonly_role="fixture_reader",
+                    elapsed_ms=1,
+                    row_count=1,
+                    sql_fingerprint=prepared.sql_fingerprint,
+                    policy_version="query-gateway.test.v1",
+                    policy_outcome="allow",
+                ),
+            )
+
+    metadata = trusted_template_registry.metadata("ratio")
+    catalog = ApprovedCalculationCatalog(
+        (
+            ApprovedCalculationBinding(
+                canonical_metric_key="metric.ratio",
+                template_id="ratio",
+                template_version=metadata.version,
+                template_checksum=metadata.checksum,
+                unit="ratio",
+                inputs=(
+                    ApprovedCalculationInput(
+                        role="numerator",
+                        metric_key="metric.revenue",
+                        metric_contract_sha256="a" * 64,
+                    ),
+                    ApprovedCalculationInput(
+                        role="denominator",
+                        metric_key="metric.stores",
+                        metric_contract_sha256="b" * 64,
+                    ),
+                ),
+                binding_revision="engine-unit-test-v1",
+                semantic_release_id=str(RELEASE_ID),
+                semantic_release_checksum="c" * 64,
+            ),
+        )
+    )
+    context = _context().model_copy(
+        update={
+            "asset_ids": (
+                "metric.ratio",
+                "metric.revenue",
+                "metric.stores",
+            )
+        }
+    )
+    plan = _query_plan().model_copy(update={"metric_keys": ("metric.ratio",)})
+    executor = PlanExecutor(
+        metric_runner=DependencyRunner(),
+        trusted_calculation_runner=RegistryTrustedCalculationRunner(),
+        calculation_catalog=catalog,
+        allow_legacy_unitless_grounding=True,
+    )
+    engine = create_v2_engine(
+        checkpointer=MemorySaver(),
+        model_gateway=_model_gateway(_CountingProvider()),
+        context_resolver=_StaticContextResolver(context),
+        query_plan_provider=_StaticQueryPlanProvider(plan),
+        plan_compiler=PlanCompiler(calculation_catalog=catalog),
+        plan_validator=PlanValidator(calculation_catalog=catalog),
+        plan_executor=executor,
+        route_policy=RoutePolicy(
+            version="trusted-unit-test-standard-route",
+            state="bootstrap",
+            fast_max_risk=20,
+            fast_min_confidence=1.0,
+            fast_max_tables=1,
+            standard_max_risk=60,
+            standard_min_confidence=0.55,
+        ),
+    )
+    if mutate_unit:
+        original_execute = PlanExecutor.execute
+
+        async def execute_with_mutated_unit(
+            self: PlanExecutor, **kwargs: Any
+        ) -> PlanExecutionResult:
+            result = await original_execute(self, **kwargs)
+            receipts = tuple(
+                receipt.model_copy(update={"unit": "count"})
+                if receipt.kind == "trusted_calculation"
+                else receipt
+                for receipt in result.record.step_receipts
+            )
+            return PlanExecutionResult(
+                record=result.record.model_copy(update={"step_receipts": receipts}),
+                outputs=result.outputs,
+                output_contracts=result.output_contracts,
+                require_semantic_contract=result.require_semantic_contract,
+            )
+
+        monkeypatch.setattr(PlanExecutor, "execute", execute_with_mutated_unit)
+
+    config = runtime_config(
+        RequestContext(
+            identity=_identity(),
+            thread_id=THREAD_ID,
+            trace_id="trusted-calculation-unit-rebinding",
+            deadline_ms=10_000,
+        )
+    )
+    result = await engine.ainvoke(
+        {
+            "messages": [{"role": "user", "content": "show revenue"}],
+            "run_envelope": RunEnvelope(
+                run_id="trusted-unit-engine-test",
+                requested_mode="QUERY",
+                effective_mode="QUERY",
+            ).model_dump(mode="json"),
+        },
+        config,
+    )
+
+    assert isinstance(result.get("execution_record"), dict), result.get("stop_reason")
+    assert result["execution_record"]["status"] == "succeeded"
+    if mutate_unit:
+        assert result["stop_reason"] == "checkpoint_calculation_unit_authority_missing"
+        assert result.get("grounded_answer_artifact") is None
+        assert result.get("response_blocks", []) == []
+        assert all(
+            "capture_execution_record_sha256" not in event["attributes"]
+            for event in result.get("trace_events", [])
+        )
+    else:
+        assert result["stop_reason"] is None
+        facts = result["grounded_answer_artifact"]["facts"]
+        assert len(facts) == 1
+        assert facts[0]["unit"] == "ratio"
+        assert any(
+            "capture_execution_record_sha256" in event["attributes"]
+            for event in result.get("trace_events", [])
+        )
+
+
+@pytest.mark.asyncio
 async def test_engine_rejects_an_execution_validation_from_a_foreign_policy() -> None:
     from src.nl2sql.agents.dynamic_calc.trusted_templates import (
         trusted_template_registry,
@@ -1147,7 +1386,7 @@ async def test_engine_rejects_an_execution_validation_from_a_foreign_policy() ->
         model_gateway=_model_gateway(_CountingProvider()),
         context_resolver=_StaticContextResolver(context),
         query_plan_provider=_StaticQueryPlanProvider(plan),
-        plan_executor=PlanExecutor(metric_runner=metric_runner),
+        plan_executor=PlanExecutor(metric_runner=metric_runner, allow_legacy_unitless_grounding=True, ),
     )
     request_context = RequestContext(
         identity=_identity(),
@@ -1218,7 +1457,7 @@ async def test_engine_resets_request_state_after_a_terminal_clarification() -> N
         model_gateway=_model_gateway(provider),
         context_resolver=context_resolver,
         query_plan_provider=_StaticQueryPlanProvider(_query_plan()),
-        plan_executor=PlanExecutor(metric_runner=metric_runner),
+        plan_executor=PlanExecutor(metric_runner=metric_runner, allow_legacy_unitless_grounding=True, ),
     )
     config = runtime_config(
         RequestContext(
@@ -1472,6 +1711,7 @@ def test_grounding_marks_no_data_unavailable_without_inventing_fields() -> None:
         execution_plan=execution_plan,
         record=record,
         outputs=outputs,
+        allow_legacy_unitless=True,
     )
 
     assert len(facts) == 1
@@ -1492,6 +1732,7 @@ def test_grounding_marks_no_data_unavailable_without_inventing_fields() -> None:
         execution_plan=execution_plan,
         record=record,
         outputs=outputs,
+        allow_legacy_unitless=True,
     )
     assert rebuilt[0].fact_id == fact.fact_id
 
@@ -1521,6 +1762,7 @@ def test_grounded_renderer_keeps_raw_rows_out_and_marks_stale_freshness() -> Non
         execution_plan=execution_plan,
         record=record,
         outputs=outputs,
+        allow_legacy_unitless=True,
     )
     text = render_grounded_answer(query_plan=plan, facts=facts)
 
@@ -1564,7 +1806,7 @@ async def test_engine_renders_a_grounded_scalar_without_raw_rows_or_sql() -> Non
         model_gateway=_model_gateway(_CountingProvider()),
         context_resolver=_StaticContextResolver(context),
         query_plan_provider=_StaticQueryPlanProvider(plan),
-        plan_executor=PlanExecutor(metric_runner=runner),
+        plan_executor=PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ),
     )
     config = runtime_config(
         RequestContext(
@@ -1608,7 +1850,7 @@ async def test_engine_renders_structured_unavailable_for_no_data() -> None:
         model_gateway=_model_gateway(_CountingProvider()),
         context_resolver=_StaticContextResolver(context),
         query_plan_provider=_StaticQueryPlanProvider(plan),
-        plan_executor=PlanExecutor(metric_runner=runner),
+        plan_executor=PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ),
     )
     config = runtime_config(
         RequestContext(

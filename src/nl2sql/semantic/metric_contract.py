@@ -6,6 +6,8 @@ semantic release. Loading this file alone never authorizes execution.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Annotated, Literal
 
 import yaml
@@ -48,10 +50,115 @@ class RatioDefinition(FrozenContract):
     # Division by zero is an undefined calculation, never "no data".
     zero_denominator_policy: Literal["calculation_error"] = "calculation_error"
 
+    @model_validator(mode="after")
+    def validate_predicate_authority(self) -> RatioDefinition:
+        """Reject repeated fields so one metric cannot carry ambiguous roles."""
+
+        denominator_by_field: dict[str, str] = {}
+        for predicate in self.denominator_predicates:
+            previous = denominator_by_field.get(predicate.field)
+            if previous is not None:
+                reason = "duplicate" if previous == predicate.operator else "conflicting"
+                raise ValueError(f"ratio denominator contains {reason} predicate authority")
+            denominator_by_field[predicate.field] = predicate.operator
+
+        numerator_by_field: dict[str, str] = {}
+        for predicate in self.numerator_predicates:
+            previous = numerator_by_field.get(predicate.field)
+            if previous is not None:
+                reason = "duplicate" if previous == predicate.operator else "conflicting"
+                raise ValueError(f"ratio numerator contains {reason} predicate authority")
+            if predicate.field in denominator_by_field:
+                reason = (
+                    "duplicate"
+                    if denominator_by_field[predicate.field] == predicate.operator
+                    else "conflicting"
+                )
+                raise ValueError(
+                    f"ratio numerator repeats denominator {reason} predicate authority"
+                )
+            numerator_by_field[predicate.field] = predicate.operator
+        return self
+
+    @property
+    def denominator_authority(self) -> tuple[Predicate, ...]:
+        """The complete denominator population predicate set."""
+
+        return self.denominator_predicates
+
+    @property
+    def numerator_authority(self) -> tuple[Predicate, ...]:
+        """The numerator population is the denominator plus numerator conditions."""
+
+        return (*self.denominator_predicates, *self.numerator_predicates)
+
 
 class FilterField(FrozenContract):
     field: Identifier
     value_type: Literal["text", "integer"]
+
+
+class JoinColumnPair(FrozenContract):
+    """One exact, ordered column equality in an approved JOIN condition."""
+
+    left_column: Identifier
+    right_column: Identifier
+
+
+class SemanticJoinAuthority(FrozenContract):
+    """Typed payload shape for a publisher-authorized semantic relationship.
+
+    This contract only makes a proposed authority explicit and integrity
+    checkable. It does not mint or confer authority: production use still
+    requires a trusted SemanticRelease publisher and a matching physical
+    relationship in the bound SchemaSnapshot. Until those release fields and
+    their trusted loader exist, SQL JOIN remains denied.
+    """
+
+    schema_version: Literal["1.0"] = "1.0"
+    join_id: ContractId
+    physical_relationship_id: ContractId
+    physical_relationship_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    left_relation_id: ContractId
+    right_relation_id: ContractId
+    column_pairs: tuple[JoinColumnPair, ...] = Field(min_length=1)
+    cardinality: Literal["one_to_one", "one_to_many", "many_to_one", "many_to_many"]
+    join_type: Literal["inner", "left", "right", "full"]
+    null_semantics: Literal["exclude_unmatched", "preserve_left", "preserve_right", "preserve_both"]
+    direction: Literal["left_to_right", "right_to_left", "bidirectional"]
+    semantic_release_id: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,128}$")
+    semantic_release_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_snapshot_id: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,128}$")
+    schema_snapshot_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    applicable_fetch_step_ids: tuple[ContractId, ...] = Field(min_length=1)
+    authority_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_authority_shape(self) -> SemanticJoinAuthority:
+        if self.left_relation_id == self.right_relation_id:
+            raise ValueError("semantic JOIN must reference two distinct relations")
+        if len(set(self.column_pairs)) != len(self.column_pairs):
+            raise ValueError("semantic JOIN contains duplicate column pairs")
+        if len(set(self.applicable_fetch_step_ids)) != len(self.applicable_fetch_step_ids):
+            raise ValueError("semantic JOIN contains duplicate execution paths")
+        if self.authority_checksum != self.expected_authority_checksum():
+            raise ValueError("semantic JOIN authority checksum mismatch")
+        return self
+
+    def _authority_payload(self) -> dict[str, object]:
+        return self.model_dump(mode="json", exclude={"authority_checksum"})
+
+    def expected_authority_checksum(self) -> str:
+        payload = json.dumps(
+            self._authority_payload(), sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def validate_integrity(self) -> None:
+        """Revalidate copied or restored instances at a future trust boundary."""
+
+        type(self).model_validate_json(self.model_dump_json())
 
 
 class MetricContract(FrozenContract):

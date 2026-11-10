@@ -11,7 +11,10 @@ from typing import Any, Literal, Mapping, Sequence
 
 from src.nl2sql.contracts import ExecutionReceipt, RouteBudget
 from src.nl2sql.infra.governance.query_gateway import PolicyEngine, QueryPolicyError
-from src.nl2sql.orchestration.evidence_digest import canonical_rowset_digest
+from src.nl2sql.orchestration.evidence_digest import (
+    canonical_json_digest,
+    canonical_rowset_digest,
+)
 
 Route = Literal["fast", "standard", "deep"]
 
@@ -69,6 +72,7 @@ class Candidate:
     sql: str = field(repr=False)
     rowset: tuple[dict[str, Any], ...] = field(repr=False)
     bind_params: dict[str, Any] = field(default_factory=dict, repr=False)
+    result_columns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,8 @@ class CandidateExpectedEvidence:
     source_checkpoint: str | None
     selection_reason: str
     source_degradation: tuple[str, ...] = ()
+    authorization_revision: str | None = None
+    unit: str | None = None
 
     def __post_init__(self) -> None:
         replace(self.metadata)
@@ -97,6 +103,7 @@ class CandidateReceipt:
     rowset_sha256: str | None
     gates: tuple[GateOutcome, ...]
     failure_code: str | None = None
+    execution_receipt_sha256: str | None = None
 
     @property
     def hard_gates_passed(self) -> bool:
@@ -117,7 +124,9 @@ class CandidateDecision:
         return "hitl" if self.needs_hitl else "rejected"
 
 
-def rowset_sha256(rowset: Sequence[dict[str, Any]]) -> str:
+def rowset_sha256(
+    rowset: Sequence[dict[str, Any]], *, result_columns: Sequence[str] = ()
+) -> str:
     """Hash typed columns and rows in the exact returned order."""
     if any(
         not isinstance(row, dict)
@@ -128,7 +137,9 @@ def rowset_sha256(rowset: Sequence[dict[str, Any]]) -> str:
     if rowset and any(set(row) != set(rowset[0]) for row in rowset):
         raise ValueError("rowset columns must be consistent")
     try:
-        return canonical_rowset_digest(rowset)
+        return canonical_rowset_digest(
+            rowset, result_columns=result_columns or None
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError("rowset contains non-canonical evidence") from exc
 
@@ -208,7 +219,9 @@ class CandidateVerifier:
         if len(gates) != len(GATE_ORDER):
             return CandidateReceipt(metadata, None, tuple(outcomes), "gate_order_invalid")
         try:
-            digest = rowset_sha256(candidate.rowset)
+            digest = rowset_sha256(
+                candidate.rowset, result_columns=candidate.result_columns
+            )
         except (ValueError, TypeError):
             return CandidateReceipt(metadata, None, tuple(outcomes), "rowset_invalid")
         if (receipt.policy_outcome != "allow" or receipt.error_taxonomy is not None
@@ -218,6 +231,8 @@ class CandidateVerifier:
                 or receipt.source_checkpoint != expected.source_checkpoint
                 or receipt.selection_reason != expected.selection_reason
                 or receipt.source_degradation != expected.source_degradation
+                or receipt.authorization_revision != expected.authorization_revision
+                or receipt.unit != expected.unit
                 or receipt.sql_fingerprint != metadata.sql_fingerprint
                 or receipt.semantic_signature != metadata.semantic_signature
                 or receipt.source_kind != metadata.source_kind
@@ -225,7 +240,14 @@ class CandidateVerifier:
                 or receipt.estimated_rows != metadata.estimated_rows
                 or receipt.plan_cost != metadata.estimated_cost):
             return CandidateReceipt(metadata, None, tuple(outcomes), "execution_evidence_mismatch")
-        return CandidateReceipt(metadata, digest, tuple(outcomes))
+        return CandidateReceipt(
+            metadata,
+            digest,
+            tuple(outcomes),
+            execution_receipt_sha256=canonical_json_digest(
+                receipt.model_dump(mode="json")
+            ),
+        )
 
 
 def select_candidate(candidates: Sequence[Candidate], *, route: Route, budget: RouteBudget,

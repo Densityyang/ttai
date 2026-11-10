@@ -24,11 +24,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import interrupt
 
+from src.core.settings import get_settings
 from src.nl2sql.config.settings import get_agent_config
 from src.nl2sql.contracts import (
+    AdHocCalculationStep,
     AuthorizationContext,
     ContextBundle,
     ExecutionPlan,
+    FetchMetricStep,
     ModelRequest,
     PlanExecutionRecord,
     PlanValidationRecord,
@@ -38,6 +41,7 @@ from src.nl2sql.contracts import (
     RouteName,
     RoutePolicy,
     RoutingBudgetPolicy,
+    TrustedCalculationStep,
     query_plan_payload,
 )
 from src.nl2sql.infra.llm.gateway import (
@@ -63,12 +67,17 @@ from src.nl2sql.orchestration.analysis_evidence import (
     validate_analysis_interpretation,
     validate_grounded_answer_checkpoint,
 )
+from src.nl2sql.orchestration.approved_compute import ApprovedCalculationCatalog
 from src.nl2sql.orchestration.budget import (
     BudgetExceeded,
     CallBudget,
     RouteBudgetLedger,
     bootstrap_routing_budget_policy,
     should_stop,
+)
+from src.nl2sql.orchestration.checkpoint_evidence_seal import (
+    CheckpointEvidenceSealError,
+    seal_grounded_execution_checkpoint,
 )
 from src.nl2sql.orchestration.decision_contract import (
     FORBIDDEN_DECISION_FIELDS,
@@ -89,6 +98,7 @@ from src.nl2sql.orchestration.decision_contract import (
 from src.nl2sql.orchestration.deterministic_query_plan import (
     normalize_frozen_real_question,
 )
+from src.nl2sql.orchestration.evidence_digest import canonical_json_digest
 from src.nl2sql.orchestration.execution import PlanExecutor
 from src.nl2sql.orchestration.grounding import (
     GroundingIntegrityError,
@@ -111,8 +121,10 @@ from src.nl2sql.orchestration.planning import (
 from src.nl2sql.orchestration.routing import RiskSignals, bootstrap_route_policy, choose_route
 from src.nl2sql.orchestration.typed_runtime import (
     TYPED_RUNTIME_UNAVAILABLE,
+    RequestTypedRuntime,
     TypedRuntimeBundle,
     TypedRuntimeUnavailable,
+    executable_metric_contracts,
 )
 from src.nl2sql.ownership import (
     authorization_context_from_config,
@@ -122,6 +134,9 @@ from src.nl2sql.semantic.calculation_contract import (
     CalculationExecutionBinding,
     CalculationSpec,
 )
+from src.nl2sql.semantic.metric_contract import MetricContract
+from src.nl2sql.semantic.registry import SemanticRelease, SemanticReleaseState
+from src.nl2sql.semantic.schema_snapshot import SchemaSnapshotState
 from src.nl2sql.supervisor.schemas import (
     ProvenanceAuthorityBlock,
     ProvenanceBlock,
@@ -467,6 +482,346 @@ def create_v2_engine(
             assert plan_executor is not None
             return plan_executor
         return _request_runtime().plan_executor
+
+    async def _ensure_checkpoint_typed_runtime(
+        state: V2EngineState,
+        execution_plan: ExecutionPlan,
+    ) -> TypedRuntimeBundle | None:
+        """Restore the same-run factory runtime before checkpoint authority checks.
+
+        Static collaborator wiring has no request runtime to restore. Factory
+        wiring resolves through the invocation-local memo cell using only the
+        authenticated identity and authorization snapshot persisted at run start.
+        """
+
+        if typed_runtime_factory is None:
+            return None
+
+        try:
+            identity = _request_identity()
+        except Exception as exc:
+            raise AnalysisEvidenceError(
+                "checkpoint_runtime_identity_invalid"
+            ) from exc
+        owner_user_id = state.get("run_owner_user_id")
+        if not isinstance(owner_user_id, str) or not owner_user_id:
+            raise AnalysisEvidenceError("checkpoint_runtime_owner_mismatch")
+        if identity.user_id != owner_user_id:
+            raise AnalysisEvidenceError("checkpoint_runtime_owner_mismatch")
+
+        authorization = _bound_authorization_context(state)
+        expected_revision = _bound_authorization_revision(state)
+        if authorization is None:
+            raise AnalysisEvidenceError("checkpoint_runtime_authorization_missing")
+        if (
+            expected_revision is None
+            or authorization.authorization_revision != expected_revision
+        ):
+            raise AnalysisEvidenceError("checkpoint_runtime_authorization_mismatch")
+
+        scope = _REQUEST_TYPED_SCOPE.get()
+        if scope is None:
+            raise AnalysisEvidenceError("checkpoint_runtime_scope_missing")
+        try:
+            runtime_or_unavailable = await scope.resolve(
+                identity=identity,
+                authorization=authorization,
+                expected_revision=expected_revision,
+                capabilities=_state_capabilities(state),
+            )
+        except Exception as exc:
+            # Provider exceptions can contain deployment secrets. The public
+            # error remains stable and contains no factory detail.
+            raise AnalysisEvidenceError("checkpoint_runtime_unavailable") from exc
+        if isinstance(runtime_or_unavailable, TypedRuntimeUnavailable):
+            raise AnalysisEvidenceError("checkpoint_runtime_unavailable")
+        runtime = runtime_or_unavailable
+        if not isinstance(runtime, TypedRuntimeBundle):
+            raise AnalysisEvidenceError("checkpoint_runtime_unavailable")
+        if runtime.identity != identity:
+            raise AnalysisEvidenceError("checkpoint_runtime_identity_invalid")
+        if (
+            runtime.authorization != authorization
+            or runtime.authorization_revision != expected_revision
+        ):
+            raise AnalysisEvidenceError("checkpoint_runtime_authorization_mismatch")
+
+        # The protocol deliberately does not require deployment internals.
+        # Only the concrete production bundle must prove the release and
+        # snapshot pinned by the saved ExecutionPlan; demo runtimes keep their
+        # existing protocol-only behavior.
+        if isinstance(runtime, RequestTypedRuntime):
+            release = runtime.release
+            snapshot = runtime.snapshot
+            if (
+                release.state != SemanticReleaseState.ACTIVE
+                or release.release_id != str(execution_plan.semantic_release_id)
+            ):
+                raise AnalysisEvidenceError("checkpoint_runtime_release_mismatch")
+            if (
+                snapshot.state != SchemaSnapshotState.VALIDATED
+                or snapshot.snapshot_id != str(execution_plan.schema_snapshot_id)
+                or release.schema_snapshot_id != snapshot.snapshot_id
+                or release.schema_snapshot_checksum != snapshot.checksum
+            ):
+                raise AnalysisEvidenceError("checkpoint_runtime_snapshot_mismatch")
+        return runtime
+
+    async def _analysis_unit_authority(
+        execution_plan: ExecutionPlan,
+        *,
+        runtime: TypedRuntimeBundle | None,
+        executor: PlanExecutor,
+    ) -> tuple[dict[str, str | None], dict[str, MetricContract] | None]:
+        """Rebuild metric and calculation unit authority from server-side inputs."""
+
+        release = getattr(runtime, "release", None)
+        if release is None:
+            metric_runner = getattr(executor, "_metric_runner", None)
+            compiler = getattr(metric_runner, "_compiler", None)
+            read_active = getattr(compiler, "_read_active", None)
+            if callable(read_active):
+                try:
+                    release = await cast(Any, read_active)()
+                except Exception as exc:
+                    raise AnalysisEvidenceError(
+                        "analysis_unit_authority_missing"
+                    ) from exc
+
+        metric_contracts: dict[str, MetricContract] | None = None
+        authoritative_units: dict[str, str | None] = {}
+        if release is not None:
+            if not isinstance(release, SemanticRelease):
+                raise AnalysisEvidenceError("analysis_unit_authority_invalid")
+            if (
+                release.state != SemanticReleaseState.ACTIVE
+                or release.release_id != str(execution_plan.semantic_release_id)
+            ):
+                raise AnalysisEvidenceError("analysis_unit_authority_mismatch")
+            active_metrics = executable_metric_contracts(release)
+            metric_contracts = {}
+            for metric in active_metrics:
+                unit = metric.ratio.unit if metric.ratio is not None else "count"
+                authoritative_units[metric.asset_id] = unit
+                authoritative_units[metric.metric_key] = unit
+                metric_contracts[metric.asset_id] = metric
+                metric_contracts[metric.metric_key] = metric
+
+        calculation_catalog = getattr(executor, "_calculation_catalog", None)
+        if calculation_catalog is None:
+            calculation_catalog = resolved_plan_compiler.calculation_catalog
+        if calculation_catalog is not None and not isinstance(
+            calculation_catalog, ApprovedCalculationCatalog
+        ):
+            raise AnalysisEvidenceError("analysis_unit_authority_invalid")
+
+        for step in execution_plan.steps:
+            if isinstance(step, FetchMetricStep):
+                for metric_key in step.metric_keys:
+                    authoritative_units.setdefault(metric_key, None)
+                    authoritative_units.setdefault(
+                        metric_key.removeprefix("metric."),
+                        authoritative_units[metric_key],
+                    )
+            elif isinstance(step, TrustedCalculationStep):
+                if step.output_metric_key is None:
+                    continue
+                binding = (
+                    calculation_catalog.binding_for(step.output_metric_key)
+                    if calculation_catalog is not None
+                    else None
+                )
+                if (
+                    calculation_catalog is None
+                    or binding is None
+                    or binding.unit is None
+                    or binding.canonical_metric_key != step.output_metric_key
+                    or binding.checksum != step.binding_checksum
+                ):
+                    raise AnalysisEvidenceError(
+                        "analysis_calculation_unit_authority_missing"
+                    )
+                metric = None
+                if metric_contracts is not None:
+                    metric = metric_contracts.get(step.output_metric_key) or (
+                        metric_contracts.get(
+                            step.output_metric_key.removeprefix("metric.")
+                        )
+                    )
+                if metric is not None:
+                    metric_unit = (
+                        metric.ratio.unit if metric.ratio is not None else "count"
+                    )
+                    if metric_unit != binding.unit:
+                        raise AnalysisEvidenceError(
+                            "analysis_calculation_unit_authority_mismatch"
+                        )
+                authoritative_units[step.output_metric_key] = binding.unit
+                authoritative_units[
+                    step.output_metric_key.removeprefix("metric.")
+                ] = binding.unit
+            elif isinstance(step, AdHocCalculationStep):
+                # The exact noncanonical unit is declared by this run-scoped
+                # spec; analysis_evidence binds both fact and receipt to it.
+                continue
+
+        return authoritative_units, metric_contracts
+
+    async def _checkpoint_unit_authority(
+        state: V2EngineState,
+        execution_plan: ExecutionPlan,
+        execution_record: PlanExecutionRecord,
+    ) -> tuple[
+        dict[str, str | None],
+        dict[str, MetricContract] | None,
+        dict[str, str | None],
+        dict[str, str],
+    ]:
+        """Rebind every output unit to active server authority for this run."""
+
+        runtime = await _ensure_checkpoint_typed_runtime(state, execution_plan)
+        if isinstance(runtime, TypedRuntimeBundle):
+            executor = runtime.plan_executor
+        elif typed_pipeline_enabled:
+            executor = _typed_plan_executor()
+        else:
+            raise AnalysisEvidenceError("checkpoint_unit_authority_missing")
+        authoritative_units, metric_contracts = await _analysis_unit_authority(
+            execution_plan,
+            runtime=runtime,
+            executor=executor,
+        )
+        catalog = getattr(executor, "_calculation_catalog", None)
+        if catalog is None:
+            catalog = resolved_plan_compiler.calculation_catalog
+        allow_legacy_unitless = (
+            bool(getattr(executor, "_allow_legacy_unitless_grounding", False))
+            and not bool(getattr(executor, "_require_semantic_contract", False))
+        )
+        receipts = {item.step_id: item for item in execution_record.step_receipts}
+        units_by_step: dict[str, str | None] = {}
+        identities: dict[str, str] = {}
+
+        for step in execution_plan.steps:
+            receipt = receipts.get(step.step_id)
+            if receipt is None or receipt.status != "succeeded":
+                continue
+            identity_payload: dict[str, object]
+            if isinstance(step, FetchMetricStep):
+                metrics = [
+                    (metric_key, (metric_contracts or {}).get(metric_key) or
+                     (metric_contracts or {}).get(metric_key.removeprefix("metric.")))
+                    for metric_key in step.metric_keys
+                ]
+                if not metrics:
+                    raise AnalysisEvidenceError(
+                        "checkpoint_unit_authority_metric_ambiguous"
+                    )
+                known_metrics = [metric for _, metric in metrics if metric is not None]
+                if len(known_metrics) != len(metrics) and known_metrics:
+                    raise AnalysisEvidenceError(
+                        "checkpoint_unit_authority_metric_ambiguous"
+                    )
+                metric_units = {
+                    (metric.ratio.unit if metric.ratio is not None else "count")
+                    for metric in known_metrics
+                }
+                if len(metric_units) > 1:
+                    raise AnalysisEvidenceError(
+                        "checkpoint_unit_authority_metric_ambiguous"
+                    )
+                if not known_metrics:
+                    legacy_receipt = (
+                        receipt.unit is None
+                        and receipt.semantic_manifest_checksum is None
+                        and receipt.semantic_validation_identity is None
+                        and receipt.semantic_validation_outcome is None
+                    )
+                    if not allow_legacy_unitless or not legacy_receipt:
+                        raise AnalysisEvidenceError(
+                            "checkpoint_unit_authority_missing"
+                        )
+                    unit = None
+                    identity_payload = {
+                        "kind": "explicit_legacy_unitless_fetch",
+                        "step_id": step.step_id,
+                        "metric_keys": list(step.metric_keys),
+                        "semantic_release_id": str(execution_plan.semantic_release_id),
+                        "semantic_manifest_checksum": receipt.semantic_manifest_checksum,
+                        "semantic_validation_identity": receipt.semantic_validation_identity,
+                    }
+                else:
+                    unit = next(iter(metric_units))
+                    if receipt.unit != unit:
+                        raise AnalysisEvidenceError(
+                            "checkpoint_unit_authority_mismatch"
+                        )
+                    identity_payload = {
+                        "kind": "fetch_metric",
+                        "step_id": step.step_id,
+                        "semantic_release_id": str(execution_plan.semantic_release_id),
+                        "metric_contract_sha256": [
+                            canonical_json_digest(metric.model_dump(mode="json"))
+                            for _, metric in metrics
+                            if metric is not None
+                        ],
+                        "semantic_manifest_checksum": receipt.semantic_manifest_checksum,
+                        "semantic_validation_identity": receipt.semantic_validation_identity,
+                        "unit": unit,
+                    }
+                units_by_step[step.step_id] = unit
+            elif isinstance(step, TrustedCalculationStep):
+                binding = (
+                    catalog.binding_for(step.output_metric_key)
+                    if catalog is not None and step.output_metric_key is not None
+                    else None
+                )
+                if (
+                    catalog is None
+                    or binding is None
+                    or binding.unit is None
+                    or binding.canonical_metric_key != step.output_metric_key
+                    or binding.checksum != step.binding_checksum
+                    or receipt.unit != binding.unit
+                ):
+                    raise AnalysisEvidenceError(
+                        "checkpoint_calculation_unit_authority_missing"
+                    )
+                unit = binding.unit
+                units_by_step[step.step_id] = unit
+                identity_payload = {
+                    "kind": "trusted_calculation",
+                    "step_id": step.step_id,
+                    "catalog_checksum": catalog.checksum,
+                    "binding_checksum": binding.checksum,
+                    "unit": unit,
+                }
+            elif isinstance(step, AdHocCalculationStep):
+                spec = step.calculation_spec
+                if spec.unit == "custom_unit":
+                    unit = spec.custom_unit_id
+                else:
+                    unit = spec.unit
+                if unit is None or receipt.unit != unit:
+                    raise AnalysisEvidenceError(
+                        "checkpoint_adhoc_unit_authority_mismatch"
+                    )
+                units_by_step[step.step_id] = unit
+                identity_payload = {
+                    "kind": "ad_hoc_calculation",
+                    "step_id": step.step_id,
+                    "calculation_spec_checksum": spec.checksum,
+                    "execution_binding_checksum": step.execution_binding.checksum,
+                    "unit": unit,
+                }
+            else:
+                continue
+            identities[step.step_id] = canonical_json_digest(identity_payload)
+        return authoritative_units, metric_contracts, units_by_step, identities
+
+    def _checkpoint_evidence_seal_key() -> str | None:
+        configured = get_settings().checkpoint_evidence_seal_key
+        return configured.get_secret_value() if configured is not None else None
 
     async def _continuation_runtime(
         state: V2EngineState,
@@ -1379,6 +1734,28 @@ def create_v2_engine(
                     "ExecutionPlanValidationMissing",
                 ),
             }
+        seal_key = _checkpoint_evidence_seal_key()
+        if seal_key is None:
+            stop_reason = route_budget.halt(
+                "checkpoint_evidence_seal_key_unavailable"
+            )
+            return {
+                "messages": [
+                    AIMessage(
+                        content=(
+                            "Execution cannot continue because checkpoint evidence "
+                            "integrity is unavailable. Nothing was executed."
+                        )
+                    )
+                ],
+                "budget_record": route_budget.checkpoint_record().model_dump(
+                    mode="json"
+                ),
+                "stop_reason": stop_reason,
+                "degradation_flags": _degradation_flags(
+                    state, "CheckpointEvidenceSealUnavailable"
+                ),
+            }
         result = await plan_executor.execute(
             query_plan=query_plan,
             context=context,
@@ -1421,11 +1798,20 @@ def create_v2_engine(
             # The raw outputs remain request-local.  Only the bounded grounded
             # artifact and its deterministic text may cross the checkpoint.
             try:
+                (
+                    _,
+                    _,
+                    authoritative_units_by_step,
+                    unit_authority_identities,
+                ) = await _checkpoint_unit_authority(state, execution_plan, record)
                 grounded = ground_execution_answer(
                     query_plan=query_plan,
                     execution_plan=execution_plan,
                     record=record,
                     outputs=outputs,
+                    output_contracts=result.output_contracts,
+                    require_semantic_contract=result.require_semantic_contract,
+                    authoritative_units_by_step=authoritative_units_by_step,
                 )
             except GroundingIntegrityError as exc:
                 stop_reason = route_budget.halt(exc.code)
@@ -1445,6 +1831,59 @@ def create_v2_engine(
                     ),
                     "response_blocks": [],
                 }
+            except AnalysisEvidenceError as exc:
+                stop_reason = route_budget.halt(exc.code)
+                return {
+                    "messages": [
+                        AIMessage(
+                            content=(
+                                "Typed execution unit authority failed integrity "
+                                "validation."
+                            )
+                        )
+                    ],
+                    "execution_record": record.model_dump(mode="json"),
+                    "budget_record": route_budget.checkpoint_record().model_dump(
+                        mode="json"
+                    ),
+                    "stop_reason": stop_reason,
+                    "degradation_flags": _degradation_flags(
+                        state, "GroundingUnitAuthorityInvalid"
+                    ),
+                    "response_blocks": [],
+                }
+            try:
+                record = seal_grounded_execution_checkpoint(
+                    key=seal_key,
+                    query_plan=query_plan,
+                    execution_plan=execution_plan,
+                    execution_record=record,
+                    answer_artifact=grounded.artifact,
+                    answer_text=grounded.answer_text,
+                    unit_authority_identities=unit_authority_identities,
+                )
+            except CheckpointEvidenceSealError as exc:
+                stop_reason = route_budget.halt(str(exc))
+                return {
+                    "messages": [
+                        AIMessage(
+                            content=(
+                                "Typed execution evidence could not be sealed "
+                                "for checkpoint storage."
+                            )
+                        )
+                    ],
+                    "execution_record": record.model_dump(mode="json"),
+                    "budget_record": route_budget.checkpoint_record().model_dump(
+                        mode="json"
+                    ),
+                    "stop_reason": stop_reason,
+                    "degradation_flags": _degradation_flags(
+                        state, "CheckpointEvidenceSealUnavailable"
+                    ),
+                    "response_blocks": [],
+                }
+            response["execution_record"] = record.model_dump(mode="json")
             # The P4-Q capture is produced from the same canonical renderer and
             # the same request-local execution record that produced the
             # response.  It is audit/trace evidence only; the public response
@@ -1606,12 +2045,22 @@ def create_v2_engine(
             query_plan = _query_plan(state)
             record = PlanExecutionRecord.model_validate(state.get("execution_record"))
             execution_plan = _execution_plan(state)
+            (
+                authoritative_units,
+                metric_contracts,
+                _,
+                unit_authority_identities,
+            ) = await _checkpoint_unit_authority(state, execution_plan, record)
             grounded = validate_grounded_answer_checkpoint(
                 query_plan,
                 artifact_raw,
                 answer_text,
                 execution_plan=execution_plan,
                 execution_record=record,
+                authoritative_units=authoritative_units,
+                metric_contracts=metric_contracts,
+                evidence_seal_key=_checkpoint_evidence_seal_key(),
+                unit_authority_identities=unit_authority_identities,
             )
             evidence = build_analysis_evidence(
                 grounded=grounded,
@@ -1620,6 +2069,8 @@ def create_v2_engine(
                 analysis_window=query_plan.time_range,
                 query_plan=query_plan,
                 execution_plan=execution_plan,
+                authoritative_units=authoritative_units,
+                metric_contracts=metric_contracts,
             )
             projection = project_analysis_model_input(
                 evidence,
@@ -1864,11 +2315,22 @@ def create_v2_engine(
             source_facts=grounded.answer_text,
             interpretation=interpretation,
         )
+        derived_output_ids = tuple(
+            dict.fromkeys(
+                fact.derived_output_id
+                for fact in evidence.facts
+                if fact.derived_output_id is not None
+            )
+        )
         blocks = [
             TextBlock(text=rendered).model_dump(mode="json"),
             ProvenanceBlock(
                 evidence_checksum=evidence.checksum,
                 metric_keys=evidence.metric_keys,
+                derived_output_ids=derived_output_ids,
+                calculation_scope=(
+                    "ad_hoc_noncanonical" if derived_output_ids else None
+                ),
                 analysis_window=ProvenanceTimeRangeBlock(
                     start=evidence.analysis_window.start.isoformat(),
                     end=evidence.analysis_window.end.isoformat(),

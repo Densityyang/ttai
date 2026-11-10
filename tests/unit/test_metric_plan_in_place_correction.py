@@ -332,6 +332,7 @@ class _RuntimeFactory:
             plan_executor=PlanExecutor(
                 metric_runner=self.metric_runner,
                 ad_hoc_calculation_runner=runner,
+                allow_legacy_unitless_grounding=True,
             ),
             identity=identity,
             authorization=authorization,

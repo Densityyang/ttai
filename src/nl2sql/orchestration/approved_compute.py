@@ -206,6 +206,14 @@ class ApprovedCalculationCatalog:
                 failures.append("trusted_calculation_version_mismatch")
             if set(metadata.input_roles) != set(binding.input_roles):
                 failures.append("trusted_calculation_input_role_mismatch")
+            if binding.unit != metadata.output_unit:
+                failures.append("trusted_calculation_unit_semantics_mismatch")
+        # Binding metadata is authority only when the registered template
+        # executes it. Current templates do not implement decimal
+        # precision/rounding, so accepting these declarations would make the
+        # grounded value contradict its catalog contract.
+        if binding.precision is not None or binding.rounding is not None:
+            failures.append("trusted_calculation_numeric_semantics_unsupported")
         if set(step.input_refs) != set(binding.input_roles):
             failures.append("trusted_calculation_input_role_mismatch")
 

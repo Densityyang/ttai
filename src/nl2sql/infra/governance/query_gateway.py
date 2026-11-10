@@ -600,6 +600,18 @@ class QueryGateway:
         self._concurrency_governor = concurrency_governor
         self._policy = PolicyEngine(max_rows=max_rows, allowed_schema=schema)
 
+    @property
+    def candidate_policy_engine(self) -> PolicyEngine:
+        """Return the exact configured policy used to prepare Gateway SQL.
+
+        Candidate verification must re-check SQL under the same schema and
+        row-bound configuration as execution. A fresh default PolicyEngine
+        would have weaker or different scope and can reject or mis-fingerprint
+        an otherwise valid Gateway query.
+        """
+
+        return self._policy
+
     def prepare(
         self,
         sql: str,

@@ -27,6 +27,10 @@ from src.nl2sql.contracts import (
     SourceDegradation,
     TimeRange,
 )
+from src.nl2sql.orchestration.checkpoint_evidence_seal import (
+    CheckpointEvidenceSealError,
+    verify_grounded_execution_checkpoint,
+)
 from src.nl2sql.orchestration.execution import PlanStepError, validate_execution_record_against_plan
 from src.nl2sql.orchestration.grounding import (
     GroundedAnswer,
@@ -219,7 +223,11 @@ class AnalysisEvidenceFact(_StrictFrozenModel):
 
     fact_id: str = Field(pattern=_CHECKSUM_PATTERN)
     step_id: PlanStepId
-    metric_key: str = Field(min_length=1, max_length=256)
+    metric_key: str | None = Field(default=None, min_length=1, max_length=256)
+    derived_output_id: str | None = Field(
+        default=None, pattern=r"^adhoc_[0-9a-f]{32}$"
+    )
+    calculation_scope: Literal["ad_hoc_noncanonical"] | None = None
     status: Literal["grounded", "unavailable"]
     value: AnalysisScalar = None
     unit: str | None = Field(default=None, min_length=1, max_length=64)
@@ -247,6 +255,20 @@ class AnalysisEvidenceFact(_StrictFrozenModel):
         if isinstance(value, str) and len(value) > 1_024:
             raise ValueError("analysis evidence string value is too large")
         return value
+
+    @model_validator(mode="after")
+    def validate_identity_scope(self) -> AnalysisEvidenceFact:
+        if self.metric_key is None:
+            if (
+                self.derived_output_id is None
+                or self.calculation_scope != "ad_hoc_noncanonical"
+            ):
+                raise ValueError(
+                    "analysis evidence requires a canonical metric or noncanonical derived id"
+                )
+        elif self.derived_output_id is not None or self.calculation_scope is not None:
+            raise ValueError("canonical metric evidence cannot carry AD_HOC identity")
+        return self
 
     @property
     def origin(self) -> EvidenceOrigin:
@@ -441,7 +463,7 @@ class AnalysisEvidenceBundle(_StrictFrozenModel):
     """Non-checkpoint ANALYZE input containing bounded, proven scalar facts."""
 
     schema_version: Literal["1.0"] = "1.0"
-    metric_keys: tuple[str, ...] = Field(min_length=1, max_length=16)
+    metric_keys: tuple[str, ...] = Field(default=(), max_length=16)
     facts: tuple[AnalysisEvidenceFact, ...] = Field(min_length=1, max_length=16)
     analysis_window: TimeRange
     data_as_of: datetime | None = None
@@ -472,9 +494,13 @@ class AnalysisEvidenceBundle(_StrictFrozenModel):
         fact_ids = tuple(fact.fact_id for fact in self.facts)
         if len(set(fact_ids)) != len(fact_ids):
             raise ValueError("analysis evidence facts must be unique")
-        projected_metrics = tuple(dict.fromkeys(fact.metric_key for fact in self.facts))
+        projected_metrics = tuple(
+            dict.fromkeys(fact.metric_key for fact in self.facts if fact.metric_key is not None)
+        )
         if self.metric_keys != projected_metrics:
             raise ValueError("analysis metric identities must match the facts")
+        if projected_metrics and any(fact.derived_output_id is not None for fact in self.facts):
+            raise ValueError("analysis evidence cannot mix canonical and AD_HOC identities")
         fact_steps = tuple(dict.fromkeys(fact.step_id for fact in self.facts))
         if self.authority_provenance.receipt_step_ids != fact_steps:
             raise ValueError("analysis authority receipts must match the facts")
@@ -563,6 +589,11 @@ def validate_grounded_answer_checkpoint(
     *,
     execution_plan: object | None = None,
     execution_record: PlanExecutionRecord | None = None,
+    authoritative_units: Mapping[str, str | None] | None = None,
+    metric_contracts: Mapping[str, MetricContract] | None = None,
+    evidence_seal_key: str | None = None,
+    unit_authority_identities: Mapping[str, str] | None = None,
+    allow_legacy_checkpoint: bool = False,
 ) -> GroundedAnswer:
     """Rebind checkpoint answer text to a validated deterministic artifact."""
 
@@ -576,6 +607,27 @@ def validate_grounded_answer_checkpoint(
     if (execution_plan is None) != (execution_record is None):
         raise AnalysisEvidenceError("analysis_execution_evidence_missing")
     if execution_plan is not None and execution_record is not None:
+        if (
+            allow_legacy_checkpoint
+            and execution_record.evidence_seal is None
+            and not _is_legacy_unitless_checkpoint(execution_record)
+        ):
+            raise AnalysisEvidenceError(
+                "analysis_checkpoint_legacy_compatibility_denied"
+            )
+        try:
+            verify_grounded_execution_checkpoint(
+                key=evidence_seal_key,
+                query_plan=query_plan,
+                execution_plan=execution_plan,  # type: ignore[arg-type]
+                execution_record=execution_record,
+                answer_artifact=validated_artifact,
+                answer_text=answer_text,
+                unit_authority_identities=unit_authority_identities or {},
+                required=not allow_legacy_checkpoint,
+            )
+        except CheckpointEvidenceSealError as exc:
+            raise AnalysisEvidenceError(str(exc)) from exc
         try:
             validate_execution_record_against_plan(execution_plan, execution_record)  # type: ignore[arg-type]
         except PlanStepError as exc:
@@ -585,11 +637,28 @@ def validate_grounded_answer_checkpoint(
             execution_plan=execution_plan,
             execution_record=execution_record,
             facts=validated_artifact.facts,
+            authoritative_units=authoritative_units,
+            metric_contracts=metric_contracts,
         )
     return GroundedAnswer(
         answer_text=canonical,
         facts=validated_artifact.facts,
         artifact=validated_artifact,
+    )
+
+
+def _is_legacy_unitless_checkpoint(record: PlanExecutionRecord) -> bool:
+    """Narrow compatibility for pre-seal fetch-only, explicitly unitless records."""
+
+    if record.status != "succeeded" or not record.step_receipts:
+        return False
+    return all(
+        receipt.kind in {"fetch_metric", "verify"}
+        and receipt.unit is None
+        and receipt.semantic_manifest_checksum is None
+        and receipt.semantic_validation_identity is None
+        and receipt.semantic_validation_outcome is None
+        for receipt in record.step_receipts
     )
 
 
@@ -637,35 +706,66 @@ def build_analysis_evidence(
     flags = list(grounded.artifact.degradation_flags)
     for fact in grounded.facts:
         receipt = receipts.get(fact.step_id)
+        adhoc_fact = (
+            fact.metric_key is None
+            and fact.derived_output_id is not None
+            and fact.calculation_scope == "ad_hoc_noncanonical"
+        )
+        identity_valid = (
+            fact.metric_key is not None
+            and fact.derived_output_id is None
+            and fact.calculation_scope is None
+        ) or adhoc_fact
+        if (
+            fact.metric_key is not None
+            and receipt is not None
+            and receipt.unit is not None
+            and authoritative_units is None
+        ):
+            raise AnalysisEvidenceError("analysis_fact_unit_authority_missing")
         authoritative_unit = _lookup_authoritative_unit(
             authoritative_units, fact.metric_key
         )
         unit_authority_mismatch = (
             authoritative_units is not None
             and fact.metric_key is not None
-            and (
-                authoritative_unit is None
-                and fact.metric_key not in authoritative_units
-                and fact.metric_key.removeprefix("metric.") not in authoritative_units
-            )
-        ) or (
-            authoritative_units is not None
             and receipt is not None
-            and receipt.unit != authoritative_unit
+            and (
+                not _has_authoritative_unit(authoritative_units, fact.metric_key)
+                or receipt.unit != authoritative_unit
+            )
         )
         # Receipt units are server-side identifiers. A free-text alias must
         # never become authority merely by surviving a checkpoint round trip.
         if (
-            fact.metric_key is None
-            or fact.derived_output_id is not None
+            not identity_valid
             or receipt is None
             or receipt.status != "succeeded"
-            or receipt.kind not in {"fetch_metric", "trusted_calculation"}
+            or (
+                receipt.kind
+                not in (
+                    {"ad_hoc_calculation"}
+                    if adhoc_fact
+                    else {"fetch_metric", "trusted_calculation"}
+                )
+            )
+            or (
+                adhoc_fact
+                and (
+                    receipt.calculation_scope != "ad_hoc_noncanonical"
+                    or receipt.derived_output_id != fact.derived_output_id
+                )
+            )
             or fact.output_digest != receipt.output_digest
             or fact.rowset_sha256 != receipt.rowset_sha256
             or fact.source_id != receipt.source_id
             or fact.semantic_signature != receipt.semantic_signature
-            or fact.unit != receipt.unit
+            # Legacy grounding paths may leave the fact unit unset even when
+            # the server receipt is typed.  Never accept a checkpoint supplied
+            # unit as authority: if present it must agree with the receipt,
+            # and the receipt itself is checked against authoritative_units
+            # above before the evidence bundle projects its unit.
+            or (fact.unit is not None and fact.unit != receipt.unit)
             or unit_authority_mismatch
             or (
                 receipt.unit is not None
@@ -694,6 +794,8 @@ def build_analysis_evidence(
                 fact_id=fact.fact_id,
                 step_id=fact.step_id,
                 metric_key=fact.metric_key,
+                derived_output_id=fact.derived_output_id,
+                calculation_scope=fact.calculation_scope,
                 status=fact.status,
                 value=cast("AnalysisScalar", fact.value),
                 unit=receipt.unit,
@@ -748,7 +850,13 @@ def build_analysis_evidence(
 
     fact_tuple = tuple(facts)
     return AnalysisEvidenceBundle(
-        metric_keys=tuple(dict.fromkeys(fact.metric_key for fact in fact_tuple)),
+        metric_keys=tuple(
+            dict.fromkeys(
+                fact.metric_key
+                for fact in fact_tuple
+                if fact.metric_key is not None
+            )
+        ),
         facts=fact_tuple,
         analysis_window=analysis_window,
         data_as_of=data_as_of,
@@ -800,9 +908,34 @@ def _fact_matches_execution_plan(
             if metric is None:
                 return False
             expected_unit = metric.ratio.unit if metric.ratio is not None else "count"
-            if fact.unit != expected_unit:
+            # Some pre-manifest injected runners do not project a unit onto
+            # AnswerFact.  The independently rebound receipt is the authority
+            # in that case; any checkpoint supplied unit must still match.
+            if fact.unit is not None and fact.unit != expected_unit:
                 return False
-    elif getattr(step, "kind", None) != "ad_hoc_calculation" or fact.derived_output_id != getattr(step, "derived_output_id", None):
+    elif getattr(step, "kind", None) == "ad_hoc_calculation":
+        if (
+            fact.calculation_scope != "ad_hoc_noncanonical"
+            or fact.derived_output_id != getattr(step, "derived_output_id", None)
+        ):
+            return False
+        spec = getattr(step, "calculation_spec", None)
+        if spec is None:
+            return False
+        custom_unit_id = getattr(spec, "custom_unit_id", None)
+        expected_unit = (
+            custom_unit_id if getattr(spec, "unit", None) == "custom_unit"
+            else getattr(spec, "unit", None)
+        )
+        if not isinstance(expected_unit, str) or fact.unit != expected_unit:
+            return False
+    else:
+        return False
+    if (
+        getattr(step, "kind", None) == "trusted_calculation"
+        and getattr(step, "output_metric_key", None) is None
+        and fact.unit is not None
+    ):
         return False
     return True
 
@@ -818,12 +951,25 @@ def _lookup_authoritative_unit(
     return authoritative_units.get(metric_key.removeprefix("metric."))
 
 
+def _has_authoritative_unit(
+    authoritative_units: Mapping[str, str | None], metric_key: str | None
+) -> bool:
+    if metric_key is None:
+        return False
+    return (
+        metric_key in authoritative_units
+        or metric_key.removeprefix("metric.") in authoritative_units
+    )
+
+
 def _validate_checkpoint_fact_bindings(
     *,
     query_plan: QueryPlan,
     execution_plan: object,
     execution_record: PlanExecutionRecord,
     facts: tuple[AnswerFact, ...],
+    authoritative_units: Mapping[str, str | None] | None,
+    metric_contracts: Mapping[str, MetricContract] | None,
 ) -> None:
     receipts = {item.step_id: item for item in execution_record.step_receipts}
     for fact in facts:
@@ -832,13 +978,30 @@ def _validate_checkpoint_fact_bindings(
             raise AnalysisEvidenceError("analysis_fact_execution_mismatch")
         if fact.output_digest != receipt.output_digest or fact.rowset_sha256 != receipt.rowset_sha256:
             raise AnalysisEvidenceError("analysis_fact_execution_mismatch")
+        # Reconstruct an omitted legacy fact unit from the receipt only after
+        # receipt.unit is independently rebound to authoritative_units below.
+        # A checkpoint cannot introduce or change a unit through this path.
+        if fact.unit is not None and fact.unit != receipt.unit:
+            raise AnalysisEvidenceError("analysis_fact_unit_authority_missing")
         if receipt.unit is not None and _canonical_unit(receipt.unit) != receipt.unit:
             raise AnalysisEvidenceError("analysis_fact_unit_authority_missing")
+        if fact.metric_key is not None:
+            if authoritative_units is None:
+                if receipt.unit is not None:
+                    raise AnalysisEvidenceError(
+                        "analysis_fact_unit_authority_missing"
+                    )
+            elif (
+                not _has_authoritative_unit(authoritative_units, fact.metric_key)
+                or receipt.unit
+                != _lookup_authoritative_unit(authoritative_units, fact.metric_key)
+            ):
+                raise AnalysisEvidenceError("analysis_fact_unit_authority_missing")
         if not _fact_matches_execution_plan(
             fact=fact,
             execution_plan=execution_plan,
             query_plan=query_plan,
-            metric_contracts=None,
+            metric_contracts=metric_contracts,
         ):
             raise AnalysisEvidenceError("analysis_fact_execution_mismatch")
 
@@ -1018,6 +1181,21 @@ def _is_scalar(value: object) -> bool:
 
 
 def _grounded_fact_id(fact: AnswerFact) -> str:
+    if (
+        fact.metric_key is None
+        and fact.derived_output_id is not None
+        and fact.calculation_scope == "ad_hoc_noncanonical"
+    ):
+        return _checksum(
+            {
+                "step_id": fact.step_id,
+                "derived_output_id": fact.derived_output_id,
+                "status": fact.status,
+                "value": fact.value,
+                "unit": fact.unit,
+                "fact_id_version": 2,
+            }
+        )
     payload: dict[str, object] = {
         "step_id": fact.step_id,
         "metric_key": fact.metric_key,

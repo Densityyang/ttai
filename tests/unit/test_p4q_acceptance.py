@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -33,11 +34,13 @@ from src.nl2sql.orchestration.p4q_acceptance import (
     P4QCaseRegistry,
     P4QCaseResult,
     P4QCaseSpec,
+    P4QEvidenceBundle,
     P4QGroundedAnswerCapture,
     P4QManifest,
     P4QOracleEvidence,
     P4QRealnessWitness,
     evaluate_p4q,
+    ingest_p4q_evidence_bundle,
 )
 from src.nl2sql.semantic.published_reader import (
     PublishedMetricReadBinding,
@@ -490,6 +493,121 @@ def _evidence_all(origin: str = "fixture") -> tuple[P4QCaseEvidence, ...]:
     )
 
 
+def _real_evidence_with_captures() -> tuple[P4QCaseEvidence, ...]:
+    evidence: list[P4QCaseEvidence] = []
+    for item in _evidence_all("real"):
+        if item.case_id not in {
+            "case-published_gold",
+            "case-approved_compute",
+            "case-clarification_resume",
+        }:
+            evidence.append(item)
+            continue
+        trusted = item.case_id == "case-approved_compute"
+        plan_without_verify = _plan(trusted=trusted)
+        final_input = "s2" if trusted else "s1"
+        verify = VerifyStep(
+            step_id="verify_result",
+            input_refs=(final_input,),
+            invariant_ids=("typed_result_present",),
+            depends_on=(final_input,),
+        )
+        plan = plan_without_verify.model_copy(
+            update={"steps": (*plan_without_verify.steps, verify)}
+        )
+        record_without_verify = _record(plan_without_verify, trusted=trusted)
+        record = PlanExecutionRecord(
+            execution_plan_checksum=plan.checksum,
+            status="succeeded",
+            step_receipts=(
+                *record_without_verify.step_receipts,
+                _step_receipt("verify_result", "verify", VERIFY_DIGEST),
+            ),
+            output_step_ids=(
+                *record_without_verify.output_step_ids,
+                "verify_result",
+            ),
+        )
+        item = item.model_copy(
+            update={"execution_plan": plan, "execution_record": record}
+        )
+        assert item.answer_artifact is not None
+        answer_text = f"verified answer for {item.case_id}"
+        answer_sha = hashlib.sha256(answer_text.encode("utf-8")).hexdigest()
+        facts_sha = _facts_sha256(item.answer_artifact)
+        record_sha = hashlib.sha256(
+            json.dumps(
+                item.execution_record.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        capture = P4QGroundedAnswerCapture(
+            answer_text=answer_text,
+            facts=item.answer_artifact.facts,
+            answer_sha256=answer_sha,
+            facts_sha256=facts_sha,
+            query_plan_sha256=item.execution_plan.query_plan_sha256,
+            execution_plan_sha256=item.execution_plan.checksum,
+            execution_record_sha256=record_sha,
+        )
+        evidence.append(
+            item.model_copy(
+                update={
+                    "captured_grounded_answer": capture,
+                    "oracle": item.oracle.model_copy(
+                        update={
+                            "expected_answer_sha256": answer_sha,
+                            "expected_facts_sha256": facts_sha,
+                        }
+                    ),
+                }
+            )
+        )
+    return tuple(evidence)
+
+
+def _signed_evidence_bundle() -> tuple[P4QEvidenceBundle, bytes]:
+    registry = _registry()
+    evidence = _real_evidence_with_captures()
+    witness = _witness()
+    signing_key = b"test-only-p4q-signer-key-material-32-bytes-minimum"
+    payload: dict[str, Any] = {
+        "schema_version": "1.0",
+        "bundle_id": "bundle-1",
+        "source_id": "trusted-harness",
+        "source_revision": "impl-1",
+        "signer_key_id": "test-signer-v1",
+        "registry": registry.model_dump(mode="json"),
+        "evidence": [item.model_dump(mode="json") for item in evidence],
+        "realness_witness": witness.model_dump(mode="json"),
+        "bundle_sha256": "0" * 64,
+        "signature_sha256": "0" * 64,
+    }
+    unsigned = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"bundle_sha256", "signature_sha256"}
+    }
+    encoded = json.dumps(
+        unsigned,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    bundle_sha = hashlib.sha256(encoded).hexdigest()
+    signature = hmac.new(
+        signing_key, bytes.fromhex(bundle_sha), hashlib.sha256
+    ).hexdigest()
+    payload["bundle_sha256"] = bundle_sha
+    payload["signature_sha256"] = signature
+    bundle = ingest_p4q_evidence_bundle(
+        payload, trusted_signing_keys={"test-signer-v1": signing_key}
+    )
+    return bundle, signing_key
+
+
 def _witness(**o: Any) -> P4QRealnessWitness:
     base: dict[str, Any] = {
         "implementation_revision": "impl-1",
@@ -632,7 +750,11 @@ def test_fixture_evidence_ceiling_is_contract_ready_never_pass() -> None:
     manifest = evaluate_p4q(_registry(), _evidence_all("fixture"))
     assert manifest.verdict == "P4-Q-CONTRACT_READY"
     assert all(r.passed for r in manifest.case_results)
-    assert manifest.readiness_gaps == ("non_real_evidence_origin", "realness_witness_absent")
+    assert manifest.readiness_gaps == (
+        "non_real_evidence_origin",
+        "realness_witness_absent",
+        "trusted_evidence_bundle_unverified",
+    )
 
 
 def test_local_integration_evidence_ceiling_is_contract_ready() -> None:
@@ -642,6 +764,60 @@ def test_local_integration_evidence_ceiling_is_contract_ready() -> None:
 def test_current_environment_cannot_produce_pass_without_realness() -> None:
     for origin in ("fixture", "local_integration"):
         assert evaluate_p4q(_registry(), _evidence_all(origin)).verdict != "P4-Q-PASS"
+
+
+def test_unsigned_real_evidence_and_recomputed_answer_captures_cannot_pass() -> None:
+    manifest = evaluate_p4q(
+        _registry(),
+        _real_evidence_with_captures(),
+        realness_witness=_witness(),
+    )
+    assert all(result.passed for result in manifest.case_results)
+    assert manifest.verdict == "P4-Q-CONTRACT_READY"
+    assert manifest.readiness_gaps == ("trusted_evidence_bundle_unverified",)
+
+
+def test_signed_bundle_is_verified_before_pass_eligibility() -> None:
+    bundle, signing_key = _signed_evidence_bundle()
+    manifest = evaluate_p4q(
+        bundle.registry,
+        (),
+        evidence_bundle=bundle,
+        trusted_signing_keys={bundle.signer_key_id: signing_key},
+    )
+    assert all(result.passed for result in manifest.case_results)
+    assert manifest.verdict == "P4-Q-PASS"
+    assert manifest.readiness_gaps == ()
+
+
+def test_jointly_mutated_signed_bundle_fails_signature_validation() -> None:
+    bundle, signing_key = _signed_evidence_bundle()
+    changed_evidence = bundle.evidence[0].model_copy(
+        update={"observed_answer_sha256": OTHER}
+    )
+    tampered_bundle = bundle.model_copy(
+        update={"evidence": (changed_evidence, *bundle.evidence[1:])}
+    )
+    manifest = evaluate_p4q(
+        bundle.registry,
+        (),
+        evidence_bundle=tampered_bundle,
+        trusted_signing_keys={bundle.signer_key_id: signing_key},
+    )
+    assert manifest.verdict == "P4-Q-FAIL"
+    assert "evidence_bundle_authentication_failed" in manifest.integrity_failures
+
+
+def test_bundle_ingestion_rejects_tampering_and_untrusted_signer() -> None:
+    bundle, signing_key = _signed_evidence_bundle()
+    payload = bundle.model_dump(mode="json")
+    with pytest.raises(ValueError, match="authentication failed"):
+        ingest_p4q_evidence_bundle(
+            {**payload, "source_id": "changed-source"},
+            trusted_signing_keys={bundle.signer_key_id: signing_key},
+        )
+    with pytest.raises(ValueError, match="authentication failed"):
+        ingest_p4q_evidence_bundle(payload, trusted_signing_keys={})
 
 
 def test_pass_branch_is_only_contract_representability_not_a_real_pass() -> None:

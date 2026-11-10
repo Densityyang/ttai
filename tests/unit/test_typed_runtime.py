@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -10,15 +12,31 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from src.nl2sql.contracts import AuthorizationContext, RequestIdentity
-from src.nl2sql.infra.governance.query_gateway import QueryGateway
+from src.nl2sql.contracts import (
+    AuthorizationContext,
+    FetchMetricStep,
+    RequestIdentity,
+)
+from src.nl2sql.infra.governance.query_gateway import QueryGateway, QueryReceipt
+from src.nl2sql.infra.governance.semantic_sql_validator import SemanticSQLValidationError
 from src.nl2sql.infra.store.ai_views import (
     AIViewsConfig,
     load_ai_views_config,
     view_output_columns,
 )
+from src.nl2sql.orchestration.budget import RouteBudgetLedger
+from src.nl2sql.orchestration.evidence_digest import (
+    canonical_json_digest,
+    canonical_rowset_digest,
+)
 from src.nl2sql.orchestration.execution import PlanExecutor
+from src.nl2sql.orchestration.grounding import (
+    GroundingIntegrityError,
+    ground_execution_answer,
+)
 from src.nl2sql.orchestration.metric_query import EligibilityPolicy, RelationBinding
+from src.nl2sql.orchestration.p4q_acceptance import capture_grounded_answer
+from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
 from src.nl2sql.orchestration.typed_runtime import (
     RequestTypedRuntime,
     TypedDeploymentError,
@@ -560,6 +578,394 @@ async def test_factory_with_valid_authorization_builds_one_coherent_set() -> Non
     assert compiled.snapshot_id == SNAPSHOT_ID
     assert '"v_fault_reporting_order"' in compiled.sql
     assert "is_valid_for_metrics" in compiled.sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rows", "expected_status", "semantic_denied"),
+    [
+        ([{"value": 7}], "succeeded", False),
+        ([{"value": 7}, {"value": 8}], "failed", False),
+        ([{"value": {"unexpected": "object"}}], "failed", False),
+        ([{"value": "not-a-number"}], "failed", False),
+        ([{"value": 7}], "failed", True),
+    ],
+    ids=(
+        "valid-production-path",
+        "multi-row",
+        "nested-wrong-type",
+        "text-wrong-type",
+        "shadow-semantic-denial",
+    ),
+)
+async def test_request_runtime_execution_and_grounding_result_validation(
+    rows: list[dict[str, object]], expected_status: str, semantic_denied: bool
+) -> None:
+    """Drive request factory -> gateway runner -> SQL validator -> receipt -> grounding.
+
+    Only the database adapter result is supplied by the fixture.  Runtime
+    composition, SQL compilation, semantic manifest production/validation,
+    execution receipts and grounding use the production components.
+    """
+
+    gateway = _gateway()
+
+    async def execute(sql: str, params: dict[str, object], **kwargs: object) -> QueryReceipt:
+        del params, kwargs
+        prepared = gateway.prepare(sql)
+        return QueryReceipt(
+            accepted=True,
+            sql=sql,
+            sql_fingerprint=prepared.fingerprint,
+            rows=rows,  # type: ignore[arg-type]
+            row_count=len(rows),
+            estimated_cost=1.0,
+            estimated_rows=1,
+            policy_outcome="allow",
+            policy_version=prepared.policy_version,
+            max_rows=prepared.max_rows,
+            result_columns=("value",),
+        )
+
+    gateway.execute = AsyncMock(side_effect=execute)  # type: ignore[method-assign]
+    identity = _identity().model_copy(
+        update={"permissions": frozenset({"nl2sql:invoke", "metrics:read"})}
+    )
+    runtime = await build_request_typed_runtime(
+        views=_views(),
+        read_active=_deployment().read_active,
+        read_snapshot=_deployment().read_snapshot,
+        gateway=gateway,
+        identity=identity,
+        authorization=_authorization(),
+    )
+    assert isinstance(runtime, RequestTypedRuntime)
+    validation_patch = None
+    if semantic_denied:
+        metric_runner = runtime.plan_executor._metric_runner
+        metric_runner._validation_mode = "shadow"
+        validation_patch = patch.object(
+            metric_runner._semantic_validator,
+            "validate",
+            side_effect=SemanticSQLValidationError("semantic_sql_output_mismatch"),
+        )
+        validation_patch.start()
+    context = await runtime.context_resolver.resolve(
+        question=QUESTION, identity=identity, route_hint="standard"
+    )
+    query_plan = await runtime.query_plan_provider.propose(
+        question=QUESTION, context=context, identity=identity
+    )
+    plan_validator = PlanValidator()
+    query_validation = plan_validator.validate_query_plan(
+        plan=query_plan, context=context, identity=identity
+    )
+    assert query_validation.outcome == "allow", query_validation.issues
+    execution_plan = PlanCompiler().compile(
+        plan=query_plan, context=context, validation=query_validation
+    )
+    execution_validation = plan_validator.validate_execution_plan(
+        execution_plan=execution_plan,
+        query_plan=query_plan,
+        context=context,
+        route_budget=RouteBudgetLedger(route="standard").limits,
+    )
+    assert execution_validation.outcome == "allow", execution_validation.issues
+    result = await runtime.plan_executor.execute(
+        query_plan=query_plan,
+        context=context,
+        execution_plan=execution_plan,
+        validation=execution_validation,
+        expected_policy_version=plan_validator.policy_version,
+        expected_policy_checksum=plan_validator.policy_checksum,
+        budget=RouteBudgetLedger(route="standard"),
+        deadline_ms=10_000,
+    )
+    if validation_patch is not None:
+        validation_patch.stop()
+    assert result.record.status == expected_status
+    fetch = next(step for step in execution_plan.steps if isinstance(step, FetchMetricStep))
+    fetch_receipt = next(
+        receipt for receipt in result.record.step_receipts if receipt.step_id == fetch.step_id
+    )
+    if expected_status == "succeeded":
+        assert fetch_receipt.semantic_validation_outcome == "allow"
+        assert fetch_receipt.semantic_manifest_checksum is not None
+        grounded = ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=execution_plan,
+            record=result.record,
+            outputs=result.outputs,
+            output_contracts=result.output_contracts,
+            require_semantic_contract=True,
+            allow_legacy_unitless=True,
+        )
+        assert len(grounded.facts) == 1
+        assert grounded.facts[0].value == 7
+        assert grounded.facts[0].unit == "count"
+        for tampered_unit in ("percent", None):
+            changed_unit_receipts = tuple(
+                receipt.model_copy(update={"unit": tampered_unit})
+                if receipt.step_id == fetch.step_id
+                else receipt
+                for receipt in result.record.step_receipts
+            )
+            changed_unit_record = result.record.model_copy(
+                update={"step_receipts": changed_unit_receipts}
+            )
+            with pytest.raises(
+                GroundingIntegrityError, match="grounding_candidate_evidence_mismatch"
+            ):
+                ground_execution_answer(
+                    query_plan=query_plan,
+                    execution_plan=execution_plan,
+                    record=changed_unit_record,
+                    outputs=result.outputs,
+                    output_contracts=result.output_contracts,
+                    require_semantic_contract=True,
+                    allow_legacy_unitless=True,
+                )
+        capture = capture_grounded_answer(
+            grounded,
+            query_plan=query_plan,
+            execution_plan=execution_plan,
+            execution_record=result.record,
+        )
+        assert capture.answer_text == grounded.answer_text
+        assert capture.facts == grounded.facts
+        assert capture.answer_sha256 == hashlib.sha256(
+            grounded.answer_text.replace("\r\n", "\n").encode("utf-8")
+        ).hexdigest()
+        assert capture.facts_sha256 is not None
+        assert capture.query_plan_sha256 == query_plan.checksum
+        assert capture.execution_plan_sha256 == execution_plan.checksum
+        expected_record_sha256 = hashlib.sha256(
+            json.dumps(
+                result.record.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        assert capture.execution_record_sha256 == expected_record_sha256
+        output = {"rows": [{"value": "7"}], "no_data": False}
+        changed_receipts = tuple(
+            receipt.model_copy(
+                update={
+                    "output_digest": canonical_json_digest(output)
+                    if receipt.step_id == fetch.step_id
+                    else receipt.output_digest,
+                    "rowset_sha256": canonical_rowset_digest(
+                        [{"value": "7"}], result_columns=("value",)
+                    )
+                    if receipt.step_id == fetch.step_id
+                    else receipt.rowset_sha256,
+                }
+            )
+            for receipt in result.record.step_receipts
+        )
+        changed_record = result.record.model_copy(
+            update={"step_receipts": changed_receipts}
+        )
+        with pytest.raises(
+            GroundingIntegrityError, match="grounding_candidate_evidence_mismatch"
+        ):
+            ground_execution_answer(
+                query_plan=query_plan,
+                execution_plan=execution_plan,
+                record=changed_record,
+                outputs={fetch.step_id: output, **{
+                    key: value for key, value in result.outputs.items() if key != fetch.step_id
+                }},
+                output_contracts=result.output_contracts,
+                require_semantic_contract=True,
+                allow_legacy_unitless=True,
+            )
+        with pytest.raises(GroundingIntegrityError, match="grounding_manifest_missing"):
+            ground_execution_answer(
+                query_plan=query_plan,
+                execution_plan=execution_plan,
+                record=result.record,
+                outputs=result.outputs,
+                require_semantic_contract=True,
+                allow_legacy_unitless=True,
+            )
+        cleared_receipts = tuple(
+            receipt.model_copy(
+                update={
+                    "semantic_validation_outcome": None,
+                    "semantic_manifest_checksum": None,
+                    "semantic_validator_version": None,
+                    "semantic_validation_identity": None,
+                }
+            )
+            for receipt in result.record.step_receipts
+        )
+        cleared_record = result.record.model_copy(
+            update={"step_receipts": cleared_receipts}
+        )
+        with pytest.raises(GroundingIntegrityError, match="grounding_manifest_mismatch"):
+            ground_execution_answer(
+                query_plan=query_plan,
+                execution_plan=execution_plan,
+                record=cleared_record,
+                outputs=result.outputs,
+                output_contracts=result.output_contracts,
+                require_semantic_contract=True,
+                allow_legacy_unitless=True,
+            )
+        with pytest.raises(
+            GroundingIntegrityError, match="grounding_unit_authority_missing"
+        ):
+            ground_execution_answer(
+                query_plan=query_plan,
+                execution_plan=execution_plan,
+                record=cleared_record,
+                outputs=result.outputs,
+            )
+        explicitly_unitless_receipts = tuple(
+            receipt.model_copy(update={"unit": None})
+            for receipt in cleared_record.step_receipts
+        )
+        explicitly_unitless_record = cleared_record.model_copy(
+            update={"step_receipts": explicitly_unitless_receipts}
+        )
+        legacy_without_unit_authority = ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=execution_plan,
+            record=explicitly_unitless_record,
+            outputs=result.outputs,
+            allow_legacy_unitless=True,
+        )
+        assert len(legacy_without_unit_authority.facts) == 1
+        assert legacy_without_unit_authority.facts[0].unit is None
+        changed_parameter_receipts = tuple(
+            receipt.model_copy(
+                update={"parameter_binding_fingerprint": "f" * 64}
+            )
+            if receipt.step_id == fetch.step_id
+            else receipt
+            for receipt in result.record.step_receipts
+        )
+        changed_parameter_record = result.record.model_copy(
+            update={"step_receipts": changed_parameter_receipts}
+        )
+        with pytest.raises(GroundingIntegrityError, match="grounding_manifest_mismatch"):
+            ground_execution_answer(
+                query_plan=query_plan,
+                execution_plan=execution_plan,
+                record=changed_parameter_record,
+                outputs=result.outputs,
+                output_contracts=result.output_contracts,
+                require_semantic_contract=True,
+                allow_legacy_unitless=True,
+            )
+    else:
+        assert fetch_receipt.status == "failed"
+        if semantic_denied:
+            assert fetch_receipt.error_code == "metric_semantic_validation_denied"
+            gateway.execute.assert_not_awaited()
+        else:
+            assert fetch_receipt.error_code == "metric_result_shape_invalid"
+        grounded = ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=execution_plan,
+            record=result.record,
+            outputs=result.outputs,
+            allow_legacy_unitless=True,
+        )
+        assert grounded.facts == ()
+        assert grounded.answer_text == (
+            "No grounded value was produced for metric.complaint_in_transit_count."
+        )
+
+
+@pytest.mark.asyncio
+async def test_wrong_topn_is_denied_before_gateway_and_cannot_ground_a_fact() -> None:
+    gateway = _gateway()
+    gateway.execute = AsyncMock()  # type: ignore[method-assign]
+    runtime = await _factory(gateway=gateway)
+    assert isinstance(runtime, RequestTypedRuntime)
+    identity = runtime.identity
+    question = (
+        "metric=complaint_first_response_rate time=2024-02-29"
+    )
+    context = await runtime.context_resolver.resolve(
+        question=question,
+        identity=identity,
+        route_hint="standard",
+    )
+    query_plan = await runtime.query_plan_provider.propose(
+        question=question,
+        context=context,
+        identity=identity,
+    )
+    query_plan = query_plan.model_copy(
+        update={"intent": "ranking", "dimensions": ("area",), "result_limit": 2}
+    )
+    assert query_plan.intent == "ranking"
+    assert query_plan.dimensions == ("area",)
+    plan_validator = PlanValidator()
+    query_validation = plan_validator.validate_query_plan(
+        plan=query_plan,
+        context=context,
+        identity=identity,
+    )
+    assert query_validation.outcome == "allow", query_validation.issues
+    execution_plan = PlanCompiler().compile(
+        plan=query_plan,
+        context=context,
+        validation=query_validation,
+    )
+    execution_validation = plan_validator.validate_execution_plan(
+        execution_plan=execution_plan,
+        query_plan=query_plan,
+        context=context,
+        route_budget=RouteBudgetLedger(route="standard").limits,
+    )
+    assert execution_validation.outcome == "allow", execution_validation.issues
+
+    metric_runner = runtime.plan_executor._metric_runner
+    semantic_validator = metric_runner._semantic_validator
+    original_validate = semantic_validator.validate
+
+    def validate_tampered_topn(sql: str, *args: object, **kwargs: object):
+        assert "ORDER BY value DESC NULLS LAST, dimension_id" in sql
+        return original_validate(
+            sql.replace(
+                "ORDER BY value DESC NULLS LAST, dimension_id",
+                "ORDER BY value ASC NULLS LAST, dimension_id",
+            ),
+            *args,
+            **kwargs,
+        )
+
+    with patch.object(
+        semantic_validator,
+        "validate",
+        side_effect=validate_tampered_topn,
+    ):
+        result = await runtime.plan_executor.execute(
+            query_plan=query_plan,
+            context=context,
+            execution_plan=execution_plan,
+            validation=execution_validation,
+            expected_policy_version=plan_validator.policy_version,
+            expected_policy_checksum=plan_validator.policy_checksum,
+            budget=RouteBudgetLedger(route="standard"),
+            deadline_ms=10_000,
+        )
+
+    assert result.record.status == "failed"
+    assert gateway.execute.await_count == 0
+    grounded = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=execution_plan,
+        record=result.record,
+        outputs=result.outputs,
+        allow_legacy_unitless=True,
+    )
+    assert grounded.facts == ()
+    assert "No grounded value was produced" in grounded.answer_text
 
 
 @pytest.mark.asyncio

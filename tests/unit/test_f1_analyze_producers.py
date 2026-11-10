@@ -160,6 +160,7 @@ def _bundle(
         scope_provenance=scope_provenance,
         manual_origin_evidence=manual_origin_evidence,
         causal_support=causal_support,
+        authoritative_units={_METRIC_KEY: "count"},
     )
 
 

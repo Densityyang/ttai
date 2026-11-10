@@ -195,6 +195,8 @@ def _gateway_with_rows(
             sql_fingerprint=prepared.fingerprint,
             rows=resolved,
             row_count=len(resolved),
+            estimated_cost=1.0,
+            estimated_rows=len(resolved),
             policy_outcome="allow",
             max_rows=200,
         )

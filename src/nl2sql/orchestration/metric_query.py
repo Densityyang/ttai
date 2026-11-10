@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -25,6 +26,7 @@ from src.nl2sql.contracts import (
     AuthorizationContext,
     AuthorizationDecision,
     ContextBundle,
+    ExecutionReceipt,
     FetchMetricStep,
     QueryPlan,
     RequestIdentity,
@@ -36,7 +38,17 @@ from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationBinding,
     ApprovedCalculationCatalog,
 )
-from src.nl2sql.orchestration.evidence_digest import canonical_rowset_digest
+from src.nl2sql.orchestration.candidates import (
+    Candidate,
+    CandidateExpectedEvidence,
+    CandidateMetadata,
+    CandidateVerifier,
+    GateOutcome,
+)
+from src.nl2sql.orchestration.evidence_digest import (
+    canonical_json_digest,
+    canonical_rowset_digest,
+)
 from src.nl2sql.orchestration.execution import (
     AdHocCalculationRunner,
     MetricStepResult,
@@ -895,12 +907,20 @@ class GatewayMetricStepRunner:
                 semantic_root_query_plan=query_plan,
             )
         if step.calculation_input_role is None:
-            if step.metric_keys != query_plan.metric_keys:
+            if (
+                len(step.metric_keys) != 1
+                or step.metric_keys[0] not in query_plan.metric_keys
+            ):
                 raise PlanStepError("metric_step_mismatch")
-            query = await self._compiler.compile(query_plan, context)
+            child_plan = (
+                query_plan
+                if step.metric_keys == query_plan.metric_keys
+                else query_plan.model_copy(update={"metric_keys": step.metric_keys})
+            )
+            query = await self._compiler.compile(child_plan, context)
             prepared = self._gateway.prepare(query.sql)
             manifest, record = self._semantic_evidence(
-                query=query, step=step, query_plan=query_plan, context=context,
+                query=query, step=step, query_plan=child_plan, context=context,
                 execution_plan=execution_plan, prepared=prepared,
                 root_query_plan=query_plan,
             )
@@ -966,7 +986,11 @@ class GatewayMetricStepRunner:
             raise PlanStepError("metric_semantic_manifest_invalid") from exc
         try:
             record = self._semantic_validator.validate(
-                query.sql, query.params, manifest, prepared=prepared
+                query.sql,
+                query.params,
+                manifest,
+                prepared=prepared,
+                expected_step_id=step.step_id,
             )
         except SemanticSQLValidationError as exc:
             if self._validation_mode == "shadow":
@@ -989,6 +1013,136 @@ class GatewayMetricStepRunner:
                 )
             raise PlanStepError(exc.code) from exc
         return manifest, record
+
+    def _verify_single_candidate(
+        self,
+        *,
+        query: CompiledMetricQuery,
+        prepared: PreparedMetricStep,
+        result: Any,
+        receipt: ExecutionReceipt,
+        rows: list[JsonValue],
+        manifest: object,
+        semantic_record: object,
+    ) -> object:
+        """Close one deterministic Gateway result through the candidate verifier.
+
+        Expected metadata comes from the compiled child plan and typed manifest,
+        while row estimates and the result evidence come directly from the
+        server-owned QueryGateway return before projecting its ExecutionReceipt.
+        A verifier failure is raised before rows can enter PlanExecutor output.
+        """
+
+        from src.nl2sql.infra.governance.semantic_sql_validator import (
+            SemanticValidationRecord,
+        )
+        from src.nl2sql.orchestration.candidates import CandidateReceipt
+        from src.nl2sql.semantic.execution_manifest import ExpectedExecutionManifest
+
+        if (
+            not isinstance(manifest, ExpectedExecutionManifest)
+            or manifest.manifest_version != "1.1"
+            or len(manifest.metric_authorities) != 1
+            or not isinstance(semantic_record, SemanticValidationRecord)
+        ):
+            raise PlanStepError("candidate_authority_missing")
+        authority = manifest.metric_authorities[0]
+        estimated_rows = getattr(result, "estimated_rows", None)
+        estimated_cost = getattr(result, "estimated_cost", None)
+        if (
+            type(estimated_rows) is not int
+            or type(estimated_cost) not in {int, float}
+        ):
+            raise PlanStepError("candidate_explain_evidence_missing")
+        # Pyright cannot narrow values through exact ``type(...)`` guards;
+        # these casts follow the runtime checks above and retain bool rejection.
+        estimated_rows_value = cast(int, estimated_rows)
+        estimated_cost_value = cast(int | float, estimated_cost)
+        if not math.isfinite(float(estimated_cost_value)) or estimated_cost_value < 0:
+            raise PlanStepError("candidate_explain_evidence_missing")
+        candidate_id = "cand-" + canonical_json_digest(
+            {
+                "fetch_step_id": authority.fetch_step_id,
+                "fetch_plan_sha256": authority.fetch_query_plan_sha256,
+                "sql_fingerprint": prepared.sql_fingerprint,
+                "semantic_signature": query.semantic_signature,
+            }
+        )[:32]
+        metadata = CandidateMetadata(
+            candidate_id=candidate_id,
+            origin="deterministic",
+            sql_fingerprint=prepared.sql_fingerprint,
+            semantic_signature=query.semantic_signature,
+            relation_ids=(authority.relation_id,),
+            source_kind=query.source_kind,
+            join_hops=prepared.join_hops,
+            estimated_rows=estimated_rows_value,
+            estimated_cost=float(estimated_cost_value),
+        )
+        expected = CandidateExpectedEvidence(
+            metadata=metadata,
+            policy_version=receipt.policy_version,
+            readonly_role=receipt.readonly_role,
+            source_id=query.source_id,
+            source_checkpoint=(
+                query.freshness.checkpoint if query.freshness is not None else None
+            ),
+            selection_reason=query.selection_reason,
+            source_degradation=query.degradation,
+            authorization_revision=query.authorization_revision,
+            unit=query.unit,
+        )
+        rowset = cast(tuple[dict[str, Any], ...], tuple(rows))
+        candidate = Candidate(
+            metadata=metadata,
+            gates=(
+                GateOutcome(
+                    "policy",
+                    result.policy_outcome == "allow"
+                    and receipt.policy_outcome == "allow"
+                    and receipt.error_taxonomy is None,
+                ),
+                GateOutcome(
+                    "semantic",
+                    semantic_record.outcome == "allow"
+                    and semantic_record.manifest_checksum == manifest.checksum
+                    and receipt.semantic_manifest_checksum == manifest.checksum,
+                ),
+                GateOutcome(
+                    "sql",
+                    receipt.sql_fingerprint == prepared.sql_fingerprint
+                    and result.sql_fingerprint == prepared.sql_fingerprint,
+                ),
+                GateOutcome(
+                    "explain",
+                    result.accepted
+                    and estimated_rows_value >= 0
+                    and float(estimated_cost_value) >= 0,
+                ),
+                GateOutcome(
+                    "execution",
+                    result.accepted
+                    and receipt.row_count == len(rowset)
+                    and receipt.rowset_sha256 is not None,
+                ),
+            ),
+            execution_receipt=receipt,
+            sql=query.sql,
+            rowset=rowset,
+            bind_params=query.params,
+            result_columns=receipt.result_columns,
+        )
+        verified = CandidateVerifier(
+            policy=self._gateway.candidate_policy_engine,
+            expected={candidate_id: expected},
+        ).verify(candidate)
+        if (
+            not isinstance(verified, CandidateReceipt)
+            or not verified.hard_gates_passed
+            or verified.execution_receipt_sha256 is None
+        ):
+            raise PlanStepError("candidate_verification_failed")
+        return verified
 
     def _dependency_plan(
         self,
@@ -1084,6 +1238,7 @@ class GatewayMetricStepRunner:
         if not isinstance(query, CompiledMetricQuery):
             raise PlanStepError("metric_prepared_query_invalid")
         semantic_record_for_receipt = prepared.semantic_record
+        semantic_manifest_for_output: object | None = None
         async with asyncio.timeout(timeout_ms / 1000):
             # Re-read active authority immediately before gateway execution.
             current = await self._compiler.compile(
@@ -1133,6 +1288,7 @@ class GatewayMetricStepRunner:
                     root_query_plan=cast(QueryPlan, prepared.semantic_root_query_plan),
                 )
                 semantic_record_for_receipt = current_record
+                semantic_manifest_for_output = current_manifest
                 if (
                     getattr(current_record, "identity", None)
                     != getattr(prepared.semantic_record, "identity", None)
@@ -1141,6 +1297,10 @@ class GatewayMetricStepRunner:
                     != getattr(prepared.semantic_manifest, "checksum", None)
                 ):
                     raise PlanStepError("metric_semantic_validation_changed")
+                if getattr(current_record, "outcome", None) != "allow":
+                    # Shadow mode can record a denial for diagnostics, but a
+                    # denied statement must not cross the execution boundary.
+                    raise PlanStepError("metric_semantic_validation_denied")
             execute_callable = self._gateway.execute
             side_effect = getattr(execute_callable, "side_effect", None)
             if callable(side_effect) and not _accepts_gateway_options(side_effect):
@@ -1226,6 +1386,17 @@ class GatewayMetricStepRunner:
         decision = self._compiler.authorization_decision()
         if decision is not None and decision.outcome == "allow":
             receipt = bind_execution_receipt_authorization(receipt, decision)
+        candidate_receipt = None
+        if semantic_manifest_for_output is not None:
+            candidate_receipt = self._verify_single_candidate(
+                query=current,
+                prepared=prepared,
+                result=result,
+                receipt=receipt,
+                rows=rows,
+                manifest=semantic_manifest_for_output,
+                semantic_record=semantic_record_for_receipt,
+            )
         # Only genuine absence may produce no_data; an undefined calculation was
         # already rejected above.
         no_data = not rows or (
@@ -1240,7 +1411,13 @@ class GatewayMetricStepRunner:
             }
         else:
             output = {"rows": rows, "no_data": no_data}
-        return MetricStepResult(value=output, receipt=receipt)
+        return MetricStepResult(
+            value=output,
+            receipt=receipt,
+            semantic_manifest=semantic_manifest_for_output,
+            semantic_validation_record=semantic_record_for_receipt,
+            candidate_receipt=candidate_receipt,
+        )
 
 
 def _accepts_gateway_options(callable_obj: object) -> bool:
@@ -1352,6 +1529,9 @@ def metric_plan_executor(
         ),
         ad_hoc_calculation_runner=ad_hoc_calculation_runner,
         calculation_catalog=calculation_catalog,
+        require_semantic_contract=(
+            semantic_validator is not None and manifest_builder is not None
+        ),
     )
 
 

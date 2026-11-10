@@ -100,6 +100,41 @@ def test_ratio_fields_cannot_be_omitted_or_generalized(field: str, value: Any) -
         seed_contract(ratio=metric.ratio)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "duplicate_denominator",
+        "conflicting_denominator",
+        "duplicate_numerator",
+        "conflicting_numerator",
+        "numerator_repeats_denominator",
+        "numerator_conflicts_with_denominator",
+    ],
+)
+def test_ratio_predicate_authority_rejects_duplicate_and_conflicting_fields(
+    mutation: str,
+) -> None:
+    metric = ratio_contract()
+    assert metric.ratio is not None
+    payload = metric.ratio.model_dump(mode="json")
+    denominator = payload["denominator_predicates"]
+    numerator = payload["numerator_predicates"]
+    if mutation == "duplicate_denominator":
+        denominator.append(dict(denominator[0]))
+    elif mutation == "conflicting_denominator":
+        denominator.append({"field": denominator[0]["field"], "operator": "is_null"})
+    elif mutation == "duplicate_numerator":
+        numerator.append(dict(numerator[0]))
+    elif mutation == "conflicting_numerator":
+        numerator.append({"field": numerator[0]["field"], "operator": "is_null"})
+    elif mutation == "numerator_repeats_denominator":
+        numerator.append(dict(denominator[0]))
+    else:
+        numerator.append({"field": denominator[0]["field"], "operator": "is_null"})
+    with pytest.raises(ValidationError, match="ratio .* predicate authority"):
+        ratio_contract(ratio=payload)
+
+
 @pytest.mark.parametrize("coverage", [
     (OrganizationCoverageBinding("area"),),
     (OrganizationCoverageBinding("team", "team_id"),),
@@ -171,6 +206,15 @@ async def test_ratio_sql_target_and_partial_month_boundaries(timestamptz: bool) 
     assert '"is_valid_for_metrics" IS TRUE' in query.sql
     assert '"completion_time" IS NOT NULL' in query.sql
     assert '"is_first_response_on_time" IS TRUE' in query.sql
+    # The numerator filter must use the complete numerator population:
+    # denominator conditions plus numerator-only conditions. Checking the
+    # emitted FILTER prevents a denominator predicate from disappearing when
+    # a contract stores numerator predicates as a delta.
+    assert (
+        'FILTER (WHERE "has_valid_bandwidth" IS TRUE AND '
+        '"completion_time" IS NOT NULL AND '
+        '"is_first_response_on_time" IS TRUE) AS numerator'
+    ) in query.sql
     # ZERO-DENOMINATOR SEMANTICS: the division is guarded explicitly rather than
     # hidden behind NULLIF, and an undefined calculation is NOT labelled no_data.
     assert "NULLIF(denominator, 0)" not in query.sql

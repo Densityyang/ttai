@@ -302,7 +302,7 @@ async def _engine(
         model_gateway=_model_gateway(provider),
         context_resolver=resolver,
         query_plan_provider=plan_provider,
-        plan_executor=PlanExecutor(metric_runner=runner),
+        plan_executor=PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ),
     )
     return engine, resolver, provider, runner, plan_provider
 

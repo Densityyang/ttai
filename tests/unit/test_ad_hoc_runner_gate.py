@@ -327,8 +327,8 @@ async def test_authorized_runner_executes_without_creating_a_definition() -> Non
         deadline_ms=4_000,
     )
     assert result.record.status == "succeeded"
-    # The executor has exactly four registered collaborators and none of them is
-    # a definition/repository/persistence port.
+    # The executor has only its registered collaborators and internal semantic
+    # gate flag; none is a definition/repository/persistence port.
     assert set(vars(PlanExecutor(
         metric_runner=_MetricRunner({}),
     ))) == {
@@ -336,4 +336,6 @@ async def test_authorized_runner_executes_without_creating_a_definition() -> Non
         "_trusted_calculation_runner",
         "_ad_hoc_calculation_runner",
         "_result_verifier",
+        "_require_semantic_contract",
+        "_allow_legacy_unitless_grounding",
     }

@@ -27,10 +27,13 @@ RuntimeCalculationRunner are the real ones.
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -41,6 +44,8 @@ from pydantic import ValidationError
 from src.nl2sql.agents.dynamic_calc.trusted_templates import trusted_template_registry
 from src.nl2sql.artifacts.definition_store import InMemoryDefinitionStore
 from src.nl2sql.contracts import (
+    AdHocCalculationStep,
+    AnswerFact,
     AuthorizationContext,
     ContextBundle,
     ExecutionReceipt,
@@ -52,6 +57,7 @@ from src.nl2sql.contracts import (
     TimeRange,
     evaluate_authorization,
 )
+from src.nl2sql.infra.governance.query_gateway import QueryGateway, QueryReceipt
 from src.nl2sql.infra.llm.gateway import (
     ModelGateway,
     ModelProfile,
@@ -59,6 +65,7 @@ from src.nl2sql.infra.llm.gateway import (
     ProviderResponse,
 )
 from src.nl2sql.orchestration.ad_hoc_request import AdHocCalculationRequest
+from src.nl2sql.orchestration.analysis_evidence import _grounded_fact_id
 from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationBinding,
     ApprovedCalculationCatalog,
@@ -67,10 +74,12 @@ from src.nl2sql.orchestration.approved_compute import (
 from src.nl2sql.orchestration.engine import create_v2_engine
 from src.nl2sql.orchestration.execution import (
     MetricStepResult,
+    PlanExecutionResult,
     PlanExecutor,
     PreparedMetricStep,
     RuntimeCalculationRunner,
 )
+from src.nl2sql.orchestration.grounding import render_grounded_answer
 from src.nl2sql.orchestration.planning import PlanCompiler
 from src.nl2sql.orchestration.typed_runtime import (
     TypedRuntimeUnavailable,
@@ -83,6 +92,8 @@ from src.nl2sql.semantic.calculation_contract import (
     CalculationInputSpec,
     CalculationSpec,
     InputRefOperand,
+    ParameterBinding,
+    ParameterSpec,
     derived_output_id,
 )
 from src.nl2sql.supervisor.schemas import (
@@ -249,8 +260,14 @@ class _CountingMetricRunner:
     repeated-SQL guard does not stand in for real execution evidence.
     """
 
-    def __init__(self, values: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        values: dict[str, object] | None = None,
+        *,
+        gateway: QueryGateway | None = None,
+    ) -> None:
         self.values = values or {"metric.revenue": 1000, "metric.stores": 25}
+        self.gateway = gateway
         self.prepare_calls = 0
         self.execute_calls = 0
 
@@ -278,6 +295,10 @@ class _CountingMetricRunner:
         self.execute_calls += 1
         payload = prepared.payload
         assert isinstance(payload, dict)
+        if self.gateway is not None:
+            await self.gateway.execute(
+                str(payload["sql"]), {}, trace_id="adhoc-checkpoint-test"
+            )
         value = self.values[str(payload["metric_key"])]
         return MetricStepResult(
             value={"value": value},
@@ -388,6 +409,7 @@ class _RuntimeFactory:
             plan_executor=PlanExecutor(
                 metric_runner=self.metric_runner,
                 ad_hoc_calculation_runner=runner,
+                allow_legacy_unitless_grounding=True,
             ),
             identity=identity,
             authorization=authorization,
@@ -434,9 +456,50 @@ class _Provider:
         return ("small",)
 
 
-def _gateway() -> ModelGateway:
+class _AnalysisProvider(_Provider):
+    """Controlled structured response provider for checkpoint restoration tests."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        timeout_ms: int,
+        max_output_tokens: int,
+        response_schema: dict[str, Any] | None = None,
+    ) -> ProviderResponse:
+        del model, timeout_ms, max_output_tokens, response_schema
+        self.calls += 1
+        source_message = messages[-1]["content"]
+        source_json = source_message.split("SOURCE FACTS\n", 1)[1].split(
+            "\n\nREQUESTED INTERPRETATION", 1
+        )[0]
+        source = json.loads(source_json)
+        fact = source["facts"][0]
+        return ProviderResponse(
+            content=json.dumps(
+                {
+                    "summary": {
+                        "text": f"The derived value is {fact['value']}.",
+                        "fact_ids": [fact["fact_id"]],
+                    },
+                    "observations": [],
+                    "caveats": [],
+                }
+            ),
+            model="controlled-analysis",
+            usage={},
+            finish_reason="stop",
+        )
+
+
+def _gateway(provider: _Provider | None = None) -> ModelGateway:
+    selected_provider = provider or _Provider()
     return ModelGateway(
-        providers={"synthetic": _Provider()},
+        providers={"synthetic": selected_provider},
         profiles={
             "fast.default": ModelProfile(
                 "fast.default",
@@ -507,6 +570,8 @@ def _engine(
     plan_compiler: PlanCompiler | None = None,
     plan_validator: Any | None = None,
     inject_runner_without_capability: bool = False,
+    checkpointer: MemorySaver | None = None,
+    model_provider: _Provider | None = None,
 ) -> tuple[Any, _RuntimeFactory]:
     factory = _RuntimeFactory(
         metric_runner=metric_runner,
@@ -516,14 +581,96 @@ def _engine(
         inject_runner_without_capability=inject_runner_without_capability,
     )
     engine = create_v2_engine(
-        checkpointer=MemorySaver(),
-        model_gateway=_gateway(),
+        checkpointer=checkpointer or MemorySaver(),
+        model_gateway=_gateway(model_provider),
         route_policy=route_policy,
         plan_compiler=plan_compiler,
         plan_validator=plan_validator,
         typed_runtime_factory=factory,
     )
     return engine, factory
+
+
+def _query_gateway() -> tuple[QueryGateway, AsyncMock]:
+    gateway = QueryGateway(None, schema="ai_views")  # type: ignore[arg-type]
+    execution = AsyncMock(
+        return_value=QueryReceipt(
+            accepted=True,
+            sql="SELECT synthetic",
+            sql_fingerprint=SQL_FINGERPRINT,
+            row_count=1,
+            policy_outcome="allow",
+            max_rows=200,
+        )
+    )
+    gateway.execute = execution  # type: ignore[method-assign]
+    return gateway, execution
+
+
+def _bind_checkpoint_step(
+    step_data: dict[str, Any], *, mutation: str
+) -> dict[str, Any]:
+    """Return one model-valid AD_HOC step with altered declaration authority."""
+
+    step = AdHocCalculationStep.model_validate(step_data)
+    spec = step.calculation_spec
+    binding = step.execution_binding
+    if mutation == "custom_unit_id":
+        spec = spec.model_copy(update={"custom_unit_id": "widgets_per_month"})
+        binding = binding.model_copy(update={"spec_checksum": spec.checksum})
+    elif mutation == "spec_checksum":
+        spec = spec.model_copy(update={"precision": 3})
+        binding = binding.model_copy(update={"spec_checksum": spec.checksum})
+    elif mutation == "execution_binding_checksum":
+        if not binding.parameters:
+            raise AssertionError("binding checksum fixture requires a declared parameter")
+        original = binding.parameters[0]
+        changed = original.model_copy(update={"value": 2})
+        binding = binding.model_copy(update={"parameters": (changed,)})
+    else:
+        raise AssertionError(f"unknown checkpoint mutation: {mutation}")
+    return step.model_copy(
+        update={
+            "calculation_spec": spec,
+            "execution_binding": binding,
+            "derived_output_id": derived_output_id(spec, binding),
+        }
+    ).model_dump(mode="json")
+
+
+def _checkpoint_carrier(
+    *,
+    unit: str,
+    with_parameter: bool = False,
+) -> tuple[AdHocCalculationRequest, CalculationSpec, CalculationExecutionBinding]:
+    base = _single_spec()
+    spec_payload = base.model_dump(mode="python")
+    if unit == "custom_unit":
+        spec_payload["unit"] = "custom_unit"
+        spec_payload["custom_unit_id"] = "widgets_per_week"
+    else:
+        spec_payload["unit"] = unit
+        spec_payload["custom_unit_id"] = None
+    if with_parameter:
+        spec_payload["parameters"] = [
+            ParameterSpec(
+                name="calculation_mode",
+                value_type="integer",
+                allowed_values=("1", "2"),
+            ).model_dump(mode="python")
+        ]
+    spec = CalculationSpec.model_validate(spec_payload)
+    binding_parameters = (
+        (ParameterBinding(name="calculation_mode", value=1),)
+        if with_parameter
+        else ()
+    )
+    binding = CalculationExecutionBinding(
+        calculation_id=spec.calculation_id,
+        spec_checksum=spec.checksum,
+        parameters=binding_parameters,
+    )
+    return _carrier(spec, binding), spec, binding
 
 
 def _confirm_payload(key: str = "k-confirm") -> dict[str, object]:
@@ -633,6 +780,258 @@ async def test_single_input_ad_hoc_executes_under_the_default_fast_route() -> No
         derived_output_id(spec, _binding(spec))
     ]
     assert provenance["metric_keys"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutate_unit", [False, True])
+async def test_custom_adhoc_unit_is_rebound_before_grounding_and_capture(
+    monkeypatch: pytest.MonkeyPatch, mutate_unit: bool
+) -> None:
+    base_spec = _single_spec()
+    spec = CalculationSpec.model_validate(
+        {
+            **base_spec.model_dump(mode="python"),
+            "unit": "custom_unit",
+            "custom_unit_id": "widgets_per_week",
+        }
+    )
+    metric_runner = _CountingMetricRunner(values={"metric.revenue": 1000})
+    ad_hoc_runner = _CountingAdHocRunner()
+    engine, _ = _engine(
+        metric_runner=metric_runner,
+        provider=_StaticPlanProvider(_plan(metric_keys=("metric.revenue",))),
+        context=_context(asset_ids=("metric.revenue",)),
+        ad_hoc_runner=ad_hoc_runner,
+    )
+
+    if mutate_unit:
+        original_execute = PlanExecutor.execute
+
+        async def execute_with_mutated_unit(
+            self: PlanExecutor, **kwargs: Any
+        ) -> PlanExecutionResult:
+            result = await original_execute(self, **kwargs)
+            receipts = tuple(
+                receipt.model_copy(update={"unit": "count"})
+                if receipt.kind == "ad_hoc_calculation"
+                else receipt
+                for receipt in result.record.step_receipts
+            )
+            return PlanExecutionResult(
+                record=result.record.model_copy(update={"step_receipts": receipts}),
+                outputs=result.outputs,
+                output_contracts=result.output_contracts,
+                require_semantic_contract=result.require_semantic_contract,
+            )
+
+        monkeypatch.setattr(PlanExecutor, "execute", execute_with_mutated_unit)
+
+    config = _config()
+    paused = await engine.ainvoke(_graph_input(_carrier(spec)), config)
+    assert paused["decision_status"] == "awaiting_decision"
+    result = await engine.ainvoke(Command(resume=_confirm_payload()), config)
+
+    assert result["execution_record"]["status"] == "succeeded"
+    assert ad_hoc_runner.calls == 1
+    assert metric_runner.execute_calls == 1
+    if mutate_unit:
+        assert result["stop_reason"] == "checkpoint_adhoc_unit_authority_mismatch"
+        assert result.get("grounded_answer_artifact") is None
+        assert result.get("response_blocks", []) == []
+        assert all(
+            "capture_execution_record_sha256" not in event["attributes"]
+            for event in result.get("trace_events", [])
+        )
+    else:
+        assert result["stop_reason"] is None
+        facts = result["grounded_answer_artifact"]["facts"]
+        assert len(facts) == 1
+        assert facts[0]["unit"] == "widgets_per_week"
+        assert any(
+            "capture_execution_record_sha256" in event["attributes"]
+            for event in result.get("trace_events", [])
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("unit", "custom_unit_id"),
+    [("count", None), ("custom_unit", "widgets_per_week")],
+)
+async def test_adhoc_checkpoint_restoration_reuses_noncanonical_authority_without_execution(
+    unit: str,
+    custom_unit_id: str | None,
+) -> None:
+    carrier, spec, binding = _checkpoint_carrier(unit=unit)
+    assert (spec.custom_unit_id if unit == "custom_unit" else None) == custom_unit_id
+    gateway, gateway_execute = _query_gateway()
+    metric_runner = _CountingMetricRunner(
+        values={"metric.revenue": 1000, "metric.stores": 25},
+        gateway=gateway,
+    )
+    ad_hoc_runner = _CountingAdHocRunner()
+    provider = _AnalysisProvider()
+    checkpointer = MemorySaver()
+    engine, _ = _engine(
+        metric_runner=metric_runner,
+        provider=_StaticPlanProvider(_plan(metric_keys=("metric.revenue",))),
+        context=_context(asset_ids=("metric.revenue",)),
+        ad_hoc_runner=ad_hoc_runner,
+        route_policy=_standard_route_policy(),
+        checkpointer=checkpointer,
+        model_provider=provider,
+    )
+    config = _config()
+    pending = await engine.ainvoke(
+        _graph_input(carrier, effective_mode="ANALYZE"), config
+    )
+    assert pending["decision_status"] == "awaiting_decision"
+    assert ad_hoc_runner.calls == 0
+    result = await engine.ainvoke(Command(resume=_confirm_payload()), config)
+
+    assert result.get("stop_reason") is None
+    assert provider.calls == 1
+    assert ad_hoc_runner.calls == 1
+    assert metric_runner.execute_calls == 1
+    assert gateway_execute.await_count == 1
+    fact = result["grounded_answer_artifact"]["facts"][0]
+    assert fact["unit"] == (custom_unit_id or "count")
+    assert fact["derived_output_id"] == derived_output_id(spec, binding)
+    assert fact["calculation_scope"] == "ad_hoc_noncanonical"
+    provenance = _provenance(result)
+    assert provenance["calculation_scope"] == "ad_hoc_noncanonical"
+    assert provenance["derived_output_ids"] == [derived_output_id(spec, binding)]
+    assert provenance["metric_keys"] == []
+
+    history = [snapshot async for snapshot in engine.aget_state_history(config)]
+    execution_checkpoint = next(
+        snapshot for snapshot in history if "analysis" in snapshot.next
+    )
+    checkpoint_record = execution_checkpoint.values["execution_record"]
+    assert checkpoint_record["evidence_seal"]["version"] == "v1"
+    checkpoint_plan = execution_checkpoint.values["execution_plan"]
+    assert any(step["kind"] == "ad_hoc_calculation" for step in checkpoint_plan["steps"])
+    resume_config = dict(config)
+    resume_config["configurable"] = {
+        **config["configurable"],
+        **execution_checkpoint.config["configurable"],
+    }
+    restored = await engine.ainvoke(None, resume_config)
+
+    assert restored.get("stop_reason") is None
+    assert provider.calls == 2
+    assert ad_hoc_runner.calls == 1
+    assert metric_runner.execute_calls == 1
+    assert gateway_execute.await_count == 1
+    assert restored["grounded_answer_artifact"]["facts"][0]["unit"] == (
+        custom_unit_id or "count"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "custom_unit_id",
+        "spec_checksum",
+        "execution_binding_checksum",
+        "derived_output_id",
+        "receipt_and_fact_unit",
+    ],
+)
+async def test_adhoc_checkpoint_restoration_rejects_calculation_authority_tampering(
+    mutation: str,
+) -> None:
+    carrier, spec, binding = _checkpoint_carrier(
+        unit="custom_unit", with_parameter=mutation == "execution_binding_checksum"
+    )
+    gateway, gateway_execute = _query_gateway()
+    metric_runner = _CountingMetricRunner(gateway=gateway)
+    ad_hoc_runner = _CountingAdHocRunner()
+    provider = _AnalysisProvider()
+    checkpointer = MemorySaver()
+    engine, _ = _engine(
+        metric_runner=metric_runner,
+        provider=_StaticPlanProvider(_plan(metric_keys=("metric.revenue",))),
+        context=_context(asset_ids=("metric.revenue",)),
+        ad_hoc_runner=ad_hoc_runner,
+        route_policy=_standard_route_policy(),
+        checkpointer=checkpointer,
+        model_provider=provider,
+    )
+    config = _config()
+    pending = await engine.ainvoke(
+        _graph_input(carrier, effective_mode="ANALYZE"), config
+    )
+    assert pending["decision_status"] == "awaiting_decision"
+    initial = await engine.ainvoke(Command(resume=_confirm_payload()), config)
+    assert initial.get("stop_reason") is None
+    assert provider.calls == 1
+    assert ad_hoc_runner.calls == 1
+    assert metric_runner.execute_calls == 1
+    assert gateway_execute.await_count == 1
+
+    saved = (await engine.aget_state(config)).values
+    plan = copy.deepcopy(saved["execution_plan"])
+    record = copy.deepcopy(saved["execution_record"])
+    artifact = copy.deepcopy(saved["grounded_answer_artifact"])
+    answer_text = str(saved["grounded_answer_text"])
+    adhoc_index = next(
+        index
+        for index, step in enumerate(plan["steps"])
+        if step["kind"] == "ad_hoc_calculation"
+    )
+    adhoc_step = plan["steps"][adhoc_index]
+
+    if mutation == "derived_output_id":
+        original = adhoc_step["derived_output_id"]
+        adhoc_step["derived_output_id"] = original[:-1] + ("b" if original[-1] == "a" else "a")
+    elif mutation in {"custom_unit_id", "spec_checksum", "execution_binding_checksum"}:
+        if mutation == "execution_binding_checksum":
+            adhoc_step = _bind_checkpoint_step(
+                adhoc_step, mutation=mutation
+            )
+        else:
+            adhoc_step = _bind_checkpoint_step(adhoc_step, mutation=mutation)
+        plan["steps"][adhoc_index] = adhoc_step
+    else:
+        fact = AnswerFact.model_validate(artifact["facts"][0]).model_copy(
+            update={"unit": "widgets_per_month"}
+        )
+        fact = fact.model_copy(update={"fact_id": _grounded_fact_id(fact)})
+        artifact["facts"][0] = fact.model_dump(mode="json")
+        answer_text = render_grounded_answer(
+            query_plan=QueryPlan.model_validate(saved["query_plan"]), facts=(fact,)
+        )
+        receipt = next(
+            receipt
+            for receipt in record["step_receipts"]
+            if receipt["kind"] == "ad_hoc_calculation"
+        )
+        receipt["unit"] = "widgets_per_month"
+
+    await engine.aupdate_state(
+        config,
+        {
+            "execution_plan": plan,
+            "execution_record": record,
+            "grounded_answer_artifact": artifact,
+            "grounded_answer_text": answer_text,
+        },
+        as_node="execute",
+    )
+    restored = await engine.ainvoke(None, config)
+
+    assert restored.get("stop_reason") in {
+        "checkpoint_adhoc_unit_authority_mismatch",
+        "checkpoint_evidence_seal_invalid",
+        "analysis_evidence_invalid",
+    }
+    assert restored.get("response_blocks", []) == []
+    assert provider.calls == 1
+    assert ad_hoc_runner.calls == 1
+    assert metric_runner.execute_calls == 1
+    assert gateway_execute.await_count == 1
 
 
 # --- 2. explicit capability gate ----------------------------------------------

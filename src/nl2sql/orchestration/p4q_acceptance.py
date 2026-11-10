@@ -17,6 +17,7 @@ grounded answer facts are bound to the successful execution receipts.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -363,6 +364,50 @@ class P4QCaseEvidence(_StrictFrozenModel):
     @classmethod
     def _not_blank(cls, value: str, info: ValidationInfo) -> str:
         return _non_blank(value, info)
+
+
+class P4QEvidenceBundle(_StrictFrozenModel):
+    """Versioned, signed import unit for one P4-Q run.
+
+    Checksums alone are not an authenticity boundary: the evaluator verifies
+    the signature against a server-configured key before a bundle can remove
+    the raw-evidence readiness gap.
+    """
+
+    schema_version: Literal["1.0"] = P4Q_SCHEMA_VERSION
+    bundle_id: str = Field(min_length=1, max_length=128)
+    source_id: str = Field(min_length=1, max_length=128)
+    source_revision: str = Field(min_length=1, max_length=256)
+    signer_key_id: str = Field(min_length=1, max_length=128)
+    registry: P4QCaseRegistry
+    evidence: tuple[P4QCaseEvidence, ...] = Field(max_length=_MAX_CASES)
+    realness_witness: P4QRealnessWitness | None = None
+    bundle_sha256: str = Field(pattern=_SHA256)
+    signature_sha256: str = Field(pattern=_SHA256)
+
+    @field_validator("bundle_id", "source_id", "source_revision", "signer_key_id")
+    @classmethod
+    def _not_blank(cls, value: str, info: ValidationInfo) -> str:
+        return _non_blank(value, info)
+
+    @model_validator(mode="after")
+    def _unique_known_cases(self) -> "P4QEvidenceBundle":
+        evidence_ids = [item.case_id for item in self.evidence]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("evidence bundle contains duplicate cases")
+        known = {item.case_id for item in self.registry.cases}
+        if set(evidence_ids) - known:
+            raise ValueError("evidence bundle contains unknown cases")
+        if any(
+            item.implementation_revision != self.source_revision
+            for item in self.evidence
+        ):
+            raise ValueError("evidence bundle implementation revision mismatch")
+        if self.realness_witness is not None and (
+            self.realness_witness.implementation_revision != self.source_revision
+        ):
+            raise ValueError("evidence bundle revision does not match realness witness")
+        return self
 
 
 class P4QCaseResult(_StrictFrozenModel):
@@ -851,13 +896,82 @@ def _realness_mismatches(
     return list(dict.fromkeys(mismatches))
 
 
+def _bundle_payload(bundle: P4QEvidenceBundle) -> bytes:
+    payload = bundle.model_dump(
+        mode="json", exclude={"bundle_sha256", "signature_sha256"}
+    )
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _verify_bundle_signature(
+    bundle: P4QEvidenceBundle,
+    trusted_signing_keys: Mapping[str, bytes] | None,
+) -> bool:
+    if trusted_signing_keys is None:
+        return False
+    key = trusted_signing_keys.get(bundle.signer_key_id)
+    if not isinstance(key, bytes) or len(key) < 32:
+        return False
+    payload = _bundle_payload(bundle)
+    digest = hashlib.sha256(payload).hexdigest()
+    if not hmac.compare_digest(digest, bundle.bundle_sha256):
+        return False
+    expected_signature = hmac.new(key, bytes.fromhex(digest), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected_signature, bundle.signature_sha256)
+
+
+def ingest_p4q_evidence_bundle(
+    payload: Mapping[str, object],
+    *,
+    trusted_signing_keys: Mapping[str, bytes],
+) -> P4QEvidenceBundle:
+    """Validate schema, case identity, checksum, and trusted source signature."""
+
+    encoded = json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    )
+    bundle = P4QEvidenceBundle.model_validate_json(encoded)
+    if not _verify_bundle_signature(bundle, trusted_signing_keys):
+        raise ValueError("P4-Q evidence bundle authentication failed")
+    return bundle
+
+
 def evaluate_p4q(
     registry: P4QCaseRegistry,
     evidence: Sequence[P4QCaseEvidence],
     *,
     realness_witness: P4QRealnessWitness | None = None,
+    evidence_bundle: P4QEvidenceBundle | None = None,
+    trusted_signing_keys: Mapping[str, bytes] | None = None,
 ) -> P4QManifest:
-    """Pure, deterministic evaluation of one bounded P4-Q acceptance run."""
+    """Pure, deterministic evaluation of one bounded P4-Q acceptance run.
+
+    Raw case evidence can establish contract readiness, but only a versioned
+    bundle authenticated against the configured trusted signer can establish
+    P4-Q-PASS eligibility. A self-recomputed unsigned hash is never authority.
+    """
+
+    bundle_verified = False
+    if evidence_bundle is not None:
+        if evidence or registry != evidence_bundle.registry:
+            bundle_valid = False
+        else:
+            bundle_valid = _verify_bundle_signature(
+                evidence_bundle, trusted_signing_keys
+            )
+        if bundle_valid:
+            bundle_verified = True
+            evidence = evidence_bundle.evidence
+            realness_witness = evidence_bundle.realness_witness
+        else:
+            evidence = evidence_bundle.evidence
+            realness_witness = evidence_bundle.realness_witness
 
     by_case_id: dict[str, P4QCaseEvidence] = {}
     for item in evidence:
@@ -882,6 +996,8 @@ def evaluate_p4q(
 
     ordered = [by_case_id[case.case_id] for case in registry.cases if case.case_id in by_case_id]
     integrity_failures = _evidence_integrity_failures(registry, evidence)
+    if evidence_bundle is not None and not bundle_verified:
+        integrity_failures.append("evidence_bundle_authentication_failed")
     if realness_witness is not None:
         integrity_failures.extend(_realness_mismatches(realness_witness, ordered))
 
@@ -892,6 +1008,8 @@ def evaluate_p4q(
             readiness_gaps.append("non_real_evidence_origin")
         if realness_witness is None:
             readiness_gaps.append("realness_witness_absent")
+        if not bundle_verified:
+            readiness_gaps.append("trusted_evidence_bundle_unverified")
 
     if any_failed or integrity_failures:
         verdict: P4QVerdict = "P4-Q-FAIL"
@@ -928,6 +1046,7 @@ __all__ = [
     "P4QCaseSpec",
     "P4QGroundedAnswerCapture",
     "P4QEvidenceOrigin",
+    "P4QEvidenceBundle",
     "P4QManifest",
     "P4QObservedMode",
     "P4QOracleEvidence",
@@ -937,4 +1056,5 @@ __all__ = [
     "P4QVerdict",
     "capture_grounded_answer",
     "evaluate_p4q",
+    "ingest_p4q_evidence_bundle",
 ]

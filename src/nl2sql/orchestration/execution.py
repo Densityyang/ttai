@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Literal, Protocol, cast
@@ -42,6 +44,7 @@ from src.nl2sql.orchestration.evidence_digest import (
     canonical_rowset_digest,
 )
 from src.nl2sql.orchestration.verification_policy import verify_execution_plan_policy
+from src.nl2sql.semantic.calculation_contract import CalculationSpec
 from src.nl2sql.semantic.calculation_runtime import (
     CalculationRuntimeError,
     evaluate_calculation,
@@ -91,6 +94,28 @@ class PreparedMetricStep:
 class MetricStepResult:
     value: JsonValue
     receipt: ExecutionReceipt
+    # Request-local validated manifest for grounding; never checkpointed.
+    semantic_manifest: object | None = None
+    # Request-local allow record paired with the manifest. Checkpoint receipt
+    # fields are evidence only; grounding rebinds them to this server-side pair.
+    semantic_validation_record: object | None = None
+    # Request-local CandidateVerifier result. It is paired with the exact
+    # Gateway receipt and consumed by grounding; it is never checkpointed.
+    candidate_receipt: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RequestOutputContract:
+    """Trusted, request-local semantic authority for one fetch output."""
+
+    manifest: object
+    semantic_validation_record: object
+    # Gateway fingerprint uses a distinct canonicalizer from the manifest's
+    # semantic fingerprint. Keep the request-local gateway value for an exact
+    # checkpoint-receipt comparison instead of comparing unlike hashes.
+    gateway_parameter_binding_fingerprint: str | None
+    gateway_execution_receipt: ExecutionReceipt | None = None
+    candidate_receipt: object | None = None
 
 
 class MetricStepRunner(Protocol):
@@ -203,7 +228,14 @@ class RegistryTrustedCalculationRunner:
 
 
 class TypedResultVerifier:
-    """Small deterministic verifier registry used until PR07A adds domain invariants."""
+    """Deterministic verifier for the typed execution result boundary.
+
+    ``typed_result_present`` is intentionally a small invariant, but presence
+    is not satisfied by an arbitrary nested object or an unbounded rowset.  The
+    verifier validates the JSON shape that later grounding is allowed to read;
+    domain-specific cardinality remains bound to the execution manifest and is
+    checked by the metric runner/grounding seam.
+    """
 
     _supported = frozenset({"typed_result_present"})
 
@@ -217,6 +249,31 @@ class TypedResultVerifier:
             raise PlanStepError("result_invariant_unregistered")
         if not inputs or any(value is None for value in inputs):
             raise PlanStepError("typed_result_missing")
+        for value in inputs:
+            if isinstance(value, Mapping):
+                mapping = cast("Mapping[str, JsonValue]", value)
+                if not mapping:
+                    raise PlanStepError("typed_result_shape_invalid")
+                if "rows" in mapping:
+                    rows = mapping.get("rows")
+                    no_data = mapping.get("no_data")
+                    if not isinstance(rows, list) or any(
+                        not isinstance(row, Mapping) for row in rows
+                    ) or not isinstance(no_data, bool):
+                        raise PlanStepError("typed_result_shape_invalid")
+                    if (no_data and rows) or (not no_data and not rows):
+                        raise PlanStepError("typed_result_shape_invalid")
+                    for row in rows:
+                        row_mapping = cast("Mapping[str, JsonValue]", row)
+                        if any(
+                            not _valid_typed_result_scalar(item)
+                            for item in row_mapping.values()
+                        ):
+                            raise PlanStepError("typed_result_shape_invalid")
+                elif any(not _valid_typed_result_scalar(item) for item in mapping.values()):
+                    raise PlanStepError("typed_result_shape_invalid")
+            elif not _valid_typed_result_scalar(value):
+                raise PlanStepError("typed_result_shape_invalid")
         return _json_value(
             {
                 "verified": True,
@@ -225,12 +282,22 @@ class TypedResultVerifier:
         )
 
 
+def _valid_typed_result_scalar(value: JsonValue) -> bool:
+    if value is None or isinstance(value, (dict, list)):
+        return False
+    if type(value) is float:
+        return math.isfinite(value)
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class PlanExecutionResult:
     """Outputs are request-local only; only ``record`` belongs in a checkpoint."""
 
     record: PlanExecutionRecord
     outputs: dict[str, JsonValue]
+    output_contracts: dict[str, RequestOutputContract] = field(default_factory=dict)
+    require_semantic_contract: bool = False
 
 
 def validate_execution_record_against_plan(
@@ -294,6 +361,8 @@ class PlanExecutor:
         ad_hoc_calculation_runner: AdHocCalculationRunner | None = None,
         result_verifier: ResultVerifier | None = None,
         calculation_catalog: ApprovedCalculationCatalog | None = None,
+        require_semantic_contract: bool = False,
+        allow_legacy_unitless_grounding: bool = False,
     ) -> None:
         self._metric_runner = metric_runner
         self._trusted_calculation_runner = trusted_calculation_runner
@@ -301,6 +370,8 @@ class PlanExecutor:
         # production arithmetic runner is separately authorized.
         self._ad_hoc_calculation_runner = ad_hoc_calculation_runner
         self._result_verifier = result_verifier or TypedResultVerifier()
+        self._require_semantic_contract = require_semantic_contract
+        self._allow_legacy_unitless_grounding = allow_legacy_unitless_grounding
         if calculation_catalog is not None:
             self._calculation_catalog = calculation_catalog
 
@@ -365,6 +436,7 @@ class PlanExecutor:
         outputs: dict[str, JsonValue] = {}
         receipts: list[PlanStepReceipt] = []
         gateway_receipts: dict[str, ExecutionReceipt] = {}
+        output_contracts: dict[str, RequestOutputContract] = {}
         current_step: PlanStep | None = None
         current_started = 0.0
         try:
@@ -382,6 +454,7 @@ class PlanExecutor:
                             timeout_ms=timeout_ms,
                             trace_id=trace_id,
                             gateway_receipts=gateway_receipts,
+                            output_contracts=output_contracts,
                         )
                     except asyncio.CancelledError:
                         raise
@@ -452,9 +525,24 @@ class PlanExecutor:
                     trusted_unit: str | None = None
                     if isinstance(current_step, TrustedCalculationStep):
                         calculation_catalog = getattr(self, "_calculation_catalog", None)
-                        if current_step.output_metric_key is not None and calculation_catalog is not None:
-                            binding = calculation_catalog.binding_for(current_step.output_metric_key)
-                            if binding is None or binding.unit is None:
+                        if current_step.output_metric_key is not None:
+                            if calculation_catalog is None:
+                                raise PlanStepError(
+                                    "trusted_calculation_unit_authority_missing"
+                                )
+                            binding = calculation_catalog.binding_for(
+                                current_step.output_metric_key
+                            )
+                            if (
+                                binding is None
+                                or (
+                                    binding.unit is None
+                                    and not self._allow_legacy_unitless_grounding
+                                )
+                                or binding.canonical_metric_key
+                                != current_step.output_metric_key
+                                or binding.checksum != current_step.binding_checksum
+                            ):
                                 raise PlanStepError("trusted_calculation_unit_missing")
                             trusted_unit = binding.unit
                         elif any(
@@ -482,17 +570,17 @@ class PlanExecutor:
                                 else _output_rowset_digest(output)
                             ),
                             unit=(
-                                gateway_receipt.unit
-                                if gateway_receipt is not None
+                                trusted_unit
+                                if isinstance(current_step, TrustedCalculationStep)
                                 else (
-                                    current_step.calculation_spec.custom_unit_id
+                                    _calculation_spec_unit(
+                                        current_step.calculation_spec
+                                    )
                                     if isinstance(current_step, AdHocCalculationStep)
-                                    and current_step.calculation_spec.custom_unit_id
-                                    is not None
                                     else (
-                                        current_step.calculation_spec.unit
-                                        if isinstance(current_step, AdHocCalculationStep)
-                                        else trusted_unit
+                                        gateway_receipt.unit
+                                        if gateway_receipt is not None
+                                        else None
                                     )
                                 )
                             ),
@@ -597,6 +685,8 @@ class PlanExecutor:
                 output_step_ids=tuple(outputs),
             ),
             outputs=outputs,
+            output_contracts=output_contracts,
+            require_semantic_contract=self._require_semantic_contract,
         )
 
     async def _execute_step(
@@ -611,6 +701,7 @@ class PlanExecutor:
         timeout_ms: int,
         trace_id: str,
         gateway_receipts: dict[str, ExecutionReceipt],
+        output_contracts: dict[str, RequestOutputContract],
     ) -> JsonValue:
         if isinstance(step, FetchMetricStep):
             prepare_kwargs: dict[str, Any] = {
@@ -651,6 +742,16 @@ class PlanExecutor:
                     result.receipt.error_taxonomy or "query_gateway_policy_denied"
                 )
             gateway_receipts[step.step_id] = result.receipt
+            if result.semantic_manifest is not None and result.semantic_validation_record is not None:
+                output_contracts[step.step_id] = RequestOutputContract(
+                    manifest=result.semantic_manifest,
+                    semantic_validation_record=result.semantic_validation_record,
+                    gateway_parameter_binding_fingerprint=(
+                        result.receipt.parameter_binding_fingerprint
+                    ),
+                    gateway_execution_receipt=result.receipt,
+                    candidate_receipt=result.candidate_receipt,
+                )
             return _json_value(result.value)
 
         if isinstance(step, TrustedCalculationStep):
@@ -854,10 +955,27 @@ def _validated_result(
     execution_plan: ExecutionPlan,
     record: PlanExecutionRecord,
     outputs: dict[str, JsonValue],
+    output_contracts: dict[str, RequestOutputContract] | None = None,
+    require_semantic_contract: bool = False,
 ) -> PlanExecutionResult:
     validate_execution_record_against_plan(execution_plan, record)
-    return PlanExecutionResult(record=record, outputs=outputs)
+    return PlanExecutionResult(
+        record=record,
+        outputs=outputs,
+        output_contracts=dict(output_contracts or {}),
+        require_semantic_contract=require_semantic_contract,
+    )
 
 
 def _elapsed_ms(started: float) -> int:
     return max(0, round((perf_counter() - started) * 1000))
+
+
+def _calculation_spec_unit(spec: CalculationSpec) -> str:
+    """Resolve the exact unit ID declared by the run-scoped calculation spec."""
+
+    if spec.unit == "custom_unit":
+        if spec.custom_unit_id is None:
+            raise PlanStepError("ad_hoc_calculation_unit_missing")
+        return spec.custom_unit_id
+    return spec.unit

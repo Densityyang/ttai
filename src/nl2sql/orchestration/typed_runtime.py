@@ -803,10 +803,12 @@ async def build_request_typed_runtime(
             actual_source_kind=expected_source_kind,
             root_query_plan=root_query_plan,
             freshness=getattr(query, "freshness", None),
-            source_step_id=getattr(step, "step_id", None),
+            source_step_id=step.step_id,
         )
 
-    semantic_validator = SemanticSQLValidator()
+    semantic_validator = SemanticSQLValidator(
+        require_complete_authority=validation_mode == "enforce"
+    )
     return RequestTypedRuntime(
         release=release,
         snapshot=snapshot,

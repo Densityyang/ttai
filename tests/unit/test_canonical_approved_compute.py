@@ -15,7 +15,6 @@ from src.nl2sql.agents.dynamic_calc.trusted_templates import (
 from src.nl2sql.contracts import (
     ContextBundle,
     ExecutionPlan,
-    ExecutionReceipt,
     FetchMetricStep,
     PlanExecutionRecord,
     PlanStepReceipt,
@@ -32,14 +31,9 @@ from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationInput,
     ApprovedComputeError,
 )
-from src.nl2sql.orchestration.budget import RouteBudgetLedger
 from src.nl2sql.orchestration.evidence_digest import canonical_json_digest
 from src.nl2sql.orchestration.execution import (
-    MetricStepResult,
-    PlanExecutor,
     PlanStepError,
-    PreparedMetricStep,
-    RegistryTrustedCalculationRunner,
 )
 from src.nl2sql.orchestration.grounding import (
     GroundingIntegrityError,
@@ -70,6 +64,7 @@ def _binding(**o: object) -> ApprovedCalculationBinding:
         "template_id": "ratio",
         "template_version": meta.version,
         "template_checksum": meta.checksum,
+        "unit": meta.output_unit,
         "inputs": (
             ApprovedCalculationInput(role="numerator", metric_key="metric.revenue", metric_contract_sha256=MCS),
             ApprovedCalculationInput(role="denominator", metric_key="metric.stores", metric_contract_sha256=MCS),
@@ -282,7 +277,7 @@ def test_binding_checksum_is_stable_and_duplicate_keys_rejected() -> None:
     # moved to "1.1", so the accepted payload intentionally changes.
     assert (
         _binding().checksum
-        == "b0b0b1485ce9b4e10730ad41d4c7c5524082b3b50b08d413e496b23f6bf97df6"
+        == "cdd7b7c2d050cc6c704d0129c644ba1ab29dac174e726fe2d27a8e6b61c77442"
     )
     with pytest.raises(ApprovedComputeError):
         ApprovedCalculationCatalog([_binding(), _binding()])
@@ -334,99 +329,29 @@ def test_unversioned_global_null_or_zero_policy_is_rejected(field: str) -> None:
         ApprovedCalculationBinding.model_validate(payload)
 
 
-@pytest.mark.asyncio
-async def test_ratio_1_0_output_remains_unrounded_with_numeric_binding_metadata() -> None:
-    # This freezes the existing ratio@1.0 implementation.  It is not evidence
-    # that v1.1 binding unit/precision/rounding fields are executed: the runner
-    # receives only the versioned template step and applies the registered
-    # numerator / denominator behavior.
-    binding = _binding(unit="percent", precision=2, rounding="half_up")
-    plan, context = _plan(), _dependency_context()
-    catalog = ApprovedCalculationCatalog([binding])
-    execution_plan = PlanCompiler(calculation_catalog=catalog).compile(
-        plan=plan,
-        context=context,
-        validation=_allow(plan, context),
+@pytest.mark.parametrize(
+    "numeric_overrides, expected_failure",
+    (
+        ({"unit": "percent"}, "trusted_calculation_unit_semantics_mismatch"),
+        ({"precision": 2}, "trusted_calculation_numeric_semantics_unsupported"),
+        (
+            {"precision": 2, "rounding": "half_up"},
+            "trusted_calculation_numeric_semantics_unsupported",
+        ),
+    ),
+)
+def test_ratio_1_0_rejects_unimplemented_numeric_binding_semantics(
+    numeric_overrides: dict[str, object], expected_failure: str
+) -> None:
+    binding = _binding(**numeric_overrides)
+    execution_plan, calculation, context = _build(binding=binding)
+    failures = _validate(
+        execution_plan,
+        calculation,
+        context,
+        catalog=ApprovedCalculationCatalog([binding]),
     )
-    calculation = next(
-        step for step in execution_plan.steps if isinstance(step, TrustedCalculationStep)
-    )
-    assert calculation.template_version == "1.0"
-
-    class FixtureMetricRunner:
-        async def prepare(
-            self,
-            *,
-            step: FetchMetricStep,
-            query_plan: QueryPlan,
-            context: ContextBundle,
-        ) -> PreparedMetricStep:
-            del query_plan, context
-            metric_key = step.metric_keys[0]
-            return PreparedMetricStep(
-                sql_fingerprint=("c" if metric_key == "metric.revenue" else "d") * 64,
-                join_hops=0,
-                payload=metric_key,
-                dependency_fetch=True,
-            )
-
-        async def execute(
-            self,
-            prepared: PreparedMetricStep,
-            *,
-            timeout_ms: int,
-        ) -> MetricStepResult:
-            del timeout_ms
-            value = {
-                "metric.revenue": 1.0,
-                "metric.stores": 3.0,
-            }[str(prepared.payload)]
-            return MetricStepResult(
-                value={"value": value},
-                receipt=ExecutionReceipt(
-                    datasource="fixture",
-                    readonly_role="fixture_reader",
-                    elapsed_ms=1,
-                    row_count=1,
-                    sql_fingerprint=prepared.sql_fingerprint,
-                    policy_version="h19a.numeric.fixture.v1",
-                    policy_outcome="allow",
-                ),
-            )
-
-    validator = PlanValidator(calculation_catalog=catalog)
-    budget = RouteBudgetLedger(route="standard")
-    validation = validator.validate_execution_plan(
-        execution_plan=execution_plan,
-        query_plan=plan,
-        context=context,
-        route_budget=budget.limits,
-    )
-    assert validation.outcome == "allow"
-    result = await PlanExecutor(
-        metric_runner=FixtureMetricRunner(),
-        trusted_calculation_runner=RegistryTrustedCalculationRunner(),
-        calculation_catalog=catalog,
-    ).execute(
-        query_plan=plan,
-        context=context,
-        execution_plan=execution_plan,
-        validation=validation,
-        expected_policy_version=validator.policy_version,
-        expected_policy_checksum=validator.policy_checksum,
-        budget=budget,
-        deadline_ms=5_000,
-    )
-
-    assert result.record.status == "succeeded"
-    assert result.outputs[calculation.step_id] == {"ratio": 1.0 / 3.0}
-    assert result.outputs[calculation.step_id]["ratio"] != 0.33
-    receipt = next(
-        item for item in result.record.step_receipts if item.step_id == calculation.step_id
-    )
-    assert receipt.template_id == "ratio"
-    assert receipt.template_version == "1.0"
-    assert receipt.binding_checksum == binding.checksum
+    assert expected_failure in failures
 
 
 def test_canonical_receipt_with_different_template_version_fails_grounding() -> None:
@@ -462,6 +387,7 @@ def test_canonical_receipt_with_different_template_version_fails_grounding() -> 
             execution_plan=execution_plan,
             record=record,
             outputs={calculation.step_id: {"ratio": 1.0 / 3.0}},
+            allow_legacy_unitless=True,
         )
 
 
@@ -1554,6 +1480,7 @@ def test_calculation_receipt_grounds_a_canonical_answer_fact() -> None:
             "calculate_metric": {"ratio": 2.0},
             "verify_result": {"ok": True},
         },
+        allow_legacy_unitless=True,
     )
     # Exactly ONE fact per requested metric: the internal dependency fetches
     # ground nothing on their own, so the requested value has a single authority.

@@ -78,6 +78,7 @@ class TemplateMetadata(_TemplateModel):
     version: str
     input_roles: tuple[str, ...]
     output_role: str
+    output_unit: str | None = None
 
     @property
     def checksum(self) -> str:
@@ -115,6 +116,7 @@ class TrustedTemplateRegistry:
             version="1.0",
             input_roles=("numerator", "denominator"),
             output_role="ratio",
+            output_unit="ratio",
         ),
     }
 

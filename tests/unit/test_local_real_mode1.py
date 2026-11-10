@@ -1035,6 +1035,31 @@ def test_real_canonical_source_passes_the_raw_source_table_check() -> None:
     assert_binding_matches_canonical(catalog=load_frozen_case_contracts())
 
 
+def test_local_real_ratio_uses_numerator_only_predicate_delta() -> None:
+    catalog = load_frozen_case_contracts()
+    metric = next(
+        item
+        for item in catalog.metrics
+        if item.metric_key == FROZEN_REAL_CASE_METRIC_KEY
+    )
+    assert metric.ratio is not None
+    assert [
+        (item.field, item.operator)
+        for item in metric.ratio.denominator_predicates
+    ] == [("completion_receipt_time", "is_not_null")]
+    assert [
+        (item.field, item.operator)
+        for item in metric.ratio.numerator_predicates
+    ] == [("is_archive_on_time", "is_true")]
+    assert {
+        (item.field, item.operator)
+        for item in metric.ratio.numerator_authority
+    } == {
+        ("completion_receipt_time", "is_not_null"),
+        ("is_archive_on_time", "is_true"),
+    }
+
+
 def test_denominator_canonical_source_table_tamper_fails_closed() -> None:
     """Changing ONLY the denominator canonical source must be detected."""
 

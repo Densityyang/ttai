@@ -234,7 +234,7 @@ class _RuntimeFactory:
         return _StubRuntime(
             context_resolver=_Resolver(),
             query_plan_provider=self.provider,
-            plan_executor=PlanExecutor(metric_runner=self.runner),
+            plan_executor=PlanExecutor(metric_runner=self.runner, allow_legacy_unitless_grounding=True, ),
             identity=identity,
             authorization=authorization,
             authorization_revision=authorization.authorization_revision,

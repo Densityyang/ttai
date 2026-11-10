@@ -193,6 +193,7 @@ async def _engine(
     query_plan_provider: Any | None = None,
     context_resolver: Any | None = None,
     fingerprint_plan: QueryPlan | None = None,
+    checkpointer: MemorySaver | None = None,
 ) -> _LiveEngine:
     """Compose the real collaborators over a real QueryGateway (mocked execute)."""
 
@@ -224,7 +225,7 @@ async def _engine(
     provider = _CountingProvider()
     clock = _FixedClock()
     engine = create_v2_engine(
-        checkpointer=MemorySaver(),
+        checkpointer=checkpointer or MemorySaver(),
         model_gateway=_model_gateway(provider),
         context_resolver=context_resolver or resolver,
         query_plan_provider=(

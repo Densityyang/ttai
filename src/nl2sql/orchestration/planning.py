@@ -280,6 +280,34 @@ class PlanValidator:
         fetch_steps = [
             step for step in execution_plan.steps if isinstance(step, FetchMetricStep)
         ]
+        has_calculation_shape = any(
+            isinstance(step, (TrustedCalculationStep, AdHocCalculationStep))
+            for step in execution_plan.steps
+        ) or any(step.calculation_input_role is not None for step in fetch_steps) or (
+            self._calculation_catalog is not None
+            and any(
+                self._calculation_catalog.binding_for(metric_key) is not None
+                for metric_key in query_plan.metric_keys
+            )
+        )
+        if not has_calculation_shape:
+            fetch_owners = [
+                metric_key
+                for step in fetch_steps
+                for metric_key in step.metric_keys
+            ]
+            if (
+                any(len(step.metric_keys) != 1 for step in fetch_steps)
+                or len(fetch_owners) != len(set(fetch_owners))
+                or set(fetch_owners) != set(query_plan.metric_keys)
+            ):
+                deny.append(
+                    _issue(
+                        "execution_plan_metric_ownership_mismatch",
+                        "execution_plan.steps",
+                        "Each requested metric must have exactly one direct fetch owner.",
+                    )
+                )
         if len(fetch_steps) > route_budget.max_sql_candidates:
             deny.append(
                 _issue(
@@ -537,17 +565,24 @@ class PlanCompiler:
                 raise PlanCompilationError("approved_calculation_plan_shape_unsupported")
             steps = _compile_bound_calculation(plan=plan, binding=binding)
         else:
-            fetch = FetchMetricStep(
-                step_id="fetch_metrics",
-                metric_keys=plan.metric_keys,
+            fetches = tuple(
+                FetchMetricStep(
+                    step_id=(
+                        "fetch_metrics"
+                        if len(plan.metric_keys) == 1
+                        else f"fetch_metric_{index}"
+                    ),
+                    metric_keys=(metric_key,),
+                )
+                for index, metric_key in enumerate(plan.metric_keys)
             )
             verify = VerifyStep(
                 step_id="verify_result",
-                input_refs=(fetch.step_id,),
+                input_refs=tuple(fetch.step_id for fetch in fetches),
                 invariant_ids=("typed_result_present",),
-                depends_on=(fetch.step_id,),
+                depends_on=tuple(fetch.step_id for fetch in fetches),
             )
-            steps: tuple[PlanStep, ...] = (fetch, verify)
+            steps: tuple[PlanStep, ...] = (*fetches, verify)
         return ExecutionPlan(
             query_plan_sha256=plan.checksum,
             semantic_release_id=context.semantic_release_id,

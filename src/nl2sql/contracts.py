@@ -863,6 +863,16 @@ class PlanStepReceipt(StrictContract):
         return self
 
 
+class CheckpointEvidenceSeal(StrictContract):
+    """Server-verifiable seal for a grounded typed execution checkpoint."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: Literal["v1"] = "v1"
+    key_id: str = Field(pattern=r"^[0-9a-f]{16}$")
+    signature: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class PlanExecutionRecord(StrictContract):
     """Checkpoint-safe summary emitted by the typed PlanExecutor."""
 
@@ -873,6 +883,7 @@ class PlanExecutionRecord(StrictContract):
     step_receipts: tuple[PlanStepReceipt, ...] = Field(default=(), max_length=16)
     output_step_ids: tuple[PlanStepId, ...] = Field(default=(), max_length=16)
     stop_reason: str | None = Field(default=None, min_length=1, max_length=128)
+    evidence_seal: CheckpointEvidenceSeal | None = None
 
     @model_validator(mode="after")
     def validate_execution_status(self) -> PlanExecutionRecord:
@@ -895,6 +906,8 @@ class PlanExecutionRecord(StrictContract):
             or any(receipt.status != "succeeded" for receipt in self.step_receipts)
         ):
             raise ValueError("successful execution requires only successful step receipts")
+        if self.status != "succeeded" and self.evidence_seal is not None:
+            raise ValueError("only successful executions may carry an evidence seal")
         return self
 
 

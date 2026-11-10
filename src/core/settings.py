@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.core.secrets import SecretProvider
@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     database_url: str = Field(default="", description="????? URL?????????????")
     control_database_url: str | None = Field(default=None)
     checkpoint_database_url: str | None = Field(default=None)
+    checkpoint_evidence_seal_key: SecretStr | None = Field(default=None)
     # Which persistence backend the product stores (artifacts, the publication
     # catalogue and the personal library) use.  Unset resolves to "control" in
     # product mode and "memory" otherwise, so a product deployment can never
@@ -186,6 +187,7 @@ class Settings(BaseSettings):
             "DATABASE_URL": "database_url",
             "CONTROL_DATABASE_URL": "control_database_url",
             "CHECKPOINT_DATABASE_URL": "checkpoint_database_url",
+            "CHECKPOINT_EVIDENCE_SEAL_KEY": "checkpoint_evidence_seal_key",
             "OPENAI_API_KEY": "openai_api_key",
             "LANGFUSE_PUBLIC_KEY": "langfuse_public_key",
             "LANGFUSE_SECRET_KEY": "langfuse_secret_key",
@@ -193,6 +195,18 @@ class Settings(BaseSettings):
             if f"{env_name}_FILE" in os.environ:
                 values[field_name] = provider.get(env_name)
         return values
+
+    @model_validator(mode="after")
+    def validate_checkpoint_evidence_seal_key(self) -> "Settings":
+        if (
+            self.checkpoint_evidence_seal_key is not None
+            and len(
+                self.checkpoint_evidence_seal_key.get_secret_value().encode("utf-8")
+            )
+            < 32
+        ):
+            raise ValueError("CHECKPOINT_EVIDENCE_SEAL_KEY must be at least 32 bytes")
+        return self
 
     @model_validator(mode="after")
     def validate_auth_settings(self) -> "Settings":

@@ -12,6 +12,10 @@ def _mock_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:9999/v1")
     monkeypatch.setenv("MODEL_NAME", "test-model")
     monkeypatch.setenv("DATABASE_URL", "sqlite+aiosqlite:///")
+    monkeypatch.setenv(
+        "CHECKPOINT_EVIDENCE_SEAL_KEY",
+        "unit-test-checkpoint-evidence-seal-key-2026",
+    )
     monkeypatch.setenv("AUTH_ENABLED", "false")
     monkeypatch.setenv("LANGFUSE_ENABLED", "false")
     monkeypatch.setenv("AI_VIEWS_AUTO_SYNC", "false")

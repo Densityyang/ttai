@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from src.core.secrets import SecretProvider
 from src.core.settings import Settings
@@ -71,6 +72,32 @@ def test_settings_support_file_backed_values(tmp_path: Path, monkeypatch: pytest
 
     settings = Settings(_env_file=None)
     assert settings.openai_api_key == "file-backed-key"
+
+
+def test_settings_load_checkpoint_evidence_seal_key_from_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret_file = tmp_path / "checkpoint-evidence-seal-key"
+    secret_file.write_text("checkpoint-evidence-seal-key-at-least-32-bytes\n", encoding="utf-8")
+    monkeypatch.setenv("CHECKPOINT_EVIDENCE_SEAL_KEY_FILE", str(secret_file))
+    monkeypatch.delenv("CHECKPOINT_EVIDENCE_SEAL_KEY", raising=False)
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+
+    settings = Settings(_env_file=None)
+    assert settings.checkpoint_evidence_seal_key is not None
+    assert (
+        settings.checkpoint_evidence_seal_key.get_secret_value()
+        == "checkpoint-evidence-seal-key-at-least-32-bytes"
+    )
+
+
+def test_settings_reject_short_checkpoint_evidence_seal_key() -> None:
+    with pytest.raises(ValidationError, match="CHECKPOINT_EVIDENCE_SEAL_KEY"):
+        Settings(
+            _env_file=None,
+            auth_enabled=False,
+            checkpoint_evidence_seal_key="too-short",
+        )
 
 
 def test_agent_config_supports_file_backed_embedding_key(

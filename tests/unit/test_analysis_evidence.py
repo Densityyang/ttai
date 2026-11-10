@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
+from typing import Any
+from uuid import UUID
 
 import pytest
 from pydantic import JsonValue
@@ -10,20 +12,33 @@ from pydantic import JsonValue
 from src.nl2sql.contracts import (
     AnswerArtifact,
     AnswerFact,
+    ExecutionPlan,
+    FetchMetricStep,
     PlanExecutionRecord,
     PlanStepReceipt,
+    QueryPlan,
     TimeRange,
+    VerifyStep,
 )
 from src.nl2sql.orchestration.analysis_evidence import (
     MAX_ANALYSIS_FACTS,
+    AnalysisEvidenceBundle,
     AnalysisEvidenceError,
     AnalysisInterpretation,
     AnalysisStatement,
     build_analysis_evidence,
     project_analysis_model_input,
     validate_analysis_interpretation,
+    validate_grounded_answer_checkpoint,
 )
-from src.nl2sql.orchestration.grounding import GroundedAnswer, conservative_data_as_of
+from src.nl2sql.orchestration.checkpoint_evidence_seal import (
+    seal_grounded_execution_checkpoint,
+)
+from src.nl2sql.orchestration.grounding import (
+    GroundedAnswer,
+    conservative_data_as_of,
+    render_grounded_answer,
+)
 
 
 def _fact_id(
@@ -118,10 +133,82 @@ def _evidence(
     return grounded, record, window
 
 
+def _build_authorized_analysis_evidence(
+    *,
+    grounded: GroundedAnswer,
+    record: PlanExecutionRecord,
+    execution_plan_checksum: str,
+    analysis_window: TimeRange,
+    **kwargs: Any,
+) -> AnalysisEvidenceBundle:
+    """Supply explicit fixture authority for tests not exercising its absence."""
+
+    if "authoritative_units" not in kwargs:
+        kwargs["authoritative_units"] = {
+            fact.metric_key: fact.unit
+            for fact in grounded.facts
+            if fact.metric_key is not None
+        }
+    return build_analysis_evidence(
+        grounded=grounded,
+        record=record,
+        execution_plan_checksum=execution_plan_checksum,
+        analysis_window=analysis_window,
+        **kwargs,
+    )
+
+
+def _checkpoint_binding(
+    grounded: GroundedAnswer,
+    record: PlanExecutionRecord,
+) -> tuple[QueryPlan, ExecutionPlan, PlanExecutionRecord]:
+    metric_key = grounded.facts[0].metric_key
+    assert metric_key is not None
+    window = TimeRange(start=date(2026, 9, 1), end=date(2026, 9, 20))
+    query_plan = QueryPlan(
+        intent="metric",
+        domain="controlled",
+        metric_keys=(metric_key,),
+        time_range=window,
+        grain="day",
+        source_strategy="aggregate_first",
+    )
+    execution_plan = ExecutionPlan(
+        query_plan_sha256=query_plan.checksum,
+        semantic_release_id=UUID("11111111-1111-1111-1111-111111111111"),
+        schema_snapshot_id=UUID("22222222-2222-2222-2222-222222222222"),
+        policy_version="analysis-evidence.test.v1",
+        steps=(
+            FetchMetricStep(step_id="fetch_archive_rate", metric_keys=(metric_key,)),
+            VerifyStep(
+                step_id="verify_result",
+                input_refs=("fetch_archive_rate",),
+                invariant_ids=("typed_result_present",),
+                depends_on=("fetch_archive_rate",),
+            ),
+        ),
+    )
+    verify_receipt = PlanStepReceipt(
+        step_id="verify_result",
+        kind="verify",
+        status="succeeded",
+        elapsed_ms=0,
+        output_digest="e" * 64,
+    )
+    bound_record = record.model_copy(
+        update={
+            "execution_plan_checksum": execution_plan.checksum,
+            "step_receipts": (*record.step_receipts, verify_receipt),
+            "output_step_ids": (*record.output_step_ids, "verify_result"),
+        }
+    )
+    return query_plan, execution_plan, bound_record
+
+
 def test_analysis_evidence_rebinds_grounded_fact_to_receipt_provenance() -> None:
     grounded, record, window = _evidence()
 
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -143,7 +230,7 @@ def test_analysis_evidence_omits_unproven_fact_and_fails_closed_if_none_remain()
     grounded, record, window = _evidence(fact_source_id="gold.other")
 
     with pytest.raises(AnalysisEvidenceError, match="analysis_evidence_no_proven_facts"):
-        build_analysis_evidence(
+        _build_authorized_analysis_evidence(
             grounded=grounded,
             record=record,
             execution_plan_checksum=record.execution_plan_checksum,
@@ -155,7 +242,7 @@ def test_analysis_evidence_requires_the_exact_execution_plan_checksum() -> None:
     grounded, record, window = _evidence()
 
     with pytest.raises(AnalysisEvidenceError, match="analysis_execution_plan_mismatch"):
-        build_analysis_evidence(
+        _build_authorized_analysis_evidence(
             grounded=grounded,
             record=record,
             execution_plan_checksum="0" * 64,
@@ -167,7 +254,7 @@ def test_analysis_evidence_does_not_consume_composite_row_values() -> None:
     grounded, record, window = _evidence(value=[{"day": "2026-09-20", "value": 42}])
 
     with pytest.raises(AnalysisEvidenceError, match="analysis_evidence_no_proven_facts"):
-        build_analysis_evidence(
+        _build_authorized_analysis_evidence(
             grounded=grounded,
             record=record,
             execution_plan_checksum=record.execution_plan_checksum,
@@ -185,7 +272,7 @@ def test_analysis_evidence_is_bounded_before_projection() -> None:
     )
 
     with pytest.raises(AnalysisEvidenceError, match="analysis_evidence_fact_limit_exceeded"):
-        build_analysis_evidence(
+        _build_authorized_analysis_evidence(
             grounded=grounded,
             record=record,
             execution_plan_checksum=record.execution_plan_checksum,
@@ -196,7 +283,7 @@ def test_analysis_evidence_is_bounded_before_projection() -> None:
 def test_missing_dates_are_not_invented() -> None:
     grounded, record, window = _evidence(data_as_of=None, time_range=None)
 
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -213,7 +300,7 @@ def test_missing_dates_are_not_invented() -> None:
 
 def test_model_projection_separates_source_facts_and_requested_interpretation() -> None:
     grounded, record, window = _evidence()
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -236,7 +323,7 @@ def test_model_projection_separates_source_facts_and_requested_interpretation() 
 def test_structured_interpretation_requires_numeric_traceability() -> None:
     fact_range = TimeRange(start=date(2026, 9, 20), end=date(2026, 9, 20))
     grounded, record, window = _evidence(time_range=fact_range)
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -273,7 +360,7 @@ def test_date_year_cannot_authorize_a_metric_percentage() -> None:
         value=42,
         time_range=TimeRange(start=date(2026, 9, 20), end=date(2026, 9, 20)),
     )
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -295,7 +382,7 @@ def test_date_year_cannot_authorize_a_metric_percentage() -> None:
 
 def test_numeric_value_requires_the_cited_unit() -> None:
     grounded, record, window = _evidence(value=42)
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -315,7 +402,7 @@ def test_numeric_value_requires_the_cited_unit() -> None:
         )
 
     grounded, record, window = _evidence(value=42, unit=None)
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -336,7 +423,7 @@ def test_numeric_value_requires_the_cited_unit() -> None:
 
 def test_decimal_representation_is_not_reformatted() -> None:
     grounded, record, window = _evidence(value="93.20")
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -369,7 +456,9 @@ def test_checkpoint_unit_is_ignored_without_authoritative_metadata() -> None:
         facts=(tampered_fact,),
         artifact=AnswerArtifact(facts=(tampered_fact,)),
     )
-    with pytest.raises(AnalysisEvidenceError, match="analysis_evidence_no_proven_facts"):
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_fact_unit_authority_missing"
+    ):
         build_analysis_evidence(
             grounded=grounded,
             record=record,
@@ -399,7 +488,7 @@ def test_checkpoint_unit_mutation_cannot_override_authoritative_metric_unit() ->
         artifact=AnswerArtifact(facts=(tampered_fact,)),
     )
     with pytest.raises(AnalysisEvidenceError, match="analysis_evidence_no_proven_facts"):
-        build_analysis_evidence(
+        _build_authorized_analysis_evidence(
             grounded=tampered,
             record=record,
             execution_plan_checksum=record.execution_plan_checksum,
@@ -410,9 +499,45 @@ def test_checkpoint_unit_mutation_cannot_override_authoritative_metric_unit() ->
         )
 
 
+def test_checkpoint_cannot_promote_missing_metric_unit_authority() -> None:
+    grounded, record, window = _evidence(value=42, unit=None)
+    original_fact = grounded.facts[0]
+    promoted_fact = original_fact.model_copy(
+        update={
+            "unit": "count",
+            "fact_id": _fact_id(
+                original_fact.step_id,
+                original_fact.metric_key or "",
+                original_fact.status,
+                original_fact.value,
+                original_fact.time_range,
+                unit="count",
+            ),
+        }
+    )
+    promoted_receipt = record.step_receipts[0].model_copy(update={"unit": "count"})
+    promoted_record = record.model_copy(update={"step_receipts": (promoted_receipt,)})
+    promoted_grounded = GroundedAnswer(
+        answer_text=grounded.answer_text,
+        facts=(promoted_fact,),
+        artifact=AnswerArtifact(facts=(promoted_fact,)),
+    )
+
+    with pytest.raises(AnalysisEvidenceError, match="analysis_evidence_no_proven_facts"):
+        _build_authorized_analysis_evidence(
+            grounded=promoted_grounded,
+            record=promoted_record,
+            execution_plan_checksum=record.execution_plan_checksum,
+            analysis_window=window,
+            authoritative_units={original_fact.metric_key or "": None},
+        )
+
+
 def test_free_text_receipt_unit_cannot_become_authority() -> None:
     grounded, record, window = _evidence(value=42, unit="orders")
-    with pytest.raises(AnalysisEvidenceError, match="analysis_evidence_no_proven_facts"):
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_fact_unit_authority_missing"
+    ):
         build_analysis_evidence(
             grounded=grounded,
             record=record,
@@ -421,9 +546,102 @@ def test_free_text_receipt_unit_cannot_become_authority() -> None:
         )
 
 
+def test_build_analysis_evidence_cannot_project_unit_without_authority() -> None:
+    grounded, record, window = _evidence(unit="percent")
+
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_fact_unit_authority_missing"
+    ):
+        build_analysis_evidence(
+            grounded=grounded,
+            record=record,
+            execution_plan_checksum=record.execution_plan_checksum,
+            analysis_window=window,
+        )
+
+
+def test_checkpoint_requires_unit_authority_for_non_null_metric_receipt_unit() -> None:
+    grounded, record, _window = _evidence(unit="percent")
+    query_plan, execution_plan, bound_record = _checkpoint_binding(grounded, record)
+    answer_text = render_grounded_answer(
+        query_plan=query_plan,
+        facts=grounded.facts,
+    )
+
+    key = "analysis-evidence-test-checkpoint-seal-key"
+    identities = {grounded.facts[0].step_id: "a" * 64}
+    sealed_record = seal_grounded_execution_checkpoint(
+        key=key,
+        query_plan=query_plan,
+        execution_plan=execution_plan,
+        execution_record=bound_record,
+        answer_artifact=grounded.artifact,
+        answer_text=answer_text,
+        unit_authority_identities=identities,
+    )
+    with pytest.raises(AnalysisEvidenceError, match="analysis_fact_unit_authority_missing"):
+        validate_grounded_answer_checkpoint(
+            query_plan,
+            grounded.artifact,
+            answer_text,
+            execution_plan=execution_plan,
+            execution_record=sealed_record,
+            evidence_seal_key=key,
+            unit_authority_identities=identities,
+        )
+
+
+def test_checkpoint_without_unit_can_remain_unitless_without_authority() -> None:
+    grounded, record, window = _evidence(unit=None)
+    query_plan, execution_plan, bound_record = _checkpoint_binding(grounded, record)
+    answer_text = render_grounded_answer(
+        query_plan=query_plan,
+        facts=grounded.facts,
+    )
+
+    validated = validate_grounded_answer_checkpoint(
+        query_plan,
+        grounded.artifact,
+        answer_text,
+        execution_plan=execution_plan,
+        execution_record=bound_record,
+        allow_legacy_checkpoint=True,
+    )
+    bundle = build_analysis_evidence(
+        grounded=validated,
+        record=bound_record,
+        execution_plan_checksum=execution_plan.checksum,
+        analysis_window=window,
+        query_plan=query_plan,
+        execution_plan=execution_plan,
+    )
+    assert bundle.facts[0].unit is None
+
+
+def test_legacy_checkpoint_gate_rejects_unitful_unsealed_records() -> None:
+    grounded, record, _window = _evidence(unit="percent")
+    query_plan, execution_plan, bound_record = _checkpoint_binding(grounded, record)
+    answer_text = render_grounded_answer(
+        query_plan=query_plan,
+        facts=grounded.facts,
+    )
+    with pytest.raises(
+        AnalysisEvidenceError,
+        match="analysis_checkpoint_legacy_compatibility_denied",
+    ):
+        validate_grounded_answer_checkpoint(
+            query_plan,
+            grounded.artifact,
+            answer_text,
+            execution_plan=execution_plan,
+            execution_record=bound_record,
+            allow_legacy_checkpoint=True,
+        )
+
+
 def test_authoritative_units_are_exact_and_parenthetical_units_are_checked() -> None:
     grounded, record, window = _evidence(value=42, unit="count")
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -467,7 +685,7 @@ def test_percent_unit_punctuation_forms_bind_to_the_authoritative_unit(
     text: str,
 ) -> None:
     grounded, record, window = _evidence(value=42, unit="percent")
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -483,7 +701,7 @@ def test_percent_unit_punctuation_forms_bind_to_the_authoritative_unit(
 
 def test_percentage_points_remain_distinct_from_percent() -> None:
     grounded, record, window = _evidence(value=42, unit="percent")
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -504,7 +722,7 @@ def test_percentage_points_remain_distinct_from_percent() -> None:
 
 def test_cny_prefix_requires_the_authoritative_currency_unit() -> None:
     grounded, record, window = _evidence(value="93.20", unit="currency_cny")
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -532,7 +750,7 @@ def test_data_as_of_requires_the_complete_iso_reference() -> None:
     grounded, record, window = _evidence(
         data_as_of=datetime(2026, 9, 20, 12, 34, tzinfo=UTC)
     )
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,
@@ -599,7 +817,7 @@ def test_complete_date_reference_remains_valid_evidence() -> None:
     grounded, record, window = _evidence(
         time_range=TimeRange(start=date(2026, 9, 20), end=date(2026, 9, 20))
     )
-    bundle = build_analysis_evidence(
+    bundle = _build_authorized_analysis_evidence(
         grounded=grounded,
         record=record,
         execution_plan_checksum=record.execution_plan_checksum,

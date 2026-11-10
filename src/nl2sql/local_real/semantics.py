@@ -458,7 +458,9 @@ def _assert_derived_dependencies(by_key: Mapping[str, Any], entry: Any) -> None:
     denominator = {
         (item.field, item.operator) for item in kpi.ratio.denominator_predicates
     }
-    numerator = {(item.field, item.operator) for item in kpi.ratio.numerator_predicates}
+    numerator = {
+        (item.field, item.operator) for item in kpi.ratio.numerator_authority
+    }
     if denominator != {("completion_receipt_time", "is_not_null")}:
         raise LocalRealSemanticError(
             "local_real_binding_canonical_mismatch: derived_dependencies"

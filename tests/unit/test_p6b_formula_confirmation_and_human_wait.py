@@ -398,6 +398,7 @@ class _RuntimeFactory:
             plan_executor=PlanExecutor(
                 metric_runner=self.metric_runner,
                 ad_hoc_calculation_runner=runner,
+                allow_legacy_unitless_grounding=True,
             ),
             identity=identity,
             authorization=authorization,
@@ -488,7 +489,7 @@ def _legacy_deep_engine() -> tuple[Any, _CountingMetricRunner]:
         query_plan_provider=_StaticPlanProvider(
             _plan(metric_keys=("metric.revenue",))
         ),
-        plan_executor=PlanExecutor(metric_runner=runner),
+        plan_executor=PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ),
     )
     return engine, runner
 
@@ -1170,7 +1171,7 @@ async def test_confirmation_without_a_request_scoped_runtime_never_executes() ->
         route_policy=_standard_route_policy(),
         context_resolver=_Resolver(_context()),
         query_plan_provider=_StaticPlanProvider(_plan()),
-        plan_executor=PlanExecutor(metric_runner=metric_runner),
+        plan_executor=PlanExecutor(metric_runner=metric_runner, allow_legacy_unitless_grounding=True, ),
     )
     config = _config()
 

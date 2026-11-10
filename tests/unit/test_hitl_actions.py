@@ -349,7 +349,7 @@ def _legacy_engine() -> tuple[Any, _LegacyRunner]:
         route_policy=_deep_route_policy(),
         context_resolver=_LegacyResolver(),
         query_plan_provider=_LegacyPlanProvider(),
-        plan_executor=PlanExecutor(metric_runner=runner),
+        plan_executor=PlanExecutor(metric_runner=runner, allow_legacy_unitless_grounding=True, ),
     )
     return engine, runner
 

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import copy
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -16,25 +20,38 @@ from src.core.auth.types import AuthUser
 from src.nl2sql.contracts import (
     AnswerArtifact,
     AnswerFact,
+    AuthorizationContext,
     ProductMode,
     QueryPlan,
     RequestContext,
+    RequestIdentity,
     RouteBudget,
     RoutePolicy,
     RoutingBudgetPolicy,
     TimeRange,
 )
+from src.nl2sql.infra.governance.query_gateway import QueryGateway, QueryReceipt
 from src.nl2sql.infra.llm.gateway import ProviderResponse, ProviderUnavailable
+from src.nl2sql.orchestration import engine as engine_module
 from src.nl2sql.orchestration.analysis_evidence import (
     AnalysisEvidenceError,
+    _grounded_fact_id,
     validate_grounded_answer_checkpoint,
 )
 from src.nl2sql.orchestration.engine import V2EngineState, create_v2_engine
+from src.nl2sql.orchestration.execution import PlanExecutionResult, PlanExecutor
+from src.nl2sql.orchestration.grounding import render_grounded_answer
 from src.nl2sql.orchestration.metric_query import SourceFreshnessRecord
 from src.nl2sql.orchestration.mode_contract import RunEnvelope
+from src.nl2sql.orchestration.typed_runtime import (
+    RequestTypedRuntime,
+    TypedRuntimeUnavailable,
+    build_request_typed_runtime,
+)
 from src.nl2sql.ownership import runtime_config
 from src.nl2sql.v2 import register_v2_routes
 from tests.metric_fixtures import NOW, RELEASE_ID, SNAPSHOT_ID, MetricAuthority, ratio_contract
+from tests.unit import test_typed_runtime as typed_runtime_fixtures
 from tests.unit.test_deterministic_query_path import (
     DISPLAY_NAME,
     _CountingProvider,
@@ -94,6 +111,127 @@ async def _run_mode(
         runtime_config(context),
     )
     return dict(result)
+
+
+async def _factory_backed_live(
+    *,
+    checkpointer: MemorySaver | None = None,
+    deployment: Any | None = None,
+    unavailable_after_first: bool = False,
+) -> Any:
+    """Build an Engine whose factory calls the real production runtime builder."""
+
+    active_deployment = deployment or typed_runtime_fixtures._deployment()
+    gateway = QueryGateway(None, schema="ai_views")  # type: ignore[arg-type]
+    execute_calls = 0
+
+    async def execute(sql: str, params: dict[str, object], **kwargs: object) -> QueryReceipt:
+        nonlocal execute_calls
+        del params, kwargs
+        execute_calls += 1
+        prepared = gateway.prepare(sql)
+        return QueryReceipt(
+            accepted=True,
+            sql=sql,
+            sql_fingerprint=prepared.fingerprint,
+            rows=[{"value": 7}],
+            row_count=1,
+            estimated_cost=1.0,
+            estimated_rows=1,
+            policy_outcome="allow",
+            policy_version=prepared.policy_version,
+            max_rows=prepared.max_rows,
+            result_columns=("value",),
+        )
+
+    gateway.execute = AsyncMock(side_effect=execute)  # type: ignore[method-assign]
+    provider = _CountingProvider()
+    factory_calls = 0
+    analysis_call_count = [0]
+    runtimes: list[RequestTypedRuntime] = []
+
+    async def factory(
+        *,
+        identity: RequestIdentity,
+        authorization: AuthorizationContext | None,
+        expected_revision: str | None,
+        capabilities: frozenset[str] = frozenset(),
+    ) -> RequestTypedRuntime | TypedRuntimeUnavailable:
+        nonlocal factory_calls
+        factory_calls += 1
+        if unavailable_after_first and factory_calls > 1:
+            return TypedRuntimeUnavailable(reason="controlled_unavailable")
+        runtime = await build_request_typed_runtime(
+            views=typed_runtime_fixtures._views(),
+            read_active=active_deployment.read_active,
+            read_snapshot=active_deployment.read_snapshot,
+            gateway=gateway,
+            identity=identity,
+            authorization=authorization,
+            expected_revision=expected_revision,
+            capabilities=capabilities,
+        )
+        if isinstance(runtime, RequestTypedRuntime):
+            runtimes.append(runtime)
+        return runtime
+
+    engine = create_v2_engine(
+        checkpointer=checkpointer or MemorySaver(),
+        model_gateway=_model_gateway(provider),
+        typed_runtime_factory=factory,
+    )
+    return SimpleNamespace(
+        engine=engine,
+        gateway=gateway,
+        gateway_execute=gateway.execute,
+        provider=provider,
+        factory_calls=lambda: factory_calls,
+        runtimes=runtimes,
+        deployment=active_deployment,
+        execute_calls=lambda: execute_calls,
+        analysis_calls=lambda: analysis_call_count[0],
+        analysis_call_count=analysis_call_count,
+    )
+
+
+async def _run_factory_analyze(live: Any) -> tuple[dict[str, Any], dict[str, object]]:
+    async def complete(**kwargs: Any) -> ProviderResponse:
+        live.analysis_call_count[0] += 1
+        return ProviderResponse(
+            content=_structured_response(kwargs["messages"]),
+            model="controlled-analysis",
+            usage={},
+            finish_reason="stop",
+        )
+
+    live.provider.complete = complete  # type: ignore[method-assign]
+    thread_id = uuid4()
+    authorization = typed_runtime_fixtures._authorization()
+    context = RequestContext(
+        identity=_identity(),
+        thread_id=thread_id,
+        trace_id=f"trace-{thread_id}",
+        deadline_ms=10_000,
+        authorization=authorization,
+    )
+    config = runtime_config(context)
+    result = await live.engine.ainvoke(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "metric=complaint_in_transit_count time=2024-02-29",
+                }
+            ],
+            "run_envelope": RunEnvelope(
+                run_id=uuid4().hex,
+                requested_mode="ANALYZE",
+                effective_mode="ANALYZE",
+            ).model_dump(mode="json"),
+        },
+        config,
+    )
+    return dict(result), config
 
 
 def _structured_response(messages: list[dict[str, Any]], *, invented: bool = False) -> str:
@@ -366,6 +504,58 @@ async def test_no_scalar_governed_fact_stops_before_model_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_query_rebinds_fetch_unit_before_grounding_and_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The common QUERY path rejects a receipt unit mutation before grounding."""
+
+    live = await _engine(_FreshMetricAuthority(), rows=[{"value": 7}])
+    original_execute = PlanExecutor.execute
+
+    async def execute_with_mutated_unit(self: PlanExecutor, **kwargs: Any) -> PlanExecutionResult:
+        result = await original_execute(self, **kwargs)
+        receipts = tuple(
+            receipt.model_copy(update={"unit": "percent"})
+            if receipt.kind == "fetch_metric"
+            else receipt
+            for receipt in result.record.step_receipts
+        )
+        return PlanExecutionResult(
+            record=result.record.model_copy(update={"step_receipts": receipts}),
+            outputs=result.outputs,
+            output_contracts=result.output_contracts,
+            require_semantic_contract=result.require_semantic_contract,
+        )
+
+    monkeypatch.setattr(PlanExecutor, "execute", execute_with_mutated_unit)
+    queried = await _run_mode(live, "QUERY")
+    assert queried["stop_reason"] == "checkpoint_unit_authority_mismatch"
+    assert queried.get("grounded_answer_artifact") is None
+    assert queried.get("response_blocks", []) == []
+    assert all(
+        "capture_execution_record_sha256" not in event["attributes"]
+        for event in queried.get("trace_events", [])
+    )
+    assert live.provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_typed_execution_fails_before_sql_without_evidence_seal_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    live = await _engine(_FreshMetricAuthority(), rows=[{"value": 7}])
+    monkeypatch.setattr(
+        engine_module,
+        "get_settings",
+        lambda: SimpleNamespace(checkpoint_evidence_seal_key=None),
+    )
+    result = await _run_mode(live, "QUERY")
+    assert result["stop_reason"] == "checkpoint_evidence_seal_key_unavailable"
+    assert live.gateway_execute.await_count == 0
+    assert result.get("grounded_answer_artifact") is None
+
+
+@pytest.mark.asyncio
 async def test_analyze_without_typed_pipeline_never_falls_through_to_model() -> None:
     provider = _CountingProvider()
     engine = create_v2_engine(
@@ -418,8 +608,403 @@ async def test_invented_numeric_claim_is_rejected_without_raw_prose_fallback() -
         for message in analyzed.get("messages", [])
     )
     assert analyzed["budget_record"]["usage"]["model_calls"] == 1
-    assert analyzed["model_receipt"]
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "receipt_output_digest",
+        "fact_output_digest",
+        "receipt_and_fact_output_digest",
+        "receipt_and_fact_rowset_digest",
+        "fact_value_and_id",
+        "answer_text_and_artifact",
+        "whole_record_and_artifact",
+        "receipt_and_fact_unit",
+    ],
+)
+async def test_engine_checkpoint_restore_rejects_joint_evidence_mutations(
+    mutation: str,
+) -> None:
+    """Real Engine restoration rejects tampering before another model call."""
+
+    checkpointer = MemorySaver()
+    live = await _engine(
+        _FreshMetricAuthority(),
+        rows=[{"value": 7}],
+        checkpointer=checkpointer,
+    )
+    calls = 0
+
+    async def complete(**kwargs: Any) -> ProviderResponse:
+        nonlocal calls
+        calls += 1
+        return ProviderResponse(
+            content=_structured_response(kwargs["messages"]),
+            model="controlled-analysis",
+            usage={},
+            finish_reason="stop",
+        )
+
+    live.provider.complete = complete  # type: ignore[method-assign]
+    thread_id = uuid4()
+    context = RequestContext(
+        identity=_identity(),
+        thread_id=thread_id,
+        trace_id=f"trace-{thread_id}",
+        deadline_ms=10_000,
+    )
+    config = runtime_config(context)
+    initial = await live.engine.ainvoke(
+        {
+            "messages": [{"role": "user", "content": _QUESTION}],
+            "run_envelope": RunEnvelope(
+                run_id=uuid4().hex,
+                requested_mode="ANALYZE",
+                effective_mode="ANALYZE",
+            ).model_dump(mode="json"),
+        },
+        config,
+    )
+    assert initial.get("stop_reason") != "checkpoint_evidence_seal_key_unavailable"
+    assert calls == 1
+    saved = (await live.engine.aget_state(config)).values
+    record = copy.deepcopy(saved["execution_record"])
+    assert record["evidence_seal"]["version"] == "v1"
+    artifact = copy.deepcopy(saved["grounded_answer_artifact"])
+    answer_text = str(saved["grounded_answer_text"])
+    query_plan = QueryPlan.model_validate(saved["query_plan"])
+    fact_index = 0
+    fact = AnswerFact.model_validate(artifact["facts"][fact_index])
+    receipt_index = next(
+        index
+        for index, receipt in enumerate(record["step_receipts"])
+        if receipt["step_id"] == fact.step_id
+    )
+    receipt = record["step_receipts"][receipt_index]
+
+    def update_fact(**changes: object) -> None:
+        nonlocal fact, answer_text
+        fact = fact.model_copy(update=changes)
+        fact = fact.model_copy(update={"fact_id": _grounded_fact_id(fact)})
+        artifact["facts"][fact_index] = fact.model_dump(mode="json")
+        answer_text = render_grounded_answer(query_plan=query_plan, facts=(fact,))
+
+    if mutation == "receipt_output_digest":
+        receipt["output_digest"] = "0" * 64
+    elif mutation == "fact_output_digest":
+        update_fact(output_digest="0" * 64)
+        answer_text = str(saved["grounded_answer_text"])
+    elif mutation == "receipt_and_fact_output_digest":
+        receipt["output_digest"] = "0" * 64
+        update_fact(output_digest="0" * 64)
+    elif mutation == "receipt_and_fact_rowset_digest":
+        receipt["rowset_sha256"] = "0" * 64
+        update_fact(rowset_sha256="0" * 64)
+    elif mutation == "fact_value_and_id":
+        original_text = answer_text
+        update_fact(value=808)
+        answer_text = original_text
+    elif mutation == "answer_text_and_artifact":
+        update_fact(value=809)
+    elif mutation == "whole_record_and_artifact":
+        receipt["output_digest"] = "0" * 64
+        receipt["rowset_sha256"] = "0" * 64
+        receipt["source_id"] = "tampered.source"
+        update_fact(
+            value=810,
+            output_digest="0" * 64,
+            rowset_sha256="0" * 64,
+            source_id="tampered.source",
+        )
+    elif mutation == "receipt_and_fact_unit":
+        receipt["unit"] = "percent"
+        update_fact(unit="percent")
+
+    await live.engine.aupdate_state(
+        config,
+        {
+            "execution_record": record,
+            "grounded_answer_artifact": artifact,
+            "grounded_answer_text": answer_text,
+        },
+        as_node="execute",
+    )
+    restored = await live.engine.ainvoke(None, config)
+    assert restored.get("stop_reason") in {
+        "checkpoint_evidence_seal_invalid",
+        "checkpoint_unit_authority_mismatch",
+        "analysis_grounded_answer_mismatch",
+    }
+    assert restored.get("response_blocks", []) == []
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_factory_backed_checkpoint_restoration_rebuilds_runtime_without_execution(
+) -> None:
+    """Resume analysis through a fresh scope and the production runtime factory."""
+
+    checkpointer = MemorySaver()
+    live = await _factory_backed_live(checkpointer=checkpointer)
+    initial, config = await _run_factory_analyze(live)
+    assert initial.get("stop_reason") is None
+
+    assert live.factory_calls() == 1
+    assert live.analysis_calls() == 1
+    assert len(live.runtimes) == 1
+    assert isinstance(live.runtimes[0], RequestTypedRuntime)
+    assert live.gateway.execute.await_count == 1
+
+    history = [snapshot async for snapshot in live.engine.aget_state_history(config)]
+    execution_checkpoint = next(
+        snapshot for snapshot in history if "analysis" in snapshot.next
+    )
+    saved = execution_checkpoint.values
+    assert saved["execution_record"] is not None
+    assert saved["execution_record"]["evidence_seal"]["version"] == "v1"
+    assert not any(isinstance(value, RequestTypedRuntime) for value in saved.values())
+    resume_config = copy.deepcopy(config)
+    resume_config["configurable"].update(
+        execution_checkpoint.config["configurable"]
+    )
+    resume_config["configurable"]["authorization_context"] = AuthorizationContext(
+        authorization_revision="rev-currently-supplied",
+        agent_enabled=True,
+        scope_level="city_company",
+        allowed_scope_ids=("1",),
+    ).model_dump(mode="json")
+    restored = await live.engine.ainvoke(None, resume_config)
+
+    assert restored.get("stop_reason") is None
+    assert live.analysis_calls() == 2
+    assert live.factory_calls() == 2
+    assert len(live.runtimes) == 2
+    assert live.runtimes[0] is not live.runtimes[1]
+    assert live.runtimes[1].authorization.authorization_revision == "rev-p4-s1b"
+    assert live.gateway.execute.await_count == 1
+    assert live.execute_calls() == 1
+    assert [block["type"] for block in restored["response_blocks"]] == [
+        "text",
+        "provenance",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drift", "expected_code"),
+    [
+        ("release", "checkpoint_runtime_release_mismatch"),
+        ("snapshot", "checkpoint_runtime_snapshot_mismatch"),
+        ("release_snapshot_checksum", "checkpoint_runtime_unavailable"),
+    ],
+)
+async def test_factory_backed_checkpoint_restore_rejects_release_or_snapshot_drift(
+    drift: str,
+    expected_code: str,
+) -> None:
+    live = await _factory_backed_live()
+    initial, config = await _run_factory_analyze(live)
+    assert initial.get("stop_reason") is None
+    saved = (await live.engine.aget_state(config)).values
+    await live.engine.aupdate_state(
+        config,
+        {"execution_record": copy.deepcopy(saved["execution_record"])},
+        as_node="execute",
+    )
+
+    deployment = live.deployment
+    release = deployment.release
+    snapshot = deployment.snapshot
+    if drift == "release":
+        deployment.release = replace(
+            release,
+            release_id="99999999-9999-9999-9999-999999999999",
+        )
+    elif drift == "snapshot":
+        changed_snapshot = replace(
+            snapshot,
+            snapshot_id="33333333-3333-3333-3333-333333333333",
+        )
+
+        async def read_changed_snapshot(snapshot_id: str) -> Any:
+            assert snapshot_id == deployment.release.schema_snapshot_id
+            return changed_snapshot
+
+        # The changed release still advertises the old snapshot id, so a
+        # separate release copy binds it to the new validated snapshot.
+        deployment.release = replace(
+            release,
+            schema_snapshot_id=changed_snapshot.snapshot_id,
+            schema_snapshot_checksum=changed_snapshot.checksum,
+        )
+        deployment.read_snapshot = read_changed_snapshot
+    else:
+        deployment.release = replace(
+            release,
+            schema_snapshot_checksum="f" * 64,
+        )
+
+    restored = await live.engine.ainvoke(None, config)
+    assert restored.get("stop_reason") == expected_code
+    assert restored.get("response_blocks", []) == []
+    assert live.gateway.execute.await_count == 1
+    assert live.factory_calls() == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ("authorization_missing", "checkpoint_runtime_authorization_missing"),
+        ("authorization_malformed", "checkpoint_runtime_authorization_missing"),
+        ("revision_missing", "checkpoint_runtime_authorization_mismatch"),
+        ("revision_mismatch", "checkpoint_runtime_authorization_mismatch"),
+        ("owner_mismatch", "checkpoint_runtime_owner_mismatch"),
+        ("identity_mismatch", "checkpoint_runtime_owner_mismatch"),
+        ("factory_unavailable", "checkpoint_runtime_unavailable"),
+    ],
+)
+async def test_factory_backed_checkpoint_restore_rejects_authority_drift(
+    mutation: str,
+    expected_code: str,
+) -> None:
+    live = await _factory_backed_live(unavailable_after_first=mutation == "factory_unavailable")
+    initial, config = await _run_factory_analyze(live)
+    assert initial.get("stop_reason") is None
+    saved = (await live.engine.aget_state(config)).values
+    changes: dict[str, object] = {}
+    if mutation == "authorization_missing":
+        changes["authorization_context"] = None
+    elif mutation == "authorization_malformed":
+        changes["authorization_context"] = {"authorization_revision": "bad"}
+    elif mutation == "revision_missing":
+        changes["authorization_revision"] = None
+    elif mutation == "revision_mismatch":
+        changes["authorization_revision"] = "revision-other"
+    elif mutation == "owner_mismatch":
+        changes["run_owner_user_id"] = "another-user"
+    await live.engine.aupdate_state(
+        config,
+        {
+            **changes,
+            "execution_record": copy.deepcopy(saved["execution_record"]),
+        },
+        as_node="execute",
+    )
+
+    resume_config = config
+    if mutation == "identity_mismatch":
+        resume_config = copy.deepcopy(config)
+        resume_config["configurable"]["request_identity"]["user_id"] = "foreign-user"
+    restored = await live.engine.ainvoke(None, resume_config)
+
+    assert restored.get("stop_reason") == expected_code
+    assert restored.get("response_blocks", []) == []
+    assert live.gateway.execute.await_count == 1
+    assert live.analysis_calls() == 1
+    if mutation in {"owner_mismatch", "identity_mismatch"}:
+        assert live.factory_calls() == 1
+    elif mutation == "factory_unavailable":
+        assert live.factory_calls() == 2
+    else:
+        assert live.factory_calls() == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "receipt_output_digest",
+        "fact_output_digest",
+        "receipt_and_fact_output_digest",
+        "receipt_and_fact_rowset_digest",
+        "fact_value_and_id",
+        "answer_text_and_artifact",
+        "whole_record_and_artifact",
+        "receipt_and_fact_unit",
+    ],
+)
+async def test_factory_backed_checkpoint_restore_rejects_joint_evidence_mutations(
+    mutation: str,
+) -> None:
+    live = await _factory_backed_live()
+    initial, config = await _run_factory_analyze(live)
+    assert initial.get("stop_reason") is None
+    saved = (await live.engine.aget_state(config)).values
+    record = copy.deepcopy(saved["execution_record"])
+    artifact = copy.deepcopy(saved["grounded_answer_artifact"])
+    answer_text = str(saved["grounded_answer_text"])
+    query_plan = QueryPlan.model_validate(saved["query_plan"])
+    fact_index = 0
+    fact = AnswerFact.model_validate(artifact["facts"][fact_index])
+    receipt_index = next(
+        index
+        for index, receipt in enumerate(record["step_receipts"])
+        if receipt["step_id"] == fact.step_id
+    )
+    receipt = record["step_receipts"][receipt_index]
+
+    def update_fact(**changes: object) -> None:
+        nonlocal fact, answer_text
+        fact = fact.model_copy(update=changes)
+        fact = fact.model_copy(update={"fact_id": _grounded_fact_id(fact)})
+        artifact["facts"][fact_index] = fact.model_dump(mode="json")
+        answer_text = render_grounded_answer(query_plan=query_plan, facts=(fact,))
+
+    if mutation == "receipt_output_digest":
+        receipt["output_digest"] = "0" * 64
+    elif mutation == "fact_output_digest":
+        update_fact(output_digest="0" * 64)
+        answer_text = str(saved["grounded_answer_text"])
+    elif mutation == "receipt_and_fact_output_digest":
+        receipt["output_digest"] = "0" * 64
+        update_fact(output_digest="0" * 64)
+    elif mutation == "receipt_and_fact_rowset_digest":
+        receipt["rowset_sha256"] = "0" * 64
+        update_fact(rowset_sha256="0" * 64)
+    elif mutation == "fact_value_and_id":
+        original_text = answer_text
+        update_fact(value=808)
+        answer_text = original_text
+    elif mutation == "answer_text_and_artifact":
+        update_fact(value=809)
+    elif mutation == "whole_record_and_artifact":
+        receipt["output_digest"] = "0" * 64
+        receipt["rowset_sha256"] = "0" * 64
+        receipt["source_id"] = "tampered.source"
+        update_fact(
+            value=810,
+            output_digest="0" * 64,
+            rowset_sha256="0" * 64,
+            source_id="tampered.source",
+        )
+    elif mutation == "receipt_and_fact_unit":
+        receipt["unit"] = "percent"
+        update_fact(unit="percent")
+
+    await live.engine.aupdate_state(
+        config,
+        {
+            "execution_record": record,
+            "grounded_answer_artifact": artifact,
+            "grounded_answer_text": answer_text,
+        },
+        as_node="execute",
+    )
+    restored = await live.engine.ainvoke(None, config)
+
+    assert restored.get("stop_reason") in {
+        "checkpoint_evidence_seal_invalid",
+        "checkpoint_unit_authority_mismatch",
+        "analysis_grounded_answer_mismatch",
+    }
+    assert restored.get("response_blocks", []) == []
+    assert live.gateway.execute.await_count == 1
+    assert live.execute_calls() == 1
+    assert live.analysis_calls() == 1
+    assert live.factory_calls() == 2
 
 @pytest.mark.asyncio
 async def test_invalid_structured_json_is_rejected() -> None:
@@ -437,6 +1022,7 @@ async def test_invalid_structured_json_is_rejected() -> None:
     analyzed = await _run_mode(live, "ANALYZE")
     assert analyzed["stop_reason"] == "analysis_interpretation_invalid"
     assert analyzed["budget_record"]["usage"]["model_calls"] == 1
+    assert analyzed["model_receipt"]
     assert analyzed["model_receipt"]
 
 

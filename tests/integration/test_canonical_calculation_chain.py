@@ -50,10 +50,13 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock
 from urllib.parse import quote
 from uuid import UUID
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -63,20 +66,31 @@ from sqlalchemy.ext.asyncio import (
 
 from src.nl2sql.agents.dynamic_calc.trusted_templates import trusted_template_registry
 from src.nl2sql.contracts import (
+    AuthorizationContext,
     ContextBundle,
     FetchMetricStep,
     QueryPlan,
+    RequestContext,
     RequestIdentity,
     TimeRange,
     TrustedCalculationStep,
 )
 from src.nl2sql.infra.governance.query_gateway import QueryGateway
+from src.nl2sql.infra.llm.gateway import (
+    FakeProvider,
+    ModelGateway,
+    ModelProfile,
+    ModelTarget,
+    ProviderResponse,
+)
+from src.nl2sql.infra.store.ai_views import AIViewsConfig, ViewDefinition
 from src.nl2sql.orchestration.approved_compute import (
     ApprovedCalculationBinding,
     ApprovedCalculationCatalog,
     ApprovedCalculationInput,
 )
 from src.nl2sql.orchestration.budget import RouteBudgetLedger
+from src.nl2sql.orchestration.engine import create_v2_engine
 from src.nl2sql.orchestration.execution import PlanStepError
 from src.nl2sql.orchestration.grounding import ground_execution_answer
 from src.nl2sql.orchestration.metric_query import (
@@ -87,7 +101,14 @@ from src.nl2sql.orchestration.metric_query import (
     aggregate_definition_checksum,
     metric_plan_executor,
 )
+from src.nl2sql.orchestration.mode_contract import RunEnvelope
 from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
+from src.nl2sql.orchestration.typed_runtime import (
+    RequestTypedRuntime,
+    TypedRuntimeUnavailable,
+    build_request_typed_runtime,
+)
+from src.nl2sql.ownership import runtime_config
 from src.nl2sql.semantic.authoring import validate_authoring_ir
 from src.nl2sql.semantic.materialization import materialize_authoring_ir
 from src.nl2sql.semantic.metric_contract import (
@@ -571,7 +592,7 @@ class _ChainAuthority:
             template_checksum=metadata.checksum,
             # The execution receipt must carry the server-resolved metric unit;
             # checkpoint or template text cannot supply this authority.
-            unit="percent",
+            unit="ratio",
             inputs=(
                 ApprovedCalculationInput(
                     role="numerator",
@@ -730,6 +751,10 @@ async def test_canonical_chain_executes_against_a_real_datasource(
         execution_plan=execution_plan,
         record=result.record,
         outputs=result.outputs,
+        authoritative_units_by_step={
+            "calculate_metric": authority.binding.unit,
+        },
+        allow_legacy_unitless=True,
     )
     print(
         "[chain] 5 grounded facts="
@@ -824,3 +849,275 @@ async def test_default_wiring_cannot_reach_the_canonical_chain() -> None:
         )
     print(f"[chain] default wiring dependency fetch refused: {refused.value.code}")
     assert refused.value.code == "metric_dependency_binding_missing"
+
+
+@pytest.mark.postgres_integration
+@pytest.mark.skipif(
+    not RUN_INTEGRATION,
+    reason="set TTAI_RUN_POSTGRES_INTEGRATION=1 to run Docker PostgreSQL contracts",
+)
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+async def test_request_typed_runtime_uses_real_postgres_adapter_and_grounds_result(
+    chain_postgres: _ChainPostgres,
+) -> None:
+    """Exercise the request factory through its real PostgreSQL gateway adapter.
+
+    The production factory accepts a source_ref that names the configured view.
+    This fixture's seeded PostgreSQL table is named ``complaint_orders``, so the
+    test builds an equivalent synthetic active release whose metric points to
+    that table's configured relation.  The authority, schema, authorization,
+    compiler, runner, semantic validator, receipt and grounding are otherwise
+    handled by the real request-scoped runtime components.
+    """
+
+    base = _ChainAuthority()
+    metrics = tuple(
+        item.model_copy(update={"source_ref": "complaint_orders"})
+        for item in (base.numerator, base.denominator)
+    )
+    ir = metric_catalog_ir(
+        MetricCatalog(metrics=metrics),
+        relations={"complaint_orders": RELATION},
+    )
+    report = validate_authoring_ir(ir, relation_columns={RELATION: _COLUMN_TYPES})
+    assert report.ok, report.to_dict()
+    candidate = materialize_authoring_ir(ir, report)
+    relation_asset = next(
+        asset for asset in candidate.assets if asset.asset_type == "relation"
+    )
+    release = SemanticRelease(
+        release_id=RELEASE_ID,
+        version=1,
+        checksum=candidate.checksum,
+        state=SemanticReleaseState.ACTIVE,
+        documents=candidate.documents,
+        validation_report=report.to_dict(),
+        change_summary="synthetic request-runtime PostgreSQL fixture",
+        previous_release_id=None,
+        created_at=NOW,
+        schema_snapshot_id=SNAPSHOT_ID,
+        schema_snapshot_checksum=base.snapshot.checksum,
+    )
+    context = ContextBundle(
+        semantic_release_id=UUID(RELEASE_ID),
+        schema_snapshot_id=UUID(SNAPSHOT_ID),
+        domains=("complaint",),
+        asset_ids=tuple(item.asset_id for item in metrics),
+        approved_relation_ids=(relation_asset.asset_id,),
+        resolution_status="resolved",
+    )
+
+    async def read_active() -> SemanticRelease:
+        return release
+
+    async def read_snapshot(snapshot_id: str) -> SchemaSnapshot:
+        assert snapshot_id == SNAPSHOT_ID
+        return base.snapshot
+
+    views = AIViewsConfig(
+        target_schema="ai_views",
+        views=[
+            ViewDefinition(
+                name="complaint_orders",
+                source_table="complaint_orders",
+                source_schema="ai_views",
+                columns=list(_COLUMN_TYPES),
+            )
+        ],
+    )
+    authorization = AuthorizationContext(
+        authorization_revision="h19i-runtime-fixture-revision",
+        agent_enabled=True,
+        scope_level="city_company",
+        allowed_scope_ids=("fixture-company",),
+    )
+
+    engine, gateway = _gateway(chain_postgres.reader_url)
+    try:
+        runtime = await build_request_typed_runtime(
+            views=views,
+            read_active=read_active,
+            read_snapshot=read_snapshot,
+            gateway=gateway,
+            identity=base.identity,
+            authorization=authorization,
+        )
+        assert isinstance(runtime, RequestTypedRuntime)
+        assert isinstance(runtime.plan_executor._metric_runner, GatewayMetricStepRunner)
+        assert runtime.plan_executor._metric_runner._validation_mode == "enforce"
+        assert runtime.plan_executor._metric_runner._semantic_validator is not None
+
+        metric = metrics[0]
+        plan = QueryPlan(
+            intent="metric",
+            domain="complaint",
+            metric_keys=(metric.asset_id,),
+            time_range=TimeRange(
+                start=date(2024, 2, 29),
+                end=date(2024, 2, 29),
+            ),
+            grain="day",
+            source_strategy="aggregate_first",
+        )
+        validator = PlanValidator()
+        query_validation = validator.validate_query_plan(
+            plan=plan,
+            context=context,
+            identity=base.identity,
+        )
+        assert query_validation.outcome == "allow", query_validation.issues
+        execution_plan = PlanCompiler().compile(
+            plan=plan,
+            context=context,
+            validation=query_validation,
+        )
+        execution_validation = validator.validate_execution_plan(
+            execution_plan=execution_plan,
+            query_plan=plan,
+            context=context,
+            route_budget=RouteBudgetLedger(route="standard").limits,
+        )
+        assert execution_validation.outcome == "allow", execution_validation.issues
+
+        budget = RouteBudgetLedger(route="standard")
+        result = await runtime.plan_executor.execute(
+            query_plan=plan,
+            context=context,
+            execution_plan=execution_plan,
+            validation=execution_validation,
+            expected_policy_version=validator.policy_version,
+            expected_policy_checksum=validator.policy_checksum,
+            budget=budget,
+            deadline_ms=10_000,
+        )
+        assert result.record.status == "succeeded"
+        assert budget.sql_executions == 1
+        fetch = next(
+            step for step in execution_plan.steps if isinstance(step, FetchMetricStep)
+        )
+        receipt = next(
+            item for item in result.record.step_receipts if item.step_id == fetch.step_id
+        )
+        assert receipt.semantic_validation_outcome == "allow"
+        assert receipt.semantic_manifest_checksum is not None
+        assert receipt.semantic_validator_version is not None
+        assert receipt.sql_fingerprint is not None
+
+        grounded = ground_execution_answer(
+            query_plan=plan,
+            execution_plan=execution_plan,
+            record=result.record,
+            outputs=result.outputs,
+            output_contracts=result.output_contracts,
+            require_semantic_contract=True,
+            allow_legacy_unitless=True,
+        )
+        assert len(grounded.facts) == 1
+        fact = grounded.facts[0]
+        assert fact.metric_key == metric.asset_id
+        assert fact.status == "grounded"
+        assert fact.value == 3
+        assert fact.output_digest == receipt.output_digest
+        assert "grounding_execution_mismatch" not in grounded.artifact.degradation_flags
+
+        # Exercise the same production typed runtime through Engine orchestration
+        # while retaining the live PostgreSQL Gateway and no LLM calls.
+        engine_gateway_calls = 0
+        original_execute = gateway.execute
+
+        async def count_engine_gateway_calls(
+            sql: str,
+            params: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ):
+            nonlocal engine_gateway_calls
+            engine_gateway_calls += 1
+            return await original_execute(sql, params, **kwargs)
+
+        gateway.execute = count_engine_gateway_calls  # type: ignore[method-assign]
+        unused_provider = FakeProvider(
+            {
+                "small": ProviderResponse(
+                    content="unused",
+                    model="small",
+                    usage={},
+                    finish_reason="stop",
+                )
+            },
+            provider_name="fixture",
+        )
+        provider_call = AsyncMock(wraps=unused_provider.complete)
+        unused_provider.complete = provider_call  # type: ignore[method-assign]
+        model_gateway = ModelGateway(
+            providers={"fixture": unused_provider},
+            profiles={
+                name: ModelProfile(
+                    name,
+                    "integration-test-v1",
+                    frozenset({capability}),
+                    ModelTarget("fixture", "small", "small"),
+                    None,
+                )
+                for name, capability in (
+                    ("fast.default", "answer"),
+                    ("plan.standard", "plan"),
+                )
+            },
+        )
+
+        async def typed_runtime_factory(
+            *,
+            identity: RequestIdentity,
+            authorization: AuthorizationContext | None,
+            expected_revision: str | None,
+            capabilities: frozenset[str] = frozenset(),
+        ) -> RequestTypedRuntime | TypedRuntimeUnavailable:
+            runtime = await build_request_typed_runtime(
+                views=views,
+                read_active=read_active,
+                read_snapshot=read_snapshot,
+                gateway=gateway,
+                identity=identity,
+                authorization=authorization,
+                expected_revision=expected_revision,
+                capabilities=capabilities,
+                clock=lambda: NOW,
+            )
+            return runtime
+
+        production_engine = create_v2_engine(
+            checkpointer=MemorySaver(),
+            model_gateway=model_gateway,
+            typed_runtime_factory=typed_runtime_factory,
+        )
+        engine_context = RequestContext(
+            identity=base.identity,
+            thread_id=uuid.uuid4(),
+            trace_id=f"trace-engine-postgres-{uuid.uuid4().hex}",
+            deadline_ms=30_000,
+            authorization=authorization,
+        )
+        engine_result = await production_engine.ainvoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"metric={metric.metric_key} time=2024-02-29",
+                    }
+                ],
+                "run_envelope": RunEnvelope(
+                    run_id=uuid.uuid4().hex,
+                    requested_mode="QUERY",
+                    effective_mode="QUERY",
+                ).model_dump(mode="json"),
+            },
+            runtime_config(engine_context),
+        )
+        assert engine_result.get("stop_reason") is None
+        assert engine_result["execution_record"]["status"] == "succeeded"
+        assert engine_result["grounded_answer_artifact"]["facts"][0]["value"] == 3
+        assert engine_gateway_calls == 1
+        assert provider_call.await_count == 0
+    finally:
+        await engine.dispose()

@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import date
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
 from pydantic import ValidationError
 
+from src.nl2sql.agents.dynamic_calc.trusted_templates import trusted_template_registry
 from src.nl2sql.contracts import (
     AdHocCalculationStep,
+    AnswerArtifact,
     AnswerFact,
+    AuthorizationContext,
     ContextBundle,
     ExecutionPlan,
     ExecutionReceipt,
@@ -22,26 +28,54 @@ from src.nl2sql.contracts import (
     PlanStep,
     PlanStepReceipt,
     QueryPlan,
+    RequestContext,
     RequestIdentity,
+    RoutePolicy,
     TimeRange,
     TrustedCalculationStep,
     VerifyStep,
 )
+from src.nl2sql.infra.governance.query_gateway import QueryGateway, QueryReceipt
+from src.nl2sql.infra.llm.gateway import (
+    ModelGateway,
+    ModelProfile,
+    ModelTarget,
+    ProviderResponse,
+)
+from src.nl2sql.orchestration.analysis_evidence import (
+    AnalysisEvidenceError,
+    _grounded_fact_id,
+    validate_grounded_answer_checkpoint,
+)
+from src.nl2sql.orchestration.approved_compute import (
+    ApprovedCalculationBinding,
+    ApprovedCalculationCatalog,
+    ApprovedCalculationInput,
+)
 from src.nl2sql.orchestration.budget import RouteBudgetLedger
+from src.nl2sql.orchestration.checkpoint_evidence_seal import (
+    seal_grounded_execution_checkpoint,
+)
+from src.nl2sql.orchestration.engine import create_v2_engine
 from src.nl2sql.orchestration.evidence_digest import canonical_json_digest
 from src.nl2sql.orchestration.execution import (
     MetricStepResult,
     PlanExecutor,
     PlanStepError,
     PreparedMetricStep,
+    RegistryTrustedCalculationRunner,
+    TypedResultVerifier,
     validate_execution_record_against_plan,
 )
 from src.nl2sql.orchestration.grounding import (
     GroundingIntegrityError,
     build_answer_facts,
+    ground_execution_answer,
     render_grounded_answer,
 )
+from src.nl2sql.orchestration.mode_contract import RunEnvelope
 from src.nl2sql.orchestration.planning import PlanCompiler, PlanValidator
+from src.nl2sql.ownership import runtime_config
 from src.nl2sql.semantic.calculation_contract import (
     AggregateOperand,
     BinaryOperand,
@@ -207,6 +241,215 @@ class _MetricRunner:
                 policy_outcome="allow",
             ),
         )
+
+
+class _GatewayMetricRunner(_MetricRunner):
+    def __init__(self, values: dict[str, float], gateway: QueryGateway) -> None:
+        super().__init__(values)
+        self.gateway = gateway
+
+    async def execute(
+        self,
+        prepared: PreparedMetricStep,
+        *,
+        timeout_ms: int,
+    ) -> MetricStepResult:
+        await self.gateway.execute(
+            "SELECT synthetic", {}, trace_id="trusted-checkpoint-test"
+        )
+        return await super().execute(prepared, timeout_ms=timeout_ms)
+
+
+class _CountingTrustedRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+        self._inner = RegistryTrustedCalculationRunner()
+
+    async def execute(self, *, step: TrustedCalculationStep, inputs: dict[str, Any]) -> Any:
+        self.calls += 1
+        return await self._inner.execute(step=step, inputs=inputs)
+
+
+class _EngineContextResolver:
+    def __init__(self, context: ContextBundle) -> None:
+        self.context = context
+
+    async def resolve(
+        self, *, question: str, identity: RequestIdentity, route_hint: str
+    ) -> ContextBundle:
+        del question, identity, route_hint
+        return self.context
+
+
+class _EngineQueryPlanProvider:
+    is_deterministic = True
+
+    def __init__(self, plan: QueryPlan) -> None:
+        self.plan = plan
+
+    async def propose(
+        self, *, question: str, context: ContextBundle, identity: RequestIdentity
+    ) -> QueryPlan:
+        del question, context, identity
+        return self.plan
+
+
+class _EngineAnalysisProvider:
+    provider_name = "synthetic"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        timeout_ms: int,
+        max_output_tokens: int,
+        response_schema: dict[str, Any] | None = None,
+    ) -> ProviderResponse:
+        del model, timeout_ms, max_output_tokens, response_schema
+        self.calls += 1
+        source_message = messages[-1]["content"]
+        source_json = source_message.split("SOURCE FACTS\n", 1)[1].split(
+            "\n\nREQUESTED INTERPRETATION", 1
+        )[0]
+        fact = json.loads(source_json)["facts"][0]
+        return ProviderResponse(
+            content=json.dumps(
+                {
+                    "summary": {
+                        "text": "The approved calculation output is recorded.",
+                        "fact_ids": [fact["fact_id"]],
+                    },
+                    "observations": [],
+                    "caveats": [],
+                }
+            ),
+            model="controlled-analysis",
+            usage={},
+            finish_reason="stop",
+        )
+
+
+def _approved_ratio_binding(
+    output_metric_key: str = "metric.revenue_ratio",
+    *,
+    binding_revision: str = "unit-authority-test",
+) -> ApprovedCalculationBinding:
+    template = trusted_template_registry.metadata("ratio")
+    return ApprovedCalculationBinding(
+        canonical_metric_key=output_metric_key,
+        template_id=template.template_id,
+        template_version=template.version,
+        template_checksum=template.checksum,
+        inputs=(
+            ApprovedCalculationInput(
+                role="numerator",
+                metric_key="metric.revenue",
+                metric_contract_sha256="a" * 64,
+            ),
+            ApprovedCalculationInput(
+                role="denominator",
+                metric_key="metric.stores",
+                metric_contract_sha256="b" * 64,
+            ),
+        ),
+        binding_revision=binding_revision,
+        semantic_release_id=str(RELEASE_ID),
+        semantic_release_checksum="c" * 64,
+        unit="ratio",
+    )
+
+
+def _trusted_engine(
+    *,
+    catalog: ApprovedCalculationCatalog | None,
+    checkpointer: MemorySaver,
+    metric_runner: _GatewayMetricRunner,
+    calculation_runner: _CountingTrustedRunner,
+    provider: _EngineAnalysisProvider,
+) -> Any:
+    output_metric_key = "metric.revenue_ratio"
+    context = _context(
+        asset_ids=("metric.revenue", "metric.stores", output_metric_key)
+    )
+    query_plan = _query_plan().model_copy(
+        update={"metric_keys": (output_metric_key,)}
+    )
+    validator = PlanValidator(calculation_catalog=catalog)
+    compiler = PlanCompiler(calculation_catalog=catalog)
+    gateway = ModelGateway(
+        providers={"synthetic": provider},
+        profiles={
+            "fast.default": ModelProfile(
+                "fast.default",
+                "test-v1",
+                frozenset({"answer"}),
+                ModelTarget("synthetic", "small", "small"),
+                None,
+            )
+        },
+    )
+    route_policy = RoutePolicy(
+        version="trusted-checkpoint-standard-only",
+        state="bootstrap",
+        fast_max_risk=20,
+        fast_min_confidence=1.0,
+        fast_max_tables=1,
+        standard_max_risk=60,
+        standard_min_confidence=0.55,
+    )
+    return create_v2_engine(
+        checkpointer=checkpointer,
+        model_gateway=gateway,
+        route_policy=route_policy,
+        context_resolver=_EngineContextResolver(context),
+        query_plan_provider=_EngineQueryPlanProvider(query_plan),
+        plan_validator=validator,
+        plan_compiler=compiler,
+        plan_executor=PlanExecutor(
+            metric_runner=metric_runner,
+            trusted_calculation_runner=calculation_runner,
+            calculation_catalog=catalog,
+            allow_legacy_unitless_grounding=True,
+        ),
+    )
+
+
+def _trusted_request_config() -> dict[str, Any]:
+    identity = RequestIdentity(
+        request_id=UUID("55555555-5555-5555-5555-555555555555"),
+        user_id="analyst",
+        roles=frozenset({"analyst"}),
+        permissions=frozenset({"metrics:read", "nl2sql:invoke"}),
+    )
+    authorization = AuthorizationContext(
+        authorization_revision="trusted-checkpoint-rev-1",
+        agent_enabled=True,
+        scope_level="team",
+        allowed_scope_ids=("team-1",),
+    )
+    context = RequestContext(
+        identity=identity,
+        thread_id=UUID("66666666-6666-6666-6666-666666666666"),
+        trace_id="trace-trusted-checkpoint",
+        deadline_ms=30_000,
+        authorization=authorization,
+    )
+    return runtime_config(context)
+
+
+def _trusted_graph_input() -> dict[str, object]:
+    return {
+        "messages": [{"role": "user", "content": "revenue ratio"}],
+        "run_envelope": RunEnvelope(
+            run_id="run-trusted-checkpoint",
+            requested_mode="ANALYZE",
+            effective_mode="ANALYZE",
+        ).model_dump(mode="json"),
+    }
 
 
 class _AdHocRunner:
@@ -562,6 +805,7 @@ async def test_ad_hoc_grounding_uses_derived_identity_and_excludes_input_fetches
         execution_plan=plan,
         record=result.record,
         outputs=result.outputs,
+        allow_legacy_unitless=True,
     )
     assert len(facts) == 1
     fact = facts[0]
@@ -628,6 +872,7 @@ def _adhoc_receipt(
         "execution_binding_checksum": binding.checksum,
         "derived_output_id": derived_output_id(spec, binding),
         "calculation_scope": "ad_hoc_noncanonical",
+        "unit": spec.custom_unit_id if spec.unit == "custom_unit" else spec.unit,
     }
     base.update(overrides)
     return PlanStepReceipt(**base)
@@ -655,6 +900,7 @@ def test_ad_hoc_grounding_rebinds_the_receipt_to_the_real_step() -> None:
     assert build_answer_facts(
         query_plan=query_plan, execution_plan=plan,
         record=_record(plan, orphan), outputs={"ghost": 2.5},
+        allow_legacy_unitless=True,
     ) == ()
 
     # 2. receipt pointing at a NON-AD_HOC step
@@ -662,6 +908,7 @@ def test_ad_hoc_grounding_rebinds_the_receipt_to_the_real_step() -> None:
     assert build_answer_facts(
         query_plan=query_plan, execution_plan=plan,
         record=_record(plan, wrong_kind), outputs={"fetch_numerator": 2.5},
+        allow_legacy_unitless=True,
     ) == ()
 
     # 3. mismatched derived_output_id
@@ -671,6 +918,7 @@ def test_ad_hoc_grounding_rebinds_the_receipt_to_the_real_step() -> None:
     assert build_answer_facts(
         query_plan=query_plan, execution_plan=plan,
         record=_record(plan, bad_id), outputs=outputs,
+        allow_legacy_unitless=True,
     ) == ()
 
     # 4. mismatched spec checksum
@@ -678,6 +926,7 @@ def test_ad_hoc_grounding_rebinds_the_receipt_to_the_real_step() -> None:
     assert build_answer_facts(
         query_plan=query_plan, execution_plan=plan,
         record=_record(plan, bad_spec), outputs=outputs,
+        allow_legacy_unitless=True,
     ) == ()
 
     # 5. mismatched execution-binding checksum
@@ -687,6 +936,7 @@ def test_ad_hoc_grounding_rebinds_the_receipt_to_the_real_step() -> None:
     assert build_answer_facts(
         query_plan=query_plan, execution_plan=plan,
         record=_record(plan, bad_binding), outputs=outputs,
+        allow_legacy_unitless=True,
     ) == ()
 
     # 7. missing request-local output -> no derived fact
@@ -697,15 +947,28 @@ def test_ad_hoc_grounding_rebinds_the_receipt_to_the_real_step() -> None:
             execution_plan=plan,
             record=_record(plan, good),
             outputs={},
+            allow_legacy_unitless=True,
         )
 
     # 6. the matching receipt still grounds exactly once
     facts = build_answer_facts(
         query_plan=query_plan, execution_plan=plan,
         record=_record(plan, good), outputs=outputs,
+        allow_legacy_unitless=True,
     )
     assert len(facts) == 1
     assert facts[0].derived_output_id == derived_output_id(spec, binding)
+    wrong_unit = _adhoc_receipt(spec, binding, unit="count")
+    with pytest.raises(
+        GroundingIntegrityError, match="grounding_unit_authority_mismatch"
+    ):
+        build_answer_facts(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=_record(plan, wrong_unit),
+            outputs=outputs,
+            allow_legacy_unitless=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -752,6 +1015,7 @@ def test_canonical_provenance_mismatch_is_reported_as_a_grounding_mismatch() -> 
             execution_plan=plan,
             record=record,
             outputs={"calculate_ratio": 2.5},
+            allow_legacy_unitless=True,
         )
 
 
@@ -766,6 +1030,7 @@ def test_matching_canonical_receipt_has_no_mismatch_flag() -> None:
             execution_plan=plan,
             record=record,
             outputs={"calculate_ratio": 2.5},
+            allow_legacy_unitless=True,
         )
 
 
@@ -784,6 +1049,7 @@ def test_ad_hoc_provenance_mismatch_is_reported_as_a_grounding_mismatch() -> Non
             execution_plan=plan,
             record=_record(plan, bad),
             outputs={"calculate_adhoc": 2.5},
+            allow_legacy_unitless=True,
         )
 
 
@@ -802,6 +1068,7 @@ def test_matching_ad_hoc_receipt_has_no_mismatch_flag() -> None:
             execution_plan=plan,
             record=_record(plan, good),
             outputs={"calculate_adhoc": 2.5},
+            allow_legacy_unitless=True,
         )
 
 
@@ -820,6 +1087,7 @@ def test_missing_or_wrong_kind_calculation_step_is_also_a_mismatch() -> None:
             execution_plan=plan,
             record=_record(plan, orphan),
             outputs={"ghost_calc": 2.5},
+            allow_legacy_unitless=True,
         )
     # (b) wrong step kind: a calculation receipt matched to a fetch step id
     wrong_kind = _trusted_receipt(step_id="fetch_numerator")
@@ -829,6 +1097,7 @@ def test_missing_or_wrong_kind_calculation_step_is_also_a_mismatch() -> None:
             execution_plan=plan,
             record=_record(plan, wrong_kind),
             outputs={"fetch_numerator": 2.5},
+            allow_legacy_unitless=True,
         )
 
 
@@ -854,6 +1123,7 @@ def test_internal_dependency_fetch_and_nodata_are_not_mismatches() -> None:
             execution_plan=plan,
             record=_record(plan, dep),
             outputs={"fetch_numerator": 5},
+            allow_legacy_unitless=True,
         )
     # a legitimate unavailable/no-data result is NOT a mismatch either
     good = _adhoc_receipt(
@@ -865,6 +1135,7 @@ def test_internal_dependency_fetch_and_nodata_are_not_mismatches() -> None:
             execution_plan=plan,
             record=_record(plan, good),
             outputs={"calculate_adhoc": None},
+            allow_legacy_unitless=True,
         )
 
 
@@ -882,6 +1153,7 @@ def test_grounding_requires_a_successful_execution_record() -> None:
         execution_plan=plan,
         record=failed,
         outputs={"calculate_ratio": 2.5},
+        allow_legacy_unitless=True,
     ) == ()
 
 
@@ -899,6 +1171,7 @@ def test_grounding_requires_the_step_in_output_step_ids() -> None:
         execution_plan=plan,
         record=tampered,
         outputs={"calculate_ratio": 2.5},
+        allow_legacy_unitless=True,
     ) == ()
 
 
@@ -911,7 +1184,9 @@ def test_ad_hoc_receipt_rejects_template_provenance(field: str) -> None:
 
 
 def test_canonical_metric_grounding_is_unchanged() -> None:
-    query_plan = _query_plan()
+    query_plan = _query_plan().model_copy(
+        update={"metric_keys": ("metric.revenue",)}
+    )
     context = _context()
     plan = ExecutionPlan(
         query_plan_sha256=query_plan.checksum,
@@ -940,6 +1215,7 @@ def test_canonical_metric_grounding_is_unchanged() -> None:
         execution_plan=plan,
         record=_record(plan, receipt),
         outputs={"fetch_metrics": {"value": 7}},
+        allow_legacy_unitless=True,
     )
     assert len(facts) == 1
     assert facts[0].metric_key == "metric.revenue"
@@ -1197,6 +1473,7 @@ def test_grounding_presence_is_key_based_not_none_based() -> None:
         execution_plan=plan,
         record=_record(plan, good),
         outputs={"calculate_adhoc": None},
+        allow_legacy_unitless=True,
     )
     assert len(present_null) == 1
     assert present_null[0].status == "unavailable"
@@ -1207,6 +1484,7 @@ def test_grounding_presence_is_key_based_not_none_based() -> None:
             execution_plan=plan,
             record=_record(plan, good),
             outputs={},
+            allow_legacy_unitless=True,
         )
 
 
@@ -1563,6 +1841,7 @@ def test_grounding_refuses_a_record_from_another_execution_plan() -> None:
         execution_plan=plan,
         record=record,
         outputs={"calculate_ratio": 2.5},
+        allow_legacy_unitless=True,
     ) == ()
 
 
@@ -1573,6 +1852,7 @@ def test_canonical_grounding_requires_receipt_step_agreement() -> None:
     good = build_answer_facts(
         query_plan=query_plan, execution_plan=plan,
         record=_record(plan, _trusted_receipt()), outputs=outputs,
+        allow_legacy_unitless=True,
     )
     assert len(good) == 1 and good[0].metric_key == "metric.revenue"
     for field, bad in (
@@ -1584,6 +1864,7 @@ def test_canonical_grounding_requires_receipt_step_agreement() -> None:
         assert build_answer_facts(
             query_plan=query_plan, execution_plan=plan,
             record=_record(plan, _trusted_receipt(**{field: bad})), outputs=outputs,
+            allow_legacy_unitless=True,
         ) == (), field
 
 
@@ -1600,6 +1881,7 @@ def test_orphan_fetch_receipt_grounds_nothing() -> None:
     assert build_answer_facts(
         query_plan=query_plan, execution_plan=plan, record=record,
         outputs={"ghost_fetch": {"value": 999}},
+        allow_legacy_unitless=True,
     ) == ()
     # a fetch receipt naming a real non-fetch step must not fall back either
     wrong_kind = PlanStepReceipt(
@@ -1613,7 +1895,134 @@ def test_orphan_fetch_receipt_grounds_nothing() -> None:
     assert build_answer_facts(
         query_plan=query_plan, execution_plan=plan, record=record2,
         outputs={"calculate_ratio": {"value": 999}},
+        allow_legacy_unitless=True,
     ) == ()
+
+
+def test_grounding_rejects_metric_multi_row_output() -> None:
+    query_plan, _context_bundle, plan = _trusted_plan()
+    output = {"rows": [{"value": 1}, {"value": 2}], "no_data": False}
+    receipt = PlanStepReceipt(
+        step_id="fetch_numerator",
+        kind="fetch_metric",
+        status="succeeded",
+        elapsed_ms=1,
+        output_digest=canonical_json_digest(output),
+    )
+    record = PlanExecutionRecord(
+        execution_plan_checksum=plan.checksum,
+        status="succeeded",
+        step_receipts=(receipt,),
+        output_step_ids=(receipt.step_id,),
+    )
+    with pytest.raises(GroundingIntegrityError, match="grounding_result_cardinality_invalid"):
+        build_answer_facts(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=record,
+            outputs={receipt.step_id: output},
+            allow_legacy_unitless=True,
+        )
+
+
+def test_grounding_rejects_non_numeric_metric_value() -> None:
+    query_plan, _context_bundle, plan = _trusted_plan()
+    output = {"value": {"forged": 1}}
+    receipt = PlanStepReceipt(
+        step_id="fetch_numerator",
+        kind="fetch_metric",
+        status="succeeded",
+        elapsed_ms=1,
+        output_digest=canonical_json_digest(output),
+    )
+    record = PlanExecutionRecord(
+        execution_plan_checksum=plan.checksum,
+        status="succeeded",
+        step_receipts=(receipt,),
+        output_step_ids=(receipt.step_id,),
+    )
+    with pytest.raises(GroundingIntegrityError, match="grounding_result_type_invalid"):
+        build_answer_facts(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=record,
+            outputs={receipt.step_id: output},
+            allow_legacy_unitless=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{"status": "no_data"}],
+        [{"value": 1}],
+    ],
+    ids=("placeholder-no-data-row", "business-row-marked-no-data"),
+)
+def test_grounding_requires_empty_rowset_for_no_data(rows: list[dict[str, object]]) -> None:
+    query_plan, _context_bundle, plan = _trusted_plan()
+    output = {"rows": rows, "no_data": True}
+    receipt = PlanStepReceipt(
+        step_id="fetch_numerator",
+        kind="fetch_metric",
+        status="succeeded",
+        elapsed_ms=1,
+        output_digest=canonical_json_digest(output),
+    )
+    record = PlanExecutionRecord(
+        execution_plan_checksum=plan.checksum,
+        status="succeeded",
+        step_receipts=(receipt,),
+        output_step_ids=(receipt.step_id,),
+    )
+    with pytest.raises(
+        GroundingIntegrityError,
+        match="grounding_result_cardinality_invalid",
+    ):
+        build_answer_facts(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=record,
+            outputs={receipt.step_id: output},
+            allow_legacy_unitless=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_typed_result_verifier_rejects_nested_or_null_values() -> None:
+    step = VerifyStep(
+        step_id="verify_result",
+        input_refs=("fetch_metrics",),
+        invariant_ids=("typed_result_present",),
+        depends_on=("fetch_metrics",),
+    )
+    verifier = TypedResultVerifier()
+    for malformed in (
+        {"rows": [{"value": {"nested": 1}}], "no_data": False},
+        {"value": None},
+        {"rows": [], "no_data": False},
+    ):
+        with pytest.raises(PlanStepError, match="typed_result_shape_invalid"):
+            await verifier.verify(step=step, inputs=(malformed,))
+
+
+def test_ground_execution_answer_rejects_query_plan_hash_mismatch() -> None:
+    query_plan, _context_bundle, plan = _trusted_plan()
+    mismatched = query_plan.model_copy(update={"domain": "other"})
+    with pytest.raises(GroundingIntegrityError, match="grounding_query_plan_mismatch"):
+        ground_execution_answer(
+            query_plan=mismatched,
+            execution_plan=plan,
+            record=PlanExecutionRecord(
+                execution_plan_checksum=plan.checksum,
+                status="failed",
+                step_receipts=(),
+                output_step_ids=(),
+                stop_reason="fixture",
+            ),
+            outputs={},
+            allow_legacy_unitless=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -1665,6 +2074,437 @@ async def test_compiled_ad_hoc_plan_allows_and_grounds_exactly_once() -> None:
         execution_plan=plan,
         record=result.record,
         outputs=result.outputs,
+        allow_legacy_unitless=True,
     )
     assert len(facts) == 1
     assert facts[0].derived_output_id == derived_output_id(spec, binding)
+    assert facts[0].unit == spec.unit
+    grounded = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=plan,
+        record=result.record,
+        outputs=result.outputs,
+        allow_legacy_unitless=True,
+    )
+    assert grounded.facts[0].unit == spec.unit
+
+    promoted_fact = grounded.facts[0].model_copy(update={"unit": "count"})
+    promoted_fact = promoted_fact.model_copy(
+        update={"fact_id": _grounded_fact_id(promoted_fact)}
+    )
+    promoted_record = result.record.model_copy(
+        update={
+            "step_receipts": tuple(
+                receipt.model_copy(update={"unit": "count"})
+                if receipt.step_id == "calculate_adhoc"
+                else receipt
+                for receipt in result.record.step_receipts
+            )
+        }
+    )
+    promoted_artifact = AnswerArtifact(facts=(promoted_fact,))
+    promoted_text = render_grounded_answer(
+        query_plan=query_plan,
+        facts=(promoted_fact,),
+    )
+    unit_authority_identities = {
+        "calculate_adhoc": canonical_json_digest(
+            {
+                "kind": "ad_hoc_calculation",
+                "step_id": "calculate_adhoc",
+                "calculation_spec_checksum": spec.checksum,
+                "execution_binding_checksum": binding.checksum,
+                "unit": spec.unit,
+            }
+        )
+    }
+    seal_key = "ad-hoc-test-checkpoint-evidence-seal-key"
+    promoted_record = seal_grounded_execution_checkpoint(
+        key=seal_key,
+        query_plan=query_plan,
+        execution_plan=plan,
+        execution_record=promoted_record,
+        answer_artifact=promoted_artifact,
+        answer_text=promoted_text,
+        unit_authority_identities=unit_authority_identities,
+    )
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_fact_execution_mismatch"
+    ):
+        validate_grounded_answer_checkpoint(
+            query_plan,
+            promoted_artifact,
+            promoted_text,
+            execution_plan=plan,
+            execution_record=promoted_record,
+            evidence_seal_key=seal_key,
+            unit_authority_identities=unit_authority_identities,
+        )
+
+
+@pytest.mark.asyncio
+async def test_trusted_calculation_unit_rebinds_to_catalog_on_checkpoint_restore() -> None:
+    template = trusted_template_registry.metadata("ratio")
+    output_metric_key = "metric.revenue_ratio"
+    catalog_binding = ApprovedCalculationBinding(
+        canonical_metric_key=output_metric_key,
+        template_id=template.template_id,
+        template_version=template.version,
+        template_checksum=template.checksum,
+        inputs=(
+            ApprovedCalculationInput(
+                role="numerator",
+                metric_key="metric.revenue",
+                metric_contract_sha256="a" * 64,
+            ),
+            ApprovedCalculationInput(
+                role="denominator",
+                metric_key="metric.stores",
+                metric_contract_sha256="b" * 64,
+            ),
+        ),
+        binding_revision="unit-authority-test",
+        semantic_release_id=str(RELEASE_ID),
+        semantic_release_checksum="c" * 64,
+        unit="ratio",
+    )
+    catalog = ApprovedCalculationCatalog((catalog_binding,))
+    context = _context(
+        asset_ids=("metric.revenue", "metric.stores", output_metric_key)
+    )
+    query_plan = _query_plan().model_copy(update={"metric_keys": (output_metric_key,)})
+    identity = RequestIdentity(
+        request_id=UUID("44444444-4444-4444-4444-444444444444"),
+        user_id="analyst",
+        permissions=frozenset({"metrics:read", "nl2sql:invoke"}),
+    )
+    validator = PlanValidator(calculation_catalog=catalog)
+    query_validation = validator.validate_query_plan(
+        plan=query_plan,
+        context=context,
+        identity=identity,
+    )
+    assert query_validation.outcome == "allow", query_validation.issues
+    plan = PlanCompiler(calculation_catalog=catalog).compile(
+        plan=query_plan,
+        context=context,
+        validation=query_validation,
+    )
+    execution_validation = validator.validate_execution_plan(
+        execution_plan=plan,
+        query_plan=query_plan,
+        context=context,
+        route_budget=RouteBudgetLedger(route="standard").limits,
+    )
+    assert execution_validation.outcome == "allow", execution_validation.issues
+    result = await PlanExecutor(
+        metric_runner=_MetricRunner(
+            {"metric.revenue": 5, "metric.stores": 2}
+        ),
+        trusted_calculation_runner=RegistryTrustedCalculationRunner(),
+        calculation_catalog=catalog,
+    ).execute(
+        query_plan=query_plan,
+        context=context,
+        execution_plan=plan,
+        validation=execution_validation,
+        expected_policy_version=validator.policy_version,
+        expected_policy_checksum=validator.policy_checksum,
+        budget=RouteBudgetLedger(route="standard"),
+        deadline_ms=4_000,
+    )
+    assert result.record.status == "succeeded", result.record.stop_reason
+    calculation_receipt = next(
+        receipt
+        for receipt in result.record.step_receipts
+        if receipt.kind == "trusted_calculation"
+    )
+    assert calculation_receipt.unit == catalog_binding.unit
+    changed_unit_record = result.record.model_copy(
+        update={
+            "step_receipts": tuple(
+                receipt.model_copy(update={"unit": "count"})
+                if receipt.step_id == calculation_receipt.step_id
+                else receipt
+                for receipt in result.record.step_receipts
+            )
+        }
+    )
+    with pytest.raises(
+        GroundingIntegrityError, match="grounding_unit_authority_mismatch"
+    ):
+        ground_execution_answer(
+            query_plan=query_plan,
+            execution_plan=plan,
+            record=changed_unit_record,
+            outputs=result.outputs,
+            authoritative_units_by_step={
+                calculation_receipt.step_id: catalog_binding.unit
+            },
+        )
+    grounded = ground_execution_answer(
+        query_plan=query_plan,
+        execution_plan=plan,
+        record=result.record,
+        outputs=result.outputs,
+        authoritative_units_by_step={"calculate_metric": catalog_binding.unit},
+    )
+    assert grounded.facts[0].unit == catalog_binding.unit
+
+    promoted_fact = grounded.facts[0].model_copy(update={"unit": "count"})
+    promoted_fact = promoted_fact.model_copy(
+        update={"fact_id": _grounded_fact_id(promoted_fact)}
+    )
+    promoted_record = result.record.model_copy(
+        update={
+            "step_receipts": tuple(
+                receipt.model_copy(update={"unit": "count"})
+                if receipt.step_id == calculation_receipt.step_id
+                else receipt
+                for receipt in result.record.step_receipts
+            )
+        }
+    )
+    promoted_artifact = AnswerArtifact(facts=(promoted_fact,))
+    promoted_text = render_grounded_answer(
+        query_plan=query_plan,
+        facts=(promoted_fact,),
+    )
+    unit_authority_identities = {
+        calculation_receipt.step_id: canonical_json_digest(
+            {
+                "kind": "trusted_calculation",
+                "step_id": calculation_receipt.step_id,
+                "catalog_checksum": catalog.checksum,
+                "binding_checksum": catalog_binding.checksum,
+                "unit": catalog_binding.unit,
+            }
+        )
+    }
+    seal_key = "trusted-test-checkpoint-evidence-seal-key"
+    promoted_record = seal_grounded_execution_checkpoint(
+        key=seal_key,
+        query_plan=query_plan,
+        execution_plan=plan,
+        execution_record=promoted_record,
+        answer_artifact=promoted_artifact,
+        answer_text=promoted_text,
+        unit_authority_identities=unit_authority_identities,
+    )
+    with pytest.raises(
+        AnalysisEvidenceError, match="analysis_fact_unit_authority_missing"
+    ):
+        validate_grounded_answer_checkpoint(
+            query_plan,
+            promoted_artifact,
+            promoted_text,
+            execution_plan=plan,
+            execution_record=promoted_record,
+            authoritative_units={output_metric_key: catalog_binding.unit},
+            evidence_seal_key=seal_key,
+            unit_authority_identities=unit_authority_identities,
+        )
+
+
+@pytest.mark.asyncio
+async def test_engine_checkpoint_restore_reuses_trusted_calculation_catalog_authority() -> None:
+    catalog_binding = _approved_ratio_binding()
+    catalog = ApprovedCalculationCatalog((catalog_binding,))
+    checkpointer = MemorySaver()
+    gateway = QueryGateway(None, schema="ai_views")  # type: ignore[arg-type]
+    gateway.execute = AsyncMock(
+        return_value=QueryReceipt(
+            accepted=True,
+            sql="SELECT synthetic",
+            sql_fingerprint=SQL_FINGERPRINT,
+            row_count=1,
+            policy_outcome="allow",
+            max_rows=200,
+        )
+    )  # type: ignore[method-assign]
+    metric_runner = _GatewayMetricRunner(
+        {"metric.revenue": 5, "metric.stores": 2}, gateway
+    )
+    calculation_runner = _CountingTrustedRunner()
+    provider = _EngineAnalysisProvider()
+    engine = _trusted_engine(
+        catalog=catalog,
+        checkpointer=checkpointer,
+        metric_runner=metric_runner,
+        calculation_runner=calculation_runner,
+        provider=provider,
+    )
+    config = _trusted_request_config()
+    initial = await engine.ainvoke(_trusted_graph_input(), config)
+
+    assert initial.get("stop_reason") is None, initial.get("stop_reason")
+    assert provider.calls == 1
+    assert metric_runner.execute_calls == 2
+    assert gateway.execute.await_count == 2
+    assert calculation_runner.calls == 1
+    assert initial["grounded_answer_artifact"]["facts"][0]["unit"] == "ratio"
+    assert any(
+        event["name"] == "governed_analysis_completed"
+        for event in initial["trace_events"]
+    )
+
+    history = [snapshot async for snapshot in engine.aget_state_history(config)]
+    execution_checkpoint = next(
+        snapshot for snapshot in history if "analysis" in snapshot.next
+    )
+    execution_plan = ExecutionPlan.model_validate(
+        execution_checkpoint.values["execution_plan"]
+    )
+    assert tuple(step.kind for step in execution_plan.steps) == (
+        "fetch_metric",
+        "fetch_metric",
+        "trusted_calculation",
+        "verify",
+    )
+    assert execution_checkpoint.values["execution_record"]["evidence_seal"]["version"] == "v1"
+    resume_config = dict(config)
+    resume_config["configurable"] = {
+        **config["configurable"],
+        **execution_checkpoint.config["configurable"],
+    }
+    restored = await engine.ainvoke(None, resume_config)
+
+    assert restored.get("stop_reason") is None
+    assert provider.calls == 2
+    assert metric_runner.execute_calls == 2
+    assert gateway.execute.await_count == 2
+    assert calculation_runner.calls == 1
+    assert restored["grounded_answer_artifact"]["facts"][0]["unit"] == "ratio"
+    assert any(
+        block.get("type") == "provenance"
+        for block in restored.get("response_blocks", [])
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "expected_stop_reason"),
+    [
+        ("catalog_checksum", "checkpoint_evidence_seal_invalid"),
+        ("binding_checksum", "analysis_calculation_unit_authority_missing"),
+        ("missing_catalog", "analysis_calculation_unit_authority_missing"),
+        (
+            "receipt_and_fact_unit",
+            "checkpoint_calculation_unit_authority_missing",
+        ),
+    ],
+)
+async def test_engine_checkpoint_restore_rejects_trusted_calculation_authority_mutations(
+    mutation: str,
+    expected_stop_reason: str,
+) -> None:
+    catalog_binding = _approved_ratio_binding()
+    catalog = ApprovedCalculationCatalog((catalog_binding,))
+    checkpointer = MemorySaver()
+    gateway = QueryGateway(None, schema="ai_views")  # type: ignore[arg-type]
+    gateway.execute = AsyncMock(
+        return_value=QueryReceipt(
+            accepted=True,
+            sql="SELECT synthetic",
+            sql_fingerprint=SQL_FINGERPRINT,
+            row_count=1,
+            policy_outcome="allow",
+            max_rows=200,
+        )
+    )  # type: ignore[method-assign]
+    metric_runner = _GatewayMetricRunner(
+        {"metric.revenue": 5, "metric.stores": 2}, gateway
+    )
+    calculation_runner = _CountingTrustedRunner()
+    provider = _EngineAnalysisProvider()
+    engine = _trusted_engine(
+        catalog=catalog,
+        checkpointer=checkpointer,
+        metric_runner=metric_runner,
+        calculation_runner=calculation_runner,
+        provider=provider,
+    )
+    config = _trusted_request_config()
+    initial = await engine.ainvoke(_trusted_graph_input(), config)
+
+    assert initial.get("stop_reason") is None, initial.get("stop_reason")
+    assert provider.calls == 1
+    assert metric_runner.execute_calls == 2
+    assert gateway.execute.await_count == 2
+    assert calculation_runner.calls == 1
+
+    history = [snapshot async for snapshot in engine.aget_state_history(config)]
+    execution_checkpoint = next(
+        snapshot for snapshot in history if "analysis" in snapshot.next
+    )
+    restore_catalog: ApprovedCalculationCatalog | None
+    if mutation == "catalog_checksum":
+        unrelated_binding = _approved_ratio_binding(
+            "metric.other_ratio", binding_revision="unrelated-binding"
+        )
+        restore_catalog = ApprovedCalculationCatalog(
+            (catalog_binding, unrelated_binding)
+        )
+    elif mutation == "binding_checksum":
+        changed_binding = _approved_ratio_binding(
+            binding_revision="changed-binding-revision"
+        )
+        restore_catalog = ApprovedCalculationCatalog((changed_binding,))
+    elif mutation == "missing_catalog":
+        restore_catalog = None
+    else:
+        restore_catalog = catalog
+
+    if mutation == "receipt_and_fact_unit":
+        saved = (await engine.aget_state(config)).values
+        record = PlanExecutionRecord.model_validate(saved["execution_record"])
+        artifact = AnswerArtifact.model_validate(saved["grounded_answer_artifact"])
+        fact = artifact.facts[0].model_copy(update={"unit": "count"})
+        fact = fact.model_copy(update={"fact_id": _grounded_fact_id(fact)})
+        artifact = artifact.model_copy(update={"facts": (fact,)})
+        record = record.model_copy(
+            update={
+                "step_receipts": tuple(
+                    receipt.model_copy(update={"unit": "count"})
+                    if receipt.kind == "trusted_calculation"
+                    else receipt
+                    for receipt in record.step_receipts
+                )
+            }
+        )
+        answer_text = render_grounded_answer(
+            query_plan=QueryPlan.model_validate(saved["query_plan"]), facts=(fact,)
+        )
+        await engine.aupdate_state(
+            config,
+            {
+                "execution_record": record.model_dump(mode="json"),
+                "grounded_answer_artifact": artifact.model_dump(mode="json"),
+                "grounded_answer_text": answer_text,
+            },
+            as_node="execute",
+        )
+        restore_engine = engine
+        resume_config = config
+    else:
+        restore_engine = _trusted_engine(
+            catalog=restore_catalog,
+            checkpointer=checkpointer,
+            metric_runner=metric_runner,
+            calculation_runner=calculation_runner,
+            provider=provider,
+        )
+        resume_config = dict(config)
+        resume_config["configurable"] = {
+            **config["configurable"],
+            **execution_checkpoint.config["configurable"],
+        }
+
+    restored = await restore_engine.ainvoke(None, resume_config)
+
+    assert restored.get("stop_reason") == expected_stop_reason
+    assert restored.get("response_blocks", []) == []
+    assert provider.calls == 1
+    assert metric_runner.execute_calls == 2
+    assert gateway.execute.await_count == 2
+    assert calculation_runner.calls == 1

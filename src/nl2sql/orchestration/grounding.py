@@ -34,9 +34,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, cast
 
 from pydantic import JsonValue
@@ -46,6 +47,7 @@ from src.nl2sql.contracts import (
     AnswerArtifact,
     AnswerFact,
     ExecutionPlan,
+    ExecutionReceipt,
     FetchMetricStep,
     PlanExecutionRecord,
     PlanStepReceipt,
@@ -53,14 +55,18 @@ from src.nl2sql.contracts import (
     TimeRange,
     TrustedCalculationStep,
 )
+from src.nl2sql.infra.governance.semantic_sql_validator import SemanticValidationRecord
+from src.nl2sql.orchestration.candidates import GATE_ORDER, CandidateReceipt
 from src.nl2sql.orchestration.evidence_digest import (
     canonical_json_digest,
     canonical_rowset_digest,
 )
 from src.nl2sql.orchestration.execution import (
     PlanStepError,
+    RequestOutputContract,
     validate_execution_record_against_plan,
 )
+from src.nl2sql.semantic.execution_manifest import ExpectedExecutionManifest
 
 __all__ = [
     "GroundedAnswer",
@@ -127,10 +133,16 @@ def ground_execution_answer(
     execution_plan: ExecutionPlan,
     record: PlanExecutionRecord,
     outputs: Mapping[str, JsonValue],
+    output_contracts: Mapping[str, RequestOutputContract] | None = None,
+    require_semantic_contract: bool = False,
+    authoritative_units_by_step: Mapping[str, str | None] | None = None,
+    allow_legacy_unitless: bool = False,
 ) -> GroundedAnswer:
     """Build grounded facts, render them, and package the request-local artifact."""
 
     try:
+        if execution_plan.query_plan_sha256 != query_plan.checksum:
+            raise GroundingIntegrityError("grounding_query_plan_mismatch")
         validate_execution_record_against_plan(execution_plan, record)
     except PlanStepError as exc:
         raise GroundingIntegrityError(exc.code) from exc
@@ -140,6 +152,10 @@ def ground_execution_answer(
         execution_plan=execution_plan,
         record=record,
         outputs=outputs,
+        output_contracts=output_contracts,
+        require_semantic_contract=require_semantic_contract,
+        authoritative_units_by_step=authoritative_units_by_step,
+        allow_legacy_unitless=allow_legacy_unitless,
     )
     return GroundedAnswer(
         answer_text=render_grounded_answer(query_plan=query_plan, facts=facts),
@@ -163,6 +179,10 @@ def build_answer_facts(
     execution_plan: ExecutionPlan,
     record: PlanExecutionRecord,
     outputs: Mapping[str, JsonValue],
+    output_contracts: Mapping[str, RequestOutputContract] | None = None,
+    require_semantic_contract: bool = False,
+    authoritative_units_by_step: Mapping[str, str | None] | None = None,
+    allow_legacy_unitless: bool = False,
 ) -> tuple[AnswerFact, ...]:
     """Project successful fetch-metric step outputs into typed grounded facts."""
 
@@ -171,6 +191,10 @@ def build_answer_facts(
         execution_plan=execution_plan,
         record=record,
         outputs=outputs,
+        output_contracts=output_contracts,
+        require_semantic_contract=require_semantic_contract,
+        authoritative_units_by_step=authoritative_units_by_step,
+        allow_legacy_unitless=allow_legacy_unitless,
     )
     return facts
 
@@ -181,6 +205,10 @@ def _build_answer_facts_with_flags(
     execution_plan: ExecutionPlan,
     record: PlanExecutionRecord,
     outputs: Mapping[str, JsonValue],
+    output_contracts: Mapping[str, RequestOutputContract] | None = None,
+    require_semantic_contract: bool = False,
+    authoritative_units_by_step: Mapping[str, str | None] | None = None,
+    allow_legacy_unitless: bool = False,
 ) -> tuple[tuple[AnswerFact, ...], tuple[str, ...]]:
     """One traversal producing both the facts and the grounding mismatch flags.
 
@@ -198,7 +226,16 @@ def _build_answer_facts_with_flags(
         # A record from another execution plan must never ground facts against
         # the supplied plan.
         return (), ()
-    _validate_output_evidence(record=record, outputs=outputs)
+    _validate_output_evidence(
+        record=record,
+        outputs=outputs,
+        query_plan=query_plan,
+        execution_plan=execution_plan,
+        output_contracts=output_contracts or {},
+        require_semantic_contract=require_semantic_contract,
+        authoritative_units_by_step=authoritative_units_by_step,
+        allow_legacy_unitless=allow_legacy_unitless,
+    )
     steps_by_id = {step.step_id: step for step in execution_plan.steps}
     facts: list[AnswerFact] = []
     flags: list[str] = []
@@ -224,7 +261,37 @@ def _build_answer_facts_with_flags(
             continue
         output = outputs.get(receipt.step_id)
         if isinstance(step, FetchMetricStep):
-            _validate_typed_fetch_output(output)
+            output_contract = _manifest_from_request_contract(
+                (output_contracts or {}).get(receipt.step_id)
+            )
+            _validate_typed_fetch_output(
+                output,
+                query_plan=query_plan,
+                step=step,
+                output_contract=output_contract,
+            )
+            authoritative_unit = _fetch_manifest_unit(
+                output_contract, step, receipt.unit
+            )
+            if authoritative_units_by_step is not None:
+                if receipt.step_id not in authoritative_units_by_step:
+                    raise GroundingIntegrityError(
+                        "grounding_unit_authority_missing"
+                    )
+                authority_unit = authoritative_units_by_step[receipt.step_id]
+                if (
+                    (output_contract is not None and authoritative_unit != authority_unit)
+                    or receipt.unit != authority_unit
+                ):
+                    raise GroundingIntegrityError(
+                        "grounding_unit_authority_mismatch"
+                    )
+                authoritative_unit = authority_unit
+            elif output_contract is None:
+                if receipt.unit is not None or not allow_legacy_unitless:
+                    raise GroundingIntegrityError(
+                        "grounding_unit_authority_missing"
+                    )
         for metric_key in step.metric_keys:
             if query_plan.intent == "trend":
                 points = _trend_points(output)
@@ -245,7 +312,7 @@ def _build_answer_facts_with_flags(
                                     end=period,
                                     timezone="Asia/Shanghai",
                                 ),
-                                unit=receipt.unit,
+                                unit=authoritative_unit,
                             )
                         )
                     continue
@@ -256,7 +323,7 @@ def _build_answer_facts_with_flags(
                     metric_key=metric_key,
                     status=status,
                     value=value,
-                    unit=receipt.unit,
+                    unit=authoritative_unit,
                 )
             )
     for receipt in record.step_receipts:
@@ -290,13 +357,19 @@ def _build_answer_facts_with_flags(
             flags.append(_MISMATCH_FLAG)
             continue
         status, value = _project_output(outputs.get(receipt.step_id), metric_key=metric_key)
+        authoritative_unit = _bound_step_unit(
+            step_id=receipt.step_id,
+            receipt_unit=receipt.unit,
+            authoritative_units_by_step=authoritative_units_by_step,
+                allow_legacy_unitless=allow_legacy_unitless,
+        )
         facts.append(
             _answer_fact(
                 receipt=receipt,
                 metric_key=metric_key,
                 status=status,
                 value=value,
-                unit=receipt.unit,
+                unit=authoritative_unit,
             )
         )
     for receipt in record.step_receipts:
@@ -332,13 +405,16 @@ def _build_answer_facts_with_flags(
         status, value = _project_output(
             outputs[receipt.step_id], metric_key=derived_output_id
         )
+        authoritative_unit = _calculation_spec_unit(step)
+        if receipt.unit != authoritative_unit:
+            raise GroundingIntegrityError("grounding_unit_authority_mismatch")
         facts.append(
             _adhoc_answer_fact(
                 receipt=receipt,
                 derived_output_id=derived_output_id,
                 status=status,
                 value=value,
-                unit=receipt.unit,
+                unit=authoritative_unit,
             )
         )
     return tuple(facts), tuple(dict.fromkeys(flags))
@@ -365,8 +441,36 @@ def receipt_degradation_flags(record: PlanExecutionRecord) -> tuple[str, ...]:
 
 
 def _validate_output_evidence(
-    *, record: PlanExecutionRecord, outputs: Mapping[str, JsonValue]
+    *,
+    record: PlanExecutionRecord,
+    outputs: Mapping[str, JsonValue],
+    query_plan: QueryPlan,
+    execution_plan: ExecutionPlan,
+    output_contracts: Mapping[str, RequestOutputContract],
+    require_semantic_contract: bool,
+    authoritative_units_by_step: Mapping[str, str | None] | None,
+    allow_legacy_unitless: bool,
 ) -> None:
+    steps_by_id = {step.step_id: step for step in execution_plan.steps}
+    calculation_shape = any(
+        isinstance(step, (TrustedCalculationStep, AdHocCalculationStep))
+        for step in execution_plan.steps
+    ) or any(
+        isinstance(step, FetchMetricStep) and step.calculation_input_role is not None
+        for step in execution_plan.steps
+    )
+    if not calculation_shape:
+        direct_fetches = [
+            step for step in execution_plan.steps
+            if isinstance(step, FetchMetricStep)
+        ]
+        owners = [key for step in direct_fetches for key in step.metric_keys]
+        if (
+            any(len(step.metric_keys) != 1 for step in direct_fetches)
+            or len(owners) != len(set(owners))
+            or set(owners) != set(query_plan.metric_keys)
+        ):
+            raise GroundingIntegrityError("grounding_metric_ownership_mismatch")
     for receipt in record.step_receipts:
         if receipt.status != "succeeded":
             continue
@@ -378,7 +482,147 @@ def _validate_output_evidence(
         if canonical_json_digest(output) != receipt.output_digest:
             raise GroundingIntegrityError("grounding_output_digest_mismatch")
         if receipt.kind != "fetch_metric":
+            if receipt.kind == "trusted_calculation":
+                if not isinstance(
+                    steps_by_id.get(receipt.step_id), TrustedCalculationStep
+                ):
+                    continue
+                _bound_step_unit(
+                    step_id=receipt.step_id,
+                    receipt_unit=receipt.unit,
+                    authoritative_units_by_step=authoritative_units_by_step,
+                        allow_legacy_unitless=allow_legacy_unitless,
+                )
+            elif receipt.kind == "ad_hoc_calculation":
+                    # The fact projection rebinds valid AD_HOC receipts to the
+                    # CalculationSpec. Orphan or mismatched provenance is
+                    # omitted there before any unit is projected.
+                    continue
             continue
+        step = steps_by_id.get(receipt.step_id)
+        if not isinstance(step, FetchMetricStep):
+            # ``ground_execution_answer`` has already applied the strict plan
+            # receipt gate.  The lower-level fact projection remains a
+            # tolerant projection helper for legacy callers: an orphan receipt
+            # contributes no fact and must not be allowed to authorize one.
+            continue
+        output_contract: ExpectedExecutionManifest | None = None
+        candidate = output_contracts.get(receipt.step_id)
+        if require_semantic_contract and candidate is None:
+            raise GroundingIntegrityError("grounding_manifest_missing")
+        if receipt.semantic_manifest_checksum is not None or candidate is not None:
+            if not isinstance(candidate, RequestOutputContract):
+                raise GroundingIntegrityError("grounding_manifest_missing")
+            manifest = candidate.manifest
+            semantic_record = candidate.semantic_validation_record
+            if not isinstance(manifest, ExpectedExecutionManifest) or not isinstance(
+                semantic_record, SemanticValidationRecord
+            ):
+                raise GroundingIntegrityError("grounding_manifest_missing")
+            if (
+                semantic_record.outcome != "allow"
+                or receipt.semantic_validation_outcome != semantic_record.outcome
+                or receipt.semantic_validator_version != semantic_record.validator_version
+                or receipt.semantic_validation_identity != semantic_record.identity
+                or receipt.semantic_manifest_checksum is None
+                or manifest.checksum != receipt.semantic_manifest_checksum
+                or semantic_record.manifest_checksum != manifest.checksum
+                or receipt.sql_fingerprint != semantic_record.sql_fingerprint
+                or receipt.parameter_binding_fingerprint
+                != candidate.gateway_parameter_binding_fingerprint
+                or semantic_record.parameter_fingerprint
+                != manifest.parameter_binding_fingerprint
+                or manifest.execution_plan_sha256 != execution_plan.checksum
+                or manifest.query_plan_sha256 != query_plan.checksum
+                or (
+                    require_semantic_contract
+                    and manifest.manifest_version != "1.1"
+                )
+            ):
+                raise GroundingIntegrityError("grounding_manifest_mismatch")
+            if manifest.manifest_version == "1.1":
+                expected_child_checksum = query_plan.model_copy(
+                    update={"metric_keys": step.metric_keys}
+                ).checksum
+                if (
+                    manifest.fetch_step_id != step.step_id
+                    or manifest.fetch_query_plan_sha256 != expected_child_checksum
+                    or len(manifest.metric_authorities) != 1
+                    or manifest.metric_authorities[0].fetch_step_id != step.step_id
+                    or manifest.metric_authorities[0].metric_key
+                    not in {
+                        item.removeprefix("metric.") for item in step.metric_keys
+                    }
+                    or manifest.metric_authorities[0].fetch_query_plan_sha256
+                    != expected_child_checksum
+                ):
+                    raise GroundingIntegrityError("grounding_manifest_fetch_authority_mismatch")
+                candidate_receipt = candidate.candidate_receipt
+                gateway_receipt = candidate.gateway_execution_receipt
+                if require_semantic_contract and (
+                    not isinstance(candidate_receipt, CandidateReceipt)
+                    or not isinstance(gateway_receipt, ExecutionReceipt)
+                ):
+                    raise GroundingIntegrityError("grounding_candidate_evidence_missing")
+                if candidate_receipt is not None or gateway_receipt is not None:
+                    if (
+                        not isinstance(candidate_receipt, CandidateReceipt)
+                        or not isinstance(gateway_receipt, ExecutionReceipt)
+                        or candidate_receipt.failure_code is not None
+                        or tuple(item.gate for item in candidate_receipt.gates)
+                        != GATE_ORDER
+                        or not all(item.passed for item in candidate_receipt.gates)
+                        or candidate_receipt.execution_receipt_sha256
+                        != canonical_json_digest(
+                            gateway_receipt.model_dump(mode="json")
+                        )
+                        or candidate_receipt.rowset_sha256
+                        != gateway_receipt.rowset_sha256
+                        or gateway_receipt.policy_outcome != "allow"
+                        or gateway_receipt.error_taxonomy is not None
+                        or candidate_receipt.metadata.sql_fingerprint
+                        != gateway_receipt.sql_fingerprint
+                        or candidate_receipt.metadata.semantic_signature
+                        != gateway_receipt.semantic_signature
+                        or candidate_receipt.metadata.relation_ids
+                        != (manifest.metric_authorities[0].relation_id,)
+                        or candidate_receipt.metadata.source_kind
+                        != gateway_receipt.source_kind
+                        or candidate_receipt.metadata.estimated_rows
+                        != gateway_receipt.estimated_rows
+                        or candidate_receipt.metadata.estimated_cost
+                        != gateway_receipt.plan_cost
+                        or gateway_receipt.unit
+                        != manifest.metric_authorities[0].unit
+                        or gateway_receipt.sql_fingerprint != receipt.sql_fingerprint
+                        or gateway_receipt.rowset_sha256 != receipt.rowset_sha256
+                        or gateway_receipt.parameter_binding_fingerprint
+                        != receipt.parameter_binding_fingerprint
+                        or gateway_receipt.semantic_manifest_checksum
+                        != receipt.semantic_manifest_checksum
+                        or gateway_receipt.source_id != receipt.source_id
+                        or gateway_receipt.source_kind != receipt.source_kind
+                        or gateway_receipt.source_checkpoint
+                        != receipt.source_checkpoint
+                        or gateway_receipt.selection_reason
+                        != receipt.selection_reason
+                        or gateway_receipt.source_degradation
+                        != receipt.source_degradation
+                        or gateway_receipt.unit != receipt.unit
+                    ):
+                        raise GroundingIntegrityError(
+                            "grounding_candidate_evidence_mismatch"
+                        )
+            output_contract = manifest
+            _fetch_manifest_unit(manifest, step, receipt.unit)
+        elif receipt.semantic_validation_outcome is not None:
+            raise GroundingIntegrityError("grounding_manifest_missing")
+        _validate_typed_fetch_output(
+            output,
+            query_plan=query_plan,
+            step=step,
+            output_contract=output_contract,
+        )
         if output is None:
             raise GroundingIntegrityError("grounding_malformed_output")
         _validate_snapshot_evidence(record)
@@ -404,17 +648,98 @@ def _validate_output_evidence(
         if digest != receipt.rowset_sha256:
             raise GroundingIntegrityError("grounding_rowset_digest_mismatch")
 
-def _validate_typed_fetch_output(output: JsonValue) -> None:
+
+def _manifest_from_request_contract(
+    contract: RequestOutputContract | None,
+) -> ExpectedExecutionManifest | None:
+    if contract is None:
+        return None
+    manifest = contract.manifest
+    return manifest if isinstance(manifest, ExpectedExecutionManifest) else None
+
+
+def _fetch_manifest_unit(
+    manifest: ExpectedExecutionManifest | None,
+    step: FetchMetricStep,
+    receipt_unit: str | None,
+) -> str | None:
+    """Return only the metric unit bound by the server-built manifest.
+
+    Receipts and checkpoint text are claims, not unit authority. Legacy callers
+    without a semantic manifest can still ground the value, but the unit is
+    omitted because it cannot be rebound to authoritative metadata.
+    """
+
+    if manifest is None:
+        return None
+    if (
+        len(manifest.metric_identity) != len(manifest.metric_units)
+        or len(step.metric_keys) != 1
+    ):
+        raise GroundingIntegrityError("grounding_manifest_unit_authority_missing")
+    unit_by_metric: dict[str, str | None] = {}
+    for metric_identity, unit in zip(
+        manifest.metric_identity, manifest.metric_units, strict=True
+    ):
+        normalized = metric_identity.removeprefix("metric.")
+        if not normalized or normalized in unit_by_metric:
+            raise GroundingIntegrityError("grounding_manifest_unit_authority_missing")
+        unit_by_metric[normalized] = unit
+    metric_key = step.metric_keys[0].removeprefix("metric.")
+    if metric_key not in unit_by_metric:
+        raise GroundingIntegrityError("grounding_manifest_unit_authority_missing")
+    expected_unit = unit_by_metric[metric_key]
+    if receipt_unit != expected_unit:
+        raise GroundingIntegrityError("grounding_manifest_unit_mismatch")
+    return expected_unit
+
+
+def _bound_step_unit(
+    *,
+    step_id: str,
+    receipt_unit: str | None,
+    authoritative_units_by_step: Mapping[str, str | None] | None,
+    allow_legacy_unitless: bool,
+) -> str | None:
+    """Use server-side unit authority; a receipt can only be checked against it."""
+
+    if authoritative_units_by_step is None or step_id not in authoritative_units_by_step:
+        if receipt_unit is not None:
+            raise GroundingIntegrityError("grounding_unit_authority_missing")
+        if not allow_legacy_unitless:
+            raise GroundingIntegrityError("grounding_unit_authority_missing")
+        return None
+    expected_unit = authoritative_units_by_step[step_id]
+    if receipt_unit != expected_unit:
+        raise GroundingIntegrityError("grounding_unit_authority_mismatch")
+    return expected_unit
+
+
+def _calculation_spec_unit(step: AdHocCalculationStep) -> str:
+    spec = step.calculation_spec
+    if spec.unit == "custom_unit":
+        if spec.custom_unit_id is None:
+            raise GroundingIntegrityError("grounding_unit_authority_missing")
+        return spec.custom_unit_id
+    return spec.unit
+
+def _validate_typed_fetch_output(
+    output: JsonValue,
+    *,
+    query_plan: QueryPlan | None = None,
+    step: FetchMetricStep | None = None,
+    output_contract: ExpectedExecutionManifest | None = None,
+) -> None:
     """Reject missing/null/malformed fetch results before projection."""
 
     if output is None:
         raise GroundingIntegrityError("grounding_malformed_output")
     if not isinstance(output, Mapping):
         # Older injected metric runners return the already-projected scalar.
-        # It is still typed evidence when it is a finite JSON scalar; malformed
-        # containers and null remain fail-closed.
-        if isinstance(output, (str, int, bool)) or (
-            isinstance(output, float) and math.isfinite(output)
+        # Only numeric scalars are valid for the typed metric result contract;
+        # arbitrary text and booleans cannot masquerade as a metric value.
+        if type(output) is int or (
+            type(output) is float and math.isfinite(output)
         ):
             return
         raise GroundingIntegrityError("grounding_malformed_output")
@@ -423,13 +748,31 @@ def _validate_typed_fetch_output(output: JsonValue) -> None:
         rows = output.get("rows")
         if not isinstance(no_data, bool) or not isinstance(rows, list):
             raise GroundingIntegrityError("grounding_malformed_output")
+        if no_data and rows:
+            # Current metric compilers represent no data with an empty rowset.
+            # A typed placeholder row is not a second no-data representation.
+            raise GroundingIntegrityError("grounding_result_cardinality_invalid")
+        if output_contract is not None:
+            _validate_manifest_typed_rows(
+                rows,
+                no_data=no_data,
+                query_plan=query_plan,
+                manifest=output_contract,
+            )
+        if step is not None and not step.calculation_input_role and not step.ad_hoc_input_role:
+            # A metric/detail fetch is single-row by contract.  Empty rowsets
+            # are allowed only for an explicit no-data result; a non-empty
+            # successful result must never be reduced to a first row at the
+            # grounding boundary.
+            if query_plan is not None and query_plan.intent in {"metric", "detail"}:
+                if not no_data and len(rows) != 1:
+                    raise GroundingIntegrityError("grounding_result_cardinality_invalid")
+            elif query_plan is not None and query_plan.intent == "ranking":
+                if len(rows) > query_plan.ranking_limit:
+                    raise GroundingIntegrityError("grounding_result_cardinality_invalid")
+            elif query_plan is not None and query_plan.intent == "trend" and len(rows) > 31:
+                raise GroundingIntegrityError("grounding_result_cardinality_invalid")
         if no_data:
-            if rows and any(
-                not isinstance(row, Mapping)
-                or row.get("status") not in {"no_data", None}
-                for row in rows
-            ):
-                raise GroundingIntegrityError("grounding_malformed_output")
             return
         if not rows or any(
             not isinstance(row, Mapping)
@@ -438,10 +781,14 @@ def _validate_typed_fetch_output(output: JsonValue) -> None:
             for row in rows
         ):
             raise GroundingIntegrityError("grounding_malformed_output")
+        _validate_grounded_rows(rows)
         return
     if "value" in output:
         if output.get("value") is None:
             raise GroundingIntegrityError("grounding_malformed_output")
+        if output_contract is not None:
+            raise GroundingIntegrityError("grounding_manifest_result_shape_mismatch")
+        _validate_scalar_value(output.get("value"))
         return
     # Legacy typed runners may use the metric's short name as the sole key.
     # Keep that bounded projection compatible while rejecting arbitrary
@@ -449,8 +796,146 @@ def _validate_typed_fetch_output(output: JsonValue) -> None:
     if len(output) == 1:
         only = next(iter(output.values()))
         if only is not None and _is_scalar(only):
+            if output_contract is not None:
+                raise GroundingIntegrityError("grounding_manifest_result_shape_mismatch")
+            _validate_scalar_value(only)
             return
     raise GroundingIntegrityError("grounding_malformed_output")
+
+
+def _validate_grounded_rows(rows: Sequence[object]) -> None:
+    """Validate the JSON row shape before any value can become a fact.
+
+    Metric execution serializes Decimal values as exact decimal strings.  The
+    grounding boundary therefore accepts finite JSON numbers and canonical
+    decimal strings, while rejecting arbitrary text, nested objects and
+    arrays that could otherwise be rendered as a grounded value.
+    """
+
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise GroundingIntegrityError("grounding_result_type_invalid")
+        status = row.get("status")
+        if status is not None and status not in {"success", "no_data"}:
+            raise GroundingIntegrityError("grounding_result_type_invalid")
+        if "value" in row:
+            value = row.get("value")
+            if value is None:
+                if status != "no_data":
+                    raise GroundingIntegrityError("grounding_result_type_invalid")
+            else:
+                _validate_scalar_value(value)
+        for key in ("numerator", "denominator"):
+            if key in row:
+                value = row.get(key)
+                if type(value) is not int or value < 0:
+                    raise GroundingIntegrityError("grounding_result_type_invalid")
+        if "numerator" in row and "denominator" in row:
+            if row["numerator"] > row["denominator"]:
+                raise GroundingIntegrityError("grounding_result_type_invalid")
+        if "period" in row:
+            period = row.get("period")
+            if not _is_compiler_date_value(period):
+                raise GroundingIntegrityError("grounding_result_type_invalid") from None
+        for key, value in row.items():
+            if key in {"value", "numerator", "denominator", "status", "period"}:
+                continue
+            if isinstance(value, (Mapping, list)) or value is None:
+                raise GroundingIntegrityError("grounding_result_type_invalid")
+
+
+def _validate_scalar_value(value: object) -> None:
+    if type(value) is bool:
+        raise GroundingIntegrityError("grounding_result_type_invalid")
+    if type(value) is int:
+        return
+    if type(value) is float:
+        if math.isfinite(value):
+            return
+        raise GroundingIntegrityError("grounding_result_type_invalid")
+    if isinstance(value, str):
+        try:
+            parsed = Decimal(value)
+        except (InvalidOperation, ValueError):
+            raise GroundingIntegrityError("grounding_result_type_invalid") from None
+        if parsed.is_finite() and value.strip():
+            return
+    raise GroundingIntegrityError("grounding_result_type_invalid")
+
+
+def _validate_manifest_typed_rows(
+    rows: list[JsonValue],
+    *,
+    no_data: bool,
+    query_plan: QueryPlan | None,
+    manifest: ExpectedExecutionManifest,
+) -> None:
+    if no_data and rows:
+        raise GroundingIntegrityError("grounding_result_cardinality_invalid")
+    if not no_data and not rows:
+        raise GroundingIntegrityError("grounding_result_cardinality_invalid")
+    if len(manifest.output_aliases) != len(manifest.output_logical_types):
+        raise GroundingIntegrityError("grounding_manifest_output_types_invalid")
+    if not manifest.output_aliases:
+        raise GroundingIntegrityError("grounding_manifest_output_types_missing")
+    if manifest.cardinality_expectation == "single_row":
+        if no_data:
+            if rows:
+                raise GroundingIntegrityError("grounding_result_cardinality_invalid")
+        elif len(rows) != 1:
+            raise GroundingIntegrityError("grounding_result_cardinality_invalid")
+    elif query_plan is not None and query_plan.intent == "ranking":
+        if len(rows) > query_plan.ranking_limit:
+            raise GroundingIntegrityError("grounding_result_cardinality_invalid")
+    elif query_plan is not None and query_plan.intent == "trend" and len(rows) > 31:
+        raise GroundingIntegrityError("grounding_result_cardinality_invalid")
+    if no_data:
+        return
+    aliases = tuple(manifest.output_aliases)
+    logical_types = tuple(manifest.output_logical_types)
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != set(aliases):
+            raise GroundingIntegrityError("grounding_manifest_result_shape_mismatch")
+        for alias, logical_type in zip(aliases, logical_types, strict=True):
+            value = row[alias]
+            if not _matches_logical_type(value, logical_type):
+                raise GroundingIntegrityError("grounding_result_type_invalid")
+
+
+def _matches_logical_type(value: JsonValue, logical_type: str) -> bool:
+    if logical_type == "integer":
+        return type(value) is int
+    if logical_type == "numeric":
+        if not isinstance(value, str):
+            return False
+        try:
+            decimal_value = Decimal(value)
+        except InvalidOperation:
+            return False
+        return (
+            decimal_value.is_finite()
+            and decimal_value.as_tuple().exponent == -2
+        )
+    if logical_type == "text":
+        return isinstance(value, str)
+    if logical_type == "date":
+        return _is_compiler_date_value(value)
+    return False
+
+
+def _is_compiler_date_value(value: object) -> bool:
+    """Accept only the exact naive midnight ISO form emitted by the runner."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return (
+        parsed.tzinfo is None
+        and parsed.time().isoformat() == "00:00:00"
+        and parsed.isoformat() == value
+    )
 
 
 def _validate_snapshot_evidence(record: PlanExecutionRecord) -> None:
